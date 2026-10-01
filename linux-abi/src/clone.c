@@ -23,6 +23,7 @@
 
 /* Linux's clone flags, of which only these mean anything here. */
 #define CLONE_VM      0x00000100
+#define CLONE_VFORK   0x00004000
 #define CLONE_THREAD  0x00010000
 #define CLONE_SETTLS  0x00080000
 #define CLONE_CHILD_CLEARTID 0x00200000
@@ -46,6 +47,19 @@ void __quark_thread_exit(int code) {
     for (;;) { }
 }
 
+long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
+
+/* The end of a detached thread, on the stack kept for it (clone-entry.s):
+   its own stack is given back, as any mapping is, and then it is gone.
+   Linux's munmap is call 11. musl has blocked every signal by now, so
+   nothing is run on the way out of it. */
+void __quark_unmap_and_exit(void *base, unsigned long size);
+void __quark_unmap_and_exit(void *base, unsigned long size) {
+    __quark_syscall(11, (long)base, (long)size, 0, 0, 0, 0);
+    __syscall1(SYS_EXIT_CODE, 0);
+    for (;;) { }
+}
+
 long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
                    int *ptid, void *tls, int *ctid) {
     /* A child with a *copy* of the address space rather than a share of it is
@@ -64,7 +78,27 @@ long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
         return __quark_fork();
     }
     if (!(flags & CLONE_THREAD)) {
-        return -LX_ENOSYS;
+        /* A child that borrows its parent's memory, with the parent held
+           until the child has become another program or gone: vfork's
+           bargain, and what musl makes `posix_spawn` of. The point of it on
+           Linux is not to copy an address space that is about to be thrown
+           away. Here the child is given a copy all the same, as `vfork`
+           is: the kernel has one way to make a process.
+
+           What a caller could see is whatever the child wrote to memory,
+           which it will not find in its own. musl's does not look: its
+           child says how the exec went down a pipe. The function is run
+           where it stands, on the child's copy of this stack — there is
+           nobody else on it — and the child ends with what it returns. */
+        if (!(flags & CLONE_VFORK) || !func) {
+            return -LX_ENOSYS;
+        }
+        long pid = __quark_fork();
+        if (pid != 0) {
+            return pid;
+        }
+        __syscall1(SYS_EXIT_PROGRAM, (unsigned long)(func(arg) & 0xFF));
+        for (;;) { }
     }
     if (!func || !stack) {
         return -LX_EINVAL;

@@ -319,6 +319,21 @@ it would be a slave opened and closed, and the last slave closing is how a
 terminal's master hears that its session has ended. A terminal is one file
 however many descriptors there are for it: its inode is the terminal's.
 
+**Every call musl makes comes through the layer, and three of them come by
+a different door.** Almost all go through `__quark_syscall`. Three are
+assembly in musl because the kernel is asked for something a C function
+cannot be written to receive, and the toolchain's patch turns each into a
+tail call here: `__quark_clone` (a child that starts on a new stack),
+`__quark_fork` for `vfork` (a child that would have borrowed its parent's),
+and `__quark_unmapself` (a detached thread giving back the stack it is on,
+which it does from one kept for the purpose in `clone-entry.s`). A file of
+musl's that still says `syscall` is making Linux's call, by number, at a
+kernel that means something else by it — and nothing fails loudly: a
+detached thread's exit fell through into whatever came next in memory, and
+the thread stayed for good. `ctests/detachtest` and `spawntest` are for
+those two. `posix_spawn` is musl's `clone` with `CLONE_VM | CLONE_VFORK`,
+and its child is a copy like any other.
+
 **Signals are the program's to run.** The kernel ends a program that has said
 nothing about a signal and tells one that has a handler; it calls no handler
 itself. `linux-abi/src/signal.c` does: on the way out of every system call

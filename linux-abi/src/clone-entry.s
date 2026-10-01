@@ -27,4 +27,34 @@ __quark_thread_entry:
 	call __quark_thread_exit
 	hlt
 	.size __quark_thread_entry,.-__quark_thread_entry
+
+/* Where a detached thread ends.
+ *
+ * It gives back its own stack, which it is standing on, and exits. musl does
+ * that with two system calls and nothing between them; here unmapping is the
+ * layer's bookkeeping as well as the kernel's, and that is C, and C wants a
+ * stack. So the thread steps onto one kept for this and does the rest there.
+ *
+ * One is enough. musl takes its thread-list lock before it gets here and
+ * never lets it go: the kernel does, when the thread has exited
+ * (`SYS_SET_CLEAR_TID`). So the next thread to end cannot get this far until
+ * this one is no longer on the stack at all.
+ *
+ * Entered with RDI = the mapping's base and RSI = its size, which is where
+ * `__quark_unmap_and_exit` wants them.
+ */
+	.global __quark_unmapself
+	.type   __quark_unmapself,@function
+__quark_unmapself:
+	lea __quark_last_stack_top(%rip),%rsp
+	call __quark_unmap_and_exit
+	hlt
+	.size __quark_unmapself,.-__quark_unmapself
+
+	.bss
+	.balign 16
+__quark_last_stack:
+	.space 16384
+__quark_last_stack_top:
+	.text
 	.section .note.GNU-stack,"",@progbits

@@ -7,7 +7,7 @@ talking to Linux: it makes Linux's system calls, with Linux's numbers and
 structures. Quark's kernel has different calls, so each one musl makes is
 answered by a layer linked into the program — `linux-abi/` in this tree —
 which turns it into what Quark does have: a call to the kernel, a message to
-the file server, or `ENOSYS`. Nothing in musl is changed beyond the five
+the file server, or `ENOSYS`. Nothing in musl is changed beyond the seven
 files that make it call the layer (`quark-toolchain`'s patch).
 
 So a program ported to Quark is a Linux program, and nearly everything in a
@@ -68,7 +68,14 @@ too. The difference is only visible to code that mixes the two kinds.
 
 - `fork` copies the whole address space at once; there is no copy-on-write.
   `vfork` is `fork`. `clone` makes a thread (with `CLONE_VM | CLONE_THREAD`)
-  or is `fork` (with neither); other combinations are `ENOSYS`.
+  or is `fork` (with neither).
+- **`posix_spawn` works, and its child does not share memory.** musl makes
+  it of `clone` with `CLONE_VM | CLONE_VFORK`: a child that borrows its
+  parent's memory while the parent waits. Here that child is a copy, as a
+  `vfork` child is. musl's reports a failed exec down a pipe, so nothing it
+  does depends on the difference; a program that calls `clone` that way
+  itself and expects to see what the child wrote will not. `CLONE_VM` with
+  neither `CLONE_THREAD` nor `CLONE_VFORK` is `ENOSYS`.
 - **A program with more than one thread cannot `exec`.** POSIX has `exec` end
   the other threads; ending them here means unwinding what they hold in a
   server, so it is refused rather than half done.
