@@ -5,7 +5,7 @@ nameserver, the drivers, the servers, the C library and the Linux system-call
 layer, the shell and the programs. It was `user/` in the kernel's repository
 until Phase 18, and its history came with it.
 
-It is one of five repositories that build together and must be checked out as
+It is one of six repositories that build together and must be checked out as
 siblings:
 
 ```
@@ -14,13 +14,15 @@ repos/
   quarkutils/  this repo
   bang/        UEFI bootloader, and nothing else
   explosion/   the distro: stages the other three and assembles the image
+  gnu-quark/   the other distro: the kernel, four programs and the boot
+               services from here, and GNU's bash and coreutils on top
   rust/        fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
 ```
 
-`explosion` refers to `../quark`, `../quarkutils` and `../bang`, and the fork's
+`explosion` and `gnu-quark` refer to `../quark`, `../quarkutils` and `../bang`, and the fork's
 `library/Cargo.toml` patches `quark-rt` through the relative path
 `../../quarkutils/quark-rt`. Anything other than a flat sibling layout breaks
-the build. The dependency runs one way — the distro reaches down, never the
+the build. The dependency runs one way — a distro reaches down, never the
 reverse — and **this tree never looks inside the kernel's**. What it knows
 about the kernel is the ABI, and `../quark/CLAUDE.md` is where ring 0's own
 rules are.

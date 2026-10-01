@@ -118,6 +118,12 @@ cd ../explosion
 make run
 ```
 
+[GNU/Quark](https://github.com/MagicJester2764/gnu-quark) is the other thing
+built on it: the boot services and four programs from here — `getty`,
+`login`, `ps`, `shutdown` — under GNU's bash and coreutils. Its programs are
+other people's C, unpatched, so it is what the C library and the Linux layer
+in this tree are held to.
+
 ## Disclaimer
 
 This is primarily an AI-assisted experimental project, not a production system. It was built as a vehicle for exploring OS development concepts with AI tooling. Use at your own risk.
