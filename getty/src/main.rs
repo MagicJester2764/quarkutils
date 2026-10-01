@@ -17,6 +17,12 @@
 //! The slave stays open here between sessions, so the terminal never sees its
 //! last holder go: a hangup is for a terminal whose user has left, and this
 //! one has only finished a session.
+//!
+//! And this is what makes it a *session*, in the sense a shell with job
+//! control needs: it begins one, and takes the terminal as the session's
+//! own. From then on the terminal has a process group in front of it, which
+//! is who Ctrl-C and Ctrl-Z are for, and a shell that puts each job in a
+//! group of its own can say which.
 
 use quark_rt::ipc::Message;
 use quark_rt::manifest::CapReq;
@@ -73,10 +79,17 @@ pub extern "C" fn _start() -> ! {
         println!("getty: no file server");
         syscall::sys_exit_code(1);
     };
+    // A session of its own, before there is a terminal for it to be the
+    // session of. Everything started from here is in it.
+    let _ = syscall::sys_setsid();
     let Some(tty) = open_terminal() else {
         println!("getty: the console has no terminal to give");
         syscall::sys_exit_code(1);
     };
+    // The session's terminal, with this group in front: `login` is started
+    // in it, and so is a shell that does nothing about groups. One that does
+    // moves itself and says so.
+    let _ = syscall::sys_pty_set_session(tty);
     // As the terminal is before anybody has changed it. A session that ends
     // with the echo off — a shell killed at its prompt — must not leave the
     // next one typing blind.
@@ -109,6 +122,10 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit_code(1);
         }
         let _ = syscall::sys_wait_for(info.tid);
+        // Whatever was in front when it went, this group is now.
+        if let Some(group) = syscall::sys_getpgid(0) {
+            let _ = syscall::sys_pty_set_front(tty, group, true);
+        }
         // Not at once: a login program that dies as it starts would otherwise
         // be started as fast as the machine can load it.
         syscall::sleep_ticks(50);

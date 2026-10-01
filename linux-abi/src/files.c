@@ -48,6 +48,7 @@ static int posix_locks_taken;
 #define LX_O_WRONLY    1
 #define LX_O_CREAT     0100
 #define LX_O_EXCL      0200
+#define LX_O_NOCTTY    0400
 #define LX_O_TRUNC     01000
 #define LX_O_APPEND    02000
 #define LX_O_DIRECTORY 0200000
@@ -215,7 +216,11 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
        kernel descriptors, caught here ahead of the VFS the way a Linux kernel
        catches them ahead of its filesystems. */
     if (__quark_pty_path(path)) {
-        return __quark_pty_open(path);
+        long tty = __quark_pty_open(path);
+        if (tty >= 0) {
+            __quark_pty_opened(tty, (flags & LX_O_NOCTTY) != 0);
+        }
+        return tty;
     }
     /* Nor is a name for a descriptor this program already holds: opening one
        is making another descriptor for the same thing. `/dev/tty` is whichever
@@ -1074,7 +1079,14 @@ long __quark_read(long fd, void *buf, unsigned long n) {
             }
         }
     }
-    return r == QUARK_ERR ? -LX_EBADF : (long)r;
+    if (r == QUARK_ERR) {
+        /* The kernel says only that it failed. A terminal that would not be
+           read is one this program is behind, and may not be stopped for:
+           it ignores the signal, or has nobody who would start it again. */
+        unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+        return k != QUARK_ERR && QUARK_FD_KIND(k) == QUARK_FD_KIND_PTY_SLAVE ? -LX_EIO : -LX_EBADF;
+    }
+    return (long)r;
 }
 
 /* Why a write to one of the kernel's descriptors failed. The kernel says

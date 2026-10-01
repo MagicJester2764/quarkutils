@@ -82,6 +82,7 @@ int __quark_sig_due(void);
 int __quark_sig_deliver(void);
 /* A wait the kernel ended for a signal: what ran, as above; 0 to wait again. */
 int __quark_sig_interrupted(void);
+int __quark_sig_is_blocked(long sig);
 unsigned long __quark_sig_swap_mask(unsigned long mask);
 void __quark_sig_forked(void);
 /* A write nobody will read: SIGPIPE, which by default is the end. */
@@ -106,6 +107,7 @@ void __quark_sig_pipe(void);
    or a value on success, and a negated errno on failure. */
 long __quark_open(const char *path, long flags, long mode);
 long __quark_openat(long dirfd, const char *path, long flags, long mode);
+void __quark_pty_opened(long fd, int noctty);
 long __quark_mknodat(long dirfd, const char *path, long mode);
 long __quark_close(long fd);
 long __quark_read(long fd, void *buf, unsigned long n);

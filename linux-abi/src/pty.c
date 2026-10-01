@@ -22,6 +22,12 @@
 #define PTY_GET_WINSIZE 2
 #define PTY_SET_WINSIZE 3
 #define PTY_NUMBER      4
+#define PTY_SET_FRONT   5
+#define PTY_GET_FRONT   6
+#define PTY_SET_SESSION 7
+#define PTY_GET_SESSION 8
+/* With PTY_SET_FRONT: the caller is not to be stopped for asking. */
+#define PTY_FRONT_QUIETLY (1UL << 63)
 
 /* The requests a terminal emulator and a shell actually send. */
 #define TCGETS     0x5401
@@ -29,6 +35,11 @@
 #define TCSETSW    0x5403
 #define TCSETSF    0x5404
 #define TIOCSCTTY  0x540E
+#define TIOCGPGRP  0x540F
+#define TIOCSPGRP  0x5410
+#define TIOCNOTTY  0x5422
+#define TIOCGSID   0x5429
+#define LX_SIGTTOU 22
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
@@ -86,6 +97,15 @@ long __quark_pty_open(const char *path) {
     }
     unsigned long fd = __syscall1(SYS_PTY_OPEN, (unsigned long)n);
     return fd == QUARK_ERR ? -LX_ENOENT : (long)fd;
+}
+
+/* A terminal opened by the leader of a session that has no terminal becomes
+   that session's, unless the open said O_NOCTTY: Linux's rule, and what a
+   getty relies on. The kernel refuses for anybody else, which is the test. */
+void __quark_pty_opened(long fd, int noctty) {
+    if (!noctty && __quark_pty_slave_number(fd) >= 0) {
+        __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_SESSION, 0);
+    }
 }
 
 /* `/dev/pts` itself, for a program that stats it before using it. */
@@ -173,14 +193,60 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
         return __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_NUMBER, 0) == QUARK_ERR
                    ? -LX_ENOTTY
                    : 0;
-    case TIOCSCTTY:
-        /* There are no sessions here, so there is no controlling terminal to
-           become. A program asks for one right after `setsid` and checks only
-           that it worked; refusing would stop a shell that has done nothing
-           wrong. */
+    case TIOCSCTTY: {
+        /* The caller's session takes this terminal: what a terminal's child
+           asks for right after `setsid`. */
+        unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_SESSION, 0);
+        return r == 0 ? 0 : r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_ENOTTY;
+    }
+    case TIOCNOTTY:
+        /* Giving up a controlling terminal is something a session does by
+           its leader ending. A program that asks is about to call `setsid`,
+           which is what leaves the terminal behind. */
         return __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_NUMBER, 0) == QUARK_ERR
                    ? -LX_ENOTTY
                    : 0;
+    case TIOCGSID:
+    case TIOCGPGRP: {
+        /* tcgetsid and tcgetpgrp: whose terminal this is, and which process
+           group is in front of it. Only of the caller's own terminal. */
+        unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd,
+                                     request == TIOCGSID ? PTY_GET_SESSION : PTY_GET_FRONT, 0);
+        if (r == QUARK_ERR) {
+            return -LX_ENOTTY;
+        }
+        if (arg) {
+            /* No group in front is said as a number no group has. */
+            *(int *)arg = r ? (int)r : 0x7FFFFFFF;
+        }
+        return 0;
+    }
+    case TIOCSPGRP: {
+        /* tcsetpgrp: put a group in front. A job in the background that
+           asks is stopped for it (SIGTTOU) rather than obeyed — unless it
+           has the signal blocked, which only this layer knows, so the kernel
+           is told. A shell takes the terminal back exactly that way. */
+        if (!arg || *(int *)arg <= 0) {
+            return -LX_EINVAL;
+        }
+        unsigned long group = (unsigned long)*(int *)arg;
+        for (;;) {
+            unsigned long quietly = __quark_sig_is_blocked(LX_SIGTTOU) ? PTY_FRONT_QUIETLY : 0;
+            unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_FRONT,
+                                         group | quietly);
+            if (r == 0) {
+                return 0;
+            }
+            if (r != QUARK_INTERRUPTED) {
+                return r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_ENOTTY;
+            }
+            /* Stopped, and started again; or a handler has run. Ask again,
+               unless the handler wanted to be told. */
+            if (__quark_sig_interrupted() & QUARK_SIG_EINTR) {
+                return -LX_EINTR;
+            }
+        }
+    }
     default:
         return -LX_ENOTTY;
     }

@@ -25,6 +25,19 @@
 #define QUARK_WAIT_NOW      1UL
 #define QUARK_WAIT_BY_PID   2UL
 #define QUARK_RAISE_BY_PID  1UL
+/* Jobs. A wait can ask to hear of a child that has stopped, or been started
+   again, and can name a process group of children (0 for the caller's own);
+   an answer about a stop or a start has QUARK_WAIT_REPORT beside the child's
+   name, and the signal that stopped it above — 0 for a start. A signal can be
+   raised for a group. */
+#define QUARK_WAIT_STOPPED   4UL
+#define QUARK_WAIT_CONTINUED 8UL
+#define QUARK_WAIT_GROUP     16UL
+#define QUARK_WAIT_REPORT    (1UL << 31)
+#define QUARK_RAISE_GROUP    2UL
+/* What a call about groups, sessions or a terminal's foreground answers when
+   the rules say no, as distinct from there being nothing of the kind. */
+#define QUARK_NOT_ALLOWED    ((unsigned long)-2)
 /* Have signal 14 raised for the program so many ticks from now, and then
    every so many: the answer is what was left of the alarm this replaces, and
    above it what that one repeated at. */
@@ -99,6 +112,13 @@
 #define SYS_PTY_CREATE      208
 #define SYS_PTY_CTL         209
 #define SYS_PTY_OPEN        210
+/* Process groups and sessions: arg0 says what is asked, arg1 names a process
+   (0 for the caller's own), arg2 a group for the one that sets it. */
+#define SYS_PGROUP          211
+#define QUARK_PGROUP_GET    0UL
+#define QUARK_PGROUP_SET    1UL
+#define QUARK_SESSION_GET   2UL
+#define QUARK_SESSION_NEW   3UL
 
 /* 0x90  time */
 #define SYS_TIMER_CREATE    146

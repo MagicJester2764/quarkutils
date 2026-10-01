@@ -27,3 +27,4 @@ shelltest
 cxxtest
 polltest
 fifotest
+jobtest

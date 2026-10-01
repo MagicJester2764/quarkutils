@@ -5,7 +5,7 @@ use quark_rt::{println, syscall};
 
 const MAX_TASKS: usize = 64;
 
-const STATE_NAMES: [&str; 4] = ["READY", "RUN", "BLOCK", "DEAD"];
+const STATE_NAMES: [&str; 5] = ["READY", "RUN", "BLOCK", "DEAD", "STOP"];
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]

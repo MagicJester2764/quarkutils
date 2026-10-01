@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 397 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 425 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -336,7 +336,7 @@ handles it so that Ctrl-C at its prompt is a fresh prompt.
 
 **A process id is not a task id.** The kernel gives a dead task's id to the
 next task made, and a Unix program assumes a pid it was told a moment ago is
-nobody else yet: bash, with job control off, does not wait for a command
+nobody else yet: bash does not wait for a command
 whose pid is the last background job's, and after `sleep 2 &` that was every
 command that landed in the slot. So in C a process is named by its process id
 (`SYS_PID`: the number of the task the program began as, which the kernel
@@ -365,6 +365,24 @@ the terminal never sees its last holder go. `login` reads `/etc/passwd` in
 Unix's seven fields or the five this began with, and starts any shell but
 `qsh` the way a Unix login does: in the home directory, with `HOME`, `USER`,
 `LOGNAME`, `SHELL`, `PATH` and `TERM`, under a name with a dash in front.
+
+**`getty` is what makes that a session**, in the sense job control needs.
+It begins one (`sys_setsid`) and takes the terminal as the session's own
+(`sys_pty_set_session`), which gives the terminal a process group in front
+of it: `getty`'s, in which `login` and whatever it starts all begin. A shell
+that does nothing about groups — `qsh` — leaves it at that, and Ctrl-C is
+for the lot of them, as it always was. A shell with job control puts itself
+in a group of its own and in front, and each job after it. Two things follow
+for whoever is *not* the shell:
+
+- **`login` takes the terminal back when the shell ends**, and `getty` when
+  `login` does (`sys_pty_set_front`, quietly). The group in front is the one
+  that has just gone; until somebody is in front again, nothing typed is for
+  anybody and a read from behind is not a read — `login` would print its
+  prompt and be refused the answer for ever.
+- **Ctrl-Z does nothing at `qsh`**, by the kernel's rule and not by anybody
+  ignoring it: a group with nobody to continue it is not stopped from a
+  terminal. Nothing here needs to say what it does about signal 20.
 
 ## The screen
 
@@ -666,9 +684,7 @@ The rules that got it there, and that a further port should follow:
 - **A handler runs at a system-call boundary and nowhere else.** A C program
   has `sigaction`, a mask, `kill`, `EINTR` and SIGPIPE (`linux-abi/src/
   signal.c`), and one that handles a signal and then computes without a call
-  is not interrupted by it. There are no process groups or sessions (`setsid`
-  answers with the caller's own id, `TIOCSCTTY` is accepted, and a shell runs
-  with job control off), and nothing is raised when a terminal changes size.
+  is not interrupted by it. Nothing is raised when a terminal changes size.
   `alarm` and `setitimer` are the kernel's one alarm for a program, in real
   time, to the tick: the timers that count time spent running are refused,
   and so is `timer_create`, which every program asked falls back from. A

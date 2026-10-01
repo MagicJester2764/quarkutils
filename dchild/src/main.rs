@@ -32,6 +32,10 @@
 //! 12, two bits each: a program a spawner made has said nothing, whatever its
 //! spawner had said. `sigignore` ignores signal 15, says so on descriptor 3,
 //! and sleeps.
+//! `beat` writes a byte to descriptor 3 every twentieth of a second for four
+//! seconds: something a parent can see has stopped. `leader` begins a
+//! session, takes descriptor 0 as its terminal, says on descriptor 3 how
+//! that went, a bit for each thing, and reads the terminal.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -218,6 +222,44 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"sleep"[..]) {
         syscall::sleep_ticks(1000);
         syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"beat"[..]) {
+        for _ in 0..80 {
+            if syscall::sys_fd_write(CONN, b".") != 1 {
+                break;
+            }
+            syscall::sleep_ticks(5);
+        }
+        syscall::sys_exit_code(7);
+    }
+    if quark_rt::args::argv(1) == Some(&b"leader"[..]) {
+        let me = syscall::sys_pid_self();
+        let mut went = 0u8;
+        if syscall::sys_setsid() == Ok(me) {
+            went |= 1;
+        }
+        // Once: a process that leads a group does not begin another session.
+        if syscall::sys_setsid() == Err(syscall::Refused::NotAllowed) {
+            went |= 2;
+        }
+        if syscall::sys_getsid(0) == Some(me) && syscall::sys_getpgid(0) == Some(me) {
+            went |= 4;
+        }
+        if syscall::sys_pty_set_session(0).is_ok() {
+            went |= 8;
+        }
+        if syscall::sys_pty_front(0) == Some(me) && syscall::sys_pty_session(0) == Some(me) {
+            went |= 16;
+        }
+        // The signal Ctrl-Z raises. This group has nobody to start it again
+        // — its parent is in another session — so it is not stopped, and
+        // gets as far as saying so.
+        let _ = syscall::sys_sig_raise(syscall::sys_getpid() as usize, syscall::SIGTSTP);
+        went |= 32;
+        let _ = syscall::sys_fd_write(CONN, &[went]);
+        let mut line = [0u8; 8];
+        let n = syscall::sys_fd_read(0, &mut line);
+        syscall::sys_exit_code(n as i32);
     }
     if quark_rt::args::argv(1) == Some(&b"sigstate"[..]) {
         let said = |signo| syscall::sys_sig_action_get(signo).unwrap_or(3) as i32;

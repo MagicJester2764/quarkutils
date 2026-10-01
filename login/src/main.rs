@@ -246,6 +246,16 @@ pub extern "C" fn _start() -> ! {
 
         let _ = syscall::sys_wait();
 
+        // The terminal back. A shell with job control put itself in front,
+        // and it has gone: until somebody is in front again nothing typed is
+        // for anybody, and a read from behind is not a read. Without being
+        // stopped for asking — this *is* behind, and has nobody to continue
+        // it. A shell that left things as they were makes this a no-op, and
+        // so does standard input not being a terminal.
+        if let Some(group) = syscall::sys_getpgid(0) {
+            let _ = syscall::sys_pty_set_front(0, group, true);
+        }
+
         // Shell exited — reset UID back to root for next login prompt
         let _ = syscall::sys_set_uid(my_tid, 0);
         let _ = syscall::sys_set_gid(my_tid, 0);

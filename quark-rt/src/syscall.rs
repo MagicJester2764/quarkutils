@@ -130,6 +130,8 @@ pub const SYS_EXEC_SPACE: u64 = 111;
 pub const SYS_PTY_CREATE: u64 = 208;
 pub const SYS_PTY_CTL: u64 = 209;
 pub const SYS_PTY_OPEN: u64 = 210;
+/// Process groups and sessions.
+pub const SYS_PGROUP: u64 = 211;
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
 pub const SYS_TIMER_GET: u64 = 148;
@@ -1407,6 +1409,14 @@ pub const SIGKILL: u64 = 9;
 pub const SIGALRM: u64 = 14;
 pub const SIGTERM: u64 = 15;
 pub const SIGCHLD: u64 = 17;
+/// The five a job is stopped and started with: start again; stop, which
+/// nothing can refuse; stop, typed at a terminal; and stop for reading a
+/// terminal, or for changing it, from behind.
+pub const SIGCONT: u64 = 18;
+pub const SIGSTOP: u64 = 19;
+pub const SIGTSTP: u64 = 20;
+pub const SIGTTIN: u64 = 21;
+pub const SIGTTOU: u64 = 22;
 
 /// What a program does about a signal: what the signal does, nothing, or run
 /// a handler of its own.
@@ -1487,6 +1497,159 @@ pub fn sys_wait_for_pid(pid: u64) -> Result<(u64, i32), ()> {
 pub fn sys_sig_raise_pid(pid: u64, signo: u64) -> Result<(), ()> {
     let ret = unsafe { syscall3(SYS_SIG_RAISE, pid, signo, 1) };
     if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+// ---------------------------------------------------------------------------
+// Jobs: process groups, sessions, and what a shell does with them.
+// ---------------------------------------------------------------------------
+
+/// What a call about groups, sessions or a terminal's foreground answers
+/// when the rules say no, as distinct from there being nothing of the kind.
+pub const NOT_ALLOWED: u64 = u64::MAX - 1;
+
+/// Why a change to a group, a session or a terminal was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// No such process, or not this session's terminal.
+    NoSuch,
+    /// There is, and the rules say no.
+    NotAllowed,
+    /// The caller was signalled for asking, and may ask again.
+    Interrupted,
+}
+
+fn refusal(ret: u64) -> Refused {
+    match ret {
+        NOT_ALLOWED => Refused::NotAllowed,
+        INTERRUPTED => Refused::Interrupted,
+        _ => Refused::NoSuch,
+    }
+}
+
+/// The process group of process `pid`; 0 is this program's own.
+pub fn sys_getpgid(pid: u64) -> Option<u64> {
+    match unsafe { syscall2(SYS_PGROUP, 0, pid) } {
+        u64::MAX => None,
+        group => Some(group),
+    }
+}
+
+/// Put process `pid` — this program, or a child of it; 0 is this one — in
+/// group `pgid`: a group of the same session, or with 0 a new one of its own.
+pub fn sys_setpgid(pid: u64, pgid: u64) -> Result<(), Refused> {
+    match unsafe { syscall3(SYS_PGROUP, 1, pid, pgid) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// The session of process `pid`; 0 is this program's own.
+pub fn sys_getsid(pid: u64) -> Option<u64> {
+    match unsafe { syscall2(SYS_PGROUP, 2, pid) } {
+        u64::MAX => None,
+        session => Some(session),
+    }
+}
+
+/// Begin a session, and a group in it, both led by this program and named
+/// after it. Refused for a program that already leads a group.
+pub fn sys_setsid() -> Result<u64, Refused> {
+    match unsafe { syscall1(SYS_PGROUP, 3) } {
+        ret @ (u64::MAX | NOT_ALLOWED) => Err(refusal(ret)),
+        session => Ok(session),
+    }
+}
+
+/// Raise `signo` for every program in process group `pgid`; 0 is this
+/// program's own group.
+pub fn sys_sig_raise_group(pgid: u64, signo: u64) -> Result<(), Refused> {
+    match unsafe { syscall3(SYS_SIG_RAISE, pgid, signo, 2) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// What became of a child, as [`sys_wait_job`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildNews {
+    /// It ended, with this status, and has been collected.
+    Ended(u64, i32),
+    /// A signal stopped it. It is still there.
+    Stopped(u64, u8),
+    /// It was started again.
+    Continued(u64),
+}
+
+/// [`sys_wait_job`]: answer now rather than wait.
+pub const WAIT_NOW: u64 = 1;
+/// Hear of a child that has stopped, and of one that has been continued.
+pub const WAIT_STOPPED: u64 = 4;
+pub const WAIT_CONTINUED: u64 = 8;
+/// What is named is a process group of children: 0 is this program's own.
+pub const WAIT_GROUP: u64 = 16;
+
+/// Wait for news of a child, named by process id (0 for any): its ending,
+/// and with [`WAIT_STOPPED`] or [`WAIT_CONTINUED`] its stopping or starting
+/// too. `Ok(None)` is [`WAIT_NOW`] with nothing to say; `Err` is no such
+/// child.
+pub fn sys_wait_job(pid: u64, flags: u64) -> Result<Option<ChildNews>, ()> {
+    match unsafe { syscall2(SYS_WAIT_FOR, pid, flags | 2) } {
+        u64::MAX => Err(()),
+        0 => Ok(None),
+        ret => {
+            let child = ret & 0x7FFF_FFFF;
+            let status = (ret >> 32) as i32;
+            Ok(Some(if ret & (1 << 31) == 0 {
+                ChildNews::Ended(child, status)
+            } else if status != 0 {
+                ChildNews::Stopped(child, status as u8)
+            } else {
+                ChildNews::Continued(child)
+            }))
+        }
+    }
+}
+
+/// Make the terminal `fd` names the controlling terminal of this program's
+/// session, with this program's group in front of it. For a session's
+/// leader, of a terminal no session has.
+pub fn sys_pty_set_session(fd: usize) -> Result<(), Refused> {
+    match unsafe { syscall3(SYS_PTY_CTL, fd as u64, 7, 0) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// The session the terminal is the controlling terminal of, if it is this
+/// program's own.
+pub fn sys_pty_session(fd: usize) -> Option<u64> {
+    match unsafe { syscall3(SYS_PTY_CTL, fd as u64, 8, 0) } {
+        u64::MAX => None,
+        session => Some(session),
+    }
+}
+
+/// The process group in front of this program's controlling terminal: the
+/// one what is typed there is for.
+pub fn sys_pty_front(fd: usize) -> Option<u64> {
+    match unsafe { syscall3(SYS_PTY_CTL, fd as u64, 6, 0) } {
+        u64::MAX => None,
+        group => Some(group),
+    }
+}
+
+/// Put group `pgid` of this session in front of its terminal.
+///
+/// Asked from behind, this raises SIGTTOU for the asker's own group, which
+/// stops it unless it has said otherwise — a job in the background does not
+/// bring itself forward. `quietly` asks without that: for whoever is taking
+/// the terminal back after the job it was lent to has gone.
+pub fn sys_pty_set_front(fd: usize, pgid: u64, quietly: bool) -> Result<(), Refused> {
+    let group = pgid | if quietly { 1 << 63 } else { 0 };
+    match unsafe { syscall3(SYS_PTY_CTL, fd as u64, 5, group) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
 }
 
 /// Have SIGALRM raised for this program in `ticks` ticks, and again every
@@ -1869,7 +2032,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 7;
+pub const ABI_VERSION_MINOR: u32 = 8;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

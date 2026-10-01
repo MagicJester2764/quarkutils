@@ -69,9 +69,12 @@ static unsigned long self(void) {
     return __syscall0(SYS_GETPID);
 }
 
-/* The signals that do nothing to a program that has said nothing. */
+/* The signals that do nothing to a program that has said nothing: a child
+   has ended, urgent data, a window has changed size, and "carry on" to a
+   program that was not stopped. The four that stop one are not here: what
+   they do is the kernel's to do. */
 static int harmless(long sig) {
-    return sig == 17 || sig == 23 || sig == 28 || (sig >= 18 && sig <= 22);
+    return sig == 17 || sig == 23 || sig == 28 || sig == 18;
 }
 
 /* Take what the kernel has for this program, and tell it where the word is. */
@@ -360,13 +363,24 @@ long __quark_kill(long pid, long sig) {
            script got a variable wrong. */
         return -LX_EPERM;
     }
-    /* 0 and a negative number name a process group, and there are none: a
-       group is its leader. */
-    unsigned long who = pid == 0 ? (unsigned long)__quark_getpid()
-                                 : (unsigned long)(pid < 0 ? -pid : pid);
-    return __syscall3(SYS_SIG_RAISE, who, (unsigned long)sig, QUARK_RAISE_BY_PID) == QUARK_ERR
+    if (pid <= 0) {
+        /* A process group: the caller's own, or the one named. For a shell
+           this is a job — every program of a pipeline at once. */
+        unsigned long r = __syscall3(SYS_SIG_RAISE, (unsigned long)-pid, (unsigned long)sig,
+                                     QUARK_RAISE_GROUP);
+        return r == QUARK_ERR ? -LX_ESRCH : r == QUARK_NOT_ALLOWED ? -LX_EPERM : 0;
+    }
+    return __syscall3(SYS_SIG_RAISE, (unsigned long)pid, (unsigned long)sig, QUARK_RAISE_BY_PID) ==
+                   QUARK_ERR
                ? -LX_ESRCH
                : 0;
+}
+
+/* Whether the program has `sig` blocked. The mask is kept here and nowhere
+   else, so anything the kernel would do differently for a blocked signal has
+   to be told. */
+int __quark_sig_is_blocked(long sig) {
+    return sig >= 1 && sig <= NSIG && (blocked & BIT(sig)) != 0;
 }
 
 /* tkill and tgkill: a signal for one thread. For the caller's own it is

@@ -376,6 +376,18 @@ struct lx_timespec {
     long tv_nsec;
 };
 
+/* What the kernel said about a process group or a session, as Linux says
+   it: the number, or why not. */
+static long job_answer(unsigned long r) {
+    if (r == QUARK_ERR) {
+        return -LX_ESRCH;
+    }
+    if (r == QUARK_NOT_ALLOWED) {
+        return -LX_EPERM;
+    }
+    return (long)r;
+}
+
 /* Sleep until `req` has passed on `clock` — or, with TIMER_ABSTIME, until
    the clock reads `req`. Time here is a 100 Hz tick, so a sleep is rounded
    up to whole ticks and one more, never ending early. It waits by receiving
@@ -835,23 +847,47 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
      * A negative code is the kernel saying "killed", with the signal number
      * negated, which is Linux's low byte with no `WIFEXITED` bit above it. */
     case LX_wait4: {
-        /* A child in particular, or any (-1, and 0 or a group, which is the
-           same thing where there are no groups); and WNOHANG, which a shell
-           tidying up after itself depends on not waiting. */
-        unsigned long who = a1 > 0 ? (unsigned long)a1 : 0;
-        unsigned long got = __syscall2(SYS_WAIT_FOR, who,
-                                       QUARK_WAIT_BY_PID | ((a3 & 1 /* WNOHANG */) ? QUARK_WAIT_NOW : 0));
+        /* A child in particular; any (-1); or one of a process group — the
+           caller's own (0) or the one named (less than -1). WNOHANG, which a
+           shell tidying up after itself depends on not waiting; and
+           WUNTRACED and WCONTINUED, which a shell with jobs uses to hear
+           that one has stopped or been started again. */
+        unsigned long how = QUARK_WAIT_BY_PID;
+        unsigned long who = 0;
+        if (a1 > 0) {
+            who = (unsigned long)a1;
+        } else if (a1 != -1) {
+            how |= QUARK_WAIT_GROUP;
+            who = (unsigned long)-a1;
+        }
+        if (a3 & 1 /* WNOHANG */) {
+            how |= QUARK_WAIT_NOW;
+        }
+        if (a3 & 2 /* WUNTRACED */) {
+            how |= QUARK_WAIT_STOPPED;
+        }
+        if (a3 & 8 /* WCONTINUED */) {
+            how |= QUARK_WAIT_CONTINUED;
+        }
+        unsigned long got = __syscall2(SYS_WAIT_FOR, who, how);
         if (got == QUARK_ERR) {
             return -LX_ECHILD;
         }
         if (got == 0) {
-            return 0; /* asked not to wait, and nothing has ended */
+            return 0; /* asked not to wait, and there is nothing to say */
         }
-        long pid = (long)(got & 0xFFFFFFFFUL);
+        long pid = (long)(got & 0x7FFFFFFFUL);
         int code = (int)(got >> 32);
         if (a2) {
             int *status = (int *)a2;
-            *status = code < 0 ? (-code & 0x7F) : ((code & 0xFF) << 8);
+            if (got & QUARK_WAIT_REPORT) {
+                /* Stopped by a signal, which Linux says as the signal above
+                   0x7f; or started again, which it says as 0xffff. Still
+                   there either way: nothing was collected. */
+                *status = code ? ((code & 0xFF) << 8) | 0x7F : 0xFFFF;
+            } else {
+                *status = code < 0 ? (-code & 0x7F) : ((code & 0xFF) << 8);
+            }
         }
         /* How long it ran is not kept. */
         if (a4) {
@@ -874,16 +910,21 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return parent == QUARK_ERR ? 1 : (long)parent;
     }
 
-    /* There are no process groups and no sessions: every program is its own.
-       Saying so in the terms the question was asked in lets a shell that
-       wants to know carry on. */
+    /* Process groups and sessions are the kernel's, and are asked of it. */
     case LX_getpgrp:
-        return __quark_getpid();
+        return job_answer(__syscall2(SYS_PGROUP, QUARK_PGROUP_GET, 0));
     case LX_getpgid:
+        return a1 < 0 ? -LX_ESRCH
+                      : job_answer(__syscall2(SYS_PGROUP, QUARK_PGROUP_GET, (unsigned long)a1));
     case LX_getsid:
-        return a1 ? a1 : __quark_getpid();
+        return a1 < 0 ? -LX_ESRCH
+                      : job_answer(__syscall2(SYS_PGROUP, QUARK_SESSION_GET, (unsigned long)a1));
     case LX_setpgid:
-        return 0;
+        if (a1 < 0 || a2 < 0) {
+            return -LX_EINVAL;
+        }
+        return job_answer(__syscall3(SYS_PGROUP, QUARK_PGROUP_SET, (unsigned long)a1,
+                                     (unsigned long)a2));
     /* In one group, its own. */
     case LX_getgroups:
         if (a1 > 0 && a2) {
@@ -1127,11 +1168,9 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     }
 
     case LX_setsid:
-        /* No sessions here. A terminal's child calls this and then asks for a
-           controlling terminal; both are about which process group hears a
-           signal, and there are no signals. Answering with the caller's own id
-           is what a successful `setsid` looks like. */
-        return __quark_getpid();
+        /* A session of the caller's own, and a group in it: what a terminal's
+           child asks for before it asks for a controlling terminal. */
+        return job_answer(__syscall1(SYS_PGROUP, QUARK_SESSION_NEW));
     /* Signals: signal.c. */
     case LX_rt_sigaction:
         return __quark_sigaction(a1, (const struct lx_ksigaction *)a2,

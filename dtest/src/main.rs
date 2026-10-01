@@ -1257,6 +1257,189 @@ fn test_signals() {
     let _ = syscall::sys_sig_take(None);
 }
 
+/// Process groups, sessions, programs that stop, and whose a terminal is.
+fn test_jobs() {
+    use syscall::{ChildNews, Refused};
+    println!("jobs:");
+    let bit = |signo: u64| 1u64 << (signo - 1);
+    let group = syscall::sys_getpgid(0);
+    let session = syscall::sys_getsid(0);
+    check("a program is in a process group and a session", group.is_some() && session.is_some());
+
+    // A child that can be seen to be running: it writes a byte every
+    // twentieth of a second.
+    let started = match (syscall::sys_socketpair(), load_child(&[b"dchild", b"beat"])) {
+        (Ok((mine, theirs)), Some(child)) => {
+            let tid = child.tid;
+            let _ = syscall::sys_fd_dup(tid, 3, theirs);
+            let _ = syscall::sys_fd_close(theirs);
+            child.start().ok().map(|()| (tid, mine))
+        }
+        _ => None,
+    };
+    let Some((tid, beats)) = started else {
+        check("start a child", false);
+        return;
+    };
+    let pid = syscall::sys_pid(tid).unwrap_or(0);
+    let mut byte = [0u8; 64];
+    check("a child runs", syscall::sys_fd_read(beats, &mut byte[..1]) == 1);
+    check(
+        "it begins in its parent's group and session",
+        syscall::sys_getpgid(pid) == group && syscall::sys_getsid(pid) == session,
+    );
+    check(
+        "its parent can put it in a group of its own",
+        syscall::sys_setpgid(pid, 0).is_ok() && syscall::sys_getpgid(pid) == Some(pid),
+    );
+    check(
+        "but not in a group that is not there",
+        syscall::sys_setpgid(pid, 0x7FFF_0000) == Err(Refused::NotAllowed),
+    );
+    check(
+        "and a process that is nobody's child is not this one's to move",
+        syscall::sys_setpgid(syscall::sys_pid(1).unwrap_or(1), 0) == Err(Refused::NoSuch),
+    );
+
+    // Stopped, it does not run; and its parent can ask to be told.
+    check("signal 19 is raised for it", syscall::sys_sig_raise_pid(pid, syscall::SIGSTOP).is_ok());
+    check(
+        "a wait that asked hears that it has stopped",
+        syscall::sys_wait_job(pid, syscall::WAIT_STOPPED) == Ok(Some(ChildNews::Stopped(pid, 19))),
+    );
+    check(
+        "once",
+        syscall::sys_wait_job(pid, syscall::WAIT_STOPPED | syscall::WAIT_NOW) == Ok(None),
+    );
+    check("its task says it is stopped", matches!(syscall::sys_task_info(tid), Ok((4, _, _))));
+    while (1..=byte.len() as u64).contains(&syscall::sys_fd_read_nb(beats, &mut byte)) {}
+    syscall::sleep_ticks(30);
+    check(
+        "and it does not run while it is",
+        syscall::sys_fd_read_nb(beats, &mut byte) == syscall::WOULD_BLOCK,
+    );
+    check("signal 18 is raised for it", syscall::sys_sig_raise_pid(pid, syscall::SIGCONT).is_ok());
+    check(
+        "a wait that asked hears that it was continued",
+        syscall::sys_wait_job(pid, syscall::WAIT_CONTINUED) == Ok(Some(ChildNews::Continued(pid))),
+    );
+    check("and it runs again", syscall::sys_fd_read(beats, &mut byte[..1]) == 1);
+
+    // A signal for a group is for everything in it, and a wait can be too.
+    let second = load_child(&[b"dchild", b"sleep"]).and_then(|c| {
+        let tid = c.tid;
+        c.start().ok().map(|()| tid)
+    });
+    let second_pid = second.and_then(syscall::sys_pid).unwrap_or(0);
+    let outsider = load_child(&[b"dchild", b"quit"]).and_then(|c| {
+        let tid = c.tid;
+        c.start().ok().map(|()| tid)
+    });
+    check(
+        "a second child joins the first one's group",
+        syscall::sys_setpgid(second_pid, pid).is_ok() && syscall::sys_getpgid(second_pid) == Some(pid),
+    );
+    check(
+        "a signal raised for the group",
+        syscall::sys_sig_raise_group(pid, syscall::SIGTERM).is_ok(),
+    );
+    let mut ended = [0u64; 2];
+    for slot in ended.iter_mut() {
+        if let Ok(Some(ChildNews::Ended(who, -15))) = syscall::sys_wait_job(pid, syscall::WAIT_GROUP) {
+            *slot = who;
+        }
+    }
+    check(
+        "ends both, and a wait for the group collects them",
+        ended.contains(&pid) && ended.contains(&second_pid) && pid != second_pid,
+    );
+    check(
+        "and nothing else: a child outside it is still there to collect",
+        syscall::sys_wait_job(pid, syscall::WAIT_GROUP).is_err()
+            && outsider.and_then(wait_for) == Some(0),
+    );
+    check(
+        "a group nobody is in cannot be signalled",
+        syscall::sys_sig_raise_group(pid, 0) == Err(Refused::NoSuch),
+    );
+    let _ = syscall::sys_fd_close(beats);
+
+    // A terminal with a session: a child begins one and takes the terminal.
+    let pair = syscall::sys_pty_create().ok().and_then(|master| {
+        let number = syscall::sys_pty_number(master).ok()?;
+        Some((master, syscall::sys_pty_open(number).ok()?))
+    });
+    let Some((master, slave)) = pair else {
+        check("a terminal", false);
+        return;
+    };
+    let leader = match (syscall::sys_socketpair(), load_child(&[b"dchild", b"leader"])) {
+        (Ok((mine, theirs)), Some(child)) => {
+            let tid = child.tid;
+            let _ = syscall::sys_fd_dup(tid, 0, slave);
+            let _ = syscall::sys_fd_dup(tid, 3, theirs);
+            let _ = syscall::sys_fd_close(theirs);
+            child.start().ok().map(|()| (tid, mine))
+        }
+        _ => None,
+    };
+    let Some((leader, says)) = leader else {
+        check("start a child on the terminal", false);
+        return;
+    };
+    let leader_pid = syscall::sys_pid(leader).unwrap_or(0);
+    // If it was stopped after all it says nothing, and this must not wait
+    // for ever to find that out.
+    let mut fds = [syscall::PollFd::new(says, syscall::POLL_READABLE)];
+    let went = if syscall::sys_poll(&mut fds, 300) == Ok(1) && syscall::sys_fd_read(says, &mut byte[..1]) == 1 {
+        byte[0]
+    } else {
+        0
+    };
+    check("a program begins a session, which it leads, once", went & 7 == 7);
+    check("and takes a terminal as the session's, with itself in front", went & 24 == 24);
+    check(
+        "a group nobody would continue is not stopped by the signal Ctrl-Z raises",
+        went & 32 != 0,
+    );
+    check(
+        "the terminal is not another session's to ask about",
+        syscall::sys_pty_front(slave).is_none() && syscall::sys_pty_session(slave).is_none(),
+    );
+    check(
+        "or to take",
+        syscall::sys_pty_set_session(slave) == Err(Refused::NotAllowed),
+    );
+    // What is typed is for the group in front, and for nobody else who
+    // happens to hold the terminal — as this does.
+    let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_HANDLE);
+    let _ = syscall::sys_sig_take(None);
+    syscall::sleep_ticks(10);
+    let _ = syscall::sys_fd_write_nb(master, b"\x03");
+    check(
+        "Ctrl-C ends the program in front of the terminal",
+        syscall::sys_wait_job(leader_pid, 0) == Ok(Some(ChildNews::Ended(leader_pid, -2))),
+    );
+    check("and is not for whoever else has it open", syscall::sys_sig_take(None) == 0);
+    // Its leader gone, the terminal is nobody's, and is as it was before
+    // anybody claimed it: what is typed is for whoever holds it.
+    let _ = syscall::sys_fd_write_nb(master, b"\x03");
+    check(
+        "a terminal whose session has ended is nobody's again",
+        syscall::sys_sig_take(None) == bit(syscall::SIGINT),
+    );
+    let _ = syscall::sys_sig_action(syscall::SIGTSTP, syscall::SIG_HANDLE);
+    let _ = syscall::sys_fd_write_nb(master, b"\x1a");
+    check("and Ctrl-Z raises signal 20 there", syscall::sys_sig_take(None) == bit(syscall::SIGTSTP));
+    for signo in [syscall::SIGINT, syscall::SIGTSTP] {
+        let _ = syscall::sys_sig_action(signo, syscall::SIG_DEFAULT);
+    }
+    let _ = syscall::sys_sig_take(None);
+    for fd in [says, slave, master] {
+        let _ = syscall::sys_fd_close(fd);
+    }
+}
+
 /// Sleep a little, then write. Run on a thread so that something can become
 /// ready while the main task is blocked in a wait — which is the whole of what
 /// Task 8 adds, and cannot be tested from one task.
@@ -3083,6 +3266,7 @@ pub extern "C" fn _start() -> ! {
         ("served", test_served),
         ("fdfiles", test_file_descriptors),
         ("signals", test_signals),
+        ("jobs", test_jobs),
         ("region", test_big_region),
         ("memfd", test_memfd),
         ("socketpair", test_socketpair),

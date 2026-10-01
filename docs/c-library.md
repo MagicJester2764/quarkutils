@@ -60,8 +60,9 @@ What follows from it:
   below 64 is a task, and one from 64 up is a process.
 
 Everything a C program does with *processes* uses process ids throughout —
-`fork`, `wait4`, `kill`, `getppid`, `getpgrp` — and is exactly as on Linux.
-The difference is only visible to code that mixes the two kinds.
+`fork`, `wait4`, `kill`, `getppid`, `getpgrp`, `setpgid`, `setsid` — and is
+exactly as on Linux. A process group and a session are named by process ids
+too. The difference is only visible to code that mixes the two kinds.
 
 ### Starting and ending
 
@@ -102,7 +103,8 @@ waits a program sits in are ended early by a signal as they are on Linux:
 So is an `open` of a named pipe that is waiting for its other end.
 
 Other waits are **not** ended by a signal: a read of a pipe, a socket or a
-file, a `wait` for a child, a lock. The handler runs when the call returns.
+file, a `wait` for a child, a lock. (A `wait` is ended by what it is
+waiting for, which with `WUNTRACED` includes a child stopping.) The handler runs when the call returns.
 A program that wants a signal to interrupt one of those waits with `poll`
 first, as it would for a timeout.
 
@@ -114,7 +116,8 @@ Also different:
 
 - A signal with no handler does what it does at once, **even if it is
   blocked**. The mask is kept by the layer, which can hold back only a signal
-  it would have run a handler for.
+  it would have run a handler for. That includes the signals that stop a
+  program: see *Job control*.
 - A handler runs on the stack of whatever the program was doing, in whichever
   thread made the next system call. There is no alternate signal stack and
   no way to aim a signal at one thread: `pthread_kill` raises it for the
@@ -125,6 +128,37 @@ Also different:
   `ITIMER_PROF`) are refused, since nothing measures it; `timer_create` is
   `ENOSYS`, and the programs that try it first fall back to `setitimer`.
 - Nothing is sent when a terminal changes size (`SIGWINCH`).
+
+## Job control
+
+There are process groups, sessions, a controlling terminal with a group in
+front of it, and programs that stop: `setpgid`, `getpgid`, `getpgrp`,
+`setsid`, `getsid`, `tcsetpgrp`, `tcgetpgrp`, `tcgetsid`, `TIOCSCTTY`,
+`kill` and `killpg` of a group, and `waitpid` with `WUNTRACED`,
+`WCONTINUED`, 0 and a negative pid. A shell with job control runs as it
+does on Linux. What is different is at the edges:
+
+- **Only a read, and a change of who is in front, are checked.** A job that
+  reads the terminal from the background is stopped (`SIGTTIN`), and so is
+  one that calls `tcsetpgrp` from there (`SIGTTOU`). A job that *writes*
+  from the background is never stopped — `stty tostop` is stored and not
+  acted on — and nor is one that calls `tcsetattr`.
+- **A blocked stop signal still stops.** The mask is the layer's, and it can
+  hold back only a signal it would have run a handler for; `SIGTSTP`,
+  `SIGTTIN` and `SIGTTOU` with no handler do what they do at once, blocked
+  or not. A program that blocks one of them to do something undisturbed
+  should ignore it instead, or catch it. The one case every shell relies on
+  works as on Linux: `tcsetpgrp` with `SIGTTOU` blocked succeeds from the
+  background.
+- **A terminal becomes a session's when its leader opens it** without
+  `O_NOCTTY`, or asks with `TIOCSCTTY`; it cannot be taken from a session
+  that has it, and is given up only by the leader ending (`TIOCNOTTY` is
+  accepted and does nothing). Nothing is hung up on when a terminal's
+  master closes: its readers see the end of the file.
+- **`SIGCHLD` is raised for every stop and continue**, whatever
+  `SA_NOCLDSTOP` asked for. A handler that waits with `WNOHANG` and without
+  `WUNTRACED` finds nothing and returns.
+- `waitid` is `ENOSYS`; `waitpid` and `wait4` are what there is.
 
 ## Files and descriptors
 
