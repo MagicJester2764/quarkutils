@@ -977,6 +977,45 @@ fn test_signals() {
     }
     check("and what was waiting stayed with the parent", syscall::sys_sig_take(None) == bit(USR1));
 
+    // A process id: what a program is called by something that will ask
+    // about it later. Never a task id, never used twice, and what a wait and
+    // a signal can each name a program by.
+    let mine = syscall::sys_pid_self();
+    check("a process id is not a task id", mine >= 64 && syscall::sys_pid(me) == Some(mine));
+    let mut seen = [0u64; 3];
+    let mut tids = [0usize; 3];
+    for i in 0..3 {
+        match syscall::sys_fork() {
+            Ok(0) => syscall::sys_exit_program(40 + i as i32),
+            Ok(child) => {
+                tids[i] = child;
+                seen[i] = syscall::sys_pid(child).unwrap_or(0);
+                let waited = syscall::sys_wait_for_pid(seen[i]);
+                if waited != Ok((seen[i], 40 + i as i32)) {
+                    seen[i] = 0;
+                }
+            }
+            Err(()) => {}
+        }
+    }
+    check(
+        "a child is waited for by its process id, and answered by it",
+        seen.iter().all(|&p| p >= 64),
+    );
+    check(
+        "the task id comes round again and the process id does not",
+        (tids[0] == tids[1] || tids[1] == tids[2]) && seen[0] < seen[1] && seen[1] < seen[2],
+    );
+    check(
+        "a process id that has gone names nothing",
+        syscall::sys_sig_raise_pid(seen[0], 0).is_err()
+            && syscall::sys_wait_for_pid(seen[0]).is_err(),
+    );
+    check("a signal can be raised by process id", {
+        let _ = syscall::sys_sig_raise_pid(mine, USR1);
+        syscall::sys_sig_take(None) == bit(USR1)
+    });
+
     // A program a spawner makes is a new one, and has said nothing.
     let fresh = load_child(&[b"dchild", b"sigstate"]).and_then(|c| {
         let tid = c.tid;

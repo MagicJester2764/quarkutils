@@ -156,7 +156,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 346 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 356 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -317,6 +317,22 @@ because a program cannot exit with a signal's status by asking to. And a
 program that holds a session's terminal without being what the session runs
 says what it does about signal 2: `getty` and `login` ignore it, and `qsh`
 handles it so that Ctrl-C at its prompt is a fresh prompt.
+
+**A process id is not a task id.** The kernel gives a dead task's id to the
+next task made, and a Unix program assumes a pid it was told a moment ago is
+nobody else yet: bash, with job control off, does not wait for a command
+whose pid is the last background job's, and after `sleep 2 &` that was every
+command that landed in the slot. So in C a process is named by its process id
+(`SYS_PID`: the number of the task the program began as, which the kernel
+never gives out again) — `getpid`, `getppid`, what `fork` returns, what
+`wait4` and `kill` take — and a thread by its task id: `gettid`, `tkill`,
+what musl keeps to lock with. The kernel's own calls still take task ids, so
+the layer's uses of itself (`SYS_FD_DUP`, a sleep, a change of identity) ask
+`SYS_GETPID`, which answers with the *task's* id despite its name, and never
+`getpid()`; C that hands `getpid()` to a Quark call is handing over the wrong
+number. Rust is unchanged: `quark_rt` spawns, waits and kills by task id, and
+`syscall::sys_pid` is there for a program that wants the other one. `ps`
+shows both.
 
 **A session runs on a terminal when the distribution says so.** `init` reads
 `/etc/init.conf`, and `session <path>` there names what it starts once the

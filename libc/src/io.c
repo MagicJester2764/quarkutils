@@ -200,8 +200,11 @@ ssize_t write(int fd, const void *buf, size_t n) {
     return (ssize_t)done;
 }
 
+/* The program's process id, which is never used twice. Not SYS_GETPID: that
+   answers with the task's id — what the kernel's own calls take, and what the
+   next task made is given once this one has gone. */
 pid_t getpid(void) {
-    return (pid_t)__syscall0(SYS_GETPID);
+    return (pid_t)__syscall1(SYS_PID, 0);
 }
 
 /* The PIT runs at 100 Hz, so a tick is 10 ms — the only clock there is. */

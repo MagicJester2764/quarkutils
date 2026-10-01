@@ -151,6 +151,7 @@ typedef unsigned long size_t;
 #define LX_arch_prctl      158
 #define LX_sched_getaffinity 204
 #define LX_futex           202
+#define LX_gettid          186
 #define LX_set_tid_address 218
 #define LX_clock_gettime   228
 #define LX_exit_group      231
@@ -763,6 +764,9 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return (long)__syscall1(SYS_SET_CLEAR_TID, (unsigned long)a1);
 
     case LX_getpid:
+        return __quark_getpid();
+    case LX_gettid:
+        /* A thread is its task. */
         return (long)__syscall0(SYS_GETPID);
 
     /* Waiting for a child.
@@ -781,7 +785,8 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
            same thing where there are no groups); and WNOHANG, which a shell
            tidying up after itself depends on not waiting. */
         unsigned long who = a1 > 0 ? (unsigned long)a1 : 0;
-        unsigned long got = __syscall2(SYS_WAIT_FOR, who, (a3 & 1 /* WNOHANG */) ? 1UL : 0UL);
+        unsigned long got = __syscall2(SYS_WAIT_FOR, who,
+                                       QUARK_WAIT_BY_PID | ((a3 & 1 /* WNOHANG */) ? QUARK_WAIT_NOW : 0));
         if (got == QUARK_ERR) {
             return -LX_ECHILD;
         }
@@ -808,17 +813,21 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         /* The task that made this one, which the kernel knows: its answer
            about a task carries the parent above the state. */
         unsigned long info = __syscall1(SYS_TASK_INFO, __syscall0(SYS_GETPID));
-        return info == QUARK_ERR ? 1 : (long)((info >> 4) & 0x0FFFFFFF);
+        if (info == QUARK_ERR) {
+            return 1;
+        }
+        unsigned long parent = __syscall1(SYS_PID, (info >> 4) & 0x0FFFFFFF);
+        return parent == QUARK_ERR ? 1 : (long)parent;
     }
 
     /* There are no process groups and no sessions: every program is its own.
        Saying so in the terms the question was asked in lets a shell that
        wants to know carry on. */
     case LX_getpgrp:
-        return (long)__syscall0(SYS_GETPID);
+        return __quark_getpid();
     case LX_getpgid:
     case LX_getsid:
-        return a1 ? a1 : (long)__syscall0(SYS_GETPID);
+        return a1 ? a1 : __quark_getpid();
     case LX_setpgid:
         return 0;
     /* In one group, its own. */
@@ -855,23 +864,14 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_execve((const char *)a1, (char *const *)a2, (char *const *)a3);
 
     case LX_fork:
-    case LX_vfork: {
-        unsigned long child = __syscall0(SYS_FORK);
-        if (child == 0) {
-            __quark_sig_forked();
-        }
-        return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
-    }
+    case LX_vfork:
+        return __quark_fork();
     case LX_clone: {
         unsigned long flags = (unsigned long)a1;
         if (flags & 0x00000100UL /* CLONE_VM */) {
             return -LX_ENOSYS;
         }
-        unsigned long child = __syscall0(SYS_FORK);
-        if (child == 0) {
-            __quark_sig_forked();
-        }
-        return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
+        return __quark_fork();
     }
 
     /* Who this is. The kernel keeps one user and one group for a task, and
@@ -1077,7 +1077,7 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
            controlling terminal; both are about which process group hears a
            signal, and there are no signals. Answering with the caller's own id
            is what a successful `setsid` looks like. */
-        return (long)__syscall0(SYS_GETPID);
+        return __quark_getpid();
     /* Signals: signal.c. */
     case LX_rt_sigaction:
         return __quark_sigaction(a1, (const struct lx_ksigaction *)a2,
@@ -1121,7 +1121,7 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_setrlimit:
         return 0;
     case LX_prlimit64:
-        if (a2 != 0 && a2 != (long)__syscall0(SYS_GETPID)) {
+        if (a2 != 0 && a2 != __quark_getpid()) {
             return -LX_ESRCH;
         }
         return a4 ? do_getrlimit(a2 ? a1 : a1, (unsigned long *)a4) : 0;

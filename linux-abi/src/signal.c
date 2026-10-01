@@ -331,8 +331,10 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
     }
 }
 
-/* kill. A signal is said to a program, and a process id here is a task's:
-   the program is whichever one that task belongs to. */
+/* kill. A signal is said to a program, which is named by its process id. One
+   that has ended and not been collected is still there to be named, and the
+   kernel says yes and does nothing; an id that names nothing is ESRCH, and
+   stays so, since no other program is ever given it. */
 long __quark_kill(long pid, long sig) {
     if (sig < 0 || sig > NSIG) {
         return -LX_EINVAL;
@@ -344,17 +346,11 @@ long __quark_kill(long pid, long sig) {
     }
     /* 0 and a negative number name a process group, and there are none: a
        group is its leader. */
-    unsigned long tid = pid == 0 ? self() : (unsigned long)(pid < 0 ? -pid : pid);
-    if (__syscall2(SYS_SIG_RAISE, tid, (unsigned long)sig) != QUARK_ERR) {
-        return 0;
-    }
-    unsigned long info = __syscall1(SYS_TASK_INFO, tid);
-    if (info == QUARK_ERR) {
-        return -LX_ESRCH;
-    }
-    /* Ended and not yet collected: there is nothing left to tell, and saying
-       so is success. */
-    return (info & 0xF) == 3 ? 0 : -LX_EPERM;
+    unsigned long who = pid == 0 ? (unsigned long)__quark_getpid()
+                                 : (unsigned long)(pid < 0 ? -pid : pid);
+    return __syscall3(SYS_SIG_RAISE, who, (unsigned long)sig, QUARK_RAISE_BY_PID) == QUARK_ERR
+               ? -LX_ESRCH
+               : 0;
 }
 
 /* tkill and tgkill: a signal for one thread. For the caller's own it is
@@ -372,7 +368,9 @@ long __quark_tkill(long tid, long sig) {
         if (sig >= 32 && sig <= 34) {
             return -LX_ENOSYS;
         }
-        return __quark_kill(tid, sig);
+        return __syscall2(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig) == QUARK_ERR
+                   ? -LX_ESRCH
+                   : 0;
     }
     if (sig == 0) {
         return 0;

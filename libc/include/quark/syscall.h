@@ -18,6 +18,13 @@
 #define SYS_SIG_ACTION      11
 #define SYS_SIG_RAISE       12
 #define SYS_SIG_TAKE        13
+/* The process id of the program a task belongs to (0: the caller's). A task
+   id is reused at once; this never is. SYS_WAIT_FOR and SYS_SIG_RAISE can
+   each be asked by it. */
+#define SYS_PID             14
+#define QUARK_WAIT_NOW      1UL
+#define QUARK_WAIT_BY_PID   2UL
+#define QUARK_RAISE_BY_PID  1UL
 #define SYS_YIELD           2
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21

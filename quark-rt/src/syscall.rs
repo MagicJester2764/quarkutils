@@ -27,6 +27,8 @@ pub const SYS_SIG_ACTION: u64 = 11;
 pub const SYS_SIG_RAISE: u64 = 12;
 /// The signals raised for this program that it handles.
 pub const SYS_SIG_TAKE: u64 = 13;
+/// The process id of the program a task belongs to: never used twice.
+pub const SYS_PID: u64 = 14;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -1409,6 +1411,41 @@ pub fn sys_sig_take(word: Option<&'static core::sync::atomic::AtomicU32>) -> u64
     }
 }
 
+/// The process id of the program `tid` belongs to: the number of the task it
+/// began as, which no other task is ever given. A task id is a slot, and the
+/// next task made is usually given the one just let go; this is what to
+/// remember a program by. Task 0 is the idle task and is in no program:
+/// asked about 0, the kernel answers for the caller.
+pub fn sys_pid(tid: usize) -> Option<u64> {
+    match unsafe { syscall1(SYS_PID, tid as u64) } {
+        u64::MAX => None,
+        pid => Some(pid),
+    }
+}
+
+/// This program's process id.
+pub fn sys_pid_self() -> u64 {
+    unsafe { syscall1(SYS_PID, 0) }
+}
+
+/// Collect the child whose process id is `pid` when it has ended:
+/// `(pid, status)`. `Err` if this task has no such child.
+pub fn sys_wait_for_pid(pid: u64) -> Result<(u64, i32), ()> {
+    let ret = unsafe { syscall2(SYS_WAIT_FOR, pid, 2) };
+    if ret == u64::MAX {
+        return Err(());
+    }
+    Ok((ret & 0xFFFF_FFFF, (ret >> 32) as i32))
+}
+
+/// Raise `signo` for the program whose process id is `pid`. A program that
+/// has ended and not been collected is still there to be named, and the call
+/// succeeds; `Err` means the id names nothing, or this may not signal it.
+pub fn sys_sig_raise_pid(pid: u64, signo: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_SIG_RAISE, pid, signo, 1) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
 /// What kind of thing a descriptor names: [`sys_fd_kind`]'s answers.
 pub const FD_KIND_ENDPOINT: u64 = 1;
 pub const FD_KIND_PIPE_READ: u64 = 2;
@@ -1764,7 +1801,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 3;
+pub const ABI_VERSION_MINOR: u32 = 4;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

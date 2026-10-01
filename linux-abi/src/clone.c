@@ -61,11 +61,7 @@ long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
         if (flags & (CLONE_THREAD | CLONE_SETTLS)) {
             return -LX_ENOSYS;
         }
-        unsigned long child = __syscall0(SYS_FORK);
-        if (child == QUARK_ERR) {
-            return -LX_EAGAIN;
-        }
-        return (long)child;
+        return __quark_fork();
     }
     if (!(flags & CLONE_THREAD)) {
         return -LX_ENOSYS;

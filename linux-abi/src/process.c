@@ -27,6 +27,29 @@
 
 #include "abi.h"
 
+/* Who this is, to anything that will ask about it later. */
+long __quark_getpid(void) {
+    return (long)__syscall1(SYS_PID, 0);
+}
+
+/* fork: a copy of this program, told apart by the answer. The parent is told
+   the child's process id and not its task id: the task id is a slot, and the
+   slot a child leaves is the one the next child is given. bash, told the
+   same number twice, took a command for the background job it had last
+   started and did not wait for it. */
+long __quark_fork(void) {
+    unsigned long child = __syscall0(SYS_FORK);
+    if (child == QUARK_ERR) {
+        return -LX_EAGAIN;
+    }
+    if (child == 0) {
+        __quark_sig_forked();
+        return 0;
+    }
+    unsigned long pid = __syscall1(SYS_PID, child);
+    return pid == QUARK_ERR ? (long)child : (long)pid;
+}
+
 #define PAGE_SIZE 4096UL
 #define EHDR_SIZE 64UL
 #define PHDR_SIZE 56UL

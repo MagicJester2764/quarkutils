@@ -41,6 +41,13 @@
 #define LX_EFBIG    27
 #define LX_EPIPE    32
 
+/* A process is named by its process id: a number the kernel never gives out
+   twice, where a task id is given to the next task made. `fork` answers with
+   one, `wait4` and `kill` take one, and `getpid` is one. A thread is still
+   named by its task id, which is what a C library locks with. */
+long __quark_getpid(void);
+long __quark_fork(void);
+
 /* Signals, in signal.c. What rt_sigaction carries on x86-64 is the kernel's
    own layout, not the C library's `struct sigaction`. */
 struct lx_ksigaction {
