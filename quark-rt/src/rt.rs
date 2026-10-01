@@ -59,11 +59,13 @@ pub fn init() {
 // ---- Process lifecycle ----
 
 pub fn exit(code: i32) -> ! {
-    syscall::sys_exit_code(code);
+    // The program, not the task: `std::process::exit` and a `main` that
+    // returns both end every thread.
+    syscall::sys_exit_program(code);
 }
 
 pub fn abort() -> ! {
-    syscall::sys_exit_code(-1);
+    syscall::sys_exit_program(-1);
 }
 
 // ---- I/O (file descriptor read/write) ----

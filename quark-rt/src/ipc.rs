@@ -53,6 +53,16 @@ pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
 /// A program asked, through the kernel, for an object's written pages to reach
 /// its file: `data` is `[cookie, object id]`, sender marked as for a page-in.
 pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
+/// From the kernel, sender 0: an object this task serves is named by no
+/// descriptor any more. No data — collect with `sys_fd_reap` until it is empty.
+pub const TAG_FD_RELEASED: u64 = 0xFFFF_0008;
+/// The kernel reading through a descriptor for the task in `sender`:
+/// `data` = `[cookie, length]`, with a buffer lent to fill. Reply tag 0 and
+/// the count in `data[0]`. Check the sender holds the cookie: any task with
+/// an endpoint for this server can send the tag.
+pub const TAG_FD_READ: u64 = 0xFFFF_0009;
+/// The same, writing: the buffer is lent to read.
+pub const TAG_FD_WRITE: u64 = 0xFFFF_000A;
 /// Set in `sender` by the kernel alone, on `TAG_PAGE_IN` and `TAG_OBJECT_SYNC`.
 pub const PAGER_BIT: usize = 1 << 62;
 
@@ -63,6 +73,13 @@ pub const PAGER_BIT: usize = 1 << 62;
 /// kernel made up. A message with the tag and any other sender is a request,
 /// and an unknown one — a server that believed it would forget a lease, a
 /// registration or a claim because somebody asked it to.
+/// Whether `msg` is the kernel saying that an object this task serves has no
+/// descriptors left. As with a death, the tag alone proves nothing: only the
+/// kernel sends as sender 0.
+pub fn fd_released_notice(msg: &Message) -> bool {
+    msg.sender == 0 && msg.tag == TAG_FD_RELEASED
+}
+
 pub fn death_notice(msg: &Message) -> Option<usize> {
     (msg.sender == 0 && msg.tag == TAG_TASK_DIED).then_some(msg.data[0] as usize)
 }

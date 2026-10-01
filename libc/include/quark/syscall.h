@@ -12,6 +12,7 @@
 /* 0x00  process */
 #define SYS_EXIT            0
 #define SYS_EXIT_CODE       1
+#define SYS_EXIT_PROGRAM    8
 #define SYS_YIELD           2
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21
@@ -109,6 +110,13 @@
 
 /* 0xA0  kernel console */
 #define SYS_WRITE           160
+
+/* 0xE0  descriptors, continued */
+#define SYS_FD_SERVED       225
+#define SYS_FD_FLAGS        228
+/* The working directory's descriptor, one past the ordinary numbers. */
+#define QUARK_FD_CWD        64UL
+#define QUARK_FD_CLOEXEC    1UL
 
 /* 0xF0  introspection */
 #define SYS_ABI_VERSION     240

@@ -607,8 +607,15 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return 0;
 
     case LX_exit:
-    case LX_exit_group:
+        /* One thread: `pthread_exit`, and what a thread's start routine
+           returning comes to. */
         __syscall1(SYS_EXIT_CODE, (unsigned long)a1);
+        for (;;) { }
+    case LX_exit_group:
+        /* The program. Ending only the caller left every other thread
+           parked on a lock nobody would release, holding what the program
+           had open. */
+        __syscall1(SYS_EXIT_PROGRAM, (unsigned long)a1);
         for (;;) { }
 
     case LX_futex: {

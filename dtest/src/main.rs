@@ -143,6 +143,265 @@ fn test_fd_table() {
     }
 }
 
+static SHARE_GO: sync::Semaphore = sync::Semaphore::new(0);
+static SHARE_DONE: sync::Semaphore = sync::Semaphore::new(0);
+static SHARE_SAW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A thread started before the pipe it reads was made.
+extern "C" fn sharer() -> ! {
+    use core::sync::atomic::Ordering;
+    SHARE_GO.acquire();
+    let mut saw = 0;
+    let mut buf = [0u8; 8];
+    if syscall::sys_fd_read(3, &mut buf) == 2 && &buf[..2] == b"ab" {
+        saw |= 1;
+    }
+    // The only write end there is. If this closes it for the program, the
+    // creator's next read is the end of the pipe.
+    if syscall::sys_fd_close(4).is_ok() {
+        saw |= 2;
+    }
+    SHARE_SAW.store(saw, Ordering::SeqCst);
+    SHARE_DONE.release();
+    syscall::sys_exit_code(0);
+}
+
+/// A descriptor is its program's: one table for every thread, a copy of it
+/// for a forked child, and gone when the program is.
+fn test_program_table() {
+    use core::sync::atomic::Ordering;
+    println!("a descriptor belongs to a program:");
+
+    let Ok(t) = thread::spawn_with_stack(sharer, 8) else {
+        check("started a thread", false);
+        return;
+    };
+    // Made after the thread, which used to start on a copy of this table and
+    // see nothing added to it since.
+    if own_pipe(3, 4).is_err() {
+        check("pipe wired to fd 3 and 4", false);
+        return;
+    }
+    let _ = syscall::sys_fd_write(4, b"ab");
+    SHARE_GO.release();
+    SHARE_DONE.acquire();
+    let saw = SHARE_SAW.load(Ordering::SeqCst);
+    check("a thread reads a descriptor made after it started", saw & 1 != 0);
+    check("a thread closes one", saw & 2 != 0);
+    let mut buf = [0u8; 8];
+    check(
+        "and it is closed for the program: the pipe has ended",
+        syscall::sys_fd_read(3, &mut buf) == 0,
+    );
+    check(
+        "and its number is free here",
+        syscall::sys_fd_write(4, b"x") == u64::MAX,
+    );
+    let _ = t.join();
+    check(
+        "a thread ending closes nothing",
+        syscall::sys_fd_close(3).is_ok(),
+    );
+
+    // A mark is the descriptor's, not the object's.
+    let wired = own_pipe(3, 4).is_ok();
+    check("pipe wired again", wired);
+    if wired {
+        let me = syscall::sys_getpid() as usize;
+        check("a new descriptor is unmarked", syscall::sys_fd_cloexec(3) == Ok(false));
+        check("marked to close on exec", syscall::sys_fd_set_cloexec(3, true).is_ok());
+        check("and says so", syscall::sys_fd_cloexec(3) == Ok(true));
+        check("a copy of it is not", {
+            let copy = syscall::sys_fd_dup(me, 5, 3).is_ok();
+            let unmarked = syscall::sys_fd_cloexec(5) == Ok(false);
+            let _ = syscall::sys_fd_close(5);
+            copy && unmarked
+        });
+        check("an empty descriptor has no mark", syscall::sys_fd_cloexec(9).is_err());
+
+        // A forked child has its own table: it closes both ends and goes, and
+        // the pipe is still whole here.
+        match syscall::sys_fork() {
+            Ok(0) => {
+                let closed = syscall::sys_fd_close(3).is_ok() && syscall::sys_fd_close(4).is_ok();
+                // The mark came across with the descriptor it was on.
+                syscall::sys_exit_program(if closed { 7 } else { 8 });
+            }
+            Ok(child) => {
+                check("a forked child holds copies", wait_for(child) == Some(7));
+                check(
+                    "and closing them closed nothing here",
+                    syscall::sys_fd_write(4, b"z") == 1 && syscall::sys_fd_read(3, &mut buf) == 1,
+                );
+            }
+            Err(()) => check("fork", false),
+        }
+        let _ = syscall::sys_fd_close(3);
+        let _ = syscall::sys_fd_close(4);
+    }
+
+    // A program that ends with a thread still parked. Its descriptors are the
+    // program's, so they close when it ends, whichever task was holding on.
+    let Some((child, mine)) = lock_child(b"leave", b"") else {
+        check("started a program with a thread that never ends", false);
+        return;
+    };
+    check("a program ends with one status, threads and all", wait_for(child.tid) == Some(5));
+    let mut ended = false;
+    for _ in 0..100 {
+        match syscall::sys_fd_read_nb(mine, &mut buf) {
+            0 => {
+                ended = true;
+                break;
+            }
+            _ => syscall::sleep_ticks(1),
+        }
+    }
+    check("and what it had open is closed", ended);
+    let _ = syscall::sys_fd_close(mine);
+}
+
+/// As `dchild fdclient` knows them.
+const ASK_OPEN: u64 = 0x51;
+const ASK_HELD: u64 = 0x52;
+const ASK_CHDIR: u64 = 0x53;
+const COOKIE_FILE: u64 = 0x5151;
+const COOKIE_DIR: u64 = 0x7700_0000_0077;
+
+/// This program as a server of descriptors, and `dchild fdclient` as what it
+/// serves: a file is this, with the file server in this program's place.
+fn test_served() {
+    use quark_rt::ipc::{self, Message, TID_ANY};
+    println!("descriptors a server serves:");
+    let me = syscall::sys_getpid() as usize;
+
+    let mut tid_text = [0u8; 20];
+    let mut n = 0;
+    let mut v = me;
+    let mut digits = [0u8; 20];
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        tid_text[i] = digits[n - 1 - i];
+    }
+    let Some(child) = load_child(&[b"dchild", b"fdclient", &tid_text[..n]]) else {
+        check("loaded a client", false);
+        return;
+    };
+    // It may call this task: an Endpoint to it, from its creator.
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0)
+        .is_ok()
+        && syscall::sys_cap_grant_any(child.tid, syscall::SLOT_SCRATCH).is_ok();
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    check("let the client call us", granted);
+    // Nobody is handed a descriptor unasked: the client is not calling yet.
+    check(
+        "a task that is not calling cannot be given one",
+        syscall::sys_fd_serve(child.tid, COOKIE_FILE, syscall::ANY_FD).is_err(),
+    );
+    if child.start().is_err() {
+        check("started the client", false);
+        return;
+    }
+    let child = child.tid;
+
+    let mut served = None;
+    let mut wrote = false;
+    let mut read = false;
+    let mut cwd_seen = false;
+    let mut notices = 0;
+    let mut collected = [0u64; 4];
+    let mut ncollected = 0;
+    let mut died = false;
+    // The client's fork is a second program holding the first cookie, so the
+    // file is released twice over before it is released: only the last counts.
+    for _ in 0..400 {
+        if ncollected >= 2 && died {
+            break;
+        }
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, 5).is_err() {
+            // 3 is `sys_task_info`'s state for a task that has exited.
+            died = !matches!(syscall::sys_task_info(child), Ok((state, _, _)) if state != 3);
+            continue;
+        }
+        if ipc::fd_released_notice(&msg) {
+            notices += 1;
+            while let Some(cookie) = syscall::sys_fd_reap() {
+                if ncollected < collected.len() {
+                    collected[ncollected] = cookie;
+                    ncollected += 1;
+                }
+            }
+            continue;
+        }
+        let from = msg.sender;
+        let mut reply = Message::empty();
+        match msg.tag {
+            ASK_OPEN => {
+                served = syscall::sys_fd_serve(from, COOKIE_FILE, syscall::ANY_FD).ok();
+                match served {
+                    Some(fd) => reply.data[0] = fd as u64,
+                    None => reply.tag = u64::MAX,
+                }
+            }
+            ASK_HELD => reply.data[0] = syscall::sys_fd_holds(from, msg.data[0]) as u64,
+            ASK_CHDIR => {
+                if syscall::sys_fd_serve(from, COOKIE_DIR, syscall::FD_CWD).is_err() {
+                    reply.tag = u64::MAX;
+                }
+                cwd_seen = syscall::sys_fd_cookie(from, syscall::FD_CWD) == Some(COOKIE_DIR)
+                    && syscall::sys_fd_holds(from, COOKIE_DIR);
+            }
+            // The kernel, writing for the client: what it wrote is lent.
+            ipc::TAG_FD_WRITE => {
+                let mut got = [0u8; 8];
+                wrote = msg.data[0] == COOKIE_FILE
+                    && msg.data[1] == 5
+                    && syscall::sys_fd_holds(from, COOKIE_FILE)
+                    && syscall::sys_lent_read(from, 0, &mut got[..5]) == Ok(5)
+                    && &got[..5] == b"hello";
+                reply.data[0] = 5;
+            }
+            // And reading: its buffer is lent to fill.
+            ipc::TAG_FD_READ => {
+                read = msg.data[0] == COOKIE_FILE
+                    && msg.data[1] == 8
+                    && syscall::sys_lent_write(from, 0, b"world") == Ok(5);
+                reply.data[0] = 5;
+            }
+            _ => reply.tag = u64::MAX,
+        }
+        let _ = syscall::sys_reply(from, &reply);
+    }
+
+    let status = wait_for(child).unwrap_or(-1);
+    check("the client was given a descriptor", served.is_some_and(|fd| fd >= 3));
+    check("and knows whose object it names", status & 1 != 0);
+    check("a write through it is a call to its server", wrote && status & 2 != 0);
+    check("and so is a read", read && status & 4 != 0);
+    check("a forked child has one of its own", status & 8 != 0);
+    check("a copy keeps the object when the first closes", status & 16 != 0);
+    check("the last close ends it", status & 32 != 0);
+    check("a working directory is a descriptor too", cwd_seen && status & 64 != 0);
+    check("the server is told when one has no descriptors left", notices >= 1);
+    check(
+        "and collects each object once: the file, then the directory",
+        ncollected == 2 && collected[0] == COOKIE_FILE && collected[1] == COOKIE_DIR,
+    );
+    check("then there is nothing to collect", syscall::sys_fd_reap().is_none());
+    check(
+        "nobody holds what was collected",
+        !syscall::sys_fd_holds(me, COOKIE_FILE) && !syscall::sys_fd_holds(child, COOKIE_DIR),
+    );
+}
+
 const SHM_AT: usize = 0x94_0000_0000;
 
 fn test_big_region() {
@@ -2044,6 +2303,8 @@ pub extern "C" fn _start() -> ! {
         ("physical", test_physical_authority),
         ("close", test_close),
         ("fds", test_fd_table),
+        ("program", test_program_table),
+        ("served", test_served),
         ("region", test_big_region),
         ("memfd", test_memfd),
         ("socketpair", test_socketpair),
@@ -2097,7 +2358,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
     println!("[dtest] {} passed, {} failed", passed, failed);
-    syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });
+    // The program, not the task: some sections leave a thread waiting.
+    syscall::sys_exit_program(if failed == 0 { 0 } else { 1 });
 }
 
 #[panic_handler]

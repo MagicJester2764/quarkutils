@@ -15,6 +15,8 @@ pub const SYS_WAIT: u64 = 4;
 pub const SYS_TASK_KILL: u64 = 5;
 pub const SYS_SIGNAL: u64 = 6;
 pub const SYS_TASK_INFO: u64 = 7;
+/// End every task of the caller's program. `SYS_EXIT_CODE` ends one.
+pub const SYS_EXIT_PROGRAM: u64 = 8;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -163,6 +165,19 @@ pub const SYS_SOCK_INFO: u64 = 177;
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
 
+// --- 0xE0  descriptors, continued ---
+pub const SYS_FD_SERVE: u64 = 224;
+pub const SYS_FD_SERVED: u64 = 225;
+pub const SYS_FD_HOLDS: u64 = 226;
+pub const SYS_FD_COOKIE: u64 = 227;
+pub const SYS_FD_FLAGS: u64 = 228;
+pub const SYS_FD_REAP: u64 = 229;
+/// The working directory's descriptor: one past the ordinary numbers. It can
+/// be copied to and from and asked about, and nothing else.
+pub const FD_CWD: usize = 64;
+/// `SYS_FD_FLAGS`: close the descriptor when the program becomes another.
+pub const FD_FLAG_CLOEXEC: u64 = 1;
+
 // --- 0xF0  ABI introspection ---
 pub const SYS_ABI_VERSION: u64 = 240;
 
@@ -297,7 +312,19 @@ pub fn sys_exit() -> ! {
     }
 }
 
-/// Exit with a status code, reported to a parent waiting in `sys_wait`.
+/// End the program: every task in this address space, with one status,
+/// reported to a parent waiting in `sys_wait`. What returning from `main`
+/// means, and what `exit` means in C.
+pub fn sys_exit_program(code: i32) -> ! {
+    unsafe { syscall1(SYS_EXIT_PROGRAM, code as u32 as u64) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// End the calling task with a status, reported to a parent waiting in
+/// `sys_wait`. A program with other threads goes on running in them, with
+/// everything it has open: to end the program, see [`sys_exit_program`].
 pub fn sys_exit_code(code: i32) -> ! {
     unsafe { syscall1(SYS_EXIT_CODE, code as u32 as u64) };
     loop {
@@ -1180,6 +1207,71 @@ pub fn sys_mmap_fd(fd: usize, vaddr: usize) -> Result<usize, ()> {
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
+/// Give the task calling this one a descriptor for one of this server's
+/// objects, and say which number it got.
+///
+/// `at` is a free descriptor number, [`ANY_FD`] for the lowest free from 3, or
+/// [`FD_CWD`] to make the object the client's working directory. `cookie` is
+/// the server's own name for the object, and comes back in every question
+/// about it. Refused unless `client` is in a call to this task: that call is
+/// its consent.
+pub fn sys_fd_serve(client: usize, cookie: u64, at: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall3(SYS_FD_SERVE, client as u64, cookie, at as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Which server one of this program's descriptors is an object of, and the
+/// server's cookie for it. `Err` if the descriptor names something the kernel
+/// keeps itself, or its server has gone.
+pub fn sys_fd_served(fd: usize) -> Result<(usize, u64), ()> {
+    let mut out = [0u64; 2];
+    let ret = unsafe { syscall2(SYS_FD_SERVED, fd as u64, out.as_mut_ptr() as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok((out[0] as usize, out[1])) }
+}
+
+/// Whether `tid`'s program holds a descriptor for this server's `cookie`.
+/// The check a server makes before it acts on a cookie somebody names.
+pub fn sys_fd_holds(tid: usize, cookie: u64) -> bool {
+    unsafe { syscall2(SYS_FD_HOLDS, tid as u64, cookie) == 1 }
+}
+
+/// This server's cookie at descriptor `fd` of `tid`'s program, if what is
+/// there is one of this server's objects.
+pub fn sys_fd_cookie(tid: usize, fd: usize) -> Option<u64> {
+    let ret = unsafe { syscall2(SYS_FD_COOKIE, tid as u64, fd as u64) };
+    (ret != u64::MAX).then_some(ret)
+}
+
+/// Collect one of this server's objects that no descriptor names any more.
+/// Called until it says `None`, after the kernel's
+/// [`crate::ipc::TAG_FD_RELEASED`].
+pub fn sys_fd_reap() -> Option<u64> {
+    let ret = unsafe { syscall0(SYS_FD_REAP) };
+    (ret != u64::MAX).then_some(ret)
+}
+
+/// Make a copy of this program: a task of its own, in a copy of this address
+/// space, with a second descriptor for everything this one has open. Returns
+/// the child's id here and 0 there.
+pub fn sys_fork() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_FORK) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Mark a descriptor to be closed when this program becomes another, or
+/// take the mark off.
+pub fn sys_fd_set_cloexec(fd: usize, on: bool) -> Result<(), ()> {
+    let flags = if on { FD_FLAG_CLOEXEC } else { 0 };
+    let ret = unsafe { syscall3(SYS_FD_FLAGS, fd as u64, 1, flags) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Whether a descriptor is marked to close when this program becomes another.
+pub fn sys_fd_cloexec(fd: usize) -> Result<bool, ()> {
+    let ret = unsafe { syscall3(SYS_FD_FLAGS, fd as u64, 0, 0) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret & FD_FLAG_CLOEXEC != 0) }
+}
+
 /// Release a descriptor.
 ///
 /// The last reader or writer of a pipe closing is what makes the other end see
@@ -1479,7 +1571,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 0;
+pub const ABI_VERSION_MINOR: u32 = 1;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

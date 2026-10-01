@@ -38,7 +38,7 @@
 
 /* Descriptors from here up are files.c's VFS files; below, the kernel's.
    The split sits at the kernel's MAX_FDS — see files.c. */
-#define LX_FIRST_FILE_FD 32
+#define LX_FIRST_FILE_FD 64
 
 /* There is no working directory anywhere in this system, so this is the only
    value the *at calls accept for one. */

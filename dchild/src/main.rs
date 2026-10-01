@@ -23,6 +23,11 @@
 //! touches them until something stops it. `mapwrite PATH` maps a file shared,
 //! writes into it, and exits without asking for it to be written back.
 //! `fault` writes through a null pointer; `sleep` sleeps ten seconds.
+//! `leave` starts a thread that never ends and then ends the program with
+//! status 5: descriptor 3, which the thread never closes, has to close.
+//! `fdclient TID` is a client of a server at TID that serves descriptors: it
+//! asks for one, reads and writes through it, copies and closes it, and exits
+//! with a bit for each thing that worked.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -47,6 +52,92 @@ const DEAD: u8 = 3;
 
 extern "C" fn quit() -> ! {
     syscall::sys_exit_code(0);
+}
+
+/// The requests `dtest` answers as a server of descriptors, and the two
+/// cookies it serves.
+const ASK_OPEN: u64 = 0x51;
+const ASK_HELD: u64 = 0x52;
+const ASK_CHDIR: u64 = 0x53;
+const COOKIE_FILE: u64 = 0x5151;
+const COOKIE_DIR: u64 = 0x7700_0000_0077;
+
+/// Everything a client does with a descriptor a server gave it. One bit of
+/// the answer for each thing that came out right.
+fn fd_client(server: usize) -> i32 {
+    let me = syscall::sys_getpid() as usize;
+    let ask = |tag, word| {
+        let msg = Message { sender: 0, tag, data: [word, 0, 0, 0, 0, 0] };
+        let mut reply = Message::empty();
+        match syscall::sys_call_timeout(server, &msg, &mut reply, 200) {
+            syscall::CallOutcome::Replied if reply.tag == 0 => Some(reply.data[0]),
+            _ => None,
+        }
+    };
+    let mut ok = 0;
+
+    let Some(fd) = ask(ASK_OPEN, 0) else { return 0 };
+    let fd = fd as usize;
+    if fd >= 3 && syscall::sys_fd_served(fd) == Ok((server, COOKIE_FILE)) {
+        ok |= 1;
+    }
+    // Through the kernel: this program has no idea what is behind the number.
+    if syscall::sys_fd_write(fd, b"hello") == 5 {
+        ok |= 2;
+    }
+    let mut buf = [0u8; 8];
+    if syscall::sys_fd_read(fd, &mut buf) == 5 && &buf[..5] == b"world" {
+        ok |= 4;
+    }
+    // A forked child has a descriptor of its own for the same object.
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let same = syscall::sys_fd_served(fd) == Ok((server, COOKIE_FILE));
+            let _ = syscall::sys_fd_close(fd);
+            syscall::sys_exit_program(if same { 0 } else { 1 });
+        }
+        Ok(child) => {
+            let mut status = None;
+            while status.is_none() {
+                match syscall::sys_wait() {
+                    Ok((t, code)) if t == child => status = Some(code),
+                    Ok(_) => {}
+                    Err(()) => status = Some(-1),
+                }
+            }
+            // The child closed its own; this one is untouched.
+            if status == Some(0) && syscall::sys_fd_served(fd).is_ok() {
+                ok |= 8;
+            }
+        }
+        Err(()) => {}
+    }
+    // A copy keeps the object after the first descriptor closes...
+    if syscall::sys_fd_dup(me, 20, fd).is_ok()
+        && syscall::sys_fd_close(fd).is_ok()
+        && ask(ASK_HELD, COOKIE_FILE) == Some(1)
+    {
+        ok |= 16;
+    }
+    // ...and the last close is the end of it.
+    if syscall::sys_fd_close(20).is_ok() && ask(ASK_HELD, COOKIE_FILE) == Some(0) {
+        ok |= 32;
+    }
+    // A working directory is a descriptor at a number of its own.
+    if ask(ASK_CHDIR, 0).is_some()
+        && syscall::sys_fd_served(syscall::FD_CWD) == Ok((server, COOKIE_DIR))
+    {
+        ok |= 64;
+    }
+    // Left open on purpose: the server hears about it when this program ends.
+    ok
+}
+
+/// A thread that is never going to finish by itself.
+extern "C" fn linger() -> ! {
+    loop {
+        syscall::sleep_ticks(1000);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -100,6 +191,21 @@ pub extern "C" fn _start() -> ! {
         }
         // Four gigabytes, and nobody stopped it.
         syscall::sys_exit_code(2);
+    }
+    if quark_rt::args::argv(1) == Some(&b"fdclient"[..]) {
+        let server = quark_rt::args::argv(2).map_or(0, |n| {
+            n.iter().fold(0usize, |acc, &d| acc * 10 + (d.wrapping_sub(b'0') as usize % 10))
+        });
+        syscall::sys_exit_program(fd_client(server));
+    }
+    if quark_rt::args::argv(1) == Some(&b"leave"[..]) {
+        if thread::spawn_with_stack(linger, 1).is_err() {
+            syscall::sys_exit_code(1);
+        }
+        // Long enough for it to be asleep, so that what ends it is this
+        // program ending and not a race it happened to lose.
+        syscall::sleep_ticks(5);
+        syscall::sys_exit_program(5);
     }
     if quark_rt::args::argv(1) == Some(&b"fault"[..]) {
         unsafe { core::ptr::write_volatile(core::hint::black_box(0usize) as *mut u8, 1) };

@@ -1110,7 +1110,7 @@ long __quark_flock(long fd, long op) {
 /* Which descriptors a program has asked to be non-blocking. One bit per
    kernel descriptor; this layer's own file numbers are always blocking,
    because the VFS is a synchronous call and there is nothing to wait for. */
-static unsigned int nonblock_mask;
+static unsigned long nonblock_mask;
 
 /* Say that a descriptor was made non-blocking when it was created, which is
    what `pipe2` and `eventfd` take a flag for. */
@@ -1119,14 +1119,14 @@ void __quark_fd_set_nonblock(long fd, int on) {
         return;
     }
     if (on) {
-        nonblock_mask |= 1u << fd;
+        nonblock_mask |= 1ul << fd;
     } else {
-        nonblock_mask &= ~(1u << fd);
+        nonblock_mask &= ~(1ul << fd);
     }
 }
 
 int __quark_fd_is_nonblock(long fd) {
-    return fd >= 0 && fd < FIRST_FD && (nonblock_mask & (1u << fd)) != 0;
+    return fd >= 0 && fd < FIRST_FD && (nonblock_mask & (1ul << fd)) != 0;
 }
 
 long __quark_fcntl(long fd, long cmd, long arg) {
