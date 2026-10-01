@@ -707,6 +707,8 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
 // ---------------------------------------------------------------------------
 
 const MAX_DEFERRED: usize = 16;
+/// The arguments a `run` line in `/etc/init.conf` may give a program.
+const MAX_RUN_ARGS: usize = 6;
 
 struct DeferredTasks {
     spawns: [Option<Spawned>; MAX_DEFERRED],
@@ -731,45 +733,69 @@ impl DeferredTasks {
     }
 }
 
-/// What `/etc/init.conf` says to start a session with, if it says.
+/// `/etc/init.conf`: what the distribution wants done once there are files.
 ///
-/// One directive: `session PATH`. A distribution that wants its users on a
-/// terminal names `getty` there; one with no such file gets `login`, started
-/// straight onto the console as it always was. Which of those a system is, is
-/// the distribution's to say and not this program's to guess.
-fn configured_session(vfs_tid: usize, out: &mut [u8; 64]) -> Option<usize> {
-    let (handle, size, is_dir) = vfs::open(vfs_tid, b"/etc/init.conf").ok()?;
-    let mut text = [0u8; 512];
-    let want = (size as usize).min(text.len());
-    let got = if is_dir { 0 } else { vfs::read(vfs_tid, handle, &mut text[..want], 0).unwrap_or(0) };
-    let _ = vfs::close(vfs_tid, handle);
-    for line in text[..got as usize].split(|&b| b == b'\n') {
-        let mut words = line
-            .split(|&b| b == b' ' || b == b'\t' || b == b'\r')
-            .filter(|w| !w.is_empty());
-        if words.next() != Some(&b"session"[..]) {
-            continue; // a comment, a blank line, or a directive from the future
-        }
-        let path = words.next()?;
-        if path.len() > out.len() || !path.starts_with(b"/") {
-            return None;
-        }
-        out[..path.len()].copy_from_slice(path);
-        return Some(path.len());
-    }
-    None
+/// Two directives, and a line that is neither is a comment, a blank, or
+/// something from the future:
+///
+/// ```text
+/// run PATH [ARGUMENT...]    a program to run to its end before the session,
+///                           in the order the lines are in
+/// session PATH              what the session is
+/// ```
+///
+/// `run` is for what has to be done once at boot by a program that can read
+/// a file — loading the console's font is the first. A distribution that
+/// wants its users on a terminal names `getty` as the session; one with no
+/// such file gets `login`, started straight onto the console as it always
+/// was. Which of those a system is, is the distribution's to say and not
+/// this program's to guess.
+struct Config {
+    text: [u8; 1024],
+    len: usize,
 }
 
-/// Load the program a session starts with and wire it to the console, to be
-/// started when everything else has been.
+impl Config {
+    fn read(vfs_tid: usize) -> Option<Config> {
+        let (handle, size, is_dir) = vfs::open(vfs_tid, b"/etc/init.conf").ok()?;
+        let mut config = Config { text: [0; 1024], len: 0 };
+        let want = (size as usize).min(config.text.len());
+        let got = if is_dir {
+            0
+        } else {
+            vfs::read(vfs_tid, handle, &mut config.text[..want], 0).unwrap_or(0)
+        };
+        let _ = vfs::close(vfs_tid, handle);
+        config.len = got as usize;
+        Some(config)
+    }
+
+    /// The lines that begin with `directive`, each as the words after it.
+    fn each<'a>(&'a self, directive: &'a [u8]) -> impl Iterator<Item = impl Iterator<Item = &'a [u8]>> + 'a {
+        self.text[..self.len].split(|&b| b == b'\n').filter_map(move |line| {
+            let mut words = line
+                .split(|&b| b == b' ' || b == b'\t' || b == b'\r')
+                .filter(|w| !w.is_empty());
+            (words.next() == Some(directive)).then_some(words)
+        })
+    }
+}
+
+/// Load a program `/etc/init.conf` names and wire it to the console, to be
+/// started when everything before it has been: one a `run` line asks for, or
+/// the session. `arguments` are what follows its own name.
 fn spawn_session(
     vfs_tid: usize,
     path: &[u8],
+    arguments: &[&[u8]],
     what: &str,
     console_pipe: usize,
     input_tid: usize,
     deferred: &mut DeferredTasks,
 ) -> bool {
+    if path.len() > 64 || !path.starts_with(b"/") {
+        return false;
+    }
     // Read it through the VFS into memory of this task's, and load it.
     let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
     match spawn::load_path(vfs_tid, path, VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) {
@@ -783,7 +809,11 @@ fn spawn_session(
                 let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
             }
             let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-            let _ = spawn::set_args(&info, &[name], &SPAWN_SCRATCH);
+            let mut argv: [&[u8]; MAX_RUN_ARGS + 1] = [b""; MAX_RUN_ARGS + 1];
+            argv[0] = name;
+            let n = arguments.len().min(MAX_RUN_ARGS);
+            argv[1..1 + n].copy_from_slice(&arguments[..n]);
+            let _ = spawn::set_args(&info, &argv[..1 + n], &SPAWN_SCRATCH);
             println!("[init] Spawned {} (TID {}, deferred start)", what, tid);
             if deferred.count < MAX_DEFERRED {
                 deferred.spawns[deferred.count] = Some(info);
@@ -798,13 +828,28 @@ fn spawn_session(
 fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
 
-    // What the distribution asked for, if it asked.
-    let mut session = [0u8; 64];
-    if let Some(len) = configured_session(vfs_tid, &mut session) {
-        if spawn_session(vfs_tid, &session[..len], "session", console_pipe, input_tid, &mut deferred) {
-            return deferred;
+    // What the distribution asked for, if it asked: the programs to run
+    // first, in order, and then the session.
+    if let Some(config) = Config::read(vfs_tid) {
+        for mut words in config.each(b"run") {
+            let Some(path) = words.next() else { continue };
+            let mut arguments: [&[u8]; MAX_RUN_ARGS] = [b""; MAX_RUN_ARGS];
+            let mut n = 0;
+            for word in words.take(MAX_RUN_ARGS) {
+                arguments[n] = word;
+                n += 1;
+            }
+            // No keyboard: it runs before anybody is there to type.
+            if !spawn_session(vfs_tid, path, &arguments[..n], "a program to run", console_pipe, 0, &mut deferred) {
+                println!("[init] /etc/init.conf asks for a program to be run that will not load.");
+            }
         }
-        println!("[init] /etc/init.conf names a session program that will not load.");
+        if let Some(path) = config.each(b"session").next().and_then(|mut words| words.next()) {
+            if spawn_session(vfs_tid, path, &[], "session", console_pipe, input_tid, &mut deferred) {
+                return deferred;
+            }
+            println!("[init] /etc/init.conf names a session program that will not load.");
+        }
     }
 
     // Open /usr/bin directory via VFS
@@ -861,7 +906,7 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
     let path_len = prefix.len() + namelen;
 
-    if !spawn_session(vfs_tid, &path[..path_len], loading_name, console_pipe, input_tid, &mut deferred) {
+    if !spawn_session(vfs_tid, &path[..path_len], &[], loading_name, console_pipe, input_tid, &mut deferred) {
         println!("[init]   FAILED to spawn");
     }
 
