@@ -2,7 +2,7 @@
 #![no_main]
 
 use quark_rt::nameserver;
-use quark_rt::{args, print, println, syscall, vfs};
+use quark_rt::{args, println, syscall, vfs};
 
 // No manifest: reading a file takes nothing but a buffer to lend the VFS.
 
@@ -83,20 +83,13 @@ pub extern "C" fn _start() -> ! {
                     if bytes_read == 0 {
                         break;
                     }
-                    let data = &page[..bytes_read as usize];
-                    // Print as text
-                    if let Ok(s) = core::str::from_utf8(data) {
-                        print!("{}", s);
-                    } else {
-                        // Binary file — just print what we can
-                        for &b in data {
-                            if b >= 0x20 && b < 0x7F || b == b'\n' || b == b'\r' || b == b'\t' {
-                                print!("{}", b as char);
-                            } else {
-                                print!(".");
-                            }
-                        }
-                    }
+                    // As they are. This used to print a page as text if all
+                    // of it was UTF-8 and a dot for every byte that was not
+                    // ASCII otherwise — so one bad byte anywhere in a page
+                    // turned every accent in it into dots, and a page that
+                    // ended in the middle of a character did the same. What
+                    // the bytes mean is for whatever is reading them.
+                    quark_rt::stdio::print_bytes(&page[..bytes_read as usize]);
                     offset += bytes_read;
                 }
                 Err(e) => {

@@ -53,6 +53,18 @@ pub fn _print(args: fmt::Arguments) {
     w.flush();
 }
 
+/// Write bytes to standard output as they are: what `print!` is for text,
+/// for a program that is passing on bytes it did not write and has no
+/// business deciding the meaning of.
+pub fn print_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if syscall::sys_fd_write(1, bytes) == u64::MAX {
+        syscall::sys_write(bytes);
+    }
+}
+
 pub fn _eprint(args: fmt::Arguments) {
     use fmt::Write;
     let mut w = BufWriter::new(2);
