@@ -43,6 +43,8 @@ ls/ cat/ echo/ ps/ ping/ shutdown/      Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
 dtest/  dchild/     374 checks of the kernel, made through the ABI.
+ctests/             The C library's own tests, one per lie a ported program
+                    has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
 fstest/ nettest/ socktest/ threadtest/ mousetest/ disktest/ ipcping/
 capdemo/ wmdemo/ wmtype/                One subsystem each, exercised.
@@ -64,9 +66,11 @@ Dependencies:
 
 - **Rust nightly**, the one `rust-toolchain.toml` pins, with the
   `x86_64-unknown-none` target, `rust-src` and `llvm-tools-preview`
-- **a C compiler**, for `libc/` and `linux-abi/`. With ExplOSion's
-  `x86_64-quark` cross toolchain on `PATH` the C programs use it; without, the
-  host compiler does the same job with the flags spelled out
+- **a C compiler**, for `libc/` and `linux-abi/`. With the `x86_64-quark`
+  cross toolchain on `PATH`
+  ([quark-toolchain](https://github.com/MagicJester2764/quark-toolchain)
+  builds it) the C programs use it; without, the host compiler does the same
+  job with the flags spelled out
 - **the std fork** at `../rust`, only for `hello` and `httpget`. Without it
   those two are skipped and the build says so
 

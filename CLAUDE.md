@@ -5,17 +5,18 @@ nameserver, the drivers, the servers, the C library and the Linux system-call
 layer, the shell and the programs. It was `user/` in the kernel's repository
 until Phase 18, and its history came with it.
 
-It is one of six repositories that build together and must be checked out as
-siblings:
+It is one of seven repositories that build together and must be checked out
+as siblings:
 
 ```
 repos/
   quark/       the kernel, and the ABI it installs
   quarkutils/  this repo
   bang/        UEFI bootloader, and nothing else
-  explosion/   the distro: stages the other three and assembles the image
-  gnu-quark/   the other distro: the kernel, four programs and the boot
-               services from here, and GNU's bash and coreutils on top
+  quark-toolchain/  the cross compilers: gcc, binutils and musl for Quark
+  explosion/   a distro: stages the other three and assembles the image
+  gnu-quark/   another: the kernel, four programs and the boot services
+               from here, and GNU's programs on top
   rust/        fork of rust-lang/rust carrying the x86_64-unknown-quark std PAL
 ```
 
@@ -113,12 +114,12 @@ fork, then `tools/std-patches.sh sync`, and commit both. `make` fails while the
 two differ, which is the point — it was a seed nothing checked once, and ten of
 its sixteen files had gone stale under notes that described a plan.
 
-The C programs here (`cwc`, `envtest`) and every ported library are built with
-the `x86_64-quark` cross toolchain, which is ExplOSion's:
-`../explosion/toolchain/README.md`. Its musl specs name three things in this
-checkout by absolute path — `libc/include`, `linux-abi/src/manifest.o` and
-`linux-abi/liblinux-abi.a` — so if this checkout moves, run
-`../explosion/toolchain/musl-wrappers.sh` again.
+The C programs here (`cwc`, `envtest`), the C library's tests (`ctests/`) and
+everything a distribution ports are built with the `x86_64-quark` cross
+toolchain, which is a repository of its own: `../quark-toolchain`. Its musl
+specs name three things in this checkout by absolute path — `libc/include`,
+`linux-abi/src/manifest.o` and `linux-abi/liblinux-abi.a` — so if this
+checkout moves, run `../quark-toolchain/musl-wrappers.sh` again.
 
 ## Build and run
 
@@ -164,11 +165,18 @@ check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service.
 
-All of it runs on a booted image, so verification is ExplOSion's:
-`tools/boot-test.sh <keys-file> <shot.ppm>` drives QEMU from a script of key
-presses and screenshots, and `tools/check-rootfs.sh` runs `e2fsck` on the image
-afterwards. Read a window's position out of a screenshot before scripting a
-pointer at it.
+**The C library's own tests are here too**, in `ctests/`: one small C program
+per lie a ported program has caught the library telling, and `libc.tests`,
+the list `runtests` reads. `tools/build-ctests.sh <outdir>` builds them with
+the musl compiler; a distribution puts the programs in `/usr/bin` and the
+lists in `/etc`. A bug in `linux-abi` gets its test there, in the commit that
+fixes it.
+
+All of it runs on a booted image, so verification is a distribution's. With
+ExplOSion: `tools/boot-test.sh <keys-file> <shot.ppm>` drives QEMU from a
+script of key presses and screenshots, and `tools/check-rootfs.sh` runs
+`e2fsck` on the image afterwards. Read a window's position out of a
+screenshot before scripting a pointer at it.
 
 ## Invariants that must not regress
 

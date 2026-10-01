@@ -1,0 +1,10 @@
+# The runner's own test. Expected: 4 passed, 3 failed.
+echo hello
+echo world
+tlstest-does-not-exist
+# With ?, any exit status passes, but a fault does not.
+? ls /no/such/place
+? dchild fault
+# With @N, a program has N seconds.
+@1 dchild sleep
+? @30 echo done

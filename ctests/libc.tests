@@ -1,0 +1,28 @@
+# The C library's own tests, one per lie a ported program has caught it
+# telling. Expected: all passed.
+tlstest
+ctortest
+mmaptest
+filetest
+dirtest
+threadfile
+randtest
+linktest
+cwdtest
+locktest
+lazytest
+maptest
+forktest
+exectest
+redirtest
+chmodtest
+seltest
+ptytest
+ttytest
+sigtest
+pidtest
+alarmtest
+timertest
+shelltest
+cxxtest
+polltest

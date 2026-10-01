@@ -1,0 +1,5 @@
+# Random requests to every service, which must survive them and still work.
+# Expected: all passed. A seed that finds something is added here once fixed.
+@600 qfuzz 2000 1
+@600 qfuzz 2000 2
+@600 qfuzz 2000 3
