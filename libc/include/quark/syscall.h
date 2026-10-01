@@ -13,10 +13,13 @@
 #define SYS_EXIT            0
 #define SYS_EXIT_CODE       1
 #define SYS_EXIT_PROGRAM    8
+#define SYS_UMASK           9
+#define SYS_WAIT_FOR        10
 #define SYS_YIELD           2
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21
 #define SYS_WAIT            4
+#define SYS_TASK_INFO       7
 
 /* 0x10  IPC */
 #define SYS_SEND            16
@@ -114,6 +117,9 @@
 /* 0xE0  descriptors, continued */
 #define SYS_FD_SERVED       225
 #define SYS_FD_FLAGS        228
+/* SYS_FD_FLAGS' second argument: read the flags, or set them. */
+#define QUARK_FD_GETFLAGS   0UL
+#define QUARK_FD_SETFLAGS   1UL
 /* The working directory's descriptor, one past the ordinary numbers. */
 #define QUARK_FD_CWD        64UL
 #define QUARK_FD_CLOEXEC    1UL

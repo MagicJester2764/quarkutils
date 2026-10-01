@@ -109,7 +109,14 @@ pub fn handle_map(sender: usize, msg: &Message) {
         FsFileData::Ext2 { inode_num } if !file.link && !file.is_dir => inode_num,
         _ => return error_reply(sender, ERR_NOT_SUPPORTED),
     };
-    if write_shared && !file.writable {
+    // Writing through a shared mapping is writing the file: the caller must
+    // be allowed to, and a descriptor must have been opened to. A descriptor
+    // opened to read does not become one that writes by being mapped.
+    if write_shared && (!file.writable || (file.by_fd && !file.may_write)) {
+        return error_reply(sender, ERR_PERMISSION);
+    }
+    // And a mapping is a way of reading it.
+    if file.by_fd && !file.may_read {
         return error_reply(sender, ERR_PERMISSION);
     }
     let inode = match ext2::read_inode(ext2_state(), inode_num) {

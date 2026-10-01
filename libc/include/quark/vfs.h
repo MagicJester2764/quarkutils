@@ -1,8 +1,10 @@
 /* The VFS protocol, in C. docs/vfs.md is the contract.
  *
- * A file on Quark is a handle held by a server, not an object the kernel
- * knows about, so `open` is a message, and a path or the bytes of a read
- * travel in a buffer lent with it. That is the same protocol whichever C
+ * A file on Quark is a handle held by a server, so `open` is a message, and a
+ * path or the bytes of a read travel in a buffer lent with it. The handle may
+ * be the program's own, or it may be what a descriptor in the kernel's table
+ * names — `quark_vfs_open_fd` — which is what makes a file something a child
+ * inherits and a shell redirects. That is the same protocol whichever C
  * library is on top of it — ours, or musl through the Linux translation
  * layer — so it is written down once here rather than once per library. Two
  * copies of a wire format drift.
@@ -35,6 +37,8 @@
 #define QUARK_VFS_TAG_GIVE_CWD 21
 #define QUARK_VFS_TAG_LOCK    22
 #define QUARK_VFS_TAG_MAP     23
+#define QUARK_VFS_TAG_SEEK    24
+#define QUARK_VFS_TAG_SETATTR 25
 
 /* QUARK_VFS_TAG_LOCK's flags: wait to be granted; the lock belongs to the
    handle, not the program; grant nothing and say what is in the way. */
@@ -54,6 +58,32 @@
 #define QUARK_VFS_OPEN_TRUNCATE  4UL  /* empty a regular file */
 #define QUARK_VFS_OPEN_DIRECTORY 8UL  /* it must be a directory */
 #define QUARK_VFS_OPEN_NOFOLLOW 16UL  /* a link at the end is opened itself */
+#define QUARK_VFS_OPEN_DESCRIPTOR 32UL /* held by a descriptor, which is given */
+#define QUARK_VFS_OPEN_APPEND   64UL  /* every write goes to the end */
+#define QUARK_VFS_OPEN_READ    128UL  /* the descriptor may read */
+#define QUARK_VFS_OPEN_WRITE   256UL  /* the descriptor may write */
+
+/* Set in a word of permission bits to say they are meant: a word of 0 is a
+   caller that says nothing, and gets 0644 for a file and 0755 for a
+   directory. */
+#define QUARK_VFS_MODE_GIVEN 0x10000UL
+
+/* In place of an offset, on a descriptor's handle: wherever the descriptor
+   is, which then moves. In place of a directory read's start, the same. */
+#define QUARK_VFS_AT_POSITION (~0UL)
+
+#define QUARK_VFS_SEEK_SET 0UL
+#define QUARK_VFS_SEEK_CUR 1UL
+#define QUARK_VFS_SEEK_END 2UL
+
+/* Which of SETATTR's five words — mode, uid, gid, atime, mtime — are meant. */
+#define QUARK_VFS_ATTR_MODE       1UL
+#define QUARK_VFS_ATTR_UID        2UL
+#define QUARK_VFS_ATTR_GID        4UL
+#define QUARK_VFS_ATTR_ATIME      8UL
+#define QUARK_VFS_ATTR_MTIME     16UL
+#define QUARK_VFS_ATTR_ATIME_NOW 32UL
+#define QUARK_VFS_ATTR_MTIME_NOW 64UL
 
 /* What the server reports. Its own small integers, not anybody's errno —
    each library maps them to whatever it calls those conditions. */
@@ -203,5 +233,29 @@ int quark_vfs_read(unsigned long handle, void *buf, unsigned long offset,
 int quark_vfs_write(unsigned long handle, const void *buf, unsigned long offset,
                     unsigned long len, unsigned long *put);
 int quark_vfs_close(unsigned long handle);
+
+/* Open a file as a descriptor. `*fd` is its number in this program's table,
+   and `out->handle` what to name it by in the calls above; it is closed by
+   closing the descriptor, never with quark_vfs_close. `flags` should say
+   QUARK_VFS_OPEN_READ, _WRITE or both. `mode` is a word of permission bits
+   for a file this makes, with QUARK_VFS_MODE_GIVEN, or 0. */
+int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
+                      unsigned long mode, struct quark_vfs_file *out, long *fd);
+/* mkdir with the permission bits said; `mode` as for quark_vfs_open_fd. */
+int quark_vfs_mkdir_mode(unsigned long base, const char *path, unsigned long mode);
+/* Move a descriptor's position; `*pos` is where it now is, and `*how`, if
+   wanted, what it was opened to do: bit 0 read, bit 1 write, bit 2 append. */
+int quark_vfs_seek(unsigned long handle, long offset, unsigned long whence,
+                   unsigned long *pos, unsigned long *how);
+/* Change a file's mode, owner or times. `attrs` is mode, uid, gid, atime,
+   mtime, of which `which` (QUARK_VFS_ATTR_*) says which are meant. With a
+   NULL `path`, the file is the one open as the handle `base` names (a handle
+   plus one). */
+int quark_vfs_setattr(unsigned long base, const char *path, unsigned long which,
+                      int nofollow, const unsigned long attrs[5]);
+/* Which of this program's descriptors a server's object is, the other way
+   round: the handle descriptor `fd` names if the file server serves it.
+   Returns 0 and fills `*handle`, or -1 for anything else. */
+int quark_vfs_handle(long fd, unsigned long *handle);
 
 #endif

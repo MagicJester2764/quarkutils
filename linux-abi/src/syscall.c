@@ -31,6 +31,50 @@ typedef unsigned long size_t;
 /* Linux x86-64 numbers, only the ones that are answered or deliberately
    refused. The rest fall through to -ENOSYS by not being here. */
 #define LX_read              0
+#define LX_select           23
+#define LX_sched_yield      24
+#define LX_fsync            74
+#define LX_fdatasync        75
+#define LX_chmod            90
+#define LX_fchmod           91
+#define LX_chown            92
+#define LX_fchown           93
+#define LX_lchown           94
+#define LX_umask            95
+#define LX_getrlimit        97
+#define LX_getrusage        98
+#define LX_sysinfo          99
+#define LX_times           100
+#define LX_setpgid         109
+#define LX_getpgrp         111
+#define LX_getgroups       115
+#define LX_getpgid         121
+#define LX_getsid          124
+#define LX_sigaltstack     131
+#define LX_mknod           133
+#define LX_getpriority     140
+#define LX_setpriority     141
+#define LX_setrlimit       160
+#define LX_sync            162
+#define LX_setxattr        188
+#define LX_lsetxattr       189
+#define LX_fsetxattr       190
+#define LX_getxattr        191
+#define LX_lgetxattr       192
+#define LX_fgetxattr       193
+#define LX_listxattr       194
+#define LX_llistxattr      195
+#define LX_flistxattr      196
+#define LX_removexattr     197
+#define LX_lremovexattr    198
+#define LX_fremovexattr    199
+#define LX_mknodat         259
+#define LX_fchownat        260
+#define LX_fchmodat        268
+#define LX_pselect6        270
+#define LX_utimensat       280
+#define LX_syncfs          306
+#define LX_fchmodat2       452
 #define LX_write             1
 #define LX_open              2
 #define LX_close             3
@@ -406,6 +450,115 @@ static long do_uname(char *u) {
     return 0;
 }
 
+#define LX_RLIMIT_STACK  3
+#define LX_RLIMIT_NOFILE 7
+#define LX_RLIM_INFINITY (~0UL)
+
+static long do_getrlimit(long what, unsigned long *lim) {
+    if (!lim) {
+        return -LX_EFAULT;
+    }
+    unsigned long v;
+    switch (what) {
+    case LX_RLIMIT_NOFILE: v = 64; break;           /* the kernel's table */
+    case LX_RLIMIT_STACK:  v = 256 * 4096UL; break; /* what a spawner gives */
+    default:               v = LX_RLIM_INFINITY; break;
+    }
+    lim[0] = v; /* soft */
+    lim[1] = v; /* hard */
+    return 0;
+}
+
+/* Linux's struct sysinfo: uptime, three load averages, then memory in units
+   of `mem_unit` bytes. The kernel says how many frames are free; how many
+   there are in all it does not, so the total is what QEMU is given. */
+static long do_sysinfo(unsigned long *out) {
+    if (!out) {
+        return -LX_EFAULT;
+    }
+    for (int i = 0; i < 14; i++) {
+        out[i] = 0;
+    }
+    unsigned long mem = __syscall0(SYS_MEM_INFO);
+    unsigned long free_frames = mem == QUARK_ERR ? 0 : mem >> 32;
+    out[0] = __syscall0(SYS_TICKS) / 100;      /* uptime */
+    out[4] = free_frames + (mem & 0xFFFFFFFF); /* totalram: at least what is in use here */
+    out[5] = free_frames;                      /* freeram */
+    /* procs (a short) and padding share the ninth word; mem_unit is an int
+       after totalhigh and freehigh. */
+    out[9] = 1;
+    ((unsigned int *)out)[26] = 4096;          /* mem_unit */
+    return 0;
+}
+
+/* select, over the same wait poll uses. An fd_set is an array of words, one
+   bit a descriptor. */
+static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned long *ex,
+                      long timeout_ms) {
+    struct { int fd; short events; short revents; } p[32];
+    long n = 0;
+    if (nfds < 0 || nfds > 1024) {
+        return -LX_EINVAL;
+    }
+    for (long fd = 0; fd < nfds; fd++) {
+        unsigned long bit = 1UL << (fd % 64);
+        long word = fd / 64;
+        short ev = 0;
+        if (rd && (rd[word] & bit)) {
+            ev |= 0x001; /* POLLIN */
+        }
+        if (wr && (wr[word] & bit)) {
+            ev |= 0x004; /* POLLOUT */
+        }
+        if (ex && (ex[word] & bit)) {
+            ev |= 0x002; /* POLLPRI: nothing here is ever exceptional */
+        }
+        if (!ev) {
+            continue;
+        }
+        if (n == 32) {
+            return -LX_EINVAL;
+        }
+        p[n].fd = (int)fd;
+        p[n].events = ev;
+        p[n].revents = 0;
+        n++;
+    }
+    long got = __quark_poll(p, n, timeout_ms);
+    if (got < 0) {
+        return got;
+    }
+    for (long word = 0; word * 64 < nfds; word++) {
+        if (rd) {
+            rd[word] = 0;
+        }
+        if (wr) {
+            wr[word] = 0;
+        }
+        if (ex) {
+            ex[word] = 0;
+        }
+    }
+    long count = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long bit = 1UL << (p[i].fd % 64);
+        long word = p[i].fd / 64;
+        if (p[i].revents & 0x020 /* POLLNVAL */) {
+            return -LX_EBADF;
+        }
+        /* A hangup is readable: the read that follows says end of file. */
+        if (rd && (p[i].events & 0x001) && (p[i].revents & (0x001 | 0x010 | 0x008))) {
+            rd[word] |= bit;
+            count++;
+        }
+        if (wr && (p[i].events & 0x004) && (p[i].revents & (0x004 | 0x008))) {
+            wr[word] |= bit;
+            count++;
+        }
+    }
+    return count;
+}
+
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -462,7 +615,7 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            name, so the address is chosen here from the same arena anonymous
            mappings come out of.
            A mapping of a file is a memory object the VFS pages, below. */
-        if (a5 >= LX_FIRST_FILE_FD) {
+        if (a5 >= 0 && __quark_fd_is_file(a5)) {
             return do_mmap_file(a5, (unsigned long)a2, a3, a4, a6);
         }
         if (a5 != -1L) {
@@ -545,28 +698,65 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
      * A negative code is the kernel saying "killed", with the signal number
      * negated, which is Linux's low byte with no `WIFEXITED` bit above it. */
     case LX_wait4: {
-        unsigned long got = __syscall0(SYS_WAIT);
+        /* A child in particular, or any (-1, and 0 or a group, which is the
+           same thing where there are no groups); and WNOHANG, which a shell
+           tidying up after itself depends on not waiting. */
+        unsigned long who = a1 > 0 ? (unsigned long)a1 : 0;
+        unsigned long got = __syscall2(SYS_WAIT_FOR, who, (a3 & 1 /* WNOHANG */) ? 1UL : 0UL);
         if (got == QUARK_ERR) {
             return -LX_ECHILD;
         }
+        if (got == 0) {
+            return 0; /* asked not to wait, and nothing has ended */
+        }
         long pid = (long)(got & 0xFFFFFFFFUL);
         int code = (int)(got >> 32);
-        /* A specific child, when it is not the one that finished, is more than
-           this kernel can say. Reporting the one that did is the honest
-           answer: a caller waiting on one child has just been given it. */
-        if (a1 > 0 && pid != a1) {
-            /* nothing else to do: the child was reaped, and saying otherwise
-               would leave the caller waiting for a task that no longer is. */
-        }
         if (a2) {
             int *status = (int *)a2;
             *status = code < 0 ? (-code & 0x7F) : ((code & 0xFF) << 8);
         }
+        /* How long it ran is not kept. */
+        if (a4) {
+            unsigned char *usage = (unsigned char *)a4;
+            for (int i = 0; i < 144; i++) {
+                usage[i] = 0;
+            }
+        }
         return pid;
     }
 
-    case LX_getppid:
+    case LX_getppid: {
+        /* The task that made this one, which the kernel knows: its answer
+           about a task carries the parent above the state. */
+        unsigned long info = __syscall1(SYS_TASK_INFO, __syscall0(SYS_GETPID));
+        return info == QUARK_ERR ? 1 : (long)((info >> 4) & 0x0FFFFFFF);
+    }
+
+    /* There are no process groups and no sessions: every program is its own.
+       Saying so in the terms the question was asked in lets a shell that
+       wants to know carry on. */
+    case LX_getpgrp:
+        return (long)__syscall0(SYS_GETPID);
+    case LX_getpgid:
+    case LX_getsid:
+        return a1 ? a1 : (long)__syscall0(SYS_GETPID);
+    case LX_setpgid:
+        return 0;
+    /* One user, in one group. */
+    case LX_getgroups:
+        if (a1 > 0 && a2) {
+            *(unsigned int *)a2 = 0;
+        }
         return 1;
+    case LX_getpriority:
+        return 20; /* the raw call's "nice 0" */
+    case LX_setpriority:
+        return 0;
+    case LX_sched_yield:
+        __syscall0(SYS_YIELD);
+        return 0;
+    case LX_sigaltstack:
+        return 0;
 
     /* A process of one's own.
      *
@@ -770,8 +960,51 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return 0; /* accepted and ignored: musl masks signals during startup */
     case LX_set_robust_list:
     case LX_rseq:
-    case LX_prlimit64:
         return -LX_ENOSYS;
+
+    /* Limits. Two are facts about this system — a program has sixty-four
+       descriptors and a megabyte of stack — and the rest are not kept. */
+    case LX_getrlimit:
+        return do_getrlimit(a1, (unsigned long *)a2);
+    case LX_setrlimit:
+        return 0;
+    case LX_prlimit64:
+        if (a2 != 0 && a2 != (long)__syscall0(SYS_GETPID)) {
+            return -LX_ESRCH;
+        }
+        return a4 ? do_getrlimit(a2 ? a1 : a1, (unsigned long *)a4) : 0;
+
+    /* What a program has used is not counted. Zeroes are what `time` then
+       prints, which is at least not a lie about a number nobody kept. */
+    case LX_getrusage:
+        if (a2) {
+            unsigned char *usage = (unsigned char *)a2;
+            for (int i = 0; i < 144; i++) {
+                usage[i] = 0;
+            }
+        }
+        return 0;
+    case LX_times: {
+        if (a1) {
+            long *t = (long *)a1;
+            t[0] = t[1] = t[2] = t[3] = 0;
+        }
+        /* Ticks since boot, at the hundred a second Linux counts in too. */
+        return (long)__syscall0(SYS_TICKS);
+    }
+    case LX_sysinfo:
+        return do_sysinfo((unsigned long *)a1);
+
+    case LX_select: {
+        const long *tv = (const long *)a5;
+        return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4,
+                         tv ? tv[0] * 1000 + tv[1] / 1000 : -1);
+    }
+    case LX_pselect6: {
+        const long *ts = (const long *)a5;
+        return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4,
+                         ts ? ts[0] * 1000 + ts[1] / 1000000 : -1);
+    }
 
     /* The kernel's generator never blocks, so GRND_NONBLOCK, GRND_RANDOM
        and GRND_INSECURE all get the same answer. One kernel call gives at
@@ -819,9 +1052,9 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     /* Files. The VFS answers all of these; `files.c` is where a handle and an
        offset become a descriptor. */
     case LX_open:
-        return __quark_open((const char *)a1, a2);
+        return __quark_open((const char *)a1, a2, a3);
     case LX_openat:
-        return __quark_openat(a1, (const char *)a2, a3);
+        return __quark_openat(a1, (const char *)a2, a3, a4);
     case LX_close:
         return __quark_close(a1);
     case LX_lseek:
@@ -876,22 +1109,92 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_dup(a1, a2);
     /* dup3 differs in refusing a copy onto itself, and in the one flag it
-       takes, which means nothing here: nothing execs. */
-    case LX_dup3:
+       takes: the copy is closed when the program becomes another. */
+    case LX_dup3: {
         if (a1 == a2 || (a3 & ~LX_O_CLOEXEC)) {
             return -LX_EINVAL;
         }
         if (a2 < 0) {
             return -LX_EBADF;
         }
-        return __quark_dup(a1, a2);
+        long copy = __quark_dup(a1, a2);
+        if (copy >= 0 && (a3 & LX_O_CLOEXEC)) {
+            __syscall3(SYS_FD_FLAGS, (unsigned long)copy, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+        }
+        return copy;
+    }
 
-    /* The mode is the server's to choose: it makes every directory 0755 for
-       the caller, which is what a umask of 022 would leave of most requests. */
     case LX_mkdir:
-        return __quark_mkdir(LX_AT_FDCWD, (const char *)a1);
+        return __quark_mkdir(LX_AT_FDCWD, (const char *)a1, a2);
     case LX_mkdirat:
-        return __quark_mkdir(a1, (const char *)a2);
+        return __quark_mkdir(a1, (const char *)a2, a3);
+
+    /* What a file's inode says of it. */
+    case LX_umask:
+        return __quark_umask(a1);
+    case LX_chmod:
+        return __quark_chmod(LX_AT_FDCWD, (const char *)a1, a2, 0);
+    case LX_fchmod:
+        return __quark_chmod(a1, NULL, a2, 0);
+    case LX_fchmodat:
+        return __quark_chmod(a1, (const char *)a2, a3, 0);
+    case LX_fchmodat2:
+        if (a4 & ~(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH)) {
+            return -LX_EINVAL;
+        }
+        return __quark_chmod(a1, (a4 & LX_AT_EMPTY_PATH) && !*(const char *)a2 ? NULL
+                                                                                : (const char *)a2,
+                             a3, (a4 & LX_AT_SYMLINK_NOFOLLOW) != 0);
+    case LX_chown:
+        return __quark_chown(LX_AT_FDCWD, (const char *)a1, a2, a3, 0);
+    case LX_lchown:
+        return __quark_chown(LX_AT_FDCWD, (const char *)a1, a2, a3, 1);
+    case LX_fchown:
+        return __quark_chown(a1, NULL, a2, a3, 0);
+    case LX_fchownat:
+        if (a5 & ~(LX_AT_SYMLINK_NOFOLLOW | LX_AT_EMPTY_PATH)) {
+            return -LX_EINVAL;
+        }
+        return __quark_chown(a1, (a5 & LX_AT_EMPTY_PATH) && !*(const char *)a2 ? NULL
+                                                                                : (const char *)a2,
+                             a3, a4, (a5 & LX_AT_SYMLINK_NOFOLLOW) != 0);
+    /* A NULL path is `futimens`: the descriptor itself. */
+    case LX_utimensat:
+        if (a4 & ~LX_AT_SYMLINK_NOFOLLOW) {
+            return -LX_EINVAL;
+        }
+        return __quark_utimens(a1, (const char *)a2, (const long *)a3,
+                               (a4 & LX_AT_SYMLINK_NOFOLLOW) != 0);
+
+    /* Nothing here is written behind: a write is on the disk, or in the
+       journal on its way there, before the call that made it returns. */
+    case LX_fsync:
+    case LX_fdatasync:
+    case LX_sync:
+    case LX_syncfs:
+        return 0;
+
+    /* No extended attributes. "Not supported" is the answer that makes `ls`
+       and `cp` carry on as for a filesystem that has none; "no such call"
+       makes them complain about every file. */
+    case LX_getxattr:
+    case LX_lgetxattr:
+    case LX_fgetxattr:
+    case LX_listxattr:
+    case LX_llistxattr:
+    case LX_flistxattr:
+    case LX_setxattr:
+    case LX_lsetxattr:
+    case LX_fsetxattr:
+    case LX_removexattr:
+    case LX_lremovexattr:
+    case LX_fremovexattr:
+        return -LX_EOPNOTSUPP;
+
+    /* Devices and pipes are not made on the disk here. */
+    case LX_mknod:
+    case LX_mknodat:
+        return -LX_EPERM;
 
     case LX_unlink:
         return __quark_unlink(LX_AT_FDCWD, (const char *)a1);
@@ -933,7 +1236,7 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_memfd_create:
         return __quark_memfd((const char *)a1, a2);
     case LX_ftruncate:
-        if (a1 >= LX_FIRST_FILE_FD) {
+        if (__quark_fd_is_file(a1)) {
             return __quark_file_truncate(a1, a2);
         }
         return __quark_ftruncate(a1, a2);
@@ -941,7 +1244,18 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         /* posix_fallocate(fd, offset, len) is what musl uses when it has it,
            and libwayland's os_create_anonymous_file prefers it to ftruncate.
            There is nothing to preallocate here -- a region's frames are taken
-           when it is sized -- so the size is all of it. */
+           when it is sized -- so the size is all of it. For a file it is
+           the length: one shorter than was asked for is made that long, and
+           the blocks come when they are written. */
+        if (__quark_fd_is_file(a1)) {
+            struct { unsigned long w[18]; } st;
+            long err = __quark_fstat(a1, &st);
+            if (err) {
+                return err;
+            }
+            /* st_size is the seventh word of the kernel's stat. */
+            return (long)st.w[6] >= a3 + a4 ? 0 : __quark_file_truncate(a1, a3 + a4);
+        }
         return __quark_ftruncate(a1, a3 + a4);
     case LX_eventfd:
     case LX_eventfd2: {

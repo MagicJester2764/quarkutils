@@ -39,7 +39,7 @@ login/  qsh/        Log in; the shell.
 ls/ cat/ echo/ ps/ ping/ shutdown/      Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     267 checks of the kernel, made through the ABI.
+dtest/  dchild/     317 checks of the kernel, made through the ABI.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
 fstest/ nettest/ socktest/ threadtest/ mousetest/ disktest/ ipcping/
 capdemo/ wmdemo/ wmtype/                One subsystem each, exercised.

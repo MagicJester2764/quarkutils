@@ -291,6 +291,11 @@ int quark_vfs_give_cwd(unsigned long child) {
     struct quark_msg msg;
     struct quark_msg reply;
 
+    /* A directory is a descriptor, in the slot the kernel keeps for one, and
+       a child is given a copy of it like any other descriptor it starts
+       with. The request after it is for a filesystem with no directory
+       handles to make a descriptor of, where the server keeps the record. */
+    __syscall4(SYS_FD_DUP, child, QUARK_FD_CWD, QUARK_FD_CWD, 0);
     zero(&msg, sizeof msg);
     msg.tag = QUARK_VFS_TAG_GIVE_CWD;
     msg.data[0] = child;
@@ -519,4 +524,113 @@ int quark_vfs_close(unsigned long handle) {
     msg.tag = QUARK_VFS_TAG_CLOSE;
     msg.data[0] = handle;
     return vfs_call(&msg, &reply);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Files as descriptors.                                                     */
+/* ------------------------------------------------------------------------ */
+
+int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
+                      unsigned long mode, struct quark_vfs_file *out, long *fd) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.data[1] = flags | QUARK_VFS_OPEN_DESCRIPTOR;
+    msg.data[2] = mode;
+    int err = vfs_path_call(QUARK_VFS_TAG_OPEN, base, path, &msg, &reply);
+    if (err) {
+        return err;
+    }
+    /* The handle above, the descriptor below. */
+    if (fd) {
+        *fd = (long)(reply.data[0] & 0xFFFFFFFFul);
+    }
+    if (out) {
+        out->handle = reply.data[0] >> 32;
+        out->size = reply.data[1];
+        out->is_dir = reply.data[2] != 0;
+        out->mode = (unsigned int)reply.data[3];
+        out->access = (unsigned int)reply.data[4];
+        out->id = reply.data[5];
+    }
+    return 0;
+}
+
+int quark_vfs_mkdir_mode(unsigned long base, const char *path, unsigned long mode) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.data[1] = mode;
+    return vfs_path_call(QUARK_VFS_TAG_MKDIR, base, path, &msg, &reply);
+}
+
+int quark_vfs_seek(unsigned long handle, long offset, unsigned long whence,
+                   unsigned long *pos, unsigned long *how) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_SEEK;
+    msg.data[0] = handle;
+    msg.data[1] = (unsigned long)offset;
+    msg.data[2] = whence;
+    int err = vfs_call(&msg, &reply);
+    if (err) {
+        return err;
+    }
+    if (pos) {
+        *pos = reply.data[0];
+    }
+    if (how) {
+        *how = reply.data[1];
+    }
+    return 0;
+}
+
+int quark_vfs_setattr(unsigned long base, const char *path, unsigned long which,
+                      int nofollow, const unsigned long attrs[5]) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    /* The path, then the five words. */
+    unsigned char lent[QUARK_VFS_MAX_PATH + 40];
+
+    unsigned long len = path ? length(path) : 0;
+    if (path && len == 0) {
+        return QUARK_VFS_INVALID_PATH;
+    }
+    if (len > QUARK_VFS_MAX_PATH) {
+        return QUARK_VFS_NAME_TOO_LONG;
+    }
+    copy(lent, path, len);
+    for (int i = 0; i < 5; i++) {
+        for (int b = 0; b < 8; b++) {
+            lent[len + (unsigned long)i * 8 + (unsigned long)b] =
+                (unsigned char)(attrs[i] >> (8 * b));
+        }
+    }
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_SETATTR;
+    msg.data[0] = len;
+    msg.data[1] = which;
+    msg.data[2] = nofollow ? 1 : 0;
+    msg.data[5] = base;
+    return vfs_call_lend(&msg, &reply, lent, len + 40, QUARK_LEND_READ);
+}
+
+int quark_vfs_handle(long fd, unsigned long *handle) {
+    unsigned long named[2];
+
+    if (fd < 0 || __syscall2(SYS_FD_SERVED, (unsigned long)fd, (unsigned long)named) == QUARK_ERR) {
+        return -1;
+    }
+    /* Served, but by whom? Only the file server's cookies are its handles. */
+    if (named[0] != quark_vfs()) {
+        return -1;
+    }
+    if (handle) {
+        *handle = named[1];
+    }
+    return 0;
 }

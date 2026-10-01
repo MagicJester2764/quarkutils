@@ -354,7 +354,8 @@ or for an empty file by its directory and name.
 A capability to map the file open as `handle`, granted into a free slot of
 the caller's CSpace: `MemObject` access 1 (read), and 2 (write) as well if
 `flags` bit 0 asks to write through a shared mapping, which needs a writable
-handle (`PERMISSION` otherwise). The caller maps it with `SYS_OBJECT_MAP` and
+handle — and, of a descriptor's, one opened to write (`PERMISSION`
+otherwise). A descriptor not opened to read cannot be mapped at all. The caller maps it with `SYS_OBJECT_MAP` and
 may delete the capability after: the mapping keeps the object. Directories,
 links, devices and FAT32 files are `NOT_SUPPORTED`.
 

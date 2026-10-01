@@ -7,16 +7,19 @@
  * user space cannot do — swap the address space under a running task.
  *
  * The task is the same task afterwards: same id, same descriptors, same
- * capabilities, same parent. What changes is the program, which is exactly
- * what `execve` promises.
+ * capabilities, same parent, same working directory. What changes is the
+ * program, which is exactly what `execve` promises.
  *
- * What does not survive is this layer's own open files. They live in the
- * memory being replaced, and the VFS knows them by the address space they were
- * opened from, which is the one going away. The kernel's descriptors — pipes,
- * ptys, sockets, shared memory — do survive, because they belong to the task.
- * A shell redirecting a child's output does it with those, so what a terminal
- * needs works; a program passing an open file across an exec does not, and
- * that is written down as a gap rather than half-done here.
+ * Everything the program has open survives, files included, because a file
+ * is a descriptor in the kernel's table and the table is what the kernel
+ * keeps; what was marked to close on exec is closed by it. Nothing of that
+ * is this file's doing. It used not to be true of files: they lived in the
+ * memory being replaced, under numbers this layer made up, and a shell could
+ * not redirect a child's output into one.
+ *
+ * What does not survive is what this layer remembers in its own memory:
+ * which descriptors were asked not to wait. A program is exec'd into holding
+ * descriptors that wait.
  */
 
 #include <quark/layout.h>
@@ -248,15 +251,25 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
        exists to leak: `execl` returning an error is an ordinary path, and a
        program that carries on after one must be no worse off for having
        tried. */
-    long fd = __quark_open(path, 0 /* O_RDONLY */);
+    /* Whether it may be run is the server's to say, and asked first: a file
+       nobody may execute is refused as that, not found wanting as a program.
+       The difference is one a shell acts on — it runs what the kernel calls
+       "not a program" as a script. */
+    long may = __quark_access(LX_AT_FDCWD, path, 1 /* X_OK */);
+    if (may) {
+        return may;
+    }
+    long fd = __quark_open(path, 0 /* O_RDONLY */, 0);
     if (fd < 0) {
         return fd;
     }
 
     struct ehdr eh;
-    if (__quark_pread(fd, &eh, sizeof eh, 0) != (long)sizeof eh) {
+    long head = __quark_pread(fd, &eh, sizeof eh, 0);
+    if (head != (long)sizeof eh) {
         __quark_close(fd);
-        return -LX_ENOEXEC;
+        /* A directory can be searched and cannot be run. */
+        return head == -LX_EISDIR ? -LX_EACCES : -LX_ENOEXEC;
     }
     if (eh.e_ident[0] != 0x7F || eh.e_ident[1] != 'E' || eh.e_ident[2] != 'L' ||
         eh.e_ident[3] != 'F' || eh.e_ident[4] != 2 /* 64-bit */ ||

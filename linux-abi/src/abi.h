@@ -35,13 +35,13 @@
 #define LX_EDEADLK  35
 #define LX_ENOLCK   37
 #define LX_ETIMEDOUT 110
+#define LX_ESRCH     3
+#define LX_EINTR     4
+#define LX_ENXIO     6
+#define LX_EFBIG    27
+#define LX_EPIPE    32
 
-/* Descriptors from here up are files.c's VFS files; below, the kernel's.
-   The split sits at the kernel's MAX_FDS — see files.c. */
-#define LX_FIRST_FILE_FD 64
-
-/* There is no working directory anywhere in this system, so this is the only
-   value the *at calls accept for one. */
+/* "From the working directory", where an *at call takes a descriptor. */
 #define LX_AT_FDCWD (-100)
 #define LX_AT_SYMLINK_FOLLOW 0x400
 #define LX_AT_SYMLINK_NOFOLLOW 0x100
@@ -58,8 +58,8 @@
 
 /* Files, implemented in files.c. Each returns a Linux-style result: a count
    or a value on success, and a negated errno on failure. */
-long __quark_open(const char *path, long flags);
-long __quark_openat(long dirfd, const char *path, long flags);
+long __quark_open(const char *path, long flags, long mode);
+long __quark_openat(long dirfd, const char *path, long flags, long mode);
 long __quark_close(long fd);
 long __quark_read(long fd, void *buf, unsigned long n);
 long __quark_write(long fd, const void *buf, unsigned long n);
@@ -67,7 +67,15 @@ long __quark_lseek(long fd, long offset, long whence);
 long __quark_fstat(long fd, void *statbuf);
 long __quark_stat(long dirfd, const char *path, void *statbuf, int follow);
 long __quark_access(long dirfd, const char *path, long mode);
-long __quark_mkdir(long dirfd, const char *path);
+long __quark_mkdir(long dirfd, const char *path, long mode);
+long __quark_umask(long mask);
+long __quark_chmod(long dirfd, const char *path, long mode, int nofollow);
+long __quark_chown(long dirfd, const char *path, long uid, long gid, int nofollow);
+long __quark_utimens(long dirfd, const char *path, const long *times, int nofollow);
+/* Whether a descriptor is a file the VFS serves, as opposed to something the
+   kernel keeps; and a way to say a number has changed what it names. */
+int __quark_fd_is_file(long fd);
+void __quark_fd_forget(long fd);
 long __quark_unlink(long dirfd, const char *path);
 long __quark_rmdir(long dirfd, const char *path);
 long __quark_rename(long fromfd, const char *from, long tofd, const char *to);

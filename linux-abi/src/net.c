@@ -288,6 +288,9 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
         }
         if (r >> 32) {
             landed_at = (long)(r >> 32) - 1;
+            /* Whatever arrived, the number now names it: a file as easily as
+               memory. */
+            __quark_fd_forget(landed_at);
         }
         unsigned long n = r & 0xFFFFFFFF;
         total += (long)n;

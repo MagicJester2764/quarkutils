@@ -156,7 +156,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 267 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 317 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -282,8 +282,21 @@ every Unix program assumes. Both are kernel calls — `../quark/CLAUDE.md` says
 what they copy and keep — and the C layer's part is `linux-abi/src/process.c`:
 `execve` reads the ELF and builds the new address space exactly as
 `quark_rt::spawn` does for a child, then asks the kernel to swap the task into
-it. What that leaves undone is under Known gaps: a forked child inherits the
-numbers of the parent's open files but not the files.
+it.
+
+What a shell does between the two works because **a C program's files are
+kernel descriptors** (`linux-abi/src/files.c`). `open` asks the server for the
+file *as a descriptor*, and from then on its number is like a pipe's: `dup2`
+puts it where standard output was, a forked child has a copy, the program it
+execs keeps it, and close-on-exec is the kernel's flag. The layer keeps no
+table — only a note of which numbers are files, forgotten whenever something
+changes what a number names (`__quark_fd_forget`; a path that installs a
+descriptor some other way, as `recvmsg` does, has to say so). Three things
+ride along in the same table and so follow a program the same way: its
+working directory (descriptor 64), its umask (`SYS_UMASK`), and nothing else.
+`open` hands out numbers from 3, where POSIX says the lowest free: 0, 1 and 2
+are where a program's standard descriptors go, and a file that landed on one
+because it happened to be closed is the bug that rule invites.
 
 A terminal is two kernel descriptors, and the paths that name one are caught
 here, ahead of the VFS: `/dev/ptmx` and `/dev/pts/N` in `linux-abi/src/pty.c`,
@@ -465,9 +478,15 @@ change here: it has found what reading the code did not.
   paths in the message and truncated them, which opens a different file.
 - **A directory's times change with its entries**, which is how fontconfig
   knows its cache is stale.
-- **A descriptor names an open file.** In the Linux layer, `dup` gives a file
-  a second descriptor that shares its position, and the VFS handle closes with
-  the last one. The server never sees the copies.
+- **A file opened as a descriptor is the kernel's to count.** The server
+  makes the descriptor (`SYS_FD_SERVE`), believes a request that names its
+  handle only after asking the kernel whether the caller holds it
+  (`SYS_FD_HOLDS`), keeps the position — shared by every copy, which is what
+  `{ a; b; } > file` needs — and closes the handle when the kernel says the
+  last descriptor has gone. `dup`, `fork` and `exec` never reach it. A handle
+  opened the old way, by a program for itself, is still its program's.
+- **A mapping asks what the descriptor was opened for.** A descriptor opened
+  to read is not one that writes because it was mapped shared.
 - **A journaled write never lets a prefetch cache the old copy.** While a
   transaction holds a sector, a read ahead skips it; caching what is on disk
   under it lost a rename on ext4.
@@ -531,14 +550,6 @@ The rules that got it there, and that a further port should follow:
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and
   no focus stealing prevention.
-- A **forked child inherits the numbers but not the files**. The kernel's
-  descriptors — pipes, streams, ptys, shared memory, timers — are the task's
-  and are copied to a child and kept across an exec. The C layer's *VFS* files
-  live in the program's own memory and are named by its address space, so a
-  forked child holds numbers the server will not answer for, and an exec starts
-  with none; a working directory is the same. `weston-terminal` needs neither,
-  and the next piece of this hole is making the VFS understand that one program
-  is a copy of another.
 - There are **no POSIX signals**. The kernel has three of its own — interrupt,
   terminate and kill — and they are what Ctrl-C at the text console (`input`
   sends interrupt to the foreground task), `qsh`'s `kill` and `shutdown` use.
@@ -566,9 +577,7 @@ The rules that got it there, and that a further port should follow:
   shorten a file whose extent tree has grown past the inode.
 - A mapped file's pages stay cached until nothing maps the file any more, and
   the VFS pages 30 objects at once. A private writable mapping copies a page
-  when it is first touched, read or write. A file descriptor cannot be `dup2`ed
-  onto one of the kernel's numbers (a program's stdout), nor the other way
-  round.
+  when it is first touched, read or write.
 - `mprotect` says yes and does nothing: a mapping is made with the protection
   it will keep, so a program that maps read-only and then asks for write gets
   a mapping that still faults on the write. Shortening a file does not take
@@ -583,8 +592,10 @@ The rules that got it there, and that a further port should follow:
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
   once.
-- A C program has 16 open files; the VFS has 512 handles for everybody, and
-  128 for any one program.
+- A program has 64 descriptors, files included; the VFS has 512 handles for
+  everybody, and 128 for any one program. A pipe, a terminal and a stream all
+  say they are a character device to `fstat`: nothing tells the layer what
+  kind a kernel descriptor is.
 - **No OpenGL, no D-Bus, no `dlopen`.** GTK starts without any of them and says
   so: `g_module_symbol` complains about a NULL module twice, the session bus
   cannot be reached, and GSK draws through cairo. Each is a real absence rather

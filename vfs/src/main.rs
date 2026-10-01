@@ -524,6 +524,13 @@ fn access_bits(inode: &ext2::Ext2Inode, uid: u32, gid: u32) -> u64 {
             bits |= probe as u64;
         }
     }
+    // User 0 may read and write whatever the mode says, but a file is run
+    // only if it is one somebody may run. A file with no execute bit at all
+    // is not a program even to user 0, as on Linux — which is what stops a
+    // shell running a text file because nobody said it could not.
+    if uid == 0 && !inode.is_dir() && inode.i_mode & 0o111 == 0 {
+        bits &= !1;
+    }
     bits
 }
 

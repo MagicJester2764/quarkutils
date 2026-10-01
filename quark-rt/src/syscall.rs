@@ -17,6 +17,10 @@ pub const SYS_SIGNAL: u64 = 6;
 pub const SYS_TASK_INFO: u64 = 7;
 /// End every task of the caller's program. `SYS_EXIT_CODE` ends one.
 pub const SYS_EXIT_PROGRAM: u64 = 8;
+/// The permission bits this program leaves off what it makes.
+pub const SYS_UMASK: u64 = 9;
+/// `SYS_WAIT` for one child, or without waiting.
+pub const SYS_WAIT_FOR: u64 = 10;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -1250,6 +1254,37 @@ pub fn sys_fd_reap() -> Option<u64> {
     (ret != u64::MAX).then_some(ret)
 }
 
+/// Collect child `tid` when it has ended, and nobody else: `(tid, status)`.
+/// `Err` if it is not a child of this task.
+pub fn sys_wait_for(tid: usize) -> Result<(usize, i32), ()> {
+    let ret = unsafe { syscall2(SYS_WAIT_FOR, tid as u64, 0) };
+    if ret == u64::MAX {
+        return Err(());
+    }
+    Ok(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) as i32))
+}
+
+/// A child that has ended, if one has: `Ok(None)` when there are children and
+/// none has ended yet, `Err` when there are none. `tid` 0 is any child.
+pub fn sys_wait_nowait(tid: usize) -> Result<Option<(usize, i32)>, ()> {
+    match unsafe { syscall2(SYS_WAIT_FOR, tid as u64, 1) } {
+        u64::MAX => Err(()),
+        0 => Ok(None),
+        ret => Ok(Some(((ret & 0xFFFF_FFFF) as usize, (ret >> 32) as i32))),
+    }
+}
+
+/// Set the permission bits this program leaves off a file or a directory it
+/// makes, and return what they were. Kept across a fork and an exec.
+pub fn sys_umask(mask: u32) -> u32 {
+    unsafe { syscall1(SYS_UMASK, (mask & 0o777) as u64) as u32 }
+}
+
+/// The bits [`sys_umask`] holds, left as they are.
+pub fn sys_umask_get() -> u32 {
+    unsafe { syscall1(SYS_UMASK, u64::MAX) as u32 }
+}
+
 /// Make a copy of this program: a task of its own, in a copy of this address
 /// space, with a second descriptor for everything this one has open. Returns
 /// the child's id here and 0 there.
@@ -1571,7 +1606,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 1;
+pub const ABI_VERSION_MINOR: u32 = 2;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
