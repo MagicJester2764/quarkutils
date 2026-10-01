@@ -156,7 +156,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 356 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 374 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -611,10 +611,11 @@ The rules that got it there, and that a further port should follow:
   signal.c`), and one that handles a signal and then computes without a call
   is not interrupted by it. There are no process groups or sessions (`setsid`
   answers with the caller's own id, `TIOCSCTTY` is accepted, and a shell runs
-  with job control off), nothing is raised when a child ends or a terminal
-  changes size, and there is no `alarm` or `setitimer` — both are refused, so
-  a program that sets a timeout finds out it has not got one. A signal that is
-  blocked and has no handler is not held back. The mask is the program's
+  with job control off), and nothing is raised when a terminal changes size.
+  `alarm` and `setitimer` are the kernel's one alarm for a program, in real
+  time, to the tick: the timers that count time spent running are refused,
+  and so is `timer_create`, which every program asked falls back from. A
+  signal that is blocked and has no handler is not held back. The mask is the program's
   rather than a thread's, and is not kept across an exec.
 - The **plain console has its own Ctrl-C**, older than signals: `input` sends
   the foreground task one of the kernel's three task signals (`SYS_SIGNAL`),

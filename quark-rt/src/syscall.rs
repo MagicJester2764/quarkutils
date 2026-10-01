@@ -29,6 +29,8 @@ pub const SYS_SIG_RAISE: u64 = 12;
 pub const SYS_SIG_TAKE: u64 = 13;
 /// The process id of the program a task belongs to: never used twice.
 pub const SYS_PID: u64 = 14;
+/// Have SIGALRM raised for this program after a time.
+pub const SYS_SIG_ALARM: u64 = 15;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -1363,7 +1365,9 @@ pub const SIGHUP: u64 = 1;
 pub const SIGINT: u64 = 2;
 pub const SIGQUIT: u64 = 3;
 pub const SIGKILL: u64 = 9;
+pub const SIGALRM: u64 = 14;
 pub const SIGTERM: u64 = 15;
+pub const SIGCHLD: u64 = 17;
 
 /// What a program does about a signal: what the signal does, nothing, or run
 /// a handler of its own.
@@ -1444,6 +1448,31 @@ pub fn sys_wait_for_pid(pid: u64) -> Result<(u64, i32), ()> {
 pub fn sys_sig_raise_pid(pid: u64, signo: u64) -> Result<(), ()> {
     let ret = unsafe { syscall3(SYS_SIG_RAISE, pid, signo, 1) };
     if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Have SIGALRM raised for this program in `ticks` ticks, and again every
+/// `every` ticks after that if `every` is not 0. `ticks` of 0 cancels the
+/// alarm there is. Answers with how the alarm this replaces stood: the ticks
+/// that were left of it, 0 if there was none, and what it repeated at.
+///
+/// It is the program's, not the task's: one for all its threads, kept by
+/// `exec` and not copied by `fork`. A program that has said nothing about
+/// SIGALRM is ended by it, which is what the signal does.
+pub fn sys_sig_alarm(ticks: u64, every: u64) -> (u64, u64) {
+    alarm_answer(unsafe { syscall3(SYS_SIG_ALARM, ticks, every, 0) })
+}
+
+/// How this program's alarm stands — the ticks left and what it repeats at —
+/// changing nothing.
+pub fn sys_sig_alarm_left() -> (u64, u64) {
+    alarm_answer(unsafe { syscall3(SYS_SIG_ALARM, 0, 0, 1) })
+}
+
+fn alarm_answer(ret: u64) -> (u64, u64) {
+    if ret == u64::MAX {
+        return (0, 0);
+    }
+    (ret & 0xFFFF_FFFF, ret >> 32)
 }
 
 /// What kind of thing a descriptor names: [`sys_fd_kind`]'s answers.
@@ -1801,7 +1830,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 4;
+pub const ABI_VERSION_MINOR: u32 = 5;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

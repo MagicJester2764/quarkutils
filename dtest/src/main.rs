@@ -907,6 +907,11 @@ extern "C" fn typist() -> ! {
 
 /// Signals: what a program says about one, what the kernel does when it has
 /// said nothing, and how it is told when it has a handler.
+/// A thread that does nothing but end.
+extern "C" fn leaver() -> ! {
+    syscall::sys_exit_code(0)
+}
+
 fn test_signals() {
     use core::sync::atomic::Ordering::SeqCst;
     println!("signals:");
@@ -1015,6 +1020,106 @@ fn test_signals() {
         let _ = syscall::sys_sig_raise_pid(mine, USR1);
         syscall::sys_sig_take(None) == bit(USR1)
     });
+
+    // An alarm: a signal the kernel raises itself, after a time.
+    const ALRM: u64 = syscall::SIGALRM;
+    const CHLD: u64 = syscall::SIGCHLD;
+    let slept = |ticks: u64| {
+        let mut msg = quark_rt::ipc::Message::empty();
+        let before = syscall::sys_ticks();
+        let ended = syscall::sys_recv_timeout(me, &mut msg, ticks);
+        (ended, syscall::sys_ticks() - before)
+    };
+    let _ = syscall::sys_sig_action(ALRM, syscall::SIG_HANDLE);
+    check("a program has no alarm until it sets one", syscall::sys_sig_alarm_left() == (0, 0));
+    check("setting one answers that there was none", syscall::sys_sig_alarm(100, 0) == (0, 0));
+    let (left, _) = syscall::sys_sig_alarm_left();
+    check("asking says what is left of it", left > 90 && left <= 100);
+    let (left, every) = syscall::sys_sig_alarm(3, 0);
+    check("setting another answers with what was left of the first", left > 90 && left <= 100 && every == 0);
+    let (ended, took) = slept(50);
+    check(
+        "an alarm ends a sleep when it is due, and not before",
+        ended == Err(syscall::SLEEP_INTERRUPTED) && (2..10).contains(&took),
+    );
+    check("as SIGALRM", syscall::sys_sig_take(None) == bit(ALRM));
+    check("and is over", syscall::sys_sig_alarm_left() == (0, 0));
+
+    let _ = syscall::sys_sig_alarm(2, 3);
+    let mut rings = 0;
+    for _ in 0..3 {
+        if slept(50).0 == Err(syscall::SLEEP_INTERRUPTED) && syscall::sys_sig_take(None) == bit(ALRM) {
+            rings += 1;
+        }
+    }
+    check("one that repeats is raised again and again", rings == 3);
+    let (left, every) = syscall::sys_sig_alarm(0, 0);
+    check("until it is cancelled, which says how it stood", (1..=3).contains(&left) && every == 3);
+    let (ended, took) = slept(8);
+    check("and then nothing more comes", ended == Err(1) && took >= 7 && syscall::sys_sig_take(None) == 0);
+
+    // It is the program's own: a child made by fork starts with none.
+    let _ = syscall::sys_sig_alarm(500, 0);
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(if syscall::sys_sig_alarm_left() == (0, 0) { 7 } else { 8 }),
+        Ok(child) => check("a forked child has no alarm of its parent's", wait_for(child) == Some(7)),
+        Err(()) => check("fork", false),
+    }
+    check("and the parent's is still running", syscall::sys_sig_alarm(0, 0).0 > 400);
+
+    // A program that has said nothing about the signal is ended by it.
+    let _ = syscall::sys_sig_action(ALRM, syscall::SIG_DEFAULT);
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let _ = syscall::sys_sig_alarm(2, 0);
+            syscall::sleep_ticks(200);
+            syscall::sys_exit_program(0);
+        }
+        Ok(child) => {
+            let before = syscall::sys_ticks();
+            check(
+                "an alarm nobody handles ends the program, as signal 14",
+                wait_for(child) == Some(-14) && syscall::sys_ticks() - before < 50,
+            );
+        }
+        Err(()) => check("fork", false),
+    }
+
+    // A child ending is a signal too, to a program that has asked to hear.
+    let _ = syscall::sys_sig_action(CHLD, syscall::SIG_HANDLE);
+    match syscall::sys_fork() {
+        Ok(0) => {
+            syscall::sleep_ticks(3);
+            syscall::sys_exit_program(5);
+        }
+        Ok(child) => {
+            let (ended, took) = slept(100);
+            check(
+                "a child ending ends its parent's sleep",
+                ended == Err(syscall::SLEEP_INTERRUPTED) && took < 50,
+            );
+            check("as SIGCHLD", syscall::sys_sig_take(None) == bit(CHLD));
+            check("with the child there to collect", wait_for(child) == Some(5));
+        }
+        Err(()) => check("fork", false),
+    }
+    // A thread ending is not: it is not a child, it is this program.
+    match thread::spawn_with_stack(leaver, 8) {
+        Ok(t) => {
+            let _ = t.join();
+            check("a thread ending is not a child ending", syscall::sys_sig_take(None) == 0);
+        }
+        Err(()) => check("start a thread to end", false),
+    }
+    let _ = syscall::sys_sig_action(CHLD, syscall::SIG_DEFAULT);
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(0),
+        Ok(child) => check(
+            "and a program that has said nothing is not troubled by one",
+            wait_for(child) == Some(0) && syscall::sys_sig_take(None) == 0,
+        ),
+        Err(()) => check("fork", false),
+    }
 
     // A program a spawner makes is a new one, and has said nothing.
     let fresh = load_child(&[b"dchild", b"sigstate"]).and_then(|c| {

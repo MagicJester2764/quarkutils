@@ -25,6 +25,11 @@
 #define QUARK_WAIT_NOW      1UL
 #define QUARK_WAIT_BY_PID   2UL
 #define QUARK_RAISE_BY_PID  1UL
+/* Have signal 14 raised for the program so many ticks from now, and then
+   every so many: the answer is what was left of the alarm this replaces, and
+   above it what that one repeated at. */
+#define SYS_SIG_ALARM       15
+#define QUARK_ALARM_ASK     1UL
 #define SYS_YIELD           2
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21

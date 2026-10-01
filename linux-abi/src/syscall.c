@@ -596,6 +596,58 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
     return count;
 }
 
+/* A length of time as ticks, for an alarm: rounded up to a whole tick and
+   then one more, because the tick under way is part of the way through and a
+   timer must not run out early. No time at all is no ticks, which is how an
+   alarm is turned off. */
+static unsigned long time_ticks(unsigned long sec, unsigned long usec) {
+    unsigned long ticks = sec * 100 + (usec + 9999) / 10000;
+    return ticks ? ticks + 1 : 0;
+}
+
+/* And the ticks left of an alarm as the time left of it: without that one
+   more, or `alarm(10)` asked at once how long it has would say eleven. One
+   tick left is still one: none means there is no alarm. */
+static unsigned long ticks_left(unsigned long ticks) {
+    return ticks > 1 ? ticks - 1 : ticks;
+}
+
+/* setitimer and getitimer. An itimerval is two timevals, the interval and
+   then what is left, each seconds and microseconds.
+
+   ITIMER_REAL is the kernel's alarm. The other two count the time a program
+   spends running, which nothing here measures. */
+static long do_itimer(long which, const long *set, long *old) {
+    if (which != 0 /* ITIMER_REAL */) {
+        return -LX_EINVAL;
+    }
+    unsigned long was;
+    if (set) {
+        if (set[0] < 0 || set[2] < 0 || set[1] < 0 || set[1] >= 1000000 || set[3] < 0
+            || set[3] >= 1000000) {
+            return -LX_EINVAL;
+        }
+        /* A repeat is a period and not a wait: no tick is added to it, or a
+           timer asked to go every fifty milliseconds would go every sixty. */
+        unsigned long every = (unsigned long)set[0] * 100 + ((unsigned long)set[1] + 9999) / 10000;
+        was = __syscall3(SYS_SIG_ALARM,
+                         time_ticks((unsigned long)set[2], (unsigned long)set[3]), every, 0);
+    } else {
+        was = __syscall3(SYS_SIG_ALARM, 0, 0, QUARK_ALARM_ASK);
+    }
+    if (was == QUARK_ERR) {
+        return -LX_EINVAL;
+    }
+    if (old) {
+        unsigned long left = ticks_left(was & 0xFFFFFFFFUL), every = was >> 32;
+        old[0] = (long)(every / 100);
+        old[1] = (long)(every % 100) * 10000;
+        old[2] = (long)(left / 100);
+        old[3] = (long)(left % 100) * 10000;
+    }
+    return 0;
+}
+
 /* setuid and its relations: become `id`, by the kernel's call `how`, whose
    answer for this task is `shift` bits up in what SYS_GET_UID says. */
 static long set_identity(unsigned long how, int shift, long id) {
@@ -1103,13 +1155,17 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_rt_sigreturn:
         /* Returning from a handler is returning from a function here. */
         return 0;
-    /* Nothing raises a signal at a time: there is no SIGALRM to send. Said
-       plainly, so that a program which sets a timeout finds out it has not
-       got one rather than waiting for it. */
-    case LX_alarm:
+    /* The one interval timer there is: real time, and SIGALRM when it runs
+       out. musl's `alarm` is a `setitimer`; the call of that name is here for
+       a program that makes it itself. */
+    case LX_alarm: {
+        unsigned long was = __syscall3(SYS_SIG_ALARM, time_ticks((unsigned int)a1, 0), 0, 0);
+        return was == QUARK_ERR ? 0 : (long)((ticks_left(was & 0xFFFFFFFFUL) + 99) / 100);
+    }
     case LX_setitimer:
+        return do_itimer(a1, (const long *)a2, (long *)a3);
     case LX_getitimer:
-        return -LX_ENOSYS;
+        return do_itimer(a1, NULL, (long *)a2);
     case LX_set_robust_list:
     case LX_rseq:
         return -LX_ENOSYS;
