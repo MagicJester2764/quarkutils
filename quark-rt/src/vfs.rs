@@ -28,6 +28,8 @@ const TAG_LOCK: u64 = 22;
 const TAG_MAP: u64 = 23;
 const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
+const TAG_SEEK: u64 = 24;
+const TAG_SETATTR: u64 = 25;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most one read or write carries.
@@ -46,6 +48,31 @@ pub const OPEN_DIRECTORY: u64 = 8;
 /// A symbolic link at the end of the path is opened itself: the handle
 /// answers `stat_full` and nothing else.
 pub const OPEN_NOFOLLOW: u64 = 16;
+/// The file is opened as a *descriptor*: a number in this program's
+/// descriptor table, which a forked child has a copy of and the program this
+/// one execs keeps. See [`open_fd`].
+pub const OPEN_DESCRIPTOR: u64 = 0x20;
+/// Every write through the descriptor goes to the end of the file.
+pub const OPEN_APPEND: u64 = 0x40;
+/// What the descriptor may do.
+pub const OPEN_READ: u64 = 0x80;
+pub const OPEN_WRITE: u64 = 0x100;
+/// Set in a mode word to say the permission bits below it are meant.
+pub const MODE_GIVEN: u64 = 1 << 16;
+
+/// As `lseek`'s.
+pub const SEEK_SET: u64 = 0;
+pub const SEEK_CUR: u64 = 1;
+pub const SEEK_END: u64 = 2;
+
+/// Which of a file's attributes [`set_attr`] changes.
+pub const ATTR_MODE: u64 = 1;
+pub const ATTR_UID: u64 = 2;
+pub const ATTR_GID: u64 = 4;
+pub const ATTR_ATIME: u64 = 8;
+pub const ATTR_MTIME: u64 = 16;
+pub const ATTR_ATIME_NOW: u64 = 32;
+pub const ATTR_MTIME_NOW: u64 = 64;
 
 // Error codes (match VFS server)
 pub const ERR_NOT_FOUND: u64 = 1;
@@ -200,6 +227,72 @@ pub fn open_with(vfs_tid: usize, path: &[u8], flags: u64) -> Result<Opened, u64>
         access: r.data[4] as u32,
         id: r.data[5],
     })
+}
+
+/// Open a file as a descriptor, and return its number.
+///
+/// What comes back is in this program's descriptor table like a pipe is: read
+/// and written with `sys_fd_read` and `sys_fd_write` from wherever it has got
+/// to, copied with `sys_fd_dup`, closed with `sys_fd_close`, inherited by a
+/// forked child and kept across an exec. `flags` are the `OPEN_*` ones, of
+/// which [`OPEN_READ`] and [`OPEN_WRITE`] say what it is for; `mode` is the
+/// permission bits for a file this makes.
+pub fn open_fd(vfs_tid: usize, path: &[u8], flags: u64, mode: u32) -> Result<usize, u64> {
+    let words = [0, flags | OPEN_DESCRIPTOR, MODE_GIVEN | (mode as u64 & 0o7777), 0, 0, 0];
+    let r = call_with_path(vfs_tid, TAG_OPEN, path, words)?;
+    Ok((r.data[0] & 0xFFFF_FFFF) as usize)
+}
+
+/// The server's handle behind descriptor `fd`, if it is one of `vfs_tid`'s.
+pub fn handle_of(vfs_tid: usize, fd: usize) -> Result<usize, u64> {
+    match syscall::sys_fd_served(fd) {
+        Ok((server, cookie)) if server == vfs_tid => Ok(cookie as usize),
+        _ => Err(ERR_INVALID_HANDLE),
+    }
+}
+
+/// Move a descriptor's position, and say where it now is.
+pub fn seek(vfs_tid: usize, fd: usize, offset: i64, whence: u64) -> Result<u64, u64> {
+    let handle = handle_of(vfs_tid, fd)?;
+    simple_call(vfs_tid, TAG_SEEK, [handle as u64, offset as u64, whence, 0, 0, 0])
+        .map(|r| r.data[0])
+}
+
+/// Change a file's mode, owner or times. `which` is a set of `ATTR_*` saying
+/// which of the rest are meant.
+pub fn set_attr(
+    vfs_tid: usize,
+    path: &[u8],
+    which: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime: u64,
+    mtime: u64,
+) -> Result<(), u64> {
+    if path.is_empty() {
+        return Err(ERR_INVALID_PATH);
+    }
+    if path.len() > MAX_PATH {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    // The path, then the five words.
+    let mut lent = [0u8; MAX_PATH + 40];
+    lent[..path.len()].copy_from_slice(path);
+    for (i, w) in [mode as u64, uid as u64, gid as u64, atime, mtime].iter().enumerate() {
+        let at = path.len() + i * 8;
+        lent[at..at + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    let msg = Message {
+        sender: 0,
+        tag: TAG_SETATTR,
+        data: [path.len() as u64, which, 0, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend(vfs_tid, &msg, &mut reply, &lent[..path.len() + 40]).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
 }
 
 /// Open an existing file or directory by path.
@@ -442,6 +535,13 @@ pub fn getcwd(vfs_tid: usize, out: &mut [u8]) -> Result<usize, u64> {
 /// Start `child`, a program this one is making, in this program's directory.
 /// Call it before starting the child.
 pub fn give_cwd(vfs_tid: usize, child: usize) -> Result<(), u64> {
+    // A directory is a descriptor, in the slot the kernel keeps for one, and
+    // the child is given a copy of it like any other descriptor it starts
+    // with. That copy is what *its* children inherit. A program that has
+    // never moved has nothing there, and neither then has its child.
+    let _ = syscall::sys_fd_dup(child, syscall::FD_CWD, syscall::FD_CWD);
+    // And the record the server keeps by program, which is all a filesystem
+    // with no directory handles has.
     simple_call(vfs_tid, TAG_GIVE_CWD, [child as u64, 0, 0, 0, 0, 0]).map(|_| ())
 }
 

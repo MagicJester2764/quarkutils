@@ -5,7 +5,7 @@
 //! root filesystem still carries an empty `/dev` directory, so that listing
 //! `/` shows it.
 
-use crate::handles::{self, FsFileData, OpenFile};
+use crate::handles::{FsFileData, OpenFile};
 use crate::protocol::*;
 use crate::{error_reply, lend_out, reply_opened, space_of, CLIENT_BUF, PAGE_SIZE};
 use quark_rt::ipc::Message;
@@ -121,17 +121,12 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
     let file = OpenFile {
         in_use: true,
         owner: space_of(sender),
-        file_size: 0,
         is_dir,
         writable: !is_dir,
-        link: false,
-        read_offset: 0,
         fs,
+        ..OpenFile::empty()
     };
-    match handles::alloc(file) {
-        Some(handle) => reply_opened(sender, [handle as u64, 0, is_dir as u64, mode, access, id]),
-        None => error_reply(sender, ERR_TOO_MANY_OPEN),
-    }
+    crate::opened(sender, flags, file, [0, 0, is_dir as u64, mode, access, id]);
 }
 
 /// Whether `msg`, a request naming a handle, is for one of these.
@@ -159,7 +154,7 @@ pub fn serve(sender: usize, msg: &Message) {
         (TAG_WRITE, Some(Device::Full)) => error_reply(sender, ERR_NO_SPACE),
         // Written and forgotten. Linux would stir the pool with what is
         // written to random; nothing here needs to.
-        (TAG_WRITE, Some(_)) => reply_opened(sender, [msg.data[3].min(PAGE_SIZE as u64), 0, 0, 0, 0, 0]),
+        (TAG_WRITE, Some(_)) => crate::reply_count(sender, msg.data[3].min(PAGE_SIZE as u64)),
         (TAG_WRITE, None) => error_reply(sender, ERR_IS_DIR),
         (TAG_STAT, _) => stat(sender, target),
         (TAG_READDIR_BULK, None) => list(sender, msg.data[1], msg.data[2] as usize),
@@ -185,7 +180,7 @@ fn read(sender: usize, dev: Device, want: usize) {
         },
     };
     if lend_out(sender, n) {
-        reply_opened(sender, [n as u64, 0, 0, 0, 0, 0]);
+        crate::reply_count(sender, n as u64);
     } else {
         error_reply(sender, ERR_IO);
     }

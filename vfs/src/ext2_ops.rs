@@ -51,6 +51,7 @@ pub fn create(
     uid: u32,
     gid: u32,
     is_dir: bool,
+    mode: Option<u16>,
 ) -> Result<(u32, Ext2Inode), u64> {
     let (parent_path, name) = split_path(path)?;
     let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
@@ -66,7 +67,13 @@ pub fn create(
 
     let t = ext2::now();
     let mut inode = Ext2Inode::empty();
-    inode.i_mode = if is_dir { ext2::S_IFDIR | 0o755 } else { ext2::S_IFREG | 0o644 };
+    // What the caller asked for, or what a client that says nothing has
+    // always got.
+    inode.i_mode = if is_dir {
+        ext2::S_IFDIR | (mode.unwrap_or(0o755) & 0o7777)
+    } else {
+        ext2::S_IFREG | (mode.unwrap_or(0o644) & 0o7777)
+    };
     inode.i_uid = uid as u16;
     inode.i_gid = gid as u16;
     inode.i_links_count = if is_dir { 2 } else { 1 };
@@ -103,6 +110,78 @@ pub fn create(
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
     Ok((ino, inode))
+}
+
+/// What SETATTR asks for: `which` says which of the rest to use.
+pub struct Attrs {
+    pub which: u64,
+    pub mode: u64,
+    pub uid: u64,
+    pub gid: u64,
+    pub atime: u64,
+    pub mtime: u64,
+}
+
+/// Change what inode `ino` says of its file, as user `uid` in group `gid`.
+///
+/// The rules are Unix's. A file's mode is its owner's to change. Giving a
+/// file away is user 0's; an owner may only say what is already so, or move
+/// the file to their own group. Times set to a value the caller names are the
+/// owner's to set; "now" is anybody's who may write the file, which is what
+/// `touch` on a file you can write but do not own comes to.
+pub fn setattr(e2: &mut Ext2State, ino: u32, a: &Attrs, uid: u32, gid: u32) -> Result<(), u64> {
+    let mut inode = ext2::read_inode(e2, ino)?;
+    let owner = uid == 0 || uid == inode.i_uid as u32;
+
+    if a.which & crate::ATTR_MODE != 0 {
+        if !owner {
+            return Err(ERR_PERMISSION);
+        }
+        // A link has no mode of its own to speak of: Linux refuses too.
+        if inode.is_symlink() {
+            return Err(ERR_NOT_SUPPORTED);
+        }
+        inode.i_mode = (inode.i_mode & ext2::S_IFMT) | (a.mode as u16 & 0o7777);
+    }
+    if a.which & (crate::ATTR_UID | crate::ATTR_GID) != 0 {
+        let to_uid = if a.which & crate::ATTR_UID != 0 { a.uid } else { inode.i_uid as u64 };
+        let to_gid = if a.which & crate::ATTR_GID != 0 { a.gid } else { inode.i_gid as u64 };
+        // Sixteen bits of each is what this keeps of an inode.
+        if to_uid > u16::MAX as u64 || to_gid > u16::MAX as u64 {
+            return Err(ERR_INVALID_PATH);
+        }
+        let stays = to_uid == inode.i_uid as u64;
+        let own_group = to_gid == inode.i_gid as u64 || to_gid == gid as u64;
+        if uid != 0 && !(uid == inode.i_uid as u32 && stays && own_group) {
+            return Err(ERR_PERMISSION);
+        }
+        inode.i_uid = to_uid as u16;
+        inode.i_gid = to_gid as u16;
+    }
+    let now = ext2::now();
+    if a.which & (crate::ATTR_ATIME | crate::ATTR_MTIME) != 0 && !owner {
+        return Err(ERR_PERMISSION);
+    }
+    if a.which & (crate::ATTR_ATIME_NOW | crate::ATTR_MTIME_NOW) != 0
+        && !owner
+        && !ext2::check_permission(&inode, uid, gid, 2)
+    {
+        return Err(ERR_PERMISSION);
+    }
+    if a.which & crate::ATTR_ATIME != 0 {
+        inode.i_atime = a.atime as u32;
+    }
+    if a.which & crate::ATTR_ATIME_NOW != 0 {
+        inode.i_atime = now;
+    }
+    if a.which & crate::ATTR_MTIME != 0 {
+        inode.i_mtime = a.mtime as u32;
+    }
+    if a.which & crate::ATTR_MTIME_NOW != 0 {
+        inode.i_mtime = now;
+    }
+    inode.i_ctime = now;
+    ext2::write_inode(e2, ino, &inode)
 }
 
 /// A directory the caller may change: it exists, is a directory, and the

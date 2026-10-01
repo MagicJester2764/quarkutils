@@ -536,15 +536,15 @@ const FAT_ACCESS: u64 = 7;
 /// A FAT32 cluster's size, which is what a file's blocks come in.
 static mut FAT_CLUSTER_BYTES: u32 = 512;
 
-fn alloc_handle_fat32(
+fn fat32_file(
     tid: usize,
     cluster: u32,
     size: u32,
     is_dir: bool,
     dir_cluster: u32,
     fat_name: &[u8; 11],
-) -> Option<usize> {
-    handles::alloc(OpenFile {
+) -> OpenFile {
+    OpenFile {
         in_use: true,
         owner: space_of(tid),
         file_size: size,
@@ -559,7 +559,8 @@ fn alloc_handle_fat32(
             dir_cluster,
             fat_name: *fat_name,
         },
-    })
+        ..OpenFile::empty()
+    }
 }
 
 /// The program a caller belongs to, or 0 if it has none (and so owns nothing).
@@ -567,9 +568,71 @@ fn space_of(sender: usize) -> u64 {
     syscall::sys_task_space(sender).unwrap_or(0)
 }
 
-/// `sender`'s program's handle `handle`.
+/// The handle `sender` may use as `handle`: its program's, or one a
+/// descriptor it holds names. For the second the kernel is asked, and its
+/// answer is the whole of the authority — a task holds a cookie only by
+/// having been given a descriptor for it.
 fn get_handle(handle: usize, sender: usize) -> Option<&'static mut OpenFile> {
+    if handles::is_descriptor(handle) {
+        return if syscall::sys_fd_holds(sender, handle as u64) {
+            handles::descriptor(handle)
+        } else {
+            None
+        };
+    }
     handles::get(handle, space_of(sender))
+}
+
+/// Where `sender` is: the directory in its descriptor table's slot for one,
+/// if this server put it there; else the one kept for its program, which is
+/// what FAT32 has and what a program nobody moved has; else the root.
+fn cwd_of(sender: usize) -> (cwd::Where, &'static [u8]) {
+    if let Some(cookie) = syscall::sys_fd_cookie(sender, syscall::FD_CWD) {
+        if let Some(file) = handles::descriptor(cookie as usize) {
+            match file.fs {
+                FsFileData::Ext2 { inode_num } if file.is_dir => {
+                    return if inode_num == ext2::EXT2_ROOT_INO {
+                        (cwd::Where::Root, b"/")
+                    } else {
+                        (cwd::Where::Inode(inode_num), b"/")
+                    };
+                }
+                FsFileData::DevDir if ext2_dir::dev_dir() != 0 => {
+                    return (cwd::Where::Inode(ext2_dir::dev_dir()), b"/");
+                }
+                _ => {}
+            }
+        }
+    }
+    cwd::get(space_of(sender))
+}
+
+/// Put `file` in the table and answer the OPEN that asked for it. For a
+/// descriptor the caller is given one, and told which.
+pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]) {
+    let by_fd = flags & OPEN_DESCRIPTOR != 0;
+    if by_fd {
+        file.by_fd = true;
+        file.append = flags & OPEN_APPEND != 0;
+        file.may_read = flags & OPEN_READ != 0;
+        file.may_write = flags & OPEN_WRITE != 0;
+    }
+    let Some(handle) = handles::alloc(file) else {
+        return error_reply(sender, ERR_TOO_MANY_OPEN);
+    };
+    words[0] = handle as u64;
+    if by_fd {
+        match syscall::sys_fd_serve(sender, handle as u64, syscall::ANY_FD) {
+            Ok(fd) => words[0] = (handle as u64) << 32 | fd as u64,
+            Err(()) => {
+                // Its table is full, or the kernel's. Nothing names the
+                // handle, so nothing will ever say it has been closed.
+                let _ = handles::release(handle);
+                return error_reply(sender, ERR_TOO_MANY_OPEN);
+            }
+        }
+    }
+    reply_opened(sender, words);
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,66 +1448,293 @@ pub extern "C" fn _start() -> ! {
             locks::drop_task(tid);
             continue;
         }
+        // The last descriptor for something has closed. One notice however
+        // many there are: collect until there are none.
+        if quark_rt::ipc::fd_released_notice(&msg) {
+            while let Some(cookie) = syscall::sys_fd_reap() {
+                descriptor_closed(cookie as usize);
+            }
+            continue;
+        }
         // A task in a call is not waiting in an earlier one: a lock it asked
         // for and gave up on is not a request any more, and granting it later
         // would hand a lock to a program that had stopped asking.
         locks::drop_task(sender);
 
+        // The kernel, reading or writing through a descriptor for a task that
+        // may know nothing of this protocol: `[cookie, length]`, wherever the
+        // descriptor is. The same thing as a client asking for itself, and
+        // checked the same way — the tag proves nothing, holding the cookie
+        // does.
+        let msg = match msg.tag {
+            quark_rt::ipc::TAG_FD_READ | quark_rt::ipc::TAG_FD_WRITE => Message {
+                sender,
+                tag: if msg.tag == quark_rt::ipc::TAG_FD_READ { TAG_READ } else { TAG_WRITE },
+                data: [msg.data[0], 0, AT_POSITION, msg.data[1].min(PAGE_SIZE as u64), 0, 0],
+            },
+            _ => msg,
+        };
+
         match msg.tag {
-            TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
-                if devices::is_ours(sender, &msg) =>
-            {
-                devices::serve(sender, &msg)
+            TAG_READ | TAG_WRITE if handles::is_descriptor(msg.data[0] as usize) => {
+                descriptor_io(&disk, sender, &msg)
             }
-            // A link opened as itself answers STAT and nothing else.
-            TAG_READ | TAG_WRITE | TAG_READDIR_BULK | TAG_TRUNCATE
-                if get_handle(msg.data[0] as usize, sender).is_some_and(|f| f.link) =>
-            {
-                error_reply(sender, ERR_NOT_SUPPORTED)
-            }
-            TAG_OPEN if msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE) != 0 => {
-                transacted(|| handle_open(&disk, sender, &msg))
-            }
-            TAG_OPEN => handle_open(&disk, sender, &msg),
-            TAG_READ => handle_read(&disk, sender, &msg),
-            TAG_CLOSE => handle_close(sender, &msg),
-            TAG_STAT => handle_stat(sender, &msg),
-            TAG_WRITE => transacted(|| handle_write(&disk, sender, &msg)),
-            TAG_MKDIR => transacted(|| handle_mkdir(&disk, sender, &msg)),
-            TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
-                transacted(|| handle_namespace(sender, &msg))
-            }
-            TAG_READLINK => handle_readlink(&disk, sender, &msg),
-            TAG_CHDIR | TAG_FCHDIR => handle_chdir(&disk, sender, &msg),
-            TAG_GETCWD => handle_getcwd(sender),
-            TAG_GIVE_CWD => handle_give_cwd(sender, &msg),
-            TAG_LOCK => handle_lock(sender, &msg),
-            TAG_MAP if unsafe { FS_TYPE } == FsType::Ext2 => pager::handle_map(sender, &msg),
-            TAG_MAP => error_reply(sender, ERR_NOT_SUPPORTED),
-            // From the kernel alone: nobody else can set the pager bit.
-            quark_rt::ipc::TAG_PAGE_IN if sender & quark_rt::ipc::PAGER_BIT != 0 => {
-                pager::page_in(sender, &msg)
-            }
-            quark_rt::ipc::TAG_OBJECT_SYNC if sender & quark_rt::ipc::PAGER_BIT != 0 => {
-                transacted(|| pager::sync(sender, &msg))
-            }
-            quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
-                transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
-            }
-            TAG_TRUNCATE => transacted(|| handle_truncate(sender, &msg)),
-            TAG_STATFS => handle_statfs(sender),
-            TAG_READDIR_BULK => handle_readdir_bulk(&disk, sender, &msg),
-            quark_rt::ipc::TAG_PING => {
-                // Liveness probe: reply immediately, touching no disk state.
-                let reply = Message {
-                    sender: 0,
-                    tag: quark_rt::ipc::TAG_PING,
-                    data: [0; 6],
-                };
-                let _ = syscall::sys_reply(sender, &reply);
-            }
-            _ => error_reply(sender, 0xFF),
+            TAG_READDIR_BULK if msg.data[1] == AT_POSITION => descriptor_list(&disk, sender, &msg),
+            TAG_SEEK => handle_seek(sender, &msg),
+            TAG_SETATTR => transacted(|| handle_setattr(sender, &msg)),
+            _ => dispatch(&disk, sender, &msg),
         }
+    }
+}
+
+/// Every request that is not about where a descriptor is.
+fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
+    match msg.tag {
+        TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
+            if devices::is_ours(sender, msg) =>
+        {
+            devices::serve(sender, msg)
+        }
+        // A link opened as itself answers STAT and nothing else.
+        TAG_READ | TAG_WRITE | TAG_READDIR_BULK | TAG_TRUNCATE
+            if get_handle(msg.data[0] as usize, sender).is_some_and(|f| f.link) =>
+        {
+            error_reply(sender, ERR_NOT_SUPPORTED)
+        }
+        TAG_OPEN if msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE) != 0 => {
+            transacted(|| handle_open(disk, sender, msg))
+        }
+        TAG_OPEN => handle_open(disk, sender, msg),
+        TAG_READ => handle_read(disk, sender, msg),
+        TAG_CLOSE => handle_close(sender, msg),
+        TAG_STAT => handle_stat(sender, msg),
+        TAG_WRITE => transacted(|| handle_write(disk, sender, msg)),
+        TAG_MKDIR => transacted(|| handle_mkdir(disk, sender, msg)),
+        TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
+            transacted(|| handle_namespace(sender, msg))
+        }
+        TAG_READLINK => handle_readlink(disk, sender, msg),
+        TAG_CHDIR | TAG_FCHDIR => handle_chdir(disk, sender, msg),
+        TAG_GETCWD => handle_getcwd(sender),
+        TAG_GIVE_CWD => handle_give_cwd(sender, msg),
+        TAG_LOCK => handle_lock(sender, msg),
+        TAG_MAP if unsafe { FS_TYPE } == FsType::Ext2 => pager::handle_map(sender, msg),
+        TAG_MAP => error_reply(sender, ERR_NOT_SUPPORTED),
+        // From the kernel alone: nobody else can set the pager bit.
+        quark_rt::ipc::TAG_PAGE_IN if sender & quark_rt::ipc::PAGER_BIT != 0 => {
+            pager::page_in(sender, msg)
+        }
+        quark_rt::ipc::TAG_OBJECT_SYNC if sender & quark_rt::ipc::PAGER_BIT != 0 => {
+            transacted(|| pager::sync(sender, msg))
+        }
+        quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
+            transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
+        }
+        TAG_TRUNCATE => transacted(|| handle_truncate(sender, msg)),
+        TAG_STATFS => handle_statfs(sender),
+        TAG_READDIR_BULK => handle_readdir_bulk(disk, sender, msg),
+        quark_rt::ipc::TAG_PING => {
+            // Liveness probe: reply immediately, touching no disk state.
+            let reply = Message {
+                sender: 0,
+                tag: quark_rt::ipc::TAG_PING,
+                data: [0; 6],
+            };
+            let _ = syscall::sys_reply(sender, &reply);
+        }
+        _ => error_reply(sender, 0xFF),
+    }
+}
+
+/// What the request being answered transferred: the bytes of a read or a
+/// write, or the entry a listing goes on from. Left by the reply, for whoever
+/// moves a descriptor past it.
+static mut MOVED: Option<u64> = None;
+
+/// Answer a read or a write with how much was transferred.
+pub fn reply_count(sender: usize, n: u64) {
+    unsafe { MOVED = Some(n) };
+    reply_opened(sender, [n, 0, 0, 0, 0, 0]);
+}
+
+/// How long the file behind a handle is.
+fn size_of(file: &OpenFile) -> Result<u64, u64> {
+    match file.fs {
+        FsFileData::Ext2 { inode_num } => {
+            ext2::read_inode(ext2_state(), inode_num).map(|inode| inode.size64())
+        }
+        FsFileData::Fat32 { .. } => Ok(file.file_size as u64),
+        _ => Ok(0),
+    }
+}
+
+/// A read or a write through a descriptor's handle.
+///
+/// It is checked against what the descriptor was opened to do, and an offset
+/// of `AT_POSITION` is wherever the descriptor is — or, writing to one opened
+/// to append, the end of the file — and moves it. The position is here and
+/// not in the client because every descriptor made from the first shares it:
+/// a child writing after its parent through what it inherited writes *after*
+/// it, which is the whole of how a shell's `{ a; b; } > file` works.
+fn descriptor_io(disk: &DiskState, sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let writing = msg.tag == TAG_WRITE;
+    let Some(file) = get_handle(handle, sender) else {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    };
+    if (writing && !file.may_write) || (!writing && !file.may_read) {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    }
+    // A directory is listed, not read: its blocks are not the caller's to see.
+    if file.is_dir {
+        return error_reply(sender, ERR_IS_DIR);
+    }
+    let moves = msg.data[2] == AT_POSITION;
+    let at = if !moves {
+        msg.data[2]
+    } else if writing && file.append {
+        match size_of(file) {
+            Ok(end) => end,
+            Err(code) => return error_reply(sender, code),
+        }
+    } else {
+        file.pos
+    };
+    // A file here is at most four gigabytes: past that there is nothing to
+    // read and nowhere to write.
+    if at > u32::MAX as u64 {
+        return if writing { error_reply(sender, ERR_NO_SPACE) } else { reply_count(sender, 0) };
+    }
+    let mut placed = *msg;
+    placed.data[2] = at;
+    unsafe { MOVED = None };
+    dispatch(disk, sender, &placed);
+    if moves {
+        if let (Some(n), Some(file)) = (unsafe { MOVED.take() }, handles::descriptor(handle)) {
+            file.pos = at + n;
+        }
+    }
+}
+
+/// READDIR_BULK from wherever a directory descriptor has got to.
+fn descriptor_list(disk: &DiskState, sender: usize, msg: &Message) {
+    let handle = msg.data[0] as usize;
+    let Some(file) = get_handle(handle, sender).filter(|f| f.by_fd) else {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    };
+    let mut from = *msg;
+    from.data[1] = file.dirpos;
+    unsafe { MOVED = None };
+    dispatch(disk, sender, &from);
+    if let (Some(next), Some(file)) = (unsafe { MOVED.take() }, handles::descriptor(handle)) {
+        file.dirpos = next;
+    }
+}
+
+/// TAG_SEEK: `[handle, offset, whence]`, the offset signed. Reply: where the
+/// descriptor now is, and what it was opened to do (bit 0 read, 1 write,
+/// 2 append) — which a client that has just been exec'd into holding it has no
+/// other way to learn. A directory can be sent to the start, or to an entry a
+/// listing named.
+fn handle_seek(sender: usize, msg: &Message) {
+    let Some(file) = get_handle(msg.data[0] as usize, sender).filter(|f| f.by_fd) else {
+        return error_reply(sender, ERR_INVALID_HANDLE);
+    };
+    let how = file.may_read as u64 | (file.may_write as u64) << 1 | (file.append as u64) << 2;
+    let offset = msg.data[1] as i64;
+    if file.is_dir {
+        return match (msg.data[2], offset) {
+            (SEEK_SET, to) if to >= 0 => {
+                file.dirpos = to as u64;
+                reply_opened(sender, [file.dirpos, how, 0, 0, 0, 0])
+            }
+            (SEEK_CUR, 0) => reply_opened(sender, [file.dirpos, how, 0, 0, 0, 0]),
+            _ => error_reply(sender, ERR_INVALID_PATH),
+        };
+    }
+    let from = match msg.data[2] {
+        SEEK_SET => 0,
+        SEEK_CUR => file.pos as i64,
+        SEEK_END => match size_of(file) {
+            Ok(end) => end as i64,
+            Err(code) => return error_reply(sender, code),
+        },
+        _ => return error_reply(sender, ERR_INVALID_PATH),
+    };
+    match from.checked_add(offset) {
+        Some(to) if to >= 0 => {
+            file.pos = to as u64;
+            reply_opened(sender, [file.pos, how, 0, 0, 0, 0])
+        }
+        _ => error_reply(sender, ERR_INVALID_PATH),
+    }
+}
+
+/// The kernel says no descriptor names `handle` any more: it is closed.
+fn descriptor_closed(handle: usize) {
+    let Some(ino) = handles::release(handle) else {
+        return;
+    };
+    // Its own locks went with it, and whoever was waiting for one through it
+    // is not going to get it.
+    while let Some(w) = locks::drop_handle(handle) {
+        error_reply(w.sender, ERR_INVALID_HANDLE);
+    }
+    grant_waiters();
+    settle(&[ino]);
+}
+
+/// TAG_SETATTR: `[path_len, which, nofollow]`, with the path lent and, after
+/// it, five words: `[mode, uid, gid, atime, mtime]`. `which` says which of
+/// them to use. A `path_len` of 0 means the open file `data[5]` names (a
+/// handle plus one) rather than a path from it.
+fn handle_setattr(sender: usize, msg: &Message) {
+    if unsafe { FS_TYPE } != FsType::Ext2 {
+        return error_reply(sender, ERR_NOT_SUPPORTED);
+    }
+    if ext2_state().read_only {
+        return error_reply(sender, ERR_READ_ONLY);
+    }
+    let len = msg.data[0] as usize;
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let ino = if len == 0 {
+        match get_handle(msg.data[5].wrapping_sub(1) as usize, sender) {
+            Some(file) => match file.fs {
+                FsFileData::Ext2 { inode_num } => Ok(inode_num),
+                // The devices are the server's, and are what they are.
+                FsFileData::Device(_) | FsFileData::DevDir => Err(ERR_PERMISSION),
+                _ => Err(ERR_NOT_SUPPORTED),
+            },
+            None => Err(ERR_INVALID_HANDLE),
+        }
+    } else {
+        protocol::lent_path(sender, 0, len, 0).and_then(|path| {
+            let base = base_of(sender, msg.data[5])?;
+            if ext2_dir::dev_dir() == 0 && devices::refuses(ext2_whole_path(base, path)?) {
+                return Err(ERR_PERMISSION);
+            }
+            match ext2_dir::resolve(ext2_state(), base, path, uid, gid, msg.data[2] == 0)? {
+                ext2_dir::Found::Inode(ino, _, _) if ino != ext2_dir::dev_dir() => Ok(ino),
+                _ => Err(ERR_PERMISSION),
+            }
+        })
+    };
+    let mut raw = [0u8; ATTR_LEN];
+    if syscall::sys_lent_read(sender, len, &mut raw) != Ok(ATTR_LEN) {
+        return error_reply(sender, ERR_INVALID_PATH);
+    }
+    let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let attrs = ext2_ops::Attrs {
+        which: msg.data[1],
+        mode: word(0),
+        uid: word(1),
+        gid: word(2),
+        atime: word(3),
+        mtime: word(4),
+    };
+    match ino.and_then(|ino| ext2_ops::setattr(ext2_state_mut(), ino, &attrs, uid, gid)) {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
     }
 }
 
@@ -1477,7 +1767,7 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
                 found => return devices::open(sender, whole, found, flags),
             }
         }
-        open_ext2(sender, base, path, flags);
+        open_ext2(sender, base, path, flags, given_mode(msg.data[2]));
     } else {
         let path = match fat_path(sender, msg.data[5], path) {
             Ok(p) => p,
@@ -1495,7 +1785,7 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
 /// program's working directory, or one more than an open directory handle.
 fn base_of(sender: usize, word: u64) -> Result<u32, u64> {
     if word == 0 {
-        return Ok(match cwd::get(space_of(sender)).0 {
+        return Ok(match cwd_of(sender).0 {
             cwd::Where::Inode(ino) => ino,
             _ => ext2::EXT2_ROOT_INO,
         });
@@ -1528,12 +1818,18 @@ fn fat_path(sender: usize, word: u64, path: &[u8]) -> Result<&'static [u8], u64>
     cwd::join(dir, path)
 }
 
+/// The permission bits a word carries for something being made, if it
+/// carries any.
+fn given_mode(word: u64) -> Option<u16> {
+    (word & MODE_GIVEN != 0).then_some((word & 0o7777) as u16)
+}
+
 fn reply_opened(sender: usize, words: [u64; 6]) {
     let reply = Message { sender: 0, tag: TAG_OK, data: words };
     let _ = syscall::sys_reply(sender, &reply);
 }
 
-fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
+fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16>) {
     let (uid, gid) = get_sender_uid_gid(sender);
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
     let wants_dir = flags & OPEN_DIRECTORY != 0 || trailing;
@@ -1563,7 +1859,7 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
             if ext2_state().read_only {
                 return error_reply(sender, ERR_READ_ONLY);
             }
-            match ext2_ops::create(ext2_state_mut(), base, path, uid, gid, false) {
+            match ext2_ops::create(ext2_state_mut(), base, path, uid, gid, false, mode) {
                 Ok(made) => made,
                 Err(code) => return error_reply(sender, code),
             }
@@ -1575,7 +1871,25 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
     }
     // Only OPEN_NOFOLLOW gets this far with a link.
     let link = inode.is_symlink();
-    if !link && !ext2::check_permission(&inode, uid, gid, 4) {
+    if flags & OPEN_DESCRIPTOR != 0 {
+        // A descriptor says what it is for, and is refused here if the file
+        // does not allow it — not at the first write, a long way from the
+        // open that should have failed.
+        if !link && flags & OPEN_READ != 0 && !ext2::check_permission(&inode, uid, gid, 4) {
+            return error_reply(sender, ERR_PERMISSION);
+        }
+        if flags & OPEN_WRITE != 0 {
+            if inode.is_dir() {
+                return error_reply(sender, ERR_IS_DIR);
+            }
+            if ext2_state().read_only {
+                return error_reply(sender, ERR_READ_ONLY);
+            }
+            if link || !ext2::check_permission(&inode, uid, gid, 2) {
+                return error_reply(sender, ERR_PERMISSION);
+            }
+        }
+    } else if !link && !ext2::check_permission(&inode, uid, gid, 4) {
         return error_reply(sender, ERR_PERMISSION);
     }
     let writable =
@@ -1594,24 +1908,20 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64) {
     let file = OpenFile {
         in_use: true,
         owner: space_of(sender),
-        file_size: 0,
         is_dir: inode.is_dir(),
         writable,
         link,
-        read_offset: 0,
         fs: FsFileData::Ext2 { inode_num: ino },
+        ..OpenFile::empty()
     };
-    match handles::alloc(file) {
-        Some(handle) => reply_opened(sender, [
-            handle as u64,
-            size,
-            inode.is_dir() as u64,
-            inode.i_mode as u64,
-            access_bits(&inode, uid, gid),
-            ino as u64,
-        ]),
-        None => error_reply(sender, ERR_TOO_MANY_OPEN),
-    }
+    opened(sender, flags, file, [
+        0,
+        size,
+        inode.is_dir() as u64,
+        inode.i_mode as u64,
+        access_bits(&inode, uid, gid),
+        ino as u64,
+    ]);
 }
 
 /// Whether `name` is a FAT short name: at most eight characters, a dot and
@@ -1669,15 +1979,9 @@ fn open_fat32(disk: &DiskState, sender: usize, path: &[u8], flags: u64) {
     if wants_dir && !is_dir {
         return error_reply(sender, ERR_NOT_DIR);
     }
-    match alloc_handle_fat32(sender, cluster, size, is_dir, dir_cluster, &fat_name) {
-        Some(handle) => {
-            let mode = if is_dir { FAT_DIR_MODE } else { FAT_FILE_MODE };
-            reply_opened(sender, [
-                handle as u64, size as u64, is_dir as u64, mode, FAT_ACCESS, cluster as u64,
-            ]);
-        }
-        None => error_reply(sender, ERR_TOO_MANY_OPEN),
-    }
+    let mode = if is_dir { FAT_DIR_MODE } else { FAT_FILE_MODE };
+    let file = fat32_file(sender, cluster, size, is_dir, dir_cluster, &fat_name);
+    opened(sender, flags, file, [0, size as u64, is_dir as u64, mode, FAT_ACCESS, cluster as u64]);
 }
 
 /// TAG_MKDIR: data[0] = path length; the path is lent.
@@ -1694,7 +1998,8 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
         } else {
             let (uid, gid) = get_sender_uid_gid(sender);
             base_of(sender, msg.data[5]).and_then(|base| {
-                ext2_ops::create(ext2_state_mut(), base, path, uid, gid, true).map(|_| ())
+                ext2_ops::create(ext2_state_mut(), base, path, uid, gid, true, given_mode(msg.data[1]))
+                    .map(|_| ())
             })
         }
     } else {
@@ -1737,10 +2042,7 @@ fn lend_in(sender: usize, n: usize) -> bool {
 /// the reply. A caller that lent too little gets an error, not a short read.
 fn reply_read(sender: usize, result: Result<u32, u64>) {
     match result {
-        Ok(n) if lend_out(sender, n as usize) => {
-            let reply = Message { sender: 0, tag: TAG_OK, data: [n as u64, 0, 0, 0, 0, 0] };
-            let _ = syscall::sys_reply(sender, &reply);
-        }
+        Ok(n) if lend_out(sender, n as usize) => reply_count(sender, n as u64),
         Ok(_) => error_reply(sender, ERR_IO),
         Err(code) => error_reply(sender, code),
     }
@@ -1820,6 +2122,9 @@ fn handle_lock(sender: usize, msg: &Message) {
     let owner = if flags & LOCK_OFD != 0 {
         locks::Owner::Handle(handle)
     } else {
+        // Its locks go when the program does, and a program that holds only
+        // descriptors is not otherwise being watched.
+        let _ = syscall::sys_space_watch(space);
         locks::Owner::Program(space)
     };
     let want = locks::Range { inode, owner, start, end, exclusive: kind == 2 };
@@ -2058,10 +2363,8 @@ fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
                 Err(ERR_NOT_DIR)
             } else if !ext2::check_permission(&dir, uid, gid, 1) {
                 Err(ERR_PERMISSION)
-            } else if ino == ext2::EXT2_ROOT_INO {
-                cwd::set(space, cwd::Where::Root, b"")
             } else {
-                cwd::set(space, cwd::Where::Inode(ino), b"")
+                move_to(sender, space, ino)
             }
         })
     } else if msg.tag == TAG_FCHDIR {
@@ -2088,9 +2391,39 @@ fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
     }
 }
 
+/// Put `sender`'s program in directory `ino`, and say what the record kept
+/// for the program held, so that a directory nobody is in any more can go.
+///
+/// The directory becomes a descriptor in the caller's table, in the slot the
+/// kernel keeps for one. That is what makes where a program *is* follow it:
+/// a forked child has a copy of the slot and the program it execs keeps it,
+/// and this server is told nothing and needs to be. Kept here by program, a
+/// working directory stopped at `fork`, because a child is another program.
+fn move_to(sender: usize, space: u64, ino: u32) -> Result<cwd::Where, u64> {
+    let dir = OpenFile {
+        in_use: true,
+        by_fd: true,
+        is_dir: true,
+        may_write: false,
+        fs: FsFileData::Ext2 { inode_num: ino },
+        ..OpenFile::empty()
+    };
+    if let Some(handle) = handles::alloc(dir) {
+        if syscall::sys_fd_serve(sender, handle as u64, syscall::FD_CWD).is_ok() {
+            // The slot answers from now on. What it replaced is the kernel's
+            // to release, and arrives here as a descriptor closing.
+            return cwd::set(space, cwd::Where::Root, b"");
+        }
+        let _ = handles::release(handle);
+    }
+    // No room for one more handle: kept by program, as a FAT32 directory is.
+    let at = if ino == ext2::EXT2_ROOT_INO { cwd::Where::Root } else { cwd::Where::Inode(ino) };
+    cwd::set(space, at, b"")
+}
+
 /// TAG_GETCWD: 4096 bytes lent for writing. Reply: the path's length.
 fn handle_getcwd(sender: usize) {
-    let path = match cwd::get(space_of(sender)) {
+    let path = match cwd_of(sender) {
         (cwd::Where::Inode(ino), _) => ext2_dir::path_of(ext2_state(), ino),
         (_, path) => Ok(path),
     };
@@ -2118,7 +2451,11 @@ fn handle_give_cwd(sender: usize, msg: &Message) {
     if !allowed {
         return error_reply(sender, ERR_PERMISSION);
     }
-    let (at, path) = cwd::get(me);
+    // Where the caller is, whichever way that is kept. A spawner also copies
+    // its directory's descriptor into the child, which is what the child's
+    // own children will inherit; this is for a filesystem with no directory
+    // handles to make a descriptor of.
+    let (at, path) = cwd_of(sender);
     match cwd::set(theirs, at, path) {
         Ok(left) => {
             reply_opened(sender, [0; 6]);
@@ -2137,6 +2474,9 @@ fn handle_truncate(sender: usize, msg: &Message) {
     };
     if unsafe { FS_TYPE } != FsType::Ext2 {
         return error_reply(sender, ERR_NOT_SUPPORTED);
+    }
+    if file.by_fd && !file.may_write {
+        return error_reply(sender, ERR_INVALID_HANDLE);
     }
     if !file.writable {
         return error_reply(sender, ERR_PERMISSION);
@@ -2232,12 +2572,7 @@ fn handle_write(disk: &DiskState, sender: usize, msg: &Message) {
                     // Update directory entry with new size
                     let new_size = file.file_size;
                     let _ = update_dir_entry_size(disk, dir_cluster, &fat_name, new_size);
-                    let reply = Message {
-                        sender: 0,
-                        tag: TAG_OK,
-                        data: [bytes_written as u64, 0, 0, 0, 0, 0],
-                    };
-                    let _ = syscall::sys_reply(sender, &reply);
+                    reply_count(sender, bytes_written as u64);
                 }
                 Err(code) => error_reply(sender, code),
             }
@@ -2356,6 +2691,7 @@ fn reply_dirents(sender: usize, used: usize, next: u64, end: bool) {
     if !lend_out(sender, used) {
         return error_reply(sender, ERR_IO);
     }
+    unsafe { MOVED = Some(next) };
     reply_opened(sender, [used as u64, next, end as u64, 0, 0, 0]);
 }
 
@@ -2471,12 +2807,7 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
                     // A mapping of the file sees what was written.
                     pager::wrote(inode_num, offset as u64, bytes_written as usize);
                     pager::resized(inode_num, inode.size64());
-                    let reply = Message {
-                        sender: 0,
-                        tag: TAG_OK,
-                        data: [bytes_written as u64, 0, 0, 0, 0, 0],
-                    };
-                    let _ = syscall::sys_reply(sender, &reply);
+                    reply_count(sender, bytes_written as u64);
                 }
                 Err(code) => error_reply(sender, code),
             }

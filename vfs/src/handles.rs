@@ -6,12 +6,23 @@
 //! a file shortened through one cannot be written past its end through a
 //! stale block map in the other.
 //!
-//! A handle belongs to the program that opened it — every thread of it may use
-//! it — and goes when the program does. Programs are named by their address
-//! space's id, which the kernel never reuses; a TID would have made a file one
-//! thread opened useless to its siblings, and, being recycled, would have
-//! handed a dead task's files to whatever took its slot. The server watches
-//! every program it gives a handle to.
+//! A handle is held one of two ways.
+//!
+//! **By a program.** It belongs to the program that opened it — every thread
+//! of it may use it — and goes when the program does. Programs are named by
+//! their address space's id, which the kernel never reuses; a TID would have
+//! made a file one thread opened useless to its siblings, and, being recycled,
+//! would have handed a dead task's files to whatever took its slot. The server
+//! watches every program it gives such a handle to. This is what quark-rt's
+//! clients use.
+//!
+//! **By a descriptor.** The kernel counts who holds it: the handle is the
+//! cookie of a descriptor in the opener's table (`SYS_FD_SERVE`), and whoever
+//! holds a descriptor for it — the opener, a child it forked, the program it
+//! became — may use it. It is what an open file *is* to a C program: one
+//! position, shared by every descriptor made from the first, and closed when
+//! the last of them is. The server keeps nothing per program for it and
+//! watches nobody: the kernel says when the last descriptor has gone.
 
 use quark_rt::syscall;
 
@@ -43,8 +54,21 @@ pub enum FsFileData {
 
 pub struct OpenFile {
     pub in_use: bool,
-    /// The owning program's space id.
+    /// The owning program's space id. 0 for a descriptor's.
     pub owner: u64,
+    /// Held by descriptors rather than by a program.
+    pub by_fd: bool,
+    /// A descriptor's position: where the next read or write that names none
+    /// happens. Here rather than in the client because it is shared by every
+    /// descriptor for the file, in whichever programs they have ended up.
+    pub pos: u64,
+    /// A directory descriptor's position: the index of the next entry.
+    pub dirpos: u64,
+    /// Writes go to the end of the file, wherever the position is.
+    pub append: bool,
+    /// What the descriptor was opened to do.
+    pub may_read: bool,
+    pub may_write: bool,
     /// FAT32's size, which lives in its directory entry. An ext2 handle reads
     /// the inode instead.
     pub file_size: u32,
@@ -62,6 +86,12 @@ impl OpenFile {
         OpenFile {
             in_use: false,
             owner: 0,
+            by_fd: false,
+            pos: 0,
+            dirpos: 0,
+            append: false,
+            may_read: true,
+            may_write: true,
             file_size: 0,
             is_dir: false,
             writable: false,
@@ -91,12 +121,21 @@ fn table() -> &'static mut [OpenFile; MAX_OPEN_FILES] {
 
 /// Put `file` in the table and return its handle, or None if it is full.
 pub fn alloc(file: OpenFile) -> Option<usize> {
+    let t = table();
+    if file.by_fd {
+        // No share to keep to: a program holds no more of these than its
+        // descriptor table has room for, and the kernel keeps that.
+        let i = t.iter().position(|f| !f.in_use)?;
+        t[i] = file;
+        t[i].in_use = true;
+        t[i].owner = 0;
+        return Some(i);
+    }
     let owner = file.owner;
     if owner == 0 {
         return None;
     }
-    let t = table();
-    if t.iter().filter(|f| f.in_use && f.owner == owner).count() >= MAX_PER_PROGRAM {
+    if t.iter().filter(|f| f.in_use && !f.by_fd && f.owner == owner).count() >= MAX_PER_PROGRAM {
         return None;
     }
     let i = t.iter().position(|f| !f.in_use)?;
@@ -112,7 +151,28 @@ pub fn alloc(file: OpenFile) -> Option<usize> {
 /// Program `space`'s handle `handle`, if it is one.
 pub fn get(handle: usize, space: u64) -> Option<&'static mut OpenFile> {
     let f = table().get_mut(handle)?;
-    if f.in_use && space != 0 && f.owner == space { Some(f) } else { None }
+    if f.in_use && !f.by_fd && space != 0 && f.owner == space { Some(f) } else { None }
+}
+
+/// Whether `handle` is one descriptors hold.
+pub fn is_descriptor(handle: usize) -> bool {
+    table().get(handle).is_some_and(|f| f.in_use && f.by_fd)
+}
+
+/// The handle descriptors hold as `handle`, whoever holds them. The caller
+/// has asked the kernel whether the task in front of it does.
+pub fn descriptor(handle: usize) -> Option<&'static mut OpenFile> {
+    let f = table().get_mut(handle)?;
+    if f.in_use && f.by_fd { Some(f) } else { None }
+}
+
+/// The last descriptor for `handle` has gone. Returns the inode it named (0
+/// for one with none), or None if it was not a descriptor's handle.
+pub fn release(handle: usize) -> Option<u32> {
+    let f = descriptor(handle)?;
+    let ino = f.inode_num();
+    *f = OpenFile::empty();
+    Some(ino)
 }
 
 /// Close program `space`'s handle `handle`. Returns the inode it named (0 for

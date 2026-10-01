@@ -261,6 +261,142 @@ fn test_program_table() {
     let _ = syscall::sys_fd_close(mine);
 }
 
+/// A file as a descriptor: in the kernel's table, with its position kept by
+/// the server, so that everything a descriptor can do a file can do.
+fn test_file_descriptors() {
+    println!("files as descriptors:");
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the VFS", false);
+        return;
+    };
+    let _ = vfs::mkdir(v, b"/tmp");
+    let path: &[u8] = b"/tmp/dtest-descriptor";
+    let _ = vfs::unlink(v, path);
+    let both = vfs::OPEN_READ | vfs::OPEN_WRITE;
+    let Ok(fd) = vfs::open_fd(v, path, vfs::OPEN_CREATE | both, 0o640) else {
+        check("a file opens as a descriptor", false);
+        return;
+    };
+    check("a file opens as a descriptor", fd >= 3);
+    check(
+        "made with the mode it was asked for",
+        vfs::lstat(v, path).is_ok_and(|st| st.mode & 0o7777 == 0o640),
+    );
+    // Through the kernel: nothing here says "file".
+    check("written like any descriptor", syscall::sys_fd_write(fd, b"one\n") == 4);
+    check("and the position moved", vfs::seek(v, fd, 0, vfs::SEEK_CUR) == Ok(4));
+
+    // The position is the descriptor's, wherever its copies end up. A child
+    // that writes through the one it inherited writes after its parent.
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let wrote = syscall::sys_fd_write(fd, b"two\n") == 4;
+            syscall::sys_exit_program(if wrote { 0 } else { 1 });
+        }
+        Ok(child) => check("a forked child writes through its copy", wait_for(child) == Some(0)),
+        Err(()) => check("fork", false),
+    }
+    let _ = syscall::sys_fd_write(fd, b"three\n");
+    let mut buf = [0u8; 32];
+    check("back to the start", vfs::seek(v, fd, 0, vfs::SEEK_SET) == Ok(0));
+    check(
+        "parent, child, parent: nothing written over",
+        syscall::sys_fd_read(fd, &mut buf) == 14 && &buf[..14] == b"one\ntwo\nthree\n",
+    );
+    check("and the read ends where the file does", syscall::sys_fd_read(fd, &mut buf) == 0);
+
+    // A second descriptor from the first shares the position; a second open
+    // has its own.
+    let copy = syscall::sys_fd_dup_self(fd, 3);
+    let _ = vfs::seek(v, fd, 4, vfs::SEEK_SET);
+    check(
+        "a copy reads from where the original is",
+        copy.is_ok_and(|c| syscall::sys_fd_read(c, &mut buf[..4]) == 4 && &buf[..4] == b"two\n"),
+    );
+    let again = vfs::open_fd(v, path, vfs::OPEN_READ, 0);
+    check(
+        "another open starts at the start",
+        again.is_ok_and(|a| syscall::sys_fd_read(a, &mut buf[..3]) == 3 && &buf[..3] == b"one"),
+    );
+    check(
+        "a descriptor opened to read refuses a write",
+        again.is_ok_and(|a| syscall::sys_fd_write(a, b"x") == u64::MAX),
+    );
+    let appender = vfs::open_fd(v, path, vfs::OPEN_WRITE | vfs::OPEN_APPEND, 0);
+    check(
+        "one opened to append writes at the end wherever it is",
+        appender.is_ok_and(|a| {
+            vfs::seek(v, a, 0, vfs::SEEK_SET) == Ok(0)
+                && syscall::sys_fd_write(a, b"!") == 1
+                && vfs::seek(v, fd, 0, vfs::SEEK_END) == Ok(15)
+        }),
+    );
+    for d in [copy.ok(), again.ok(), appender.ok()].into_iter().flatten() {
+        let _ = syscall::sys_fd_close(d);
+    }
+
+    // Mode and times, changed and read back.
+    check(
+        "chmod and a time set",
+        vfs::set_attr(v, path, vfs::ATTR_MODE | vfs::ATTR_MTIME, 0o600, 0, 0, 0, 1_234_567).is_ok()
+            && vfs::lstat(v, path).is_ok_and(|st| st.mode & 0o7777 == 0o600 && st.mtime == 1_234_567),
+    );
+    check(
+        "nothing of a file that is not there",
+        vfs::set_attr(v, b"/tmp/dtest-no-such-file", vfs::ATTR_MODE, 0o600, 0, 0, 0, 0)
+            == Err(vfs::ERR_NOT_FOUND),
+    );
+
+    // Removed while open: still a file to whoever holds it, and gone when the
+    // last descriptor is.
+    check("removed while open", vfs::unlink(v, path).is_ok());
+    check(
+        "still there for its descriptor",
+        vfs::seek(v, fd, 0, vfs::SEEK_SET) == Ok(0)
+            && syscall::sys_fd_read(fd, &mut buf[..3]) == 3
+            && &buf[..3] == b"one",
+    );
+    check("closed", syscall::sys_fd_close(fd).is_ok());
+
+    // Closing gives the handle back: a hundred and fifty opens, sixty at a
+    // time, in a table that holds sixty-four.
+    let mut opened = 0;
+    for _ in 0..3 {
+        let mut held = [0usize; 50];
+        let mut n = 0;
+        for slot in held.iter_mut() {
+            match vfs::open_fd(v, b"/etc/passwd", vfs::OPEN_READ, 0) {
+                Ok(d) => {
+                    *slot = d;
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        opened += n;
+        for d in &held[..n] {
+            let _ = syscall::sys_fd_close(*d);
+        }
+    }
+    check("a hundred and fifty opens, each closed", opened == 150);
+
+    // Where a program is goes with it. A forked child is another program as
+    // far as the server can tell, and used to start at the root.
+    let moved = vfs::chdir(v, b"/etc").is_ok();
+    check("chdir to /etc", moved);
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let here = vfs::open(v, b"passwd").is_ok();
+            let mut name = [0u8; 16];
+            let said = vfs::getcwd(v, &mut name) == Ok(4) && &name[..4] == b"/etc";
+            syscall::sys_exit_program(if here && said { 0 } else { 1 });
+        }
+        Ok(child) => check("a forked child is where its parent was", wait_for(child) == Some(0)),
+        Err(()) => check("fork", false),
+    }
+    check("and back to /", vfs::chdir(v, b"/").is_ok());
+}
+
 /// As `dchild fdclient` knows them.
 const ASK_OPEN: u64 = 0x51;
 const ASK_HELD: u64 = 0x52;
@@ -2305,6 +2441,7 @@ pub extern "C" fn _start() -> ! {
         ("fds", test_fd_table),
         ("program", test_program_table),
         ("served", test_served),
+        ("fdfiles", test_file_descriptors),
         ("region", test_big_region),
         ("memfd", test_memfd),
         ("socketpair", test_socketpair),

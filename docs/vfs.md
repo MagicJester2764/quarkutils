@@ -66,17 +66,45 @@ itself). A path that follows more than 40 links is `LOOP`. `..` is the
 directory's own `..` entry, so it goes up from where a link led, not from
 where the link was.
 
+## Handles, and who holds them
+
+An open file is a *handle*: an index into the server's table. It names an
+inode, never a copy of one. A handle is held one of two ways, and the opener
+chooses which.
+
+**By a program.** The handle belongs to the program that opened it — every
+thread of it may use it — and the server closes it when the program's last
+task dies. It knows a program by its address space (`SYS_TASK_SPACE`) and
+watches each one it gives a handle to (`SYS_SPACE_WATCH`). The client keeps
+its own position and says an offset with every read and write. This is what
+`quark-rt`'s `vfs` module and Quark's own C library use.
+
+**By a descriptor** (`OPEN_DESCRIPTOR`). The handle is the cookie of a
+descriptor the server puts in the caller's table (`SYS_FD_SERVE`, in the
+kernel's `docs/abi.md`), and the kernel counts who holds it. So it is copied
+by `fork`, kept by `exec`, duplicated, passed over a stream and put where a
+program's standard output was, and the server hears nothing of any of that:
+when a request names such a handle, the server asks the kernel whether the
+task asking holds a descriptor for it (`SYS_FD_HOLDS`), and that is the whole
+check. The position is the server's — one for the handle, shared by every
+descriptor made from the first, which is what makes a child that writes
+through what it inherited write *after* its parent. It is closed when the
+kernel says the last descriptor has gone; `CLOSE` on one is refused. This is
+what the Linux layer uses, so it is what a ported program's files are.
+
+Every request below that takes a handle takes either kind.
+
 ## Requests
 
 | Tag | Name | Words | Lent | Reply |
 |---|---|---|---|---|
-| 1 | `OPEN` | `[len, flags]` | path | `[handle, size, is_dir, mode, access, id]` |
+| 1 | `OPEN` | `[len, flags, mode]` | path | `[handle, size, is_dir, mode, access, id]` |
 | 2 | `READ` | `[handle, -, offset, len]` | `len` bytes to fill (at most 4096) | `[bytes read]` |
 | 3 | `CLOSE` | `[handle]` | — | — |
 | 5 | `STAT` | `[handle]` | 88 bytes to fill | `[88]` |
 | 6 | `WRITE` | `[handle, -, offset, len]` | `len` bytes to copy (at most 4096) | `[bytes written]` |
 | 8 | `READDIR_BULK` | `[handle, start, len]` | `len` bytes to fill (at most 4096) | `[bytes, next, end]` |
-| 9 | `MKDIR` | `[len]` | path | — |
+| 9 | `MKDIR` | `[len, mode]` | path | — |
 | 10 | `UNLINK` | `[len]` | path | — |
 | 11 | `RMDIR` | `[len]` | path | — |
 | 12 | `RENAME` | `[from_len, to_len]` | both paths, end to end | — |
@@ -91,6 +119,8 @@ where the link was.
 | 21 | `GIVE_CWD` | `[child_tid]` | — | — |
 | 22 | `LOCK` | `[handle, kind, start, len, flags]` | — | `[kind, start, len, holder]` for a query |
 | 23 | `MAP` | `[handle, flags]` | — | `[slot, size]` |
+| 24 | `SEEK` | `[handle, offset, whence]` | — | `[position, how]` |
+| 25 | `SETATTR` | `[path_len, which, nofollow]` | path, then five words | — |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -107,8 +137,22 @@ message and cut it to 40 bytes.
 | 4 | `TRUNCATE` | Empty a regular file the caller may write |
 | 8 | `DIRECTORY` | Fail with `NOT_DIR` unless it is a directory |
 | 16 | `NOFOLLOW` | A symbolic link at the end is opened itself |
+| 32 | `DESCRIPTOR` | The handle is held by a descriptor, which the caller is given |
+| 64 | `APPEND` | Every write through the descriptor goes to the end of the file |
+| 128 | `READ` | The descriptor may read |
+| 256 | `WRITE` | The descriptor may write |
 
-A file made by `CREATE` is a regular file, mode 0644, owned by the caller.
+With `DESCRIPTOR` the reply's first word is `handle << 32 | descriptor`: the
+number the caller now has, the lowest free from 3, and the handle to name in
+other requests. `READ` and `WRITE` say what it is for. They are checked
+against the file's mode when it is opened — `PERMISSION`, or `IS_DIR` for a
+directory asked for writing — and again on every read and write, where a
+descriptor that was not opened for it gets `INVALID_HANDLE`. `TOO_MANY_OPEN`
+if the caller's descriptor table is full.
+
+A file made by `CREATE` is a regular file, owned by the caller, with the
+permission bits in `data[2]` if that word has bit 16 (`0x10000`) set, and
+mode 0644 if the word is 0.
 The reply's `mode` includes the file-type bits (`0o170000`), `access` is what
 this caller may do (4 read, 2 write, 1 execute), and `id` is the inode number
 (FAT32: the first cluster), stable for as long as the file exists.
@@ -118,10 +162,31 @@ size the target's length) and `CLOSE`, and `NOT_SUPPORTED` to everything else.
 `CREATE` through a link whose target does not exist says `EXISTS`; Linux would
 make the target.
 
-A handle belongs to the program that opened it — every thread of it may use
-it — and the server closes a program's handles when its last task dies. It
-knows a program by its address space (`SYS_TASK_SPACE`) and watches each one
-it gives a handle to (`SYS_SPACE_WATCH`).
+### READ, WRITE and SEEK
+
+`READ` and `WRITE` take an offset, at most a page of data, and reply with how
+much was transferred. A read at or past the end replies 0.
+
+On a descriptor's handle the offset may be all ones (`u64::MAX`): wherever
+the descriptor is. The transfer happens there — or, for a write through a
+descriptor opened with `APPEND`, at the end of the file — and the position
+moves past it. An offset that is a number is `pread` and `pwrite`: it happens
+there and the position stays.
+
+`SEEK` moves a descriptor's position: `whence` 0 from the start, 1 from where
+it is, 2 from the end, with the offset signed. The reply is where it now is,
+and what the descriptor was opened to do — bit 0 read, bit 1 write, bit 2
+append — which a program that has just been exec'd into holding it has no
+other way to learn. A directory's descriptor can be sent to 0 or to a `next`
+a listing gave.
+
+The kernel makes two requests of its own, when a task reads or writes a
+served descriptor with `SYS_FD_READ` or `SYS_FD_WRITE`: tags `0xFFFF_0009` and
+`0xFFFF_000A`, `[handle, length]`, with the task's buffer lent. They are a
+`READ` and a `WRITE` at the descriptor's position, and are checked as those
+are — the tag proves nothing; holding the handle does. That is how a program
+that has never heard of this protocol writes to a file its parent put on its
+standard output.
 
 ### STAT
 
@@ -147,7 +212,8 @@ instead, and so does everything else on it.
 
 ### MKDIR
 
-Makes a directory, mode 0755, owned by the caller. `EXISTS` if the name is
+Makes a directory, owned by the caller, with the permission bits in `data[1]`
+if that word has bit 16 set and mode 0755 if it is 0. `EXISTS` if the name is
 taken.
 
 ### UNLINK, RMDIR, RENAME and LINK
@@ -196,7 +262,9 @@ operation to size 0.
 ### READDIR_BULK
 
 Fills up to `len` bytes of the lent buffer with directory records, starting
-with entry `start` (the first is 0). Each record is:
+with entry `start` (the first is 0). On a descriptor's handle `start` may be
+all ones: from wherever the descriptor has got to, which then moves to the
+reply's `next`. Each record is:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -217,24 +285,35 @@ seen twice, as with any `readdir`.
 
 ### Working directories
 
-Each program has one, kept by the server and named by the program's address
-space like its handles. A program nobody gave a directory is at `/`.
-`CHDIR` moves the caller's program to a directory it may search, following
-links; `FCHDIR` to an open directory handle's. `GETCWD` fills the lent buffer
-with the directory's path and replies with its length; it is `NOT_FOUND` once
-the directory has been removed.
+Where a program is, is a descriptor: number 64 of its table, one past the
+ordinary ones, which the kernel keeps for exactly this. `CHDIR` opens the
+directory — the caller must be able to search it — and puts a descriptor for
+it there, replacing what was there; `FCHDIR` does the same with an open
+directory handle's. A relative path with base 0 starts from whatever
+directory the caller's descriptor 64 names, and from `/` if it names none.
+`GETCWD` fills the lent buffer with that directory's path and replies with
+its length; it is `NOT_FOUND` once the directory has been removed.
+
+Being a descriptor is what makes it follow the program. A forked child has a
+copy of it and the program it execs keeps it, with no request to this server:
+the server learns where a caller is by asking the kernel what its descriptor
+64 is (`SYS_FD_COOKIE`). A client holding a directory open as a descriptor
+need not ask for `FCHDIR` at all — copying that descriptor onto 64
+(`SYS_FD_DUP`) is the same thing. And a spawner puts a child where it is by
+copying its own 64 into the child before starting it.
 
 The server holds the directory by inode, as Linux does, so a rename above it
 changes what `GETCWD` says and nothing else, and a directory removed while a
-program is in it lasts until the program leaves or goes. FAT32, which renames
-nothing, keeps the path, and has no directory handles to start from
-(`NOT_SUPPORTED`).
+program is in it lasts until the last program in it leaves or goes.
 
-`GIVE_CWD` puts a program being made in the caller's directory. The child
-must be a task the caller's program made (`SYS_TASK_CREATE_IN` lets that be
-before it runs) for another program; anything else is `PERMISSION`. A
-spawner calls it before starting the child, so the child's first relative
-path already starts in the right place.
+FAT32 has no directory handles to make a descriptor of, so there the server
+keeps each program's directory itself, as a path, by address space. That
+record does not follow a `fork` or an `exec`. `GIVE_CWD` is for it: it puts a
+program being made in the caller's directory. The child must be a task the
+caller's program made (`SYS_TASK_CREATE_IN` lets that be before it runs) for
+another program; anything else is `PERMISSION`. `quark-rt`'s `give_cwd` does
+both — the copy and the request — so a spawner need not know which
+filesystem it is on.
 
 ### LOCK
 
@@ -253,7 +332,12 @@ replaces what the program held over its range and joins neighbours of the same
 kind, and closing any of the program's handles on the file drops all of them.
 A handle's locks (`OFD`, which is also what `flock` is) conflict with every
 other owner, another handle of the same program included, and go when the
-handle closes. A program's death drops everything it held or was waiting for.
+handle closes — for a descriptor's handle, when the last descriptor does, so
+a forked child shares its parent's `flock`. A program's death drops
+everything it held or was waiting for. The server never hears one descriptor
+of several close, so a client that has taken a program's lock and closes a
+descriptor for the file unlocks it itself, which is what POSIX has a close
+do.
 
 A query's reply names the lock in the way — `kind` (0 if none), `start`, `len`
 (0 for "to the end") and the program holding it, all ones for a handle's
@@ -285,6 +369,36 @@ ways: what `WRITE` writes is copied into any of its pages the kernel has
 cached, `READ` reads cached pages from the cache, and `TRUNCATE` resizes the
 object (pages already mapped stay; a new fault past the end is SIGBUS).
 Thirty files can be mapped at once.
+
+### SETATTR
+
+Changes what a file's inode says of it. The lent buffer is the path —
+`data[0]` bytes of it — followed by five little-endian 64-bit words: mode,
+uid, gid, atime, mtime. `which` says which of them are meant:
+
+| Bit | Name | Sets |
+|---|---|---|
+| 1 | `MODE` | the permission bits (the type is kept) |
+| 2 | `UID` | the owner |
+| 4 | `GID` | the group |
+| 8 | `ATIME` | the access time, to the word given |
+| 16 | `MTIME` | the modification time, to the word given |
+| 32 | `ATIME_NOW` | the access time, to now |
+| 64 | `MTIME_NOW` | the modification time, to now |
+
+The path starts from the base in `data[5]` like any other, and a link at its
+end is followed unless `data[2]` is not 0. A `data[0]` of 0 means no path:
+the file is the one open as the handle `data[5]` names (a handle plus one),
+which is `fchmod`, `fchown` and `futimens`.
+
+The rules are Unix's. A mode is its file's owner's to change, or user 0's;
+a link has none to change (`NOT_SUPPORTED`). Giving a file to another user is
+user 0's alone; an owner may move a file to their own group, or say what is
+already so. A time set to a value is the owner's to set; a time set to now is
+also anybody's who may write the file. Every change sets the change time.
+Owners and groups are sixteen bits (`INVALID_PATH` beyond). `/dev` and what
+is in it are the server's and stay as they are (`PERMISSION`); FAT32 has
+none of this (`NOT_SUPPORTED`).
 
 ### Devices
 

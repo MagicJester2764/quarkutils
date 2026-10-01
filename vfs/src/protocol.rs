@@ -43,6 +43,10 @@ pub const TAG_GIVE_CWD: u64 = 21;
 pub const TAG_LOCK: u64 = 22;
 /// A capability to map an open file.
 pub const TAG_MAP: u64 = 23;
+/// Move a descriptor's position: `[handle, offset, whence]`.
+pub const TAG_SEEK: u64 = 24;
+/// Change what a file's inode says of it — mode, owner, times.
+pub const TAG_SETATTR: u64 = 25;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -56,6 +60,40 @@ pub const OPEN_TRUNCATE: u64 = 4;
 pub const OPEN_DIRECTORY: u64 = 8;
 /// A symbolic link at the end of the path is opened itself, not followed.
 pub const OPEN_NOFOLLOW: u64 = 16;
+/// The handle is the kernel's to count: the caller is given a descriptor for
+/// it, and the reply's first word is `handle << 32 | descriptor`.
+pub const OPEN_DESCRIPTOR: u64 = 0x20;
+/// Every write through the descriptor goes to the end of the file.
+pub const OPEN_APPEND: u64 = 0x40;
+/// What the descriptor may do. Checked when it is opened, against the file's
+/// mode, and again on every read and write.
+pub const OPEN_READ: u64 = 0x80;
+pub const OPEN_WRITE: u64 = 0x100;
+
+/// In a READ's or a WRITE's offset, or a READDIR_BULK's start: wherever the
+/// descriptor is. The position moves past what is transferred.
+pub const AT_POSITION: u64 = u64::MAX;
+
+/// Set in a word that carries permission bits for something being made —
+/// OPEN's `data[2]`, MKDIR's `data[1]` — to say the bits below it are meant.
+/// A word of zero is a client that says nothing, and gets 0644 or 0755.
+pub const MODE_GIVEN: u64 = 1 << 16;
+
+pub const SEEK_SET: u64 = 0;
+pub const SEEK_CUR: u64 = 1;
+pub const SEEK_END: u64 = 2;
+
+/// SETATTR's `data[1]`: which of the five words lent after the path to use.
+pub const ATTR_MODE: u64 = 1;
+pub const ATTR_UID: u64 = 2;
+pub const ATTR_GID: u64 = 4;
+pub const ATTR_ATIME: u64 = 8;
+pub const ATTR_MTIME: u64 = 16;
+/// The time the request arrives, rather than one the caller names.
+pub const ATTR_ATIME_NOW: u64 = 32;
+pub const ATTR_MTIME_NOW: u64 = 64;
+/// `[mode, uid, gid, atime, mtime]`, eight bytes each.
+pub const ATTR_LEN: usize = 40;
 
 /// LINK: follow a symbolic link at the end of the source path.
 pub const LINK_FOLLOW: u64 = 1;
