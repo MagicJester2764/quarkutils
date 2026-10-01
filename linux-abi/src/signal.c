@@ -19,8 +19,12 @@
  * wrong here, a handler may still leave by `longjmp`, and a program that
  * computes for ever without a call is not interrupted. What is not here at
  * all: a mask for a signal with no handler (it does what it does at once),
- * anything sent when a child ends or a timer runs out, and a thread a signal
- * is aimed at — the first thread to look runs the handler.
+ * and a thread a signal is aimed at — the first thread to look runs the
+ * handler.
+ *
+ * Two signals the kernel raises of its own accord, and both arrive here like
+ * any other: SIGALRM, when the alarm `setitimer` set is due, and SIGCHLD,
+ * when a child of this program ends.
  */
 
 #include <quark/syscall.h>
