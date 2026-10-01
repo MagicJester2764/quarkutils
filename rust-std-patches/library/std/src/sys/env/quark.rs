@@ -1,7 +1,13 @@
 use crate::ffi::{OsStr, OsString};
-use crate::io;
+use crate::{fmt, io};
 
 pub struct Env(!);
+
+impl fmt::Debug for Env {
+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0
+    }
+}
 
 impl Iterator for Env {
     type Item = (OsString, OsString);

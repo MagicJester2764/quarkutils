@@ -24,11 +24,15 @@ pub fn error_string(errno: i32) -> String {
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
-    Ok(PathBuf::from("/"))
+    let mut buf = vec![0u8; 4096];
+    let len = quark_rt::rt::getcwd(&mut buf).map_err(io::Error::from_raw_os_error)?;
+    buf.truncate(len);
+    // SAFETY: an OsString here is bytes, and any bytes are one.
+    Ok(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(buf) }))
 }
 
-pub fn chdir(_p: &path::Path) -> io::Result<()> {
-    Err(io::Error::UNSUPPORTED_PLATFORM)
+pub fn chdir(p: &path::Path) -> io::Result<()> {
+    quark_rt::rt::chdir(p.as_os_str().as_encoded_bytes()).map_err(io::Error::from_raw_os_error)
 }
 
 pub struct SplitPaths<'a>(!, core::marker::PhantomData<&'a ()>);

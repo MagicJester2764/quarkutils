@@ -9,6 +9,7 @@
 #   make install DESTDIR=<dir>   stage them for a distro to assemble
 #   make check-abi  the numbers here agree with each other, and with the
 #                   kernel's if it has been installed where QUARK_ABI says
+#   make check-std-patches   rust-std-patches/ is what the std fork carries
 
 TARGET := x86_64-unknown-none
 
@@ -75,7 +76,7 @@ LIBC_A      := libc/libquark.a
 # still happening.
 LINUX_ABI_A := linux-abi/liblinux-abi.a
 
-.PHONY: all check-abi install clean rootfs FORCE
+.PHONY: all check-abi check-std-patches install clean rootfs FORCE
 
 # `all` is not the first target in this file, so say which one is.
 .DEFAULT_GOAL := all
@@ -83,7 +84,18 @@ LINUX_ABI_A := linux-abi/liblinux-abi.a
 check-abi:
 	@REQUIRE_ABI="$(REQUIRE_ABI)" ./tools/check-abi.sh $(QUARK_ABI)
 
-all: check-abi $(RUST_ELFS) $(HOSTED_ELFS) $(C_ELFS) $(LINUX_ABI_A) rootfs
+# rust-std-patches/ is a mirror of what the std fork carries, and a mirror
+# nothing checks goes stale: this one had, by ten files of sixteen. So when the
+# fork is here to compare against, it is compared — and the compiler with it,
+# which has to be the one built from the commit the fork is based on.
+check-std-patches:
+ifeq ($(HAVE_STD_FORK),)
+	@echo "std-patches: no std fork at $(QUARK_RUST_STD_PATH) — the mirror was not checked"
+else
+	@./tools/std-patches.sh check $(QUARK_RUST_STD_PATH)/..
+endif
+
+all: check-abi check-std-patches $(RUST_ELFS) $(HOSTED_ELFS) $(C_ELFS) $(LINUX_ABI_A) rootfs
 ifeq ($(HAVE_STD_FORK),)
 	@echo "note: no std fork at $(QUARK_RUST_STD_PATH); skipped $(HOSTED_PROGRAMS)"
 endif

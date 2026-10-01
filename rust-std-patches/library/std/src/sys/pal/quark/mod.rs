@@ -12,7 +12,7 @@ pub(crate) fn map_quark_error(err: i32) -> io::Error {
 
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
-#[link_section = ".text.entry"]
+#[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
     // Initialize the runtime.
     quark_rt::rt::init();

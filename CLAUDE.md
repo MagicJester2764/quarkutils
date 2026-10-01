@@ -68,16 +68,18 @@ whose pin has to be exactly what it is.
 **The pin must equal the commit the fork is based on.** `../rust`'s `library/`
 is a checkout of upstream at one commit and only compiles with the rustc built
 from it; a newer compiler rejects its own `core` (`impl const Trait for Type`
-becomes "expected a trait, found type", features get removed). This is
-checkable rather than guessable:
+becomes "expected a trait, found type", features get removed). This is checked
+rather than remembered — `make` runs it whenever the fork is on disk:
 
 ```bash
-rustc --version                       # ... (38c0de8dc 2026-02-28)
-git -C ../rust merge-base HEAD main   # 38c0de8dc..., the fork's base
+tools/std-patches.sh check
+# std-patches: the mirror is the fork (16 files added, 29 changed, on 38c0de8dc)
+# std-patches: rustc is built from the fork's base (38c0de8dc)
 ```
 
-The short hash in `rustc --version` must match the fork's base commit. It does:
-`38c0de8dc` for both. If you rebase the fork, move every pin in the same step.
+The base is `rust-std-patches/BASE`, and by hand it is
+`git -C ../rust merge-base HEAD main` against the short hash in
+`rustc --version`. If you rebase the fork, move every pin in the same step.
 
 Note the off-by-one — the date in a rustup channel is the *publish* date, so
 `nightly-2026-03-01` is the build dated 02-28. A floating `nightly` channel is
@@ -99,6 +101,15 @@ debug the wrong binary.
 
 The fork is needed only for the hosted programs, `hello` and `httpget`. Without
 it on disk, `make` skips those and says so; everything else still builds.
+
+**`rust-std-patches/` is a mirror of what the fork carries, and it is
+generated.** The upstream commit the fork left from, one patch for the files
+upstream already has, and the sixteen files the fork adds — enough to rebuild
+the fork's tree object for object. It lives here because the platform layer is
+written against `quark-rt` and has to change with it. Never edit it: change the
+fork, then `tools/std-patches.sh sync`, and commit both. `make` fails while the
+two differ, which is the point — it was a seed nothing checked once, and ten of
+its sixteen files had gone stale under notes that described a plan.
 
 The C programs here (`cwc`, `envtest`) and every ported library are built with
 the `x86_64-quark` cross toolchain, which is ExplOSion's:
@@ -561,8 +572,11 @@ The rules that got it there, and that a further port should follow:
   away pages of it a program has already mapped past the new end; what it does
   is stop new ones being filled from beyond it.
 - `std::fs` is not implemented for this target: a hosted Rust program reads
-  and writes through descriptors it is given, not through `File::open`. C
-  programs have the whole of the C library's file interface.
+  and writes through descriptors it is given, not through `File::open`. Nor are
+  `std::process` or `std::io::pipe`, and `std::env` sees no variables — the
+  spawner passes an environment and std does not look. The fork has files for
+  the first three that nothing selects; `rust-std-patches/README.md` says
+  which. C programs have the whole of the C library's interface.
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
   once.
@@ -585,5 +599,3 @@ The rules that got it there, and that a further port should follow:
   means re-checking the PAL against std's internals, which move: the allocator
   PAL shape, the futex module location, `RawOsError`'s home and
   `BorrowedCursor`'s parameters have all changed under it before.
-  `rust-std-patches/` here is the seed that branch grew from, kept as it was;
-  the fork is the truth.

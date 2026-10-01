@@ -1,0 +1,884 @@
+diff --git a/library/Cargo.lock b/library/Cargo.lock
+index 4801f92c63e5a9103f078c09b8f1fa9f49e94ffa..3c381211b55143c68e66b4ac0708898ce6eda520 100644
+--- a/library/Cargo.lock
++++ b/library/Cargo.lock
+@@ -78,9 +78,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "dlmalloc"
+-version = "0.2.11"
++version = "0.2.13"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "06cdfe340b16dd990c54cce79743613fa09fbb16774f33a77c9fd196f8f3fa30"
++checksum = "9f5b01c17f85ee988d832c40e549a64bd89ab2c9f8d8a613bdf5122ae507e294"
+ dependencies = [
+  "cfg-if",
+  "libc",
+@@ -146,18 +146,18 @@ dependencies = [
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.178"
++version = "0.2.183"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
++checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
+ dependencies = [
+  "rustc-std-workspace-core",
+ ]
+ 
+ [[package]]
+ name = "memchr"
+-version = "2.7.6"
++version = "2.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
++checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+ dependencies = [
+  "rustc-std-workspace-core",
+ ]
+@@ -229,6 +229,14 @@ dependencies = [
+  "cc",
+ ]
+ 
++[[package]]
++name = "quark-rt"
++version = "0.1.0"
++dependencies = [
++ "rustc-std-workspace-alloc",
++ "rustc-std-workspace-core",
++]
++
+ [[package]]
+ name = "r-efi"
+ version = "5.3.0"
+@@ -259,9 +267,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rand_core"
+-version = "0.9.3"
++version = "0.9.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
++checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+ 
+ [[package]]
+ name = "rand_xorshift"
+@@ -336,6 +344,7 @@ dependencies = [
+  "object",
+  "panic_abort",
+  "panic_unwind",
++ "quark-rt",
+  "r-efi",
+  "r-efi-alloc",
+  "rand",
+@@ -439,78 +448,13 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+ 
+ [[package]]
+ name = "windows-sys"
+-version = "0.60.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
+-dependencies = [
+- "windows-targets",
+-]
+-
+-[[package]]
+-name = "windows-targets"
+-version = "0.53.5"
++version = "0.61.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+ dependencies = [
+  "windows-link 0.2.1",
+- "windows_aarch64_gnullvm",
+- "windows_aarch64_msvc",
+- "windows_i686_gnu",
+- "windows_i686_gnullvm",
+- "windows_i686_msvc",
+- "windows_x86_64_gnu",
+- "windows_x86_64_gnullvm",
+- "windows_x86_64_msvc",
+ ]
+ 
+-[[package]]
+-name = "windows_aarch64_gnullvm"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
+-
+-[[package]]
+-name = "windows_aarch64_msvc"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
+-
+-[[package]]
+-name = "windows_i686_gnu"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
+-
+-[[package]]
+-name = "windows_i686_gnullvm"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
+-
+-[[package]]
+-name = "windows_i686_msvc"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
+-
+-[[package]]
+-name = "windows_x86_64_gnu"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
+-
+-[[package]]
+-name = "windows_x86_64_gnullvm"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
+-
+-[[package]]
+-name = "windows_x86_64_msvc"
+-version = "0.53.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+-
+ [[package]]
+ name = "wit-bindgen"
+ version = "0.45.1"
+diff --git a/library/Cargo.toml b/library/Cargo.toml
+index 87df966bb6b874faa0358c6d626954d76b384890..da46e15d0af49a93c20b6bfe553aab204b1e5209 100644
+--- a/library/Cargo.toml
++++ b/library/Cargo.toml
+@@ -85,3 +85,4 @@ rustflags = [
+ rustc-std-workspace-core = { path = 'rustc-std-workspace-core' }
+ rustc-std-workspace-alloc = { path = 'rustc-std-workspace-alloc' }
+ rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
++quark-rt = { path = '../../quarkutils/quark-rt' }
+diff --git a/library/std/Cargo.toml b/library/std/Cargo.toml
+index 1b7a41d6973672aef0d2598ab5298e2e727ba7e1..4e71fa6ca9702017596d9eeb194faef7a49b422a 100644
+--- a/library/std/Cargo.toml
++++ b/library/std/Cargo.toml
+@@ -73,6 +73,9 @@ fortanix-sgx-abi = { version = "0.6.1", features = [
+ [target.'cfg(target_os = "motor")'.dependencies]
+ moto-rt = { version = "0.16", features = ['rustc-dep-of-std'], public = true }
+ 
++[target.'cfg(target_os = "quark")'.dependencies]
++quark-rt = { version = "0.1", features = ['rustc-dep-of-std'], public = true }
++
+ [target.'cfg(target_os = "hermit")'.dependencies]
+ hermit-abi = { version = "0.5.0", features = [
+     'rustc-dep-of-std',
+diff --git a/library/std/src/os/fd/mod.rs b/library/std/src/os/fd/mod.rs
+index 473d7ae3e2ae6d5d340dea81aef887a5f7fa854d..9443c1573235e557873183e3316381cfce5b97ac 100644
+--- a/library/std/src/os/fd/mod.rs
++++ b/library/std/src/os/fd/mod.rs
+@@ -13,7 +13,7 @@
+ mod owned;
+ 
+ // Implementations for `AsRawFd` etc. for network types.
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ mod net;
+ 
+ // Implementation of stdio file descriptor constants.
+diff --git a/library/std/src/os/fd/owned.rs b/library/std/src/os/fd/owned.rs
+index 8a39fe073bf95f9f7c216d354eecc818e325811c..b9fd496755022193af6f8d0bf9b00d123927417a 100644
+--- a/library/std/src/os/fd/owned.rs
++++ b/library/std/src/os/fd/owned.rs
+@@ -5,9 +5,11 @@
+ 
+ #[cfg(target_os = "motor")]
+ use moto_rt::libc;
++#[cfg(target_os = "quark")]
++use quark_rt::libc;
+ 
+ use super::raw::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ use crate::fs;
+ use crate::marker::PhantomData;
+ use crate::mem::ManuallyDrop;
+@@ -16,10 +18,11 @@
+     target_env = "sgx",
+     target_os = "hermit",
+     target_os = "trusty",
+-    target_os = "motor"
++    target_os = "motor",
++    target_os = "quark"
+ )))]
+ use crate::sys::cvt;
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ use crate::sys::{AsInner, FromInner, IntoInner};
+ use crate::{fmt, io};
+ 
+@@ -107,7 +110,8 @@ impl BorrowedFd<'_> {
+         target_arch = "wasm32",
+         target_os = "hermit",
+         target_os = "trusty",
+-        target_os = "motor"
++        target_os = "motor",
++        target_os = "quark"
+     )))]
+     #[stable(feature = "io_safety", since = "1.63.0")]
+     pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
+@@ -145,6 +149,14 @@ pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
+         let fd = moto_rt::fs::duplicate(self.as_raw_fd()).map_err(crate::sys::map_motor_error)?;
+         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+     }
++
++    /// Creates a new `OwnedFd` instance that shares the same underlying file
++    /// description as the existing `BorrowedFd` instance.
++    #[cfg(target_os = "quark")]
++    #[stable(feature = "io_safety", since = "1.63.0")]
++    pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
++        Err(io::Error::UNSUPPORTED_PLATFORM)
++    }
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+@@ -314,7 +326,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for fs::File {
+     #[inline]
+     fn as_fd(&self) -> BorrowedFd<'_> {
+@@ -323,7 +335,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<fs::File> for OwnedFd {
+     /// Takes ownership of a [`File`](fs::File)'s underlying file descriptor.
+     #[inline]
+@@ -333,7 +345,7 @@ fn from(file: fs::File) -> OwnedFd {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for fs::File {
+     /// Returns a [`File`](fs::File) that takes ownership of the given
+     /// file descriptor.
+@@ -344,7 +356,7 @@ fn from(owned_fd: OwnedFd) -> Self {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for crate::net::TcpStream {
+     #[inline]
+     fn as_fd(&self) -> BorrowedFd<'_> {
+@@ -353,7 +365,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<crate::net::TcpStream> for OwnedFd {
+     /// Takes ownership of a [`TcpStream`](crate::net::TcpStream)'s socket file descriptor.
+     #[inline]
+@@ -363,7 +375,7 @@ fn from(tcp_stream: crate::net::TcpStream) -> OwnedFd {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for crate::net::TcpStream {
+     #[inline]
+     fn from(owned_fd: OwnedFd) -> Self {
+@@ -374,7 +386,7 @@ fn from(owned_fd: OwnedFd) -> Self {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for crate::net::TcpListener {
+     #[inline]
+     fn as_fd(&self) -> BorrowedFd<'_> {
+@@ -383,7 +395,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<crate::net::TcpListener> for OwnedFd {
+     /// Takes ownership of a [`TcpListener`](crate::net::TcpListener)'s socket file descriptor.
+     #[inline]
+@@ -393,7 +405,7 @@ fn from(tcp_listener: crate::net::TcpListener) -> OwnedFd {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for crate::net::TcpListener {
+     #[inline]
+     fn from(owned_fd: OwnedFd) -> Self {
+@@ -404,7 +416,7 @@ fn from(owned_fd: OwnedFd) -> Self {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for crate::net::UdpSocket {
+     #[inline]
+     fn as_fd(&self) -> BorrowedFd<'_> {
+@@ -413,7 +425,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<crate::net::UdpSocket> for OwnedFd {
+     /// Takes ownership of a [`UdpSocket`](crate::net::UdpSocket)'s file descriptor.
+     #[inline]
+@@ -423,7 +435,7 @@ fn from(udp_socket: crate::net::UdpSocket) -> OwnedFd {
+ }
+ 
+ #[stable(feature = "io_safety", since = "1.63.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for crate::net::UdpSocket {
+     #[inline]
+     fn from(owned_fd: OwnedFd) -> Self {
+@@ -532,7 +544,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for io::PipeReader {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         self.0.as_fd()
+@@ -540,7 +552,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<io::PipeReader> for OwnedFd {
+     fn from(pipe: io::PipeReader) -> Self {
+         pipe.0.into_inner()
+@@ -548,7 +560,7 @@ fn from(pipe: io::PipeReader) -> Self {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsFd for io::PipeWriter {
+     fn as_fd(&self) -> BorrowedFd<'_> {
+         self.0.as_fd()
+@@ -556,7 +568,7 @@ fn as_fd(&self) -> BorrowedFd<'_> {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<io::PipeWriter> for OwnedFd {
+     fn from(pipe: io::PipeWriter) -> Self {
+         pipe.0.into_inner()
+@@ -564,7 +576,7 @@ fn from(pipe: io::PipeWriter) -> Self {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for io::PipeReader {
+     fn from(owned_fd: OwnedFd) -> Self {
+         Self(FromInner::from_inner(owned_fd))
+@@ -572,7 +584,7 @@ fn from(owned_fd: OwnedFd) -> Self {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl From<OwnedFd> for io::PipeWriter {
+     fn from(owned_fd: OwnedFd) -> Self {
+         Self(FromInner::from_inner(owned_fd))
+diff --git a/library/std/src/os/fd/raw.rs b/library/std/src/os/fd/raw.rs
+index 39e374174646c4bd56d2b680514228066bead397..e58194f5afb16a45d6bdaab7f46639a60b5641f1 100644
+--- a/library/std/src/os/fd/raw.rs
++++ b/library/std/src/os/fd/raw.rs
+@@ -6,15 +6,17 @@
+ use hermit_abi as libc;
+ #[cfg(target_os = "motor")]
+ use moto_rt::libc;
++#[cfg(target_os = "quark")]
++use quark_rt::libc;
+ 
+-#[cfg(target_os = "motor")]
++#[cfg(any(target_os = "motor", target_os = "quark"))]
+ use super::owned::OwnedFd;
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ use crate::fs;
+ use crate::io;
+ #[cfg(target_os = "hermit")]
+ use crate::os::hermit::io::OwnedFd;
+-#[cfg(all(not(target_os = "hermit"), not(target_os = "motor")))]
++#[cfg(all(not(target_os = "hermit"), not(target_os = "motor"), not(target_os = "quark")))]
+ use crate::os::raw;
+ #[cfg(all(doc, not(target_arch = "wasm32")))]
+ use crate::os::unix::io::AsFd;
+@@ -22,15 +24,15 @@
+ use crate::os::unix::io::OwnedFd;
+ #[cfg(target_os = "wasi")]
+ use crate::os::wasi::io::OwnedFd;
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ use crate::sys::{AsInner, FromInner, IntoInner};
+ 
+ /// Raw file descriptors.
+ #[stable(feature = "rust1", since = "1.0.0")]
+-#[cfg(all(not(target_os = "hermit"), not(target_os = "motor")))]
++#[cfg(all(not(target_os = "hermit"), not(target_os = "motor"), not(target_os = "quark")))]
+ pub type RawFd = raw::c_int;
+ #[stable(feature = "rust1", since = "1.0.0")]
+-#[cfg(any(target_os = "hermit", target_os = "motor"))]
++#[cfg(any(target_os = "hermit", target_os = "motor", target_os = "quark"))]
+ pub type RawFd = i32;
+ 
+ /// A trait to extract the raw file descriptor from an underlying object.
+@@ -168,7 +170,7 @@ unsafe fn from_raw_fd(fd: RawFd) -> RawFd {
+ }
+ 
+ #[stable(feature = "rust1", since = "1.0.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsRawFd for fs::File {
+     #[inline]
+     fn as_raw_fd(&self) -> RawFd {
+@@ -176,7 +178,7 @@ fn as_raw_fd(&self) -> RawFd {
+     }
+ }
+ #[stable(feature = "from_raw_os", since = "1.1.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl FromRawFd for fs::File {
+     #[inline]
+     unsafe fn from_raw_fd(fd: RawFd) -> fs::File {
+@@ -184,7 +186,7 @@ unsafe fn from_raw_fd(fd: RawFd) -> fs::File {
+     }
+ }
+ #[stable(feature = "into_raw_os", since = "1.4.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl IntoRawFd for fs::File {
+     #[inline]
+     fn into_raw_fd(self) -> RawFd {
+@@ -193,7 +195,7 @@ fn into_raw_fd(self) -> RawFd {
+ }
+ 
+ #[stable(feature = "asraw_stdio", since = "1.21.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsRawFd for io::Stdin {
+     #[inline]
+     fn as_raw_fd(&self) -> RawFd {
+@@ -218,7 +220,7 @@ fn as_raw_fd(&self) -> RawFd {
+ }
+ 
+ #[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl<'a> AsRawFd for io::StdinLock<'a> {
+     #[inline]
+     fn as_raw_fd(&self) -> RawFd {
+@@ -290,7 +292,7 @@ fn as_raw_fd(&self) -> RawFd {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsRawFd for io::PipeReader {
+     fn as_raw_fd(&self) -> RawFd {
+         self.0.as_raw_fd()
+@@ -298,7 +300,7 @@ fn as_raw_fd(&self) -> RawFd {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl FromRawFd for io::PipeReader {
+     unsafe fn from_raw_fd(raw_fd: RawFd) -> Self {
+         Self::from_inner(unsafe { FromRawFd::from_raw_fd(raw_fd) })
+@@ -306,7 +308,7 @@ unsafe fn from_raw_fd(raw_fd: RawFd) -> Self {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl IntoRawFd for io::PipeReader {
+     fn into_raw_fd(self) -> RawFd {
+         self.0.into_raw_fd()
+@@ -314,7 +316,7 @@ fn into_raw_fd(self) -> RawFd {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl AsRawFd for io::PipeWriter {
+     fn as_raw_fd(&self) -> RawFd {
+         self.0.as_raw_fd()
+@@ -322,7 +324,7 @@ fn as_raw_fd(&self) -> RawFd {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl FromRawFd for io::PipeWriter {
+     unsafe fn from_raw_fd(raw_fd: RawFd) -> Self {
+         Self::from_inner(unsafe { FromRawFd::from_raw_fd(raw_fd) })
+@@ -330,7 +332,7 @@ unsafe fn from_raw_fd(raw_fd: RawFd) -> Self {
+ }
+ 
+ #[stable(feature = "anonymous_pipe", since = "1.87.0")]
+-#[cfg(not(target_os = "trusty"))]
++#[cfg(not(any(target_os = "trusty", target_os = "quark")))]
+ impl IntoRawFd for io::PipeWriter {
+     fn into_raw_fd(self) -> RawFd {
+         self.0.into_raw_fd()
+diff --git a/library/std/src/os/mod.rs b/library/std/src/os/mod.rs
+index 76374402be4b3b5fbf0bb1796471fd0e4424d5f8..983219d2990fd72c6666fff3a927a712a0521b6c 100644
+--- a/library/std/src/os/mod.rs
++++ b/library/std/src/os/mod.rs
+@@ -190,6 +190,7 @@ pub mod windows {}
+     target_os = "trusty",
+     target_os = "wasi",
+     target_os = "motor",
++    target_os = "quark",
+     doc
+ ))]
+ pub mod fd;
+diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
+index f2f1d1c7feceb60f8bd69d1ce03d0f4def430cf3..e3ae64e5f1b4d88402e301c260228f5a66a5cd04 100644
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -86,6 +86,9 @@ unsafe fn realloc_fallback(
+     target_os = "motor" => {
+         mod motor;
+     }
++    target_os = "quark" => {
++        mod quark;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+     }
+diff --git a/library/std/src/sys/args/mod.rs b/library/std/src/sys/args/mod.rs
+index 5424d40a158834b50c466e0b2135bcf9fd431c84..4baf27520fe55dd85d282ae31c291efb6e25ccce 100644
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -7,6 +7,7 @@
+     target_family = "windows",
+     target_os = "hermit",
+     target_os = "motor",
++    target_os = "quark",
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
+@@ -33,6 +34,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     target_os = "uefi" => {
+         mod uefi;
+         pub use uefi::*;
+diff --git a/library/std/src/sys/env/mod.rs b/library/std/src/sys/env/mod.rs
+index 89856516b6dcea5b33f5d2a31ec9370791eff09d..da0c01f33f3066b3b4d68bea272292e600ee88e0 100644
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -31,6 +31,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::*;
+diff --git a/library/std/src/sys/exit.rs b/library/std/src/sys/exit.rs
+index 53fb92ba077e0a19b6a4ef7fe2c2ccd751e7bdee..0219eb8de1aff29c4976dbea23575e82b986d7d8 100644
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -82,6 +82,9 @@ pub fn exit(code: i32) -> ! {
+         target_os = "motor" => {
+             moto_rt::process::exit(code)
+         }
++        target_os = "quark" => {
++            quark_rt::rt::exit(code)
++        }
+         all(target_vendor = "fortanix", target_env = "sgx") => {
+             crate::sys::pal::abi::exit_with_code(code as _)
+         }
+diff --git a/library/std/src/sys/fd/mod.rs b/library/std/src/sys/fd/mod.rs
+index 02d61a62f4e6bcf843368d2987ffbfea0740c078..685aa2008ef06d5f50a6ac38f458566e7de7f9d9 100644
+--- a/library/std/src/sys/fd/mod.rs
++++ b/library/std/src/sys/fd/mod.rs
+@@ -15,6 +15,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::*;
+diff --git a/library/std/src/sys/io/error/mod.rs b/library/std/src/sys/io/error/mod.rs
+index d7a0b9b4b301dddc7ebce3c4fcee9f6b1a5b22ad..99230f9254e490d322ce2a990d9a01ba7097d437 100644
+--- a/library/std/src/sys/io/error/mod.rs
++++ b/library/std/src/sys/io/error/mod.rs
+@@ -7,6 +7,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::*;
+diff --git a/library/std/src/sys/io/mod.rs b/library/std/src/sys/io/mod.rs
+index b3587ab63696a55e813a459fc2744a8c7d7bbca7..33b69642c0a3e90324ae1921bda5318335eed579 100644
+--- a/library/std/src/sys/io/mod.rs
++++ b/library/std/src/sys/io/mod.rs
+@@ -41,6 +41,10 @@ mod is_terminal {
+             mod motor;
+             pub use motor::*;
+         }
++        target_os = "quark" => {
++            mod quark;
++            pub use quark::*;
++        }
+         _ => {
+             mod unsupported;
+             pub use unsupported::*;
+diff --git a/library/std/src/sys/net/connection/mod.rs b/library/std/src/sys/net/connection/mod.rs
+index 2f064914a83172331990d03399b730bb8df2dce0..a8142cbc76058f1817462514f9148080a6a1318a 100644
+--- a/library/std/src/sys/net/connection/mod.rs
++++ b/library/std/src/sys/net/connection/mod.rs
+@@ -21,6 +21,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     target_os = "xous" => {
+         mod xous;
+         pub use xous::*;
+diff --git a/library/std/src/sys/os_str/mod.rs b/library/std/src/sys/os_str/mod.rs
+index f7007cbf18b4c0dc78575124e42599b329fbf618..2d6f0ce04f52336a56d84dac7a935c1e82d492fb 100644
+--- a/library/std/src/sys/os_str/mod.rs
++++ b/library/std/src/sys/os_str/mod.rs
+@@ -5,7 +5,7 @@
+         mod wtf8;
+         pub use wtf8::{Buf, Slice};
+     }
+-    any(target_os = "motor") => {
++    any(target_os = "motor", target_os = "quark") => {
+         mod utf8;
+         pub use utf8::{Buf, Slice};
+     }
+diff --git a/library/std/src/sys/pal/mod.rs b/library/std/src/sys/pal/mod.rs
+index 88d9d42059900cfee4ca08d7e80639a3d4ac0a42..2f0b90cd75fff75a8cf762160e6265af3b10c32c 100644
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -24,6 +24,10 @@
+         mod motor;
+         pub use self::motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use self::quark::*;
++    }
+     target_os = "trusty" => {
+         mod trusty;
+         pub use self::trusty::*;
+diff --git a/library/std/src/sys/personality/mod.rs b/library/std/src/sys/personality/mod.rs
+index eabef92244d0139c0dc70ccc575c76ea90bd2461..209dcdfc48bb618289682f15b807fce835373d0a 100644
+--- a/library/std/src/sys/personality/mod.rs
++++ b/library/std/src/sys/personality/mod.rs
+@@ -17,7 +17,7 @@
+     target_os = "emscripten" => {
+         mod emcc;
+     }
+-    any(target_env = "msvc", target_family = "wasm", target_os = "motor") => {
++    any(target_env = "msvc", target_family = "wasm", target_os = "motor", target_os = "quark") => {
+         // This is required by the compiler to exist (e.g., it's a lang item),
+         // but it's never actually called by the compiler because
+         // __CxxFrameHandler3 (msvc) / __gxx_wasm_personality_v0 (wasm) is the
+diff --git a/library/std/src/sys/pipe/unsupported.rs b/library/std/src/sys/pipe/unsupported.rs
+index 1c5df47c95817f4f329c69ffd015179943791119..cf7cb43ca4efc873121bc6d6e5142c1fb05d54f1 100644
+--- a/library/std/src/sys/pipe/unsupported.rs
++++ b/library/std/src/sys/pipe/unsupported.rs
+@@ -56,7 +56,7 @@ fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+     }
+ }
+ 
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
++#[cfg(any(unix, target_os = "hermit", target_os = "wasi", target_os = "quark"))]
+ mod unix_traits {
+     use super::Pipe;
+     use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+diff --git a/library/std/src/sys/random/mod.rs b/library/std/src/sys/random/mod.rs
+index 91f72d073879091b81ea6d5318b0f4706ec83186..dab1e46b86d5ffb362ab9a892bd591a5e25c6229 100644
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -66,6 +66,10 @@
+         mod motor;
+         pub use motor::fill_bytes;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::fill_bytes;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::fill_bytes;
+diff --git a/library/std/src/sys/stdio/mod.rs b/library/std/src/sys/stdio/mod.rs
+index 86d0f3fe49cb327368ed7039c877808c130772a8..3a218eea5fcf1899efbebb58e9067f41aaed4170 100644
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -17,6 +17,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     target_os = "solid_asp3" => {
+         mod solid;
+         pub use solid::*;
+diff --git a/library/std/src/sys/sync/condvar/mod.rs b/library/std/src/sys/sync/condvar/mod.rs
+index 83cf0ae629851b10eb12ab5912dccecbe0b91147..4aa87affab819009e89d0783b269271a547883a1 100644
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -7,6 +7,7 @@
+         target_os = "openbsd",
+         target_os = "dragonfly",
+         target_os = "motor",
++        target_os = "quark",
+         target_os = "fuchsia",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+diff --git a/library/std/src/sys/sync/mutex/mod.rs b/library/std/src/sys/sync/mutex/mod.rs
+index e3d6ad1129c83b59959c0760060a5ceb8ef73084..d1f9a307aff3b50b3682625ba97acde409265739 100644
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -6,6 +6,7 @@
+         target_os = "freebsd",
+         target_os = "openbsd",
+         target_os = "motor",
++        target_os = "quark",
+         target_os = "dragonfly",
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+diff --git a/library/std/src/sys/sync/once/mod.rs b/library/std/src/sys/sync/once/mod.rs
+index aeea884b9f617eff2793bc79290c654490d2ffe0..72c8886d6946c36ce3b67f60f8cc634543f21801 100644
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -15,6 +15,7 @@
+         all(target_arch = "wasm32", target_feature = "atomics"),
+         target_os = "freebsd",
+         target_os = "motor",
++        target_os = "quark",
+         target_os = "openbsd",
+         target_os = "dragonfly",
+         target_os = "fuchsia",
+diff --git a/library/std/src/sys/sync/rwlock/mod.rs b/library/std/src/sys/sync/rwlock/mod.rs
+index 8603fca2da5b5736a8ed85c37ec8f2404be26709..c1c1838499377eb45bb6d8b2971d2f8e3de01c2f 100644
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -10,6 +10,7 @@
+         all(target_family = "wasm", target_feature = "atomics"),
+         target_os = "hermit",
+        target_os = "motor",
++        target_os = "quark",
+     ) => {
+         mod futex;
+         pub use futex::RwLock;
+diff --git a/library/std/src/sys/sync/thread_parking/mod.rs b/library/std/src/sys/sync/thread_parking/mod.rs
+index 74b5b72b19a75f795e287754a2212b9d1804d4c2..befedd6235f8b059348ed0d2200aa1cd3ed654a4 100644
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -9,6 +9,7 @@
+         target_os = "dragonfly",
+         target_os = "fuchsia",
+         target_os = "motor",
++        target_os = "quark",
+         target_os = "hermit",
+     ) => {
+         mod futex;
+diff --git a/library/std/src/sys/thread/mod.rs b/library/std/src/sys/thread/mod.rs
+index 9816981c7fc887b22783fa2c16c6c26ea0de9b8f..6711b587bdee88d44bb118f1e8a204ee089e960d 100644
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -10,6 +10,10 @@
+         mod motor;
+         pub use motor::*;
+     }
++    target_os = "quark" => {
++        mod quark;
++        pub use quark::*;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         pub use sgx::{Thread, current_os_id, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
+@@ -134,6 +138,7 @@
+     target_os = "wasi",
+     target_vendor = "apple",
+     target_os = "motor",
++    target_os = "quark",
+     target_os = "vexos"
+ )))]
+ pub fn sleep_until(deadline: crate::time::Instant) {
+diff --git a/library/std/src/sys/thread_local/mod.rs b/library/std/src/sys/thread_local/mod.rs
+index e88011aa22dadb70a6614a5fa14e9a6bd436aa8e..f0905bf21bbbf8107e5c99914d6549d73400c7fc 100644
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -118,6 +118,7 @@ pub(crate) fn enable() {
+         any(
+             target_os = "hermit",
+             target_os = "xous",
++            target_os = "quark",
+         ) => {
+             // `std` is the only runtime, so it just calls the destructor functions
+             // itself when the time comes.
+diff --git a/library/std/src/sys/time/mod.rs b/library/std/src/sys/time/mod.rs
+index 6cd1850e7cca16df6d3e9d9d80264c841e453175..7284a869fc3b3a82e269553649732b34c6c08819 100644
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -6,6 +6,10 @@
+     target_os = "motor" => {
+         use moto_rt::time as imp;
+     }
++    target_os = "quark" => {
++        mod quark;
++        use quark as imp;
++    }
+     all(target_vendor = "fortanix", target_env = "sgx") => {
+         mod sgx;
+         use sgx as imp;
