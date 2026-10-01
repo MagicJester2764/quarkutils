@@ -301,7 +301,13 @@ because it happened to be closed is the bug that rule invites.
 A terminal is two kernel descriptors, and the paths that name one are caught
 here, ahead of the VFS: `/dev/ptmx` and `/dev/pts/N` in `linux-abi/src/pty.c`,
 the way a Linux kernel catches them ahead of its filesystems. musl's `openpty`
-and `forkpty` run unpatched on top.
+and `forkpty` run unpatched on top. So does its `ttyname`, which is a
+`readlink` of `/proc/self/fd/N` and then a `stat` of what that said: the
+first is answered for a descriptor that is a terminal's slave, and the second
+only for a terminal the program has open — opening one in order to describe
+it would be a slave opened and closed, and the last slave closing is how a
+terminal's master hears that its session has ended. A terminal is one file
+however many descriptors there are for it: its inode is the terminal's.
 
 **Signals are the program's to run.** The kernel ends a program that has said
 nothing about a signal and tells one that has a handler; it calls no handler

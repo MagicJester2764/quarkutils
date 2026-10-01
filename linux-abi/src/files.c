@@ -30,9 +30,6 @@
 
 #define PAGE_SIZE 4096UL
 
-/* As many as the kernel's table holds. */
-#define MAX_FDS 64
-
 /* Which descriptors are files. A descriptor is `UNKNOWN` until it is asked
    about, and again whenever it is closed or something is put on it. */
 #define UNKNOWN 0
@@ -488,6 +485,10 @@ static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     }
 }
 
+/* The device the terminals under /dev/pts are on: not the filesystem's, and
+   not the one the kernel's other descriptors are given. */
+#define PTS_DEV 24
+
 long __quark_fstat(long fd, void *statbuf) {
     unsigned long h;
     if (!is_file(fd, &h)) {
@@ -517,10 +518,19 @@ long __quark_fstat(long fd, void *statbuf) {
             st->st_mode = 0140000 | 0777; /* S_IFSOCK */
             break;
         case QUARK_FD_KIND_PTY_SLAVE: {
-            /* /dev/pts/N: major 136, and the pty's number. */
+            /* /dev/pts/N: major 136, and the pty's number. One terminal is
+               one file however many descriptors a program has for it, so its
+               inode is the terminal's and not the descriptor's — which is
+               also what lets `ttyname` check the name it was given against
+               the descriptor it asked about. */
             unsigned long number = __syscall3(SYS_PTY_CTL, (unsigned long)fd, 4, 0);
+            if (number == QUARK_ERR) {
+                number = 0;
+            }
             st->st_mode = 020000 | 0620; /* S_IFCHR */
-            st->st_rdev = (136ul << 8) | (number == QUARK_ERR ? 0 : number);
+            st->st_rdev = (136ul << 8) | number;
+            st->st_dev = PTS_DEV;
+            st->st_ino = number + 3;
             break;
         }
         case QUARK_FD_KIND_PTY_MASTER:
@@ -559,6 +569,10 @@ long __quark_stat(long dirfd, const char *path, void *statbuf, int follow) {
         return -LX_ENOENT;
     }
     long alias = dev_alias(path);
+    if (alias < 0) {
+        /* A terminal this program has open, by its name. */
+        alias = __quark_pty_held(path);
+    }
     if (alias >= 0) {
         return __quark_fstat(alias, statbuf);
     }
@@ -652,6 +666,27 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
     return (long)put;
 }
 
+/* "/proc/self/fd/7" -> 7, or -1 for anything else. */
+static long proc_fd(const char *path) {
+    const char *p = path;
+    for (const char *w = "/proc/self/fd/"; *w; w++, p++) {
+        if (*p != *w) {
+            return -1;
+        }
+    }
+    if (!*p) {
+        return -1;
+    }
+    long n = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9' || n >= MAX_FDS) {
+            return -1;
+        }
+        n = n * 10 + (*p - '0');
+    }
+    return n < MAX_FDS ? n : -1;
+}
+
 /* readlink: at most `size` bytes of the target, and no NUL. */
 long __quark_readlink(long dirfd, const char *path, char *buf, unsigned long size) {
     if ((long)size <= 0) {
@@ -659,6 +694,34 @@ long __quark_readlink(long dirfd, const char *path, char *buf, unsigned long siz
     }
     if (!path || !*path) {
         return -LX_ENOENT;
+    }
+    /* There is no /proc. But `/proc/self/fd/N` is how a C library asks what
+       a descriptor is called — it is the whole of musl's `ttyname` — and a
+       terminal has a name to give: the one it is opened by. */
+    long fd = proc_fd(path);
+    if (fd >= 0) {
+        long number = __quark_pty_slave_number(fd);
+        if (number < 0) {
+            return -LX_ENOENT;
+        }
+        char name[24] = "/dev/pts/";
+        unsigned long len = 9;
+        char digits[8];
+        int n = 0;
+        do {
+            digits[n++] = (char)('0' + number % 10);
+            number /= 10;
+        } while (number && n < 8);
+        while (n) {
+            name[len++] = digits[--n];
+        }
+        if (len > size) {
+            len = size;
+        }
+        for (unsigned long i = 0; i < len; i++) {
+            buf[i] = name[i];
+        }
+        return (long)len;
     }
     unsigned long base;
     long bad = base_for(dirfd, path, &base);

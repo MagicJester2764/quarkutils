@@ -93,6 +93,39 @@ int __quark_pty_path(const char *path) {
     return path && (streq(path, "/dev/ptmx") || pts_number(path) >= 0);
 }
 
+/* Which terminal descriptor `fd` is the slave of, or -1 if it is not one. */
+long __quark_pty_slave_number(long fd) {
+    if (fd < 0 || fd >= MAX_FDS) {
+        return -1;
+    }
+    unsigned long kind = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+    if (kind == QUARK_ERR || QUARK_FD_KIND(kind) != QUARK_FD_KIND_PTY_SLAVE) {
+        return -1;
+    }
+    unsigned long number = __syscall3(SYS_PTY_CTL, (unsigned long)fd, 4, 0);
+    return number == QUARK_ERR ? -1 : (long)number;
+}
+
+/* A descriptor this program has for the terminal `path` names, or -1.
+ *
+ * What a `stat` of `/dev/pts/N` is answered from. Opening the terminal to ask
+ * about it would be a slave opened and closed, and the last slave closing is
+ * how a terminal's master is told its session has ended; so the only
+ * terminals a program can ask about by name are the ones it already has —
+ * which is all `ttyname` does. */
+long __quark_pty_held(const char *path) {
+    long number = path ? pts_number(path) : -1;
+    if (number < 0) {
+        return -1;
+    }
+    for (long fd = 0; fd < MAX_FDS; fd++) {
+        if (__quark_pty_slave_number(fd) == number) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
 /* The requests a terminal makes of a descriptor.
  *
  * Anything this does not answer is `ENOTTY`, which is the right answer to a

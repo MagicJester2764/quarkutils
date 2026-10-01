@@ -41,6 +41,13 @@
 #define LX_EFBIG    27
 #define LX_EPIPE    32
 
+/* How many descriptors a program has: as many as the kernel's table holds. */
+#define MAX_FDS 64
+
+/* A terminal by its name, for a `stat` and for `ttyname`: in pty.c. */
+long __quark_pty_slave_number(long fd);
+long __quark_pty_held(const char *path);
+
 /* A process is named by its process id: a number the kernel never gives out
    twice, where a task id is given to the next task made. `fork` answers with
    one, `wait4` and `kill` take one, and `getpid` is one. A thread is still
