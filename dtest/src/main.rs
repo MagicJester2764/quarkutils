@@ -2750,9 +2750,17 @@ fn test_disks() {
     check("a volume that is not there is not there", block::info(disk, 16) == Err(block::ERR_NO_VOLUME));
 
     let mut sector = [0u8; 512];
+    let last = efi.map_or(0, |v| v.sectors);
     check(
-        "a volume is not read by somebody who has not claimed it",
-        block::read(disk, 1, 0, &mut sector) == Err(block::ERR_NOT_CLAIMANT),
+        "root reads a volume it has not claimed",
+        block::read(disk, 1, last - 1, &mut sector).is_ok(),
+    );
+    // What was just read, written back: if this were answered, nothing
+    // would have changed.
+    check(
+        "and does not write one",
+        block::write(disk, 1, last - 1, &sector) == Err(block::ERR_NOT_CLAIMANT)
+            && block::write(disk, 2, 0, &sector) == Err(block::ERR_NOT_CLAIMANT),
     );
     check("the file server's is not anybody else's to claim", block::claim(disk, 2) == Err(block::ERR_BUSY));
     check(
@@ -2764,7 +2772,6 @@ fn test_disks() {
         "and read: the EFI partition begins as a FAT filesystem does",
         block::read(disk, 1, 0, &mut sector).is_ok() && sector[510] == 0x55 && sector[511] == 0xAA,
     );
-    let last = efi.map_or(0, |v| v.sectors);
     check(
         "to its last sector and not past it",
         block::read(disk, 1, last - 1, &mut sector).is_ok()
@@ -2775,11 +2782,7 @@ fn test_disks() {
         block::rescan(disk) == Err(block::ERR_NOT_CLAIMANT),
     );
     check("it is let go", block::release(disk, 1).is_ok());
-    check(
-        "and is then nobody's again",
-        block::read(disk, 1, 0, &mut sector) == Err(block::ERR_NOT_CLAIMANT)
-            && block::info(disk, 1).is_ok_and(|v| v.claimant == 0),
-    );
+    check("and is then nobody's again", block::info(disk, 1).is_ok_and(|v| v.claimant == 0));
 }
 
 /// The RAM disk `ramdisk 4` has just made: the one of `ram0`..`ram7` that is

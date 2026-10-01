@@ -248,6 +248,7 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
         }
     }
     default:
-        return -LX_ENOTTY;
+        /* Not a terminal's question. A disk has a few of its own. */
+        return __quark_blk_ioctl(fd, request, arg);
     }
 }

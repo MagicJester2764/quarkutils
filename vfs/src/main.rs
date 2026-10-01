@@ -1437,6 +1437,7 @@ pub extern "C" fn _start() -> ! {
             }
             TAG_READDIR_BULK if msg.data[1] == AT_POSITION => descriptor_list(&disk, sender, &msg),
             TAG_SEEK => handle_seek(sender, &msg),
+            TAG_DEVCTL => devices::control(sender, &msg),
             TAG_SETATTR => transacted(|| handle_setattr(sender, &msg)),
             _ => dispatch(&disk, sender, &msg),
         }
@@ -1521,6 +1522,7 @@ fn size_of(file: &OpenFile) -> Result<u64, u64> {
             ext2::read_inode(ext2_state(), inode_num).map(|inode| inode.size64())
         }
         FsFileData::Fat32 { .. } => Ok(file.file_size as u64),
+        FsFileData::Device(dev) => Ok(devices::size_of(dev)),
         _ => Ok(0),
     }
 }
@@ -1558,8 +1560,10 @@ fn descriptor_io(disk: &DiskState, sender: usize, msg: &Message) {
         file.pos
     };
     // A file here is at most four gigabytes: past that there is nothing to
-    // read and nowhere to write.
-    if at > u32::MAX as u64 {
+    // read and nowhere to write. A disk is not a file, and is as long as it
+    // is.
+    let is_disk = matches!(file.fs, FsFileData::Device(dev) if devices::is_block(dev));
+    if at > u32::MAX as u64 && !is_disk {
         return if writing { error_reply(sender, ERR_NO_SPACE) } else { reply_count(sender, 0) };
     }
     let mut placed = *msg;
@@ -2048,13 +2052,13 @@ fn fat32_mkdir(disk: &DiskState, path: &[u8]) -> Result<(), u64> {
     }
 }
 /// Copy the first `n` bytes of `CLIENT_BUF` into what `sender` lent.
-fn lend_out(sender: usize, n: usize) -> bool {
+pub fn lend_out(sender: usize, n: usize) -> bool {
     let data = unsafe { core::slice::from_raw_parts(CLIENT_BUF as *const u8, n) };
     n == 0 || syscall::sys_lent_write(sender, 0, data) == Ok(n)
 }
 
 /// Copy `n` bytes of what `sender` lent into `CLIENT_BUF`.
-fn lend_in(sender: usize, n: usize) -> bool {
+pub fn lend_in(sender: usize, n: usize) -> bool {
     let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, n) };
     n == 0 || syscall::sys_lent_read(sender, 0, buf) == Ok(n)
 }
@@ -2749,7 +2753,7 @@ fn handle_statfs(sender: usize) {
 // ext2 IPC handlers
 // ---------------------------------------------------------------------------
 
-fn get_sender_uid_gid(sender: usize) -> (u32, u32) {
+pub fn get_sender_uid_gid(sender: usize) -> (u32, u32) {
     syscall::sys_get_tuid(sender).unwrap_or((0, 0))
 }
 

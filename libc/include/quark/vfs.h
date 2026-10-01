@@ -40,6 +40,10 @@
 #define QUARK_VFS_TAG_SEEK    24
 #define QUARK_VFS_TAG_SETATTR 25
 #define QUARK_VFS_TAG_MKNOD   26
+#define QUARK_VFS_TAG_DEVCTL  27
+/* QUARK_VFS_TAG_DEVCTL's operations: have a disk's driver read its partition
+   table again. */
+#define QUARK_VFS_DEVCTL_RESCAN 1UL
 
 /* QUARK_VFS_TAG_LOCK's flags: wait to be granted; the lock belongs to the
    handle, not the program; grant nothing and say what is in the way. */
@@ -108,10 +112,13 @@
 #define QUARK_VFS_DEADLOCK      17
 #define QUARK_VFS_TOO_MANY_LINKS 18
 #define QUARK_VFS_NO_PEER       19 /* a named pipe opened to write, unread, by one who will not wait */
+#define QUARK_VFS_BUSY          20 /* a disk somebody else is using, or the one this runs from */
 
 /* The server's devices have ids from here up, in the order null, zero, full,
    random, urandom. */
 #define QUARK_VFS_DEVICE_ID 0xFFFFFF00ul
+/* And its disks begin here, thirty-two to a driver. */
+#define QUARK_VFS_BLOCK_ID  0xFFFFFD00ul
 
 /* A path is lent with the call that names it. One longer than this is
    refused, never shortened. */
@@ -253,6 +260,8 @@ int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
    is what to wait on — 0 if somebody holds the other end, and otherwise the
    number SYS_PIPE_PEER takes to wait for it to be opened. */
 int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode);
+/* Ask something of the device an open handle is: QUARK_VFS_DEVCTL_*. */
+int quark_vfs_devctl(unsigned long handle, unsigned long operation);
 /* mkdir with the permission bits said; `mode` as for quark_vfs_open_fd. */
 int quark_vfs_mkdir_mode(unsigned long base, const char *path, unsigned long mode);
 /* Move a descriptor's position; `*pos` is where it now is, and `*how`, if

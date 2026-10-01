@@ -82,6 +82,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_TOO_MANY_LINKS: return -LX_EMLINK;
     case QUARK_VFS_LOOP:           return -LX_ELOOP;
     case QUARK_VFS_NO_PEER:        return -LX_ENXIO;
+    case QUARK_VFS_BUSY:           return -LX_EBUSY;
     default:                       return -LX_EIO;
     }
 }
@@ -548,6 +549,70 @@ static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     unsigned long dev = r->id - QUARK_VFS_DEVICE_ID;
     if ((r->mode & 0170000) == 020000 && dev < sizeof minors) {
         st->st_rdev = (1ul << 8) | minors[dev];
+    }
+    /* A disk. Linux gives a block device no size here — a program asks the
+       device (BLKGETSIZE64), or seeks to its end — and a number: 8 for a
+       disk and 1 for one made of memory, the driver and the partition in
+       the minor. The server numbers them thirty-two to a driver, disks
+       first. */
+    if ((r->mode & 0170000) == 060000) {
+        unsigned long n = r->id - QUARK_VFS_BLOCK_ID;
+        st->st_size = 0;
+        st->st_rdev = n < 4 * 32 ? (8ul << 8) | n : (1ul << 8) | (n - 4 * 32);
+    }
+}
+
+/* What a program asks a disk: how big it is, how big its sectors are, and to
+   look at its partition table again. Not a disk, and the answer is ENOTTY,
+   as it is to any question a descriptor has no answer to. */
+#define LX_BLKROGET     0x125EUL
+#define LX_BLKRRPART    0x125FUL
+#define LX_BLKGETSIZE   0x1260UL
+#define LX_BLKFLSBUF    0x1261UL
+#define LX_BLKSSZGET    0x1268UL
+#define LX_BLKBSZGET    0x80081270UL
+#define LX_BLKGETSIZE64 0x80081272UL
+#define LX_BLKIOMIN     0x1278UL
+#define LX_BLKIOOPT     0x1279UL
+#define LX_BLKALIGNOFF  0x127AUL
+#define LX_BLKPBSZGET   0x127BUL
+
+long __quark_blk_ioctl(long fd, unsigned long request, unsigned long arg) {
+    unsigned long h;
+    struct quark_vfs_stat st;
+    if (!is_file(fd, &h) || quark_vfs_stat(h, &st) || (st.mode & 0170000) != 060000) {
+        return -LX_ENOTTY;
+    }
+    switch (request) {
+    case LX_BLKGETSIZE64:
+        *(unsigned long *)arg = st.size;
+        return 0;
+    case LX_BLKGETSIZE:
+        *(unsigned long *)arg = st.size / 512;
+        return 0;
+    case LX_BLKBSZGET:
+        *(unsigned long *)arg = 512;
+        return 0;
+    case LX_BLKSSZGET:
+    case LX_BLKPBSZGET:
+    case LX_BLKIOMIN:
+        *(unsigned int *)arg = 512;
+        return 0;
+    case LX_BLKIOOPT:
+    case LX_BLKALIGNOFF:
+    case LX_BLKROGET:
+        *(unsigned int *)arg = 0;
+        return 0;
+    case LX_BLKFLSBUF:
+        /* Nothing is kept back to flush: a write is on the disk when it
+           returns. */
+        return 0;
+    case LX_BLKRRPART: {
+        int err = quark_vfs_devctl(h, QUARK_VFS_DEVCTL_RESCAN);
+        return err ? vfs_errno(err) : 0;
+    }
+    default:
+        return -LX_ENOTTY;
     }
 }
 

@@ -6,10 +6,13 @@
 //! volume: a client that was given a partition cannot reach outside it, and
 //! does not need to know where it is.
 //!
-//! A volume is used by one client at a time. A client *claims* it, and from
-//! then on only that client's reads and writes of it are answered, until it
-//! lets go or dies. That is what stops a partition being formatted while a
-//! file server has it mounted: the file server holds the claim. The whole
+//! A volume is written by one client at a time. A client *claims* it, and
+//! from then on only that client's writes to it are answered, until it lets
+//! go or dies. That is what stops a partition being formatted while a file
+//! server has it mounted: the file server holds the claim. Reading takes
+//! nothing from whoever holds a volume, and root may read one it has not
+//! claimed — which is how a program says what is on a disk without taking
+//! it from anybody. The whole
 //! device and its partitions are the same sectors, so a claim on volume 0
 //! and a claim on any other, by different clients, are refused each other.
 //!
@@ -364,14 +367,18 @@ pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
                 let n = if single { 1 } else { msg.data[2] };
                 let lba = msg.data[0];
                 let len = n as usize * SECTOR;
-                if !known || volumes[volume].claimant != sender {
+                let reading = msg.tag == TAG_READ_SECTOR || msg.tag == TAG_READ_SECTORS;
+                let allowed = known
+                    && (volumes[volume].claimant == sender
+                        || (reading && matches!(syscall::sys_get_tuid(sender), Ok((0, _)))));
+                if !allowed {
                     status(TAG_ERROR, ERR_NOT_CLAIMANT)
                 } else if n == 0
                     || n > MAX_SECTORS as u64
                     || lba.checked_add(n).is_none_or(|end| end > volumes[volume].sectors)
                 {
                     status(TAG_ERROR, ERR_RANGE)
-                } else if msg.tag == TAG_READ_SECTOR || msg.tag == TAG_READ_SECTORS {
+                } else if reading {
                     if !dev.read(volumes[volume].start + lba, n as u32, &mut buf[..len]) {
                         status(TAG_ERROR, ERR_READ)
                     } else if syscall::sys_lent_write(sender, 0, &buf[..len]).is_err() {

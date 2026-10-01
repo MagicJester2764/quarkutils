@@ -47,7 +47,7 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST \
                  fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE \
                  mousetest:MOUSETEST runtests:RUNTESTS nettest:NETTEST \
-                 setfont:SETFONT ramdisk:RAMDISK
+                 setfont:SETFONT ramdisk:RAMDISK disks:DISKS
 
 # Programs written in C, built against libc/.
 C_PROGRAMS    := cwc:CWC envtest:ENVTEST

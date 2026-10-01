@@ -20,15 +20,24 @@ use crate::DISK_IO_BUF;
 /// Sectors one request may carry: as many as fill `DISK_IO_BUF`.
 pub const MAX_SECTORS: u32 = block::MAX_SECTORS;
 
-/// The volume this server was started on.
+/// The volume this server was started on, and whose it is.
 static mut VOLUME: u64 = 0;
+static mut DRIVER: usize = 0;
 
 /// Take `volume` of the driver for this server alone. Nobody else's reads
 /// or writes of it are answered from then on.
 pub fn claim(disk_tid: usize, volume: u64) -> Result<(), u64> {
     block::claim(disk_tid, volume)?;
-    unsafe { VOLUME = volume };
+    unsafe {
+        VOLUME = volume;
+        DRIVER = disk_tid;
+    }
     Ok(())
+}
+
+/// The driver and the volume this server's filesystem is on.
+pub fn root() -> (usize, u64) {
+    unsafe { (DRIVER, VOLUME) }
 }
 
 fn volume() -> u64 {

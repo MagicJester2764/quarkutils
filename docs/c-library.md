@@ -183,6 +183,14 @@ does on Linux. What is different is at the edges:
   `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` are names for
   descriptors the program already has, and `/dev/ptmx` and `/dev/pts/N` are
   terminals.
+- **A disk is a file under `/dev`**: `/dev/disk0`, `/dev/disk0p1`,
+  `/dev/ram0`. It is a block device to `stat`, root's alone, and is read and
+  written with `pread` and `pwrite` at any offset. `BLKGETSIZE64`,
+  `BLKGETSIZE`, `BLKSSZGET` and `BLKRRPART` are answered, and `lseek` to its
+  end finds its size; `st_size` is 0, as on Linux. Opening one to write
+  fails with `EBUSY` if a filesystem on it is mounted, or if it is the disk
+  the system is running from. Nothing is cached: a write is on the disk
+  when it returns, and `fsync` and `BLKFLSBUF` have nothing to do.
 - `mmap` of a file works, shared and private. Anonymous memory is given its
   pages when they are first touched.
 - **A named pipe** is made with `mkfifo` or `mknod`, on ext2 and ext4, and

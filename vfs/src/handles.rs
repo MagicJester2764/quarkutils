@@ -171,8 +171,23 @@ pub fn descriptor(handle: usize) -> Option<&'static mut OpenFile> {
 pub fn release(handle: usize) -> Option<u32> {
     let f = descriptor(handle)?;
     let ino = f.inode_num();
+    gone(f);
     *f = OpenFile::empty();
     Some(ino)
+}
+
+/// A handle is about to be forgotten: whatever it held besides a file's
+/// inode is let go. A disk opened as a device is claimed from its driver for
+/// as long as anybody has it open.
+fn gone(f: &OpenFile) {
+    if let FsFileData::Device(dev) = f.fs {
+        crate::devices::closed(dev);
+    }
+}
+
+/// How many handles there are, of either kind.
+pub fn count() -> usize {
+    table().iter().filter(|f| f.in_use).count()
 }
 
 /// Close program `space`'s handle `handle`. Returns the inode it named (0 for
@@ -180,6 +195,7 @@ pub fn release(handle: usize) -> Option<u32> {
 pub fn close(handle: usize, space: u64) -> Option<u32> {
     let f = get(handle, space)?;
     let ino = f.inode_num();
+    gone(f);
     *f = OpenFile::empty();
     Some(ino)
 }
@@ -192,6 +208,7 @@ pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
         if f.in_use && f.owner == space {
             closed[n] = f.inode_num();
             n += 1;
+            gone(f);
             *f = OpenFile::empty();
             // The program is going, so whoever waited through it is too.
             while crate::locks::drop_handle(i).is_some() {}

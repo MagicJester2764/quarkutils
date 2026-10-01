@@ -39,6 +39,7 @@ code in `data[0]`:
 | 17 | `DEADLOCK` | Waiting for this lock would wait for ever |
 | 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
 | 19 | `NO_PEER` | A named pipe opened to write, without waiting, that nobody is reading |
+| 20 | `BUSY` | A disk somebody else is using, or the one this system runs from |
 
 Permission is checked against the caller's user and group, which the server
 asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
@@ -123,6 +124,7 @@ Every request below that takes a handle takes either kind.
 | 24 | `SEEK` | `[handle, offset, whence]` | — | `[position, how]` |
 | 25 | `SETATTR` | `[path_len, which, nofollow]` | path, then five words | — |
 | 26 | `MKNOD` | `[path_len, mode]` | path | — |
+| 27 | `DEVCTL` | `[handle, operation]` | — | per operation |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -463,6 +465,35 @@ typed `DT_CHR`. Nothing can be made, removed or renamed under it
 says `EXISTS`. `STAT` gives a device size 0 and the current time. The Linux
 layer reports Linux's device numbers for them (1:3, 1:5, 1:7, 1:8, 1:9). The
 images carry an empty `/dev` directory so that listing `/` shows it.
+
+### Disks
+
+`/dev` also lists the disks there are, each a block device (mode `060600`,
+root's): `disk0` is the whole of the first disk and `disk0p2` its second
+partition; `ram0` is a disk made of memory. Each is a volume of a block
+driver (`quark_rt::block`), found by asking the nameserver for the driver
+when the name is looked up, so the listing is what is there now. Their ids
+begin at `0xFFFF_FD00`, thirty-two to a driver, the disks before the RAM
+disks.
+
+One can be read and written at any offset and for any length up to a page a
+request; a sector the request only partly covers is read first and written
+back whole. A descriptor's position on one is not limited to four
+gigabytes. `STAT` gives its size in bytes, and `SEEK` to the end finds it.
+Only root opens one (`PERMISSION`).
+
+- **Opening one to write claims its volume** from the driver until the last
+  such handle closes. A driver gives a volume to one client at a time, so a
+  volume a file server has mounted cannot be opened to write (`BUSY`), and
+  a disk cannot while any partition of it is. Opening to read claims
+  nothing: a driver lets root read what somebody else holds.
+- **The disk this server's own root is on is read-only here** — its
+  volume, and the whole disk around it (`BUSY` for a write). The server
+  holds that claim itself, so the driver would not refuse it.
+- **`DEVCTL` operation 1** has the driver of a whole disk read its
+  partition table again, for a handle open on that disk: what a program
+  does after it has written one. `BUSY` if a partition is in use. The reply
+  is how many volumes there now are.
 
 ### STATFS
 

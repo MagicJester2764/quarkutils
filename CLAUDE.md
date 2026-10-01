@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 454 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 455 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -594,9 +594,11 @@ is. `disk`, the ATA driver, registers as `disk0`.
   driver's half — volumes, claims, the partition table — and a driver
   supplies only where the sectors are (`block::Device`). A second kind of
   disk is a second `Device`, not a second copy of who may read what.
-- **A volume has one client at a time**, which *claims* it. Reads and writes
-  are answered to the claimant and nobody else, and a claim goes when its
-  holder does. The whole device and a partition of it are the same sectors:
+- **A volume has one writer at a time**, which *claims* it. Writes are
+  answered to the claimant and nobody else, and a claim goes when its holder
+  does. Reads are answered to the claimant and to root: looking at a disk
+  somebody has mounted takes nothing from them, and it is how `disks` says
+  what is on one. The whole device and a partition of it are the same sectors:
   two different clients cannot hold one each. That is what stops a mounted
   filesystem being written under its server.
 - **Only root claims.** A capability to call a driver is handed to anybody
@@ -618,6 +620,16 @@ is. `disk`, the ATA driver, registers as `disk0`.
   an installed system finds a root that is not where an image built
   elsewhere puts it. With nothing said the server takes volume 2 of
   `disk0`, or the only partition, or a device with no table at all.
+- **A disk is also a file** (`vfs/src/devices.rs`): `/dev/disk0`,
+  `/dev/disk0p2`, `/dev/ram0`, for programs that want `pread` and `pwrite`
+  — the ones that make filesystems are C. The file server claims the volume
+  from its driver while anybody has the device open to write, so the
+  driver's rule is the rule here too: what is mounted cannot be opened to
+  write. The exception is the file server's own root, which it holds
+  itself and so has to refuse itself. A handle on a disk is given back to
+  the driver when it closes — `handles.rs` has one place every way of
+  closing goes through, because a volume left claimed is a disk nobody can
+  format.
 - **`qfuzz` does not send a disk driver a claim.** It runs as root, a volume
   nobody has is one it would be given, and its next random write would be a
   write.

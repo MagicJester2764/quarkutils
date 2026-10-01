@@ -40,6 +40,7 @@
 #define LX_ENXIO     6
 #define LX_EFBIG    27
 #define LX_EPIPE    32
+#define LX_EBUSY    16
 
 /* How many descriptors a program has: as many as the kernel's table holds. */
 #define MAX_FDS 64
@@ -109,6 +110,7 @@ long __quark_open(const char *path, long flags, long mode);
 long __quark_openat(long dirfd, const char *path, long flags, long mode);
 void __quark_pty_opened(long fd, int noctty);
 long __quark_mknodat(long dirfd, const char *path, long mode);
+long __quark_blk_ioctl(long fd, unsigned long request, unsigned long arg);
 long __quark_close(long fd);
 long __quark_read(long fd, void *buf, unsigned long n);
 long __quark_write(long fd, const void *buf, unsigned long n);

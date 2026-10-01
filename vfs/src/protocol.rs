@@ -50,6 +50,10 @@ pub const TAG_SETATTR: u64 = 25;
 /// Make something that is not a file or a directory: `[path length, mode]`,
 /// where the mode's type says what. A named pipe is the only kind there is.
 pub const TAG_MKNOD: u64 = 26;
+/// Ask something of the device behind a handle: `[handle, operation]`.
+pub const TAG_DEVCTL: u64 = 27;
+/// DEVCTL: have a disk's driver read its partition table again.
+pub const DEVCTL_RESCAN: u64 = 1;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -143,6 +147,9 @@ pub const ERR_TOO_MANY_LINKS: u64 = 18;
 /// A named pipe, opened to write by somebody who will not wait, that nobody
 /// has open to read.
 pub const ERR_NO_PEER: u64 = 19;
+/// A device that somebody else is using: a disk with a filesystem mounted
+/// from it, or the one this system is running from.
+pub const ERR_BUSY: u64 = 20;
 
 pub const MAX_PATH: usize = 4095;
 /// What an ext2 directory entry's one-byte length allows.
