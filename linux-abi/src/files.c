@@ -494,17 +494,53 @@ long __quark_fstat(long fd, void *statbuf) {
         if (!is_open(fd) && !(fd >= 0 && fd < 3)) {
             return -LX_EBADF;
         }
-        /* Not a file: a terminal, a pipe, a stream. Reporting a character
-           device is what makes stdio treat it as one and pick line buffering
-           when it is a terminal. Its device is not the filesystem's, so that
-           nothing mistakes it for the file whose inode has its number. */
+        /* Not a file: one of the kernel's own, which says what kind. A
+           program asks in order to choose — whether to seek, how to buffer,
+           whether two descriptors are the same thing — so a pipe has to be a
+           pipe and a terminal a terminal. Its device is not the filesystem's,
+           so that nothing mistakes it for the file whose inode has its
+           number. */
         struct lx_kstat *st = statbuf;
         bytes_zero(st, sizeof *st);
         st->st_dev = 2;
         st->st_ino = (unsigned long)fd;
         st->st_nlink = 1;
-        st->st_mode = 020000 | 0666; /* S_IFCHR */
         st->st_blksize = (long)PAGE_SIZE;
+        unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+        switch (k == QUARK_ERR ? 0 : QUARK_FD_KIND(k)) {
+        case QUARK_FD_KIND_PIPE_READ:
+        case QUARK_FD_KIND_PIPE_WRITE:
+            st->st_mode = 010000 | 0600; /* S_IFIFO */
+            break;
+        case QUARK_FD_KIND_STREAM:
+        case QUARK_FD_KIND_SOCKET:
+            st->st_mode = 0140000 | 0777; /* S_IFSOCK */
+            break;
+        case QUARK_FD_KIND_PTY_SLAVE: {
+            /* /dev/pts/N: major 136, and the pty's number. */
+            unsigned long number = __syscall3(SYS_PTY_CTL, (unsigned long)fd, 4, 0);
+            st->st_mode = 020000 | 0620; /* S_IFCHR */
+            st->st_rdev = (136ul << 8) | (number == QUARK_ERR ? 0 : number);
+            break;
+        }
+        case QUARK_FD_KIND_PTY_MASTER:
+            st->st_mode = 020000 | 0666;
+            st->st_rdev = (5ul << 8) | 2; /* /dev/ptmx */
+            break;
+        case QUARK_FD_KIND_MEMORY:
+            st->st_mode = 0100000 | 0777; /* S_IFREG, as a memfd is */
+            break;
+        case QUARK_FD_KIND_TIMER:
+        case QUARK_FD_KIND_EVENT:
+        case QUARK_FD_KIND_POLLSET:
+            st->st_mode = 0600; /* no type at all, which is what Linux says */
+            break;
+        default:
+            /* An endpoint — a service on the other end of a descriptor, which
+               is what standard input is on a console that is no terminal. */
+            st->st_mode = 020000 | 0666;
+            break;
+        }
         return 0;
     }
     /* Asked, not remembered: another descriptor, or another program, may
@@ -902,9 +938,48 @@ long __quark_read(long fd, void *buf, unsigned long n) {
             return -LX_EAGAIN;
         }
     } else {
-        r = __syscall3(SYS_FD_READ, (unsigned long)fd, (unsigned long)buf, n);
+        for (;;) {
+            r = __syscall3(SYS_FD_READ, (unsigned long)fd, (unsigned long)buf, n);
+            if (r != QUARK_INTERRUPTED) {
+                break;
+            }
+            /* A read of a terminal that a signal ended. If a handler ran and
+               did not ask for the read to go on, the read is over. */
+            if (__quark_sig_interrupted()) {
+                return -LX_EINTR;
+            }
+        }
     }
     return r == QUARK_ERR ? -LX_EBADF : (long)r;
+}
+
+/* Why a write to one of the kernel's descriptors failed. The kernel says
+   only that it did; what the descriptor is, and whether anybody is left at
+   the other end of it, says the rest. */
+static long write_failed(long fd) {
+    unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+    if (k == QUARK_ERR) {
+        return -LX_EBADF;
+    }
+    switch (QUARK_FD_KIND(k)) {
+    case QUARK_FD_KIND_PIPE_WRITE:
+    case QUARK_FD_KIND_STREAM:
+        if (k & QUARK_FD_GONE) {
+            /* Nobody will read it. By default that is the end of this
+               program, quietly, which is how `yes | head` ends. */
+            __quark_sig_pipe();
+            return -LX_EPIPE;
+        }
+        return -LX_EIO;
+    case QUARK_FD_KIND_PTY_MASTER:
+    case QUARK_FD_KIND_PTY_SLAVE:
+    case QUARK_FD_KIND_ENDPOINT:
+    case QUARK_FD_KIND_SOCKET:
+        return -LX_EIO;
+    default:
+        /* Open, and not a thing that is written to. */
+        return -LX_EBADF;
+    }
 }
 
 long __quark_write(long fd, const void *buf, unsigned long n) {
@@ -924,7 +999,7 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
     } else {
         r = __syscall3(SYS_FD_WRITE, (unsigned long)fd, (unsigned long)buf, n);
     }
-    return r == QUARK_ERR ? -LX_EBADF : (long)r;
+    return r == QUARK_ERR ? write_failed(fd) : (long)r;
 }
 
 /* chmod, chown and the times, by path or by descriptor: one request, which

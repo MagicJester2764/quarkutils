@@ -41,6 +41,34 @@
 #define LX_EFBIG    27
 #define LX_EPIPE    32
 
+/* Signals, in signal.c. What rt_sigaction carries on x86-64 is the kernel's
+   own layout, not the C library's `struct sigaction`. */
+struct lx_ksigaction {
+    unsigned long handler;
+    unsigned long flags;
+    unsigned long restorer;
+    unsigned long mask;
+};
+long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksigaction *old,
+                       unsigned long size);
+long __quark_sigprocmask(long how, const unsigned long *set, unsigned long *old,
+                         unsigned long size);
+long __quark_sigpending(unsigned long *set, unsigned long size);
+long __quark_sigsuspend(const unsigned long *mask, unsigned long size);
+long __quark_sigtimedwait(const unsigned long *set, void *info, const long *timeout,
+                          unsigned long size);
+long __quark_kill(long pid, long sig);
+long __quark_tkill(long tid, long sig);
+/* Is there a handler to run on the way out of a call, and run them. */
+int __quark_sig_due(void);
+int __quark_sig_deliver(void);
+/* A wait the kernel ended for a signal: 1 to say EINTR, 0 to wait again. */
+int __quark_sig_interrupted(void);
+unsigned long __quark_sig_swap_mask(unsigned long mask);
+void __quark_sig_forked(void);
+/* A write nobody will read: SIGPIPE, which by default is the end. */
+void __quark_sig_pipe(void);
+
 /* "From the working directory", where an *at call takes a descriptor. */
 #define LX_AT_FDCWD (-100)
 #define LX_AT_SYMLINK_FOLLOW 0x400

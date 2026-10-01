@@ -44,10 +44,10 @@ struct cmsghdr {
 #define SOL_SOCKET  1
 #define SCM_RIGHTS  1
 
-/* The only message flags that change what a call does here. MSG_NOSIGNAL is
- * ignored on purpose: there are no signals, so a broken stream is already an
- * error return rather than a death. */
+/* The message flags that change what a call does here: do not wait, and do
+ * not raise SIGPIPE at a stream nobody is reading. */
 #define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
 
 
 #define AF_UNIX      1
@@ -221,7 +221,22 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
         unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd,
                                      (unsigned long)v->iov_base, v->iov_len, attach, fl);
         if (w == QUARK_ERR) {
-            return total ? total : -LX_EIO;
+            if (total) {
+                return total;
+            }
+            /* Nobody at the other end is a broken pipe, and a signal unless
+               the call asked for none. */
+            unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+            if (k == QUARK_ERR) {
+                return -LX_EBADF;
+            }
+            if (k & QUARK_FD_GONE) {
+                if (!(flags & MSG_NOSIGNAL)) {
+                    __quark_sig_pipe();
+                }
+                return -LX_EPIPE;
+            }
+            return -LX_EIO;
         }
         if (w == QUARK_WOULD_BLOCK) {
             return total ? total : -LX_EAGAIN;
@@ -350,7 +365,24 @@ long __quark_poll(void *fds, long nfds, long timeout_ms) {
         ticks = ((unsigned long)timeout_ms + 9) / 10;
     }
 
-    unsigned long n = __syscall3(SYS_POLL, (unsigned long)q, (unsigned long)nfds, ticks);
+    unsigned long deadline = __syscall0(SYS_TICKS) + ticks;
+    unsigned long n;
+    for (;;) {
+        n = __syscall3(SYS_POLL, (unsigned long)q, (unsigned long)nfds, ticks);
+        if (n != QUARK_INTERRUPTED) {
+            break;
+        }
+        /* A signal ended the wait. A handler that ran makes that the answer;
+           one that asked for the call to go on, or a signal that is blocked,
+           leaves what is left of the wait to do. */
+        if (__quark_sig_interrupted()) {
+            return -LX_EINTR;
+        }
+        if (timeout_ms >= 0) {
+            unsigned long now = __syscall0(SYS_TICKS);
+            ticks = now < deadline ? deadline - now : 0;
+        }
+    }
     if (n == QUARK_ERR) {
         return -LX_EINVAL;
     }
@@ -445,8 +477,22 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms
         ticks = ((unsigned long)timeout_ms + 9) / 10;
     }
 
-    unsigned long n = __syscall4(SYS_POLLSET_WAIT, (unsigned long)epfd,
-                                 (unsigned long)ready, (unsigned long)maxevents, ticks);
+    unsigned long deadline = __syscall0(SYS_TICKS) + ticks;
+    unsigned long n;
+    for (;;) {
+        n = __syscall4(SYS_POLLSET_WAIT, (unsigned long)epfd, (unsigned long)ready,
+                       (unsigned long)maxevents, ticks);
+        if (n != QUARK_INTERRUPTED) {
+            break;
+        }
+        if (__quark_sig_interrupted()) {
+            return -LX_EINTR;
+        }
+        if (timeout_ms >= 0) {
+            unsigned long now = __syscall0(SYS_TICKS);
+            ticks = now < deadline ? deadline - now : 0;
+        }
+    }
     if (n == QUARK_ERR) {
         return -LX_EINVAL;
     }

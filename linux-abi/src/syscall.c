@@ -91,6 +91,18 @@ typedef unsigned long size_t;
 #define LX_brk              12
 #define LX_rt_sigaction     13
 #define LX_rt_sigprocmask   14
+#define LX_rt_sigreturn     15
+#define LX_pause            34
+#define LX_getitimer        36
+#define LX_alarm            37
+#define LX_setitimer        38
+#define LX_kill             62
+#define LX_rt_sigpending   127
+#define LX_rt_sigtimedwait 128
+#define LX_rt_sigsuspend   130
+#define LX_tkill           200
+#define LX_tgkill          234
+#define LX_epoll_pwait     281
 #define LX_ioctl            16
 #define LX_readv            19
 #define LX_writev           20
@@ -356,7 +368,8 @@ struct lx_timespec {
    the clock reads `req`. Time here is a 100 Hz tick, so a sleep is rounded
    up to whole ticks and one more, never ending early. It waits by receiving
    from itself, which nobody sends to. */
-static long do_sleep(long clock, long flags, const struct lx_timespec *req) {
+static long do_sleep(long clock, long flags, const struct lx_timespec *req,
+                     struct lx_timespec *rem) {
     if (!req) {
         return -LX_EFAULT;
     }
@@ -387,7 +400,19 @@ static long do_sleep(long clock, long flags, const struct lx_timespec *req) {
     unsigned long self = __syscall0(SYS_GETPID);
     while ((now = __syscall0(SYS_TICKS)) < deadline) {
         struct quark_msg m;
-        __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, deadline - now);
+        unsigned long r = __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, deadline - now);
+        /* A signal ended the sleep. If a handler ran and did not ask for the
+           call to go on, that is the sleep over, with what was left of it
+           said; otherwise there is the rest of it still to do. */
+        if (r == QUARK_SLEEP_INTERRUPTED && __quark_sig_interrupted()) {
+            if (rem && !(flags & LX_TIMER_ABSTIME)) {
+                now = __syscall0(SYS_TICKS);
+                unsigned long left = now < deadline ? deadline - now : 0;
+                rem->tv_sec = (long)(left / 100);
+                rem->tv_nsec = (long)(left % 100) * 10000000L;
+            }
+            return -LX_EINTR;
+        }
     }
     return 0;
 }
@@ -559,9 +584,37 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
     return count;
 }
 
+/* Wait under another signal mask, as ppoll and pselect do: the mask goes in,
+   whatever it lets through that was already waiting runs — and is an
+   interruption, with no wait at all — and the mask comes back out. */
+#define WAIT_UNDER(maskp, wait)                                          \
+    do {                                                                 \
+        const unsigned long *under_ = (maskp);                           \
+        if (!under_) {                                                   \
+            return (wait);                                               \
+        }                                                                \
+        unsigned long saved_ = __quark_sig_swap_mask(*under_);           \
+        long r_ = __quark_sig_deliver() ? -LX_EINTR : (wait);            \
+        __quark_sig_swap_mask(saved_);                                   \
+        return r_;                                                       \
+    } while (0)
+
+static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a6);
+
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
+/* Every call musl makes arrives here. A handler runs on the way out of one:
+   the kernel has said a signal is waiting, or the call just made let one
+   through — `sigprocmask`, `kill` at itself. */
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long r = dispatch(n, a1, a2, a3, a4, a5, a6);
+    if (__quark_sig_due()) {
+        __quark_sig_deliver();
+    }
+    return r;
+}
+
+static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     (void)a4; (void)a5; (void)a6;
 
     switch (n) {
@@ -778,6 +831,9 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_fork:
     case LX_vfork: {
         unsigned long child = __syscall0(SYS_FORK);
+        if (child == 0) {
+            __quark_sig_forked();
+        }
         return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
     }
     case LX_clone: {
@@ -786,6 +842,9 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
             return -LX_ENOSYS;
         }
         unsigned long child = __syscall0(SYS_FORK);
+        if (child == 0) {
+            __quark_sig_forked();
+        }
         return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
     }
 
@@ -870,9 +929,13 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     }
 
     case LX_nanosleep:
-        return do_sleep(LX_CLOCK_MONOTONIC, 0, (const struct lx_timespec *)a1);
-    case LX_clock_nanosleep:
-        return do_sleep(a1, a2, (const struct lx_timespec *)a3);
+        return do_sleep(LX_CLOCK_MONOTONIC, 0, (const struct lx_timespec *)a1,
+                        (struct lx_timespec *)a2);
+    case LX_clock_nanosleep: {
+        /* This one returns its error rather than setting errno. */
+        long r = do_sleep(a1, a2, (const struct lx_timespec *)a3, (struct lx_timespec *)a4);
+        return r < 0 ? -r : r;
+    }
 
     /* Refused deliberately, and each for a reason worth stating rather than
        leaving as an unexplained failure later:
@@ -881,9 +944,6 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
                 not a device with ioctls. ENOTTY is the true answer, and it is
                 also the one that makes isatty() say "no" and stdio pick block
                 buffering, which is what we want.
-       signals — Quark has three, delivered to a task rather than to a handler
-                a program installs. Accepting a sigaction would be promising
-                something that cannot happen.
        rseq, robust lists, prlimit — no equivalent, and musl copes with
                 being refused all three. */
     case LX_ioctl:
@@ -955,9 +1015,38 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
            signal, and there are no signals. Answering with the caller's own id
            is what a successful `setsid` looks like. */
         return (long)__syscall0(SYS_GETPID);
+    /* Signals: signal.c. */
     case LX_rt_sigaction:
+        return __quark_sigaction(a1, (const struct lx_ksigaction *)a2,
+                                 (struct lx_ksigaction *)a3, (unsigned long)a4);
     case LX_rt_sigprocmask:
-        return 0; /* accepted and ignored: musl masks signals during startup */
+        return __quark_sigprocmask(a1, (const unsigned long *)a2, (unsigned long *)a3,
+                                   (unsigned long)a4);
+    case LX_rt_sigpending:
+        return __quark_sigpending((unsigned long *)a1, (unsigned long)a2);
+    case LX_rt_sigsuspend:
+        return __quark_sigsuspend((const unsigned long *)a1, (unsigned long)a2);
+    case LX_pause:
+        return __quark_sigsuspend(NULL, 8);
+    case LX_rt_sigtimedwait:
+        return __quark_sigtimedwait((const unsigned long *)a1, (void *)a2, (const long *)a3,
+                                    (unsigned long)a4);
+    case LX_kill:
+        return __quark_kill(a1, a2);
+    case LX_tkill:
+        return __quark_tkill(a1, a2);
+    case LX_tgkill:
+        return __quark_tkill(a2, a3);
+    case LX_rt_sigreturn:
+        /* Returning from a handler is returning from a function here. */
+        return 0;
+    /* Nothing raises a signal at a time: there is no SIGALRM to send. Said
+       plainly, so that a program which sets a timeout finds out it has not
+       got one rather than waiting for it. */
+    case LX_alarm:
+    case LX_setitimer:
+    case LX_getitimer:
+        return -LX_ENOSYS;
     case LX_set_robust_list:
     case LX_rseq:
         return -LX_ENOSYS;
@@ -1002,8 +1091,11 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
     }
     case LX_pselect6: {
         const long *ts = (const long *)a5;
-        return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4,
-                         ts ? ts[0] * 1000 + ts[1] / 1000000 : -1);
+        long ms = ts ? ts[0] * 1000 + ts[1] / 1000000 : -1;
+        /* The sixth argument is a pointer to a mask and its size. */
+        const unsigned long *const *sixth = (const unsigned long *const *)a6;
+        WAIT_UNDER(sixth ? sixth[0] : NULL,
+                   do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4, ms));
     }
 
     /* The kernel's generator never blocks, so GRND_NONBLOCK, GRND_RANDOM
@@ -1288,15 +1380,14 @@ long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_recvmsg(a1, (void *)a2, a3);
     case LX_poll:
         return __quark_poll((void *)a1, a2, a3);
-    case LX_ppoll:
-        /* The signal mask is the only difference and there are no handlers
-           here, so the timeout is the whole of it: a timespec rather than
-           milliseconds. */
-        if (a3) {
-            const long *ts = (const long *)a3;
-            return __quark_poll((void *)a1, a2, ts[0] * 1000 + ts[1] / 1000000);
-        }
-        return __quark_poll((void *)a1, a2, -1);
+    case LX_ppoll: {
+        /* A timespec rather than milliseconds, and a mask to wait under. */
+        const long *ts = (const long *)a3;
+        long ms = ts ? ts[0] * 1000 + ts[1] / 1000000 : -1;
+        WAIT_UNDER((const unsigned long *)a4, __quark_poll((void *)a1, a2, ms));
+    }
+    case LX_epoll_pwait:
+        WAIT_UNDER((const unsigned long *)a5, __quark_epoll_wait(a1, (void *)a2, a3, a4));
     case LX_epoll_create1:
         return __quark_epoll_create();
     case LX_epoll_ctl:

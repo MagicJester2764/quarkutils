@@ -303,6 +303,21 @@ here, ahead of the VFS: `/dev/ptmx` and `/dev/pts/N` in `linux-abi/src/pty.c`,
 the way a Linux kernel catches them ahead of its filesystems. musl's `openpty`
 and `forkpty` run unpatched on top.
 
+**Signals are the program's to run.** The kernel ends a program that has said
+nothing about a signal and tells one that has a handler; it calls no handler
+itself. `linux-abi/src/signal.c` does: on the way out of every system call
+the layer makes for musl, and when a read of a terminal, a poll or a sleep
+comes back saying a signal ended it (`QUARK_INTERRUPTED`), it takes what is
+waiting and calls the handlers as functions — which is when that wait fails
+with `EINTR`, unless the handler asked for it to go on. Three rules follow.
+A wait added to the layer that the kernel can end has to handle that answer,
+or it returns a count of four thousand million. A default action is the
+kernel's to carry out — the layer asks it to (`SYS_SIG_RAISE` at itself),
+because a program cannot exit with a signal's status by asking to. And a
+program that holds a session's terminal without being what the session runs
+says what it does about signal 2: `getty` and `login` ignore it, and `qsh`
+handles it so that Ctrl-C at its prompt is a fresh prompt.
+
 **A session runs on a terminal when the distribution says so.** `init` reads
 `/etc/init.conf`, and `session <path>` there names what it starts once the
 filesystem is up. With no such file that is `login`, on the console as it
@@ -575,13 +590,20 @@ The rules that got it there, and that a further port should follow:
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and
   no focus stealing prevention.
-- There are **no POSIX signals**. The kernel has three of its own — interrupt,
-  terminate and kill — and they are what Ctrl-C at the text console (`input`
-  sends interrupt to the foreground task), `qsh`'s `kill` and `shutdown` use.
-  A C program gets none of it: `sigaction` is accepted and remembered by
-  nobody, `setsid` answers with the caller's own id, and `TIOCSCTTY` is
-  accepted. On a terminal, Ctrl-C is taken out of what is typed and shown as
-  `^C`, and the program is not told.
+- **A handler runs at a system-call boundary and nowhere else.** A C program
+  has `sigaction`, a mask, `kill`, `EINTR` and SIGPIPE (`linux-abi/src/
+  signal.c`), and one that handles a signal and then computes without a call
+  is not interrupted by it. There are no process groups or sessions (`setsid`
+  answers with the caller's own id, `TIOCSCTTY` is accepted, and a shell runs
+  with job control off), nothing is raised when a child ends or a terminal
+  changes size, and there is no `alarm` or `setitimer` — both are refused, so
+  a program that sets a timeout finds out it has not got one. A signal that is
+  blocked and has no handler is not held back. The mask is the program's
+  rather than a thread's, and is not kept across an exec.
+- The **plain console has its own Ctrl-C**, older than signals: `input` sends
+  the foreground task one of the kernel's three task signals (`SYS_SIGNAL`),
+  which `qsh`'s `kill` and `shutdown` use too. On a terminal it is signal 2,
+  from the line discipline.
 - A program started by `fork` and `exec` **holds what its parent held**: the
   kernel copies capabilities at a fork and keeps them across an exec, and
   nothing narrows them to what the new program's manifest asks for, as a
