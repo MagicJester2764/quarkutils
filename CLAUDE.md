@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 504 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 565 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -743,6 +743,85 @@ The rules that got it there, and that a further port should follow:
   memory twice while it starts. QEMU gets a gigabyte and the root filesystem is
   128 MiB.
 
+## Mounts
+
+**A mount is a server.** `mount /dev/disk0p2 /mnt` starts a second file
+server — `vfs disk0 2 mount`, the same program — and hands it to the server
+`/mnt` is in, which stands between it and everybody else from then on
+(`vfs/src/mounts.rs`). A path that walks into the directory goes on in the
+other server; a file opened there is a handle here that names a handle
+there, and reading it is asking the other server to read. Nothing outside
+the file servers knows: a client calls the server it always called, a
+descriptor is the root server's, and a program built before any of this
+reads a file on a mounted disk. `docs/vfs.md` has the requests.
+
+- **The root is nobody's to adopt.** A mounted filesystem's server believes
+  the server above about whose request it is passing on (`TAG_IDENTITY`),
+  and ends when that server does. Only a server started to be mounted
+  accepts `TAG_ADOPT`. The first version let anybody say it to the root:
+  any program could then speak as user 0, and the root's file server ended
+  when that program did. `qfuzz` sends all of them, and `dtest mounts`
+  checks the refusal.
+- **A mounted filesystem's server has no name.** It is not registered, so
+  nobody can look it up and call it: the capability for it goes from the
+  program that started it to the server it is mounted in, with the request
+  (`SYS_CALL_WITH` lends the path and offers the capability at once), and
+  that is the only copy given out. Permissions there are checked against
+  what the server above says, so a second way in would be a way round them.
+- **A request is taken before its handler if it crosses** — and there are
+  two places, because a descriptor's read is turned into a positioned one
+  before it is dispatched: `mounts::intercept` in the loop, for requests
+  that name a path and for what servers say to each other, and
+  `mounts::serve` in `dispatch`, for reads, writes, `STAT`, listings and
+  `TRUNCATE` on a handle that stands for another server's. A new request is
+  one more thing to place: if it names a path it goes in `crossing`, and if
+  it names a handle, something has to say what it means for a `Remote`.
+- **Handlers never see a path that leaves.** `ext2_dir::resolve` stops at a
+  directory something is mounted on and says `ERR_ELSEWHERE`; `locate` asks
+  it first, with the handler's own idea of whether the last component is
+  followed, and a handler runs only for a path that stays. That code is
+  never sent to a client. With nothing mounted none of it runs.
+- **A handle here closes its handle there**, through the same `gone` that
+  lets a disk's claim go — including the handle that was never made.
+- **A server that stops answering has gone.** Every request passed on has a
+  deadline of a minute, and a server that misses it, or cannot be called, is
+  marked dead: everything through that mount is an error until `umount`
+  takes the entry away. A lent buffer of no length is not lent — the kernel
+  refuses one, and a call that could not be made is not a dead server.
+- **What is offered as a server is asked whether it is one**, with a third
+  of a second to say so. A task that is not a file server would not answer
+  at all, and the file server would wait with everybody waiting on it.
+- **An id is folded as it comes up**: the mounts a file is under are written
+  above the fortieth bit, four bits to a mount. `STAT`, `OPEN`'s reply and
+  directory entries all do it, or `d_ino` and `st_ino` disagree.
+- **`/etc/mtab` is a file.** `mount`, `umount` and `init` (at boot) write
+  it from what the file server says is mounted, for the programs written
+  for Unix that look there: `mke2fs` refuses a mounted disk by reading it,
+  and complains when it is missing.
+
+At the edge of a mount two things are not as one kernel holding every
+filesystem would have them, and both are in `docs/vfs.md`: `..` at a
+mounted filesystem's root leads out only where the server above can see it
+coming, and an absolute symbolic link inside a mount is followed from the
+mount's root. A file there cannot be mapped, and a named pipe there cannot
+be opened.
+
+**Nothing has run as another user through a mount.** Every test is root,
+because nothing here can start a program as anybody else without `login`.
+The path that carries a caller's identity down is read, and short; it has
+not been run with an identity that would be refused. That is owed when
+there are users to test with.
+
+FAT32, which had only ever been a root nobody wrote much to, is what an EFI
+system partition is, so it had to be right enough to mount one and have
+`fsck.fat` find nothing: a file with nothing in it has no cluster (one with
+a cluster and no length is an error to a checker), the count of free
+clusters the filesystem keeps is brought up to date after every request
+that changes it, the search for a free cluster starts where the last one
+ended and stops at the last cluster the volume has rather than the last
+the table has room for, and a file can be shortened, written over and
+removed.
+
 ## Known gaps
 
 - Servers still know their clients by TID (`Message.sender`). The kernel will
@@ -794,10 +873,10 @@ The rules that got it there, and that a further port should follow:
   Toolkits do call `resize`, so this is a real gap rather than a preference.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
   where Linux makes the target, and `linkat` cannot name its source by
-  descriptor (`AT_EMPTY_PATH`). FAT32 has no links, and no directory handles
-  to start a relative path from.
-- A FAT32 root cannot remove, rename or shorten anything, and ext4 refuses to
-  shorten a file whose extent tree has grown past the inode.
+  descriptor (`AT_EMPTY_PATH`). FAT32 has no links.
+- FAT32 cannot rename anything or make a file longer except by writing to
+  it, and ext4 refuses to shorten a file whose extent tree has grown past
+  the inode.
 - A mapped file's pages stay cached until nothing maps the file any more, and
   the VFS pages 30 objects at once. A private writable mapping copies a page
   when it is first touched, read or write.

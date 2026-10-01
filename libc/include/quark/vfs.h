@@ -113,12 +113,16 @@
 #define QUARK_VFS_TOO_MANY_LINKS 18
 #define QUARK_VFS_NO_PEER       19 /* a named pipe opened to write, unread, by one who will not wait */
 #define QUARK_VFS_BUSY          20 /* a disk somebody else is using, or the one this runs from */
+#define QUARK_VFS_CROSS_DEVICE  21 /* two names in two filesystems, asked for as one file */
 
 /* The server's devices have ids from here up, in the order null, zero, full,
    random, urandom. */
 #define QUARK_VFS_DEVICE_ID 0xFFFFFF00ul
 /* And its disks begin here, thirty-two to a driver. */
 #define QUARK_VFS_BLOCK_ID  0xFFFFFD00ul
+/* A file's id is its number in its own filesystem in the low forty bits,
+   and above them which mounted filesystem that is: 0 for the root. */
+#define QUARK_VFS_ID_MASK   0xFFFFFFFFFFul
 
 /* A path is lent with the call that names it. One longer than this is
    refused, never shortened. */
@@ -235,6 +239,9 @@ struct quark_vfs_statfs {
     unsigned long namemax;
 };
 int quark_vfs_statfs(struct quark_vfs_statfs *out);
+/* The same of the filesystem an open file is in, which may be a mounted
+   one. */
+int quark_vfs_statfs_of(unsigned long handle, struct quark_vfs_statfs *out);
 /* A read or write carries at most QUARK_VFS_MAX_IO bytes, which the VFS is
    lent for the call: it fills `buf` or copies out of it, and never maps it. */
 #define QUARK_VFS_MAX_IO 4096UL

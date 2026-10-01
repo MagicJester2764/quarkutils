@@ -49,6 +49,9 @@ pub enum FsFileData {
     Device(crate::devices::Device),
     /// A disk, or a partition of one, open as a file under `/dev`.
     Disk(crate::devices::Disk),
+    /// Something in a filesystem mounted in this one: the handle its server
+    /// gave for it.
+    Remote(crate::mounts::Remote),
     /// `/dev` itself.
     DevDir,
     None,
@@ -155,7 +158,11 @@ fn room_for(file: &OpenFile) -> Option<usize> {
         if owner == 0 {
             return None;
         }
-        if t.iter().filter(|f| f.in_use && !f.by_fd && f.owner == owner).count() >= MAX_PER_PROGRAM {
+        // The server above holds every handle anybody has here, and is not
+        // one program taking more than its share.
+        if !crate::mounts::is_parent(owner)
+            && t.iter().filter(|f| f.in_use && !f.by_fd && f.owner == owner).count() >= MAX_PER_PROGRAM
+        {
             return None;
         }
     }
@@ -195,9 +202,30 @@ pub fn release(handle: usize) -> Option<u32> {
 /// the last such handle has gone, and every way a handle goes comes through
 /// here — a volume left claimed is a disk nobody can format.
 fn gone(f: &OpenFile) {
-    if let FsFileData::Disk(disk) = &f.fs {
-        crate::devices::closed(disk);
+    match &f.fs {
+        FsFileData::Disk(disk) => crate::devices::closed(disk),
+        // The other server's handle goes with this one.
+        FsFileData::Remote(remote) => crate::mounts::closed(remote),
+        _ => {}
     }
+}
+
+/// Whether any handle is open on the FAT32 file called `name` in the
+/// directory at `dir`.
+pub fn fat_is_open(dir: u32, name: &[u8; 11]) -> bool {
+    table().iter().any(|f| {
+        f.in_use && matches!(&f.fs, FsFileData::Fat32 { dir_cluster, fat_name, .. } if *dir_cluster == dir && fat_name == name)
+    })
+}
+
+/// Whether any handle is in use.
+pub fn any() -> bool {
+    table().iter().any(|f| f.in_use)
+}
+
+/// Whether any handle names something in mount `mount`.
+pub fn any_in_mount(mount: usize) -> bool {
+    table().iter().any(|f| f.in_use && matches!(&f.fs, FsFileData::Remote(r) if r.mount as usize == mount))
 }
 
 /// Close program `space`'s handle `handle`. Returns the inode it named (0 for
@@ -249,6 +277,11 @@ pub fn lock_key(file: &OpenFile) -> Option<u32> {
         }
         FsFileData::Device(dev) => Some(crate::devices::id_of(*dev) as u32),
         FsFileData::Disk(disk) => Some(crate::devices::id_of(disk.dev) as u32),
+        // In a half of the numbers no inode here has: the mount, and as much
+        // of the file's number there as fits.
+        FsFileData::Remote(r) => {
+            Some(0x4000_0000 | (r.mount as u32 & 0xF) << 26 | (r.id as u32 & 0x03FF_FFFF))
+        }
         FsFileData::DevDir => Some(crate::devices::DIR_ID as u32),
         FsFileData::None => None,
     }

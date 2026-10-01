@@ -3014,6 +3014,432 @@ fn test_disk_files() {
     let _ = wait_for(server);
 }
 
+/// Run a program in `/usr/bin` with `args` and say how it ended. `None` if
+/// it is not there.
+fn run(name: &[u8], args: &[&[u8]]) -> Option<i32> {
+    let mut lower = [0u8; 40];
+    let mut upper = [0u8; 44];
+    let at = b"/usr/bin/".len();
+    lower[..at].copy_from_slice(b"/usr/bin/");
+    lower[at..at + name.len()].copy_from_slice(name);
+    upper[..at + name.len()].copy_from_slice(&lower[..at + name.len()]);
+    upper[at..at + name.len()].make_ascii_uppercase();
+    upper[at + name.len()..at + name.len() + 4].copy_from_slice(b".ELF");
+    let mut argv: [&[u8]; 8] = [name; 8];
+    argv[1..1 + args.len()].copy_from_slice(args);
+    let child = load_program(&lower[..at + name.len()], &upper[..at + name.len() + 4], &argv[..1 + args.len()])?;
+    let tid = child.tid;
+    child.start().ok()?;
+    wait_for(tid)
+}
+
+/// The whole of a file, by path; how much of it there was.
+fn slurp(vfs_tid: usize, path: &[u8], into: &mut [u8]) -> Result<usize, u64> {
+    let (handle, _, _) = vfs::open(vfs_tid, path)?;
+    let mut got = 0;
+    let result = loop {
+        match vfs::read(vfs_tid, handle, &mut into[got..], got as u32) {
+            Ok(0) => break Ok(got),
+            Ok(n) => got += n as usize,
+            Err(code) => break Err(code),
+        }
+        if got == into.len() {
+            break Ok(got);
+        }
+    };
+    let _ = vfs::close(vfs_tid, handle);
+    result
+}
+
+/// Make a file hold exactly `bytes`.
+fn spill(vfs_tid: usize, path: &[u8], bytes: &[u8]) -> Result<(), u64> {
+    let handle = vfs::open_with(vfs_tid, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE)?.handle;
+    let mut at = 0;
+    let result = loop {
+        if at == bytes.len() {
+            break Ok(());
+        }
+        match vfs::write(vfs_tid, handle, &bytes[at..], at as u32) {
+            Ok(n) if n > 0 => at += n as usize,
+            Ok(_) => break Err(vfs::ERR_IO),
+            Err(code) => break Err(code),
+        }
+    };
+    let _ = vfs::close(vfs_tid, handle);
+    result
+}
+
+/// A filesystem mounted in another: a server of its own, reached through the
+/// one its directory is in.
+fn test_mounts() {
+    use quark_rt::block;
+    use quark_rt::ipc::Message;
+    println!("mounts:");
+    let Some(vfs_tid) = nameserver::lookup(b"vfs") else {
+        check("find the file server", false);
+        return;
+    };
+    // What a mounted filesystem's server takes from the server above it —
+    // "you are mine", "this is for user 0", "stop" — the root takes from
+    // nobody. A server that believed the first would believe the second from
+    // any program that said it, and end when that program did.
+    let refused = |tag: u64| {
+        let mut reply = Message::empty();
+        let said = Message { sender: 0, tag, data: [0; 6] };
+        syscall::sys_call(vfs_tid, &said, &mut reply).is_ok() && reply.tag == u64::MAX
+    };
+    check(
+        "the root's file server is nobody's to adopt, to speak through or to stop",
+        refused(31) && refused(32) && refused(33),
+    );
+    check(
+        "and it is still there",
+        vfs::open(vfs_tid, b"/etc/passwd").is_ok_and(|(h, _, _)| vfs::close(vfs_tid, h).is_ok()),
+    );
+    // The programs that make filesystems are a distribution's to bring.
+    if vfs::open(vfs_tid, b"/usr/bin/mkfs.ext4").map(|(h, _, _)| vfs::close(vfs_tid, h)).is_err() {
+        println!("  (no mkfs.ext4 here; nothing to mount)");
+        return;
+    }
+    // Big enough for a FAT32 filesystem to be one: it wants 65525 clusters.
+    let Some((server, disk, name)) = start_ram_disk(b"64", 64 * 2048) else {
+        check("start a RAM disk", false);
+        return;
+    };
+    let mut dev_text = [0u8; 16];
+    let dev_len = dev_path(&name, 0, &mut dev_text);
+    let dev = &dev_text[..dev_len];
+    let vfs_pid = syscall::sys_pid(vfs_tid).unwrap_or(0);
+    let holder = || block::info(disk, 0).map_or(u64::MAX, |i| i.claimant);
+    let at: &[u8] = b"/tmp/dtest-mnt";
+
+    // Whatever an earlier run left.
+    let _ = run(b"umount", &[at]);
+    let _ = vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/under");
+    let _ = vfs::mkdir(vfs_tid, at);
+    check("a filesystem is made on a disk of memory", run(b"mkfs.ext4", &[b"-q", b"-F", dev]) == Some(0));
+    check("a file is left in the directory it will be mounted on", spill(vfs_tid, b"/tmp/dtest-mnt/under", b"under").is_ok());
+    let root_before = vfs::lstat(vfs_tid, at).map(|s| s.id);
+
+    check("it is mounted there", run(b"mount", &[dev, at]) == Some(0));
+    let server_pid = holder();
+    check(
+        "by a server of its own, which holds the disk",
+        server_pid != 0 && server_pid != u64::MAX && server_pid != vfs_pid,
+    );
+    let mut record = [0u8; 512];
+    let listed = (0..8).find_map(|i| match vfs::mounted(vfs_tid, i, &mut record) {
+        Ok(Some(m)) if vfs::mount_record(&record[..m.len]).1 == at => Some(m),
+        _ => None,
+    });
+    check(
+        "and is listed: what, where, of what kind and served by whom",
+        listed.is_some_and(|m| {
+            vfs::mount_record(&record[..m.len]).0 == dev && m.kind == vfs::KIND_EXT4 && m.pid == server_pid
+        }),
+    );
+    let mut text = [0u8; 256];
+    check(
+        "/etc/mtab says so too, for programs that look there",
+        slurp(vfs_tid, b"/etc/mtab", &mut text).is_ok_and(|n| {
+            text[..n].split(|&b| b == b'\n').any(|line| {
+                let mut words = line.split(|&b| b == b' ');
+                words.next() == Some(dev) && words.next() == Some(at) && words.next() == Some(b"ext4")
+            })
+        }),
+    );
+    check(
+        "what the directory held is out of sight",
+        vfs::open(vfs_tid, b"/tmp/dtest-mnt/under").err() == Some(vfs::ERR_NOT_FOUND),
+    );
+    check(
+        "and the filesystem's own root is in its place",
+        vfs::open(vfs_tid, b"/tmp/dtest-mnt/lost+found").is_ok_and(|(h, _, dir)| dir && vfs::close(vfs_tid, h).is_ok()),
+    );
+    let root_now = vfs::lstat(vfs_tid, at).map(|s| s.id);
+    check(
+        "whose id is not the directory's, nor any file's of the filesystem around it",
+        matches!((root_before, root_now), (Ok(a), Ok(b)) if a != b && b >> 40 != 0 && a >> 40 == 0),
+    );
+
+    // Files.
+    let mut pattern = [0u8; 10000];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i * 31 + 7) as u8;
+    }
+    let mut back = [0u8; 10016];
+    check(
+        "a file is written there, pages of it, and read back",
+        spill(vfs_tid, b"/tmp/dtest-mnt/a", &pattern).is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/a", &mut back) == Ok(10000)
+            && back[..10000] == pattern[..],
+    );
+    let a = vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/a");
+    check("it is as long as what was written, and root's", a.is_ok_and(|s| s.size == 10000 && s.uid == 0));
+    check("a directory is made there", vfs::mkdir(vfs_tid, b"/tmp/dtest-mnt/d").is_ok());
+    check("and a file in it", spill(vfs_tid, b"/tmp/dtest-mnt/d/b", b"in a directory\n").is_ok());
+    let b_id = vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/b").map_or(0, |s| s.id);
+    let mut entries = [vfs::DirEntry::empty(); 8];
+    let listing = vfs::open_with(vfs_tid, b"/tmp/dtest-mnt/d", vfs::OPEN_DIRECTORY).and_then(|o| {
+        let page = vfs::readdir_bulk(vfs_tid, o.handle, 0, &mut entries);
+        let _ = vfs::close(vfs_tid, o.handle);
+        page
+    });
+    check(
+        "the directory lists it, by the id stat gives it",
+        listing.is_ok_and(|p| entries[..p.count].iter().any(|e| e.name_bytes() == b"b" && e.id == b_id && b_id != 0)),
+    );
+    check(
+        "a rename inside the filesystem",
+        vfs::rename(vfs_tid, b"/tmp/dtest-mnt/a", b"/tmp/dtest-mnt/d/a2").is_ok()
+            && vfs::open(vfs_tid, b"/tmp/dtest-mnt/a").err() == Some(vfs::ERR_NOT_FOUND)
+            && vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/a2").is_ok_and(|s| s.size == 10000),
+    );
+    check(
+        "but not out of it: that is two filesystems",
+        vfs::rename(vfs_tid, b"/tmp/dtest-mnt/d/a2", b"/tmp/dtest-out") == Err(vfs::ERR_CROSS_DEVICE)
+            && vfs::rename(vfs_tid, b"/etc/passwd", b"/tmp/dtest-mnt/passwd") == Err(vfs::ERR_CROSS_DEVICE),
+    );
+    check(
+        "nor a second name for a file in one made in the other",
+        vfs::link(vfs_tid, b"/tmp/dtest-mnt/d/a2", b"/tmp/dtest-out") == Err(vfs::ERR_CROSS_DEVICE),
+    );
+    check(
+        "a second name inside it is the same file",
+        vfs::link(vfs_tid, b"/tmp/dtest-mnt/d/a2", b"/tmp/dtest-mnt/a3").is_ok()
+            && vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/a3").is_ok_and(|s| s.links == 2 && Ok(s.id) == vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/a2").map(|t| t.id)),
+    );
+    let mut target = [0u8; 16];
+    check(
+        "a symbolic link there says what it was given",
+        vfs::symlink(vfs_tid, b"d/b", b"/tmp/dtest-mnt/l").is_ok()
+            && vfs::readlink(vfs_tid, b"/tmp/dtest-mnt/l", &mut target) == Ok(3)
+            && &target[..3] == b"d/b",
+    );
+    check(
+        "and is followed there",
+        slurp(vfs_tid, b"/tmp/dtest-mnt/l", &mut text).is_ok_and(|n| &text[..n] == b"in a directory\n"),
+    );
+    check(
+        "a file's mode is changed there",
+        vfs::set_attr(vfs_tid, b"/tmp/dtest-mnt/d/b", vfs::ATTR_MODE, 0o600, 0, 0, 0, 0).is_ok()
+            && vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/b").is_ok_and(|s| s.mode & 0o7777 == 0o600),
+    );
+    let shorter = vfs::open(vfs_tid, b"/tmp/dtest-mnt/a3").and_then(|(h, _, _)| {
+        let cut = vfs::truncate(vfs_tid, h, 100);
+        let size = vfs::stat(vfs_tid, h).map(|(size, _)| size);
+        let _ = vfs::close(vfs_tid, h);
+        cut.and(size)
+    });
+    check("a file there is cut short", shorter == Ok(100));
+    check(
+        "the filesystem says how big it is, and it is not the root",
+        vfs::open(vfs_tid, b"/tmp/dtest-mnt/d").is_ok_and(|(h, _, _)| {
+            let there = vfs::statfs_of(vfs_tid, h);
+            let _ = vfs::close(vfs_tid, h);
+            // Sixty-four megabytes in blocks of a kilobyte.
+            matches!((there, vfs::statfs(vfs_tid)), (Ok(a), Ok(b)) if a.blocks == 64 * 1024 && a.blocks != b.blocks)
+        }),
+    );
+    check(
+        "names go, and the directory after them",
+        vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/a3").is_ok()
+            && vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/l").is_ok()
+            && vfs::rmdir(vfs_tid, b"/tmp/dtest-mnt/d") == Err(vfs::ERR_NOT_EMPTY),
+    );
+    check(
+        "the mount's own directory is not removed, renamed or made again",
+        vfs::rmdir(vfs_tid, at) == Err(vfs::ERR_BUSY)
+            && vfs::rename(vfs_tid, at, b"/tmp/dtest-elsewhere").is_err()
+            && vfs::mkdir(vfs_tid, at) == Err(vfs::ERR_EXISTS),
+    );
+
+    // Being in it.
+    let mut cwd = [0u8; 64];
+    check(
+        "a program moves into a directory there, and is told where it is",
+        vfs::chdir(vfs_tid, b"/tmp/dtest-mnt/d").is_ok()
+            && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == b"/tmp/dtest-mnt/d"),
+    );
+    check(
+        "a path from there is looked up there",
+        slurp(vfs_tid, b"b", &mut text).is_ok_and(|n| &text[..n] == b"in a directory\n")
+            && slurp(vfs_tid, b"../d/b", &mut text).is_ok(),
+    );
+    check(
+        "`..` goes up inside it",
+        vfs::chdir(vfs_tid, b"..").is_ok() && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == at),
+    );
+    check(
+        "and out of it from its root",
+        slurp(vfs_tid, b"../dtest-mnt/d/b", &mut text).is_ok()
+            && vfs::chdir(vfs_tid, b"..").is_ok()
+            && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == b"/tmp"),
+    );
+    check(
+        "as it does written after the mount's name",
+        matches!(
+            (vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/.."), vfs::lstat(vfs_tid, b"/tmp")),
+            (Ok(a), Ok(b)) if a.id == b.id
+        ),
+    );
+    let _ = vfs::chdir(vfs_tid, b"/");
+
+    // In use.
+    let open = vfs::open(vfs_tid, b"/tmp/dtest-mnt/d/b").map(|(h, _, _)| h);
+    check("it is not unmounted with a file in it open", open.is_ok() && run(b"umount", &[at]) == Some(1));
+    if let Ok(h) = open {
+        let _ = vfs::close(vfs_tid, h);
+    }
+    check(
+        "or with a program in it",
+        vfs::chdir(vfs_tid, at).is_ok() && run(b"umount", &[at]) == Some(1) && vfs::chdir(vfs_tid, b"/").is_ok(),
+    );
+    check("it is unmounted when nothing is using it", run(b"umount", &[at]) == Some(0));
+    // Its server ends on its own time.
+    for _ in 0..50 {
+        if holder() == 0 {
+            break;
+        }
+        syscall::sleep_ticks(2);
+    }
+    check("and its server lets the disk go", holder() == 0);
+    check(
+        "the directory is what it was",
+        slurp(vfs_tid, b"/tmp/dtest-mnt/under", &mut text).is_ok_and(|n| &text[..n] == b"under")
+            && vfs::lstat(vfs_tid, at).map(|s| s.id) == root_before,
+    );
+    check("nothing is unmounted twice", run(b"umount", &[at]) == Some(1));
+
+    // What was written is on the disk.
+    check(
+        "mounted again, what was written is there",
+        run(b"mount", &[dev, at]) == Some(0)
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/d/a2", &mut back) == Ok(100)
+            && back[..100] == pattern[..100]
+            && vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/b").is_ok_and(|s| s.mode & 0o7777 == 0o600),
+    );
+    // A filesystem mounted in a mounted filesystem: two servers deep.
+    if let Some((inner_server, _, inner_name)) = start_ram_disk(b"24", 24 * 2048) {
+        let mut inner_text = [0u8; 16];
+        let inner_len = dev_path(&inner_name, 0, &mut inner_text);
+        let inner = &inner_text[..inner_len];
+        let inside: &[u8] = b"/tmp/dtest-mnt/in";
+        check(
+            "a second filesystem is mounted on a directory inside the first",
+            run(b"mkfs.ext2", &[b"-q", b"-F", inner]) == Some(0)
+                && run(b"mount", &[b"--mkdir", inner, inside]) == Some(0),
+        );
+        check(
+            "a file in it is written and read through both servers",
+            spill(vfs_tid, b"/tmp/dtest-mnt/in/deep", &pattern[..6000]).is_ok()
+                && slurp(vfs_tid, b"/tmp/dtest-mnt/in/deep", &mut back) == Ok(6000)
+                && back[..6000] == pattern[..6000],
+        );
+        let deep = vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/in/deep").map(|s| s.id);
+        let shallow = vfs::lstat(vfs_tid, b"/tmp/dtest-mnt/d/b").map(|s| s.id);
+        check(
+            "its id says both mounts it is under",
+            matches!((deep, shallow), (Ok(a), Ok(b)) if a >> 44 != 0 && b >> 44 == 0 && b >> 40 != 0),
+        );
+        check(
+            "a file does not move from the one to the other",
+            vfs::rename(vfs_tid, b"/tmp/dtest-mnt/in/deep", b"/tmp/dtest-mnt/deep") == Err(vfs::ERR_CROSS_DEVICE),
+        );
+        let moved = vfs::chdir(vfs_tid, inside).is_ok()
+            && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == inside)
+            && vfs::chdir(vfs_tid, b"..").is_ok()
+            && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == at);
+        let _ = vfs::chdir(vfs_tid, b"/");
+        check("a program is in it, is told where, and goes up into the first", moved);
+        let mut seen = [0usize; 2];
+        for index in 0..8 {
+            if let Ok(Some(m)) = vfs::mounted(vfs_tid, index, &mut record) {
+                let target = vfs::mount_record(&record[..m.len]).1;
+                if target == at {
+                    seen[0] = index as usize + 1;
+                } else if target == inside {
+                    seen[1] = index as usize + 1;
+                }
+            }
+        }
+        check("both are listed, the one inside after the one it is in", seen[0] != 0 && seen[1] == seen[0] + 1);
+        check("the outer is not unmounted with another inside it", run(b"umount", &[at]) == Some(1));
+        check("the inner is", run(b"umount", &[inside]) == Some(0));
+        let _ = syscall::sys_task_kill(inner_server);
+        let _ = wait_for(inner_server);
+    } else {
+        check("start a second RAM disk", false);
+    }
+    check("a disk with a mounted filesystem is not opened to write", {
+        let busy = vfs::open_with(vfs_tid, dev, vfs::OPEN_WRITE).err() == Some(vfs::ERR_BUSY);
+        busy && run(b"mkfs.ext4", &[b"-q", b"-F", dev]).is_some_and(|code| code != 0)
+    });
+    check("and it is unmounted", run(b"umount", &[at]) == Some(0));
+    check("the filesystem's own checker finds nothing wrong", run(b"e2fsck", &[b"-fn", dev]) == Some(0));
+
+    // FAT, as an EFI system partition is.
+    check("a FAT filesystem is made and mounted", {
+        run(b"mkfs.fat", &[b"-F", b"32", dev]) == Some(0) && run(b"mount", &[dev, at]) == Some(0)
+    });
+    check(
+        "a directory and a file are made in it and read back",
+        vfs::mkdir(vfs_tid, b"/tmp/dtest-mnt/EFI").is_ok()
+            && spill(vfs_tid, b"/tmp/dtest-mnt/EFI/BOOT.BIN", &pattern[..5000]).is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/EFI/BOOT.BIN", &mut back) == Ok(5000)
+            && back[..5000] == pattern[..5000],
+    );
+    let inside = vfs::chdir(vfs_tid, b"/tmp/dtest-mnt/EFI").is_ok()
+        && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == b"/tmp/dtest-mnt/EFI")
+        && slurp(vfs_tid, b"BOOT.BIN", &mut back) == Ok(5000);
+    let _ = vfs::chdir(vfs_tid, b"/");
+    check("a program in a directory of it reads by a name from there", inside);
+    check(
+        "a file is written over, shorter, and is then that short",
+        spill(vfs_tid, b"/tmp/dtest-mnt/EFI/BOOT.BIN", &pattern[..700]).is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/EFI/BOOT.BIN", &mut back) == Ok(700)
+            && back[..700] == pattern[..700],
+    );
+    check(
+        "an empty file is made, and a name is removed",
+        spill(vfs_tid, b"/tmp/dtest-mnt/EMPTY", b"").is_ok()
+            && spill(vfs_tid, b"/tmp/dtest-mnt/GONE.TXT", &pattern[..3000]).is_ok()
+            && vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/GONE.TXT").is_ok()
+            && vfs::open(vfs_tid, b"/tmp/dtest-mnt/GONE.TXT").err() == Some(vfs::ERR_NOT_FOUND)
+            && vfs::rmdir(vfs_tid, b"/tmp/dtest-mnt/EFI") == Err(vfs::ERR_NOT_EMPTY),
+    );
+    check("it is unmounted", run(b"umount", &[at]) == Some(0));
+    check("and its checker finds nothing wrong", run(b"fsck.fat", &[b"-n", dev]) == Some(0));
+
+    // A server that goes.
+    check("a filesystem is mounted", {
+        run(b"mkfs.ext2", &[b"-q", b"-F", dev]) == Some(0) && run(b"mount", &[dev, at]) == Some(0)
+    });
+    let doomed = holder();
+    check("its server is ended", syscall::sys_sig_raise_pid(doomed, syscall::SIGKILL).is_ok());
+    for _ in 0..50 {
+        if holder() == 0 {
+            break;
+        }
+        syscall::sleep_ticks(2);
+    }
+    check(
+        "and what was mounted cannot be reached, though the root can",
+        vfs::open(vfs_tid, b"/tmp/dtest-mnt/lost+found").err() == Some(vfs::ERR_IO)
+            && vfs::open(vfs_tid, b"/etc/passwd").is_ok_and(|(h, _, _)| vfs::close(vfs_tid, h).is_ok()),
+    );
+    check(
+        "it is unmounted, and the directory is a directory again",
+        run(b"umount", &[at]) == Some(0)
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/under", &mut text).is_ok_and(|n| &text[..n] == b"under"),
+    );
+
+    let _ = vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/under");
+    let _ = vfs::rmdir(vfs_tid, at);
+    let _ = syscall::sys_task_kill(server);
+    let _ = wait_for(server);
+}
+
 /// The CRC a GPT is checked with.
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -3837,6 +4263,7 @@ pub extern "C" fn _start() -> ! {
         ("ramdisk", test_ram_disk),
         ("parts", test_parts),
         ("diskfiles", test_disk_files),
+        ("mounts", test_mounts),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

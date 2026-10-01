@@ -32,7 +32,15 @@ const TAG_SEEK: u64 = 24;
 const TAG_SETATTR: u64 = 25;
 const TAG_MKNOD: u64 = 26;
 const TAG_DEVCTL: u64 = 27;
+const TAG_ATTACH: u64 = 28;
+const TAG_DETACH: u64 = 29;
+const TAG_MOUNTS: u64 = 30;
 const TAG_ERROR: u64 = u64::MAX;
+
+/// What kind of filesystem a mount is, as [`mounted`] says it.
+pub const KIND_EXT2: u64 = 1;
+pub const KIND_EXT4: u64 = 2;
+pub const KIND_FAT: u64 = 3;
 
 /// [`devctl`]'s operations: have a disk's driver read its partition table
 /// again.
@@ -114,8 +122,11 @@ pub const LOCK_OFD: u64 = 2;
 pub const LOCK_QUERY: u64 = 4;
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
 pub const ERR_NO_PEER: u64 = 19;
-/// A disk somebody else is using, or the one the system is running from.
+/// A disk somebody else is using, or the one the system is running from; a
+/// mounted filesystem something still has open.
 pub const ERR_BUSY: u64 = 20;
+/// Two names in two filesystems, asked for as one file.
+pub const ERR_CROSS_DEVICE: u64 = 21;
 /// A signal the program handles ended the wait for the other end of a named
 /// pipe. This side's own: the server never says it.
 pub const ERR_INTERRUPTED: u64 = 254;
@@ -460,10 +471,14 @@ pub fn readdir_bulk(vfs_tid: usize, handle: usize, start: u64, out: &mut [DirEnt
     Ok(page)
 }
 
-/// What the mounted filesystem is and how full.
+/// What the root filesystem is and how full.
 pub fn statfs(vfs_tid: usize) -> Result<FsStat, u64> {
+    statfs_from(vfs_tid, 0)
+}
+
+fn statfs_from(vfs_tid: usize, word: u64) -> Result<FsStat, u64> {
     let mut rec = [0u8; 64];
-    let msg = Message { sender: 0, tag: TAG_STATFS, data: [0; 6] };
+    let msg = Message { sender: 0, tag: TAG_STATFS, data: [word, 0, 0, 0, 0, 0] };
     let mut reply = Message::empty();
     if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, &mut rec).is_err() {
         return Err(ERR_IO);
@@ -675,6 +690,151 @@ fn two_paths(vfs_tid: usize, tag: u64, from: &[u8], to: &[u8], extra: u64) -> Re
         return Err(reply.data[0]);
     }
     Ok(())
+}
+
+/// Mount the filesystem `server` serves on the directory `target`.
+///
+/// `server` is a file server this program started on a volume
+/// (`vfs DRIVER VOLUME mount`), and so one it may hand on: the capability to
+/// call it goes to the file server `target` is in, which stands between it
+/// and everybody else from then on. `source` is what the mount is written
+/// down as having come from, and `target` should be the whole path, since
+/// that is written down too. Only root mounts.
+pub fn mount(vfs_tid: usize, server: usize, source: &[u8], target: &[u8]) -> Result<(), u64> {
+    if target.is_empty() || source.is_empty() {
+        return Err(ERR_INVALID_PATH);
+    }
+    if source.len() > 200 || target.len() > 300 {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    // The path, then what to write down: the source and the target, each
+    // ended by a NUL.
+    let mut lent = [0u8; 1024];
+    let mut len = 0;
+    for part in [target, source, b"\0", target, b"\0"] {
+        lent[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
+    }
+    let record = len - target.len();
+    let msg = Message {
+        sender: 0,
+        tag: TAG_ATTACH,
+        data: [target.len() as u64, record as u64, server as u64, 0, 0, 0],
+    };
+    // The capability for the server goes with the request, for the length
+    // of the call.
+    syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, server as u64, 0)
+        .map_err(|()| ERR_PERMISSION)?;
+    let with = syscall::CallWith {
+        buf: lent.as_ptr() as u64,
+        len_access: len as u64 | syscall::LEND_READ,
+        offer: syscall::SLOT_SCRATCH as u64,
+        ticks: 0,
+    };
+    let mut reply = Message::empty();
+    let outcome = syscall::sys_call_with(vfs_tid, &msg, &mut reply, &with);
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    if outcome != syscall::CallOutcome::Replied {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+/// Take away the filesystem mounted on `target`; its server ends. Refused
+/// ([`ERR_BUSY`]) while anything in it is open or anything is mounted in it.
+pub fn unmount(vfs_tid: usize, target: &[u8]) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_DETACH, target, [0; 6]).map(|_| ())
+}
+
+/// One mounted filesystem, as [`mounted`] reports it.
+#[derive(Clone, Copy, Debug)]
+pub struct Mounted {
+    /// How much of the buffer the record took: where the filesystem came
+    /// from and where it is, each ended by a NUL ([`mount_record`]).
+    pub len: usize,
+    /// One of the `KIND_*`.
+    pub kind: u64,
+    /// The process that serves it.
+    pub pid: u64,
+}
+
+/// The `index`th mounted filesystem, the root first and each followed by
+/// what is mounted inside it; its record is written to `record`. `None`
+/// past the last.
+pub fn mounted(vfs_tid: usize, index: u64, record: &mut [u8]) -> Result<Option<Mounted>, u64> {
+    let msg = Message { sender: 0, tag: TAG_MOUNTS, data: [index, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend_mut(vfs_tid, &msg, &mut reply, record).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return if reply.data[0] == ERR_NOT_FOUND { Ok(None) } else { Err(reply.data[0]) };
+    }
+    Ok(Some(Mounted { len: (reply.data[0] as usize).min(record.len()), kind: reply.data[1], pid: reply.data[2] }))
+}
+
+/// A mount's record as its two paths: where the filesystem came from, and
+/// where it is.
+pub fn mount_record(record: &[u8]) -> (&[u8], &[u8]) {
+    let mut parts = record.split(|&b| b == 0);
+    (parts.next().unwrap_or(b""), parts.next().unwrap_or(b""))
+}
+
+/// What a kind of filesystem is called.
+pub fn kind_name(kind: u64) -> &'static str {
+    match kind {
+        KIND_EXT2 => "ext2",
+        KIND_EXT4 => "ext4",
+        KIND_FAT => "vfat",
+        _ => "unknown",
+    }
+}
+
+/// Write `/etc/mtab`: what is mounted, a line for each, as programs that
+/// were written for Unix look for it — `mke2fs` reads it to refuse a disk
+/// with a mounted filesystem. It is a file and not a view of the truth, so
+/// whoever changes what is mounted writes it again, and `init` writes it at
+/// boot, when whatever the last system left in it is wrong.
+pub fn write_mtab(vfs_tid: usize) -> Result<(), u64> {
+    let mut text = [0u8; 2048];
+    let mut len = 0;
+    let mut record = [0u8; 512];
+    for index in 0.. {
+        let Some(m) = mounted(vfs_tid, index, &mut record)? else { break };
+        let (source, target) = mount_record(&record[..m.len]);
+        let line = [source, b" ", target, b" ", kind_name(m.kind).as_bytes(), b" rw 0 0\n"];
+        if len + line.iter().map(|p| p.len()).sum::<usize>() > text.len() {
+            break;
+        }
+        for part in line {
+            text[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
+        }
+    }
+    let file = open_with(vfs_tid, b"/etc/mtab", OPEN_CREATE | OPEN_TRUNCATE)?;
+    let mut at = 0;
+    let mut result = Ok(());
+    while at < len {
+        match write(vfs_tid, file.handle, &text[at..len], at as u32) {
+            Ok(n) if n > 0 => at += n as usize,
+            Ok(_) => {
+                result = Err(ERR_IO);
+                break;
+            }
+            Err(code) => {
+                result = Err(code);
+                break;
+            }
+        }
+    }
+    let _ = close(vfs_tid, file.handle);
+    result
+}
+
+/// What the filesystem holding the open file `handle` is and how full:
+/// [`statfs`], for a file that may be in a mounted filesystem.
+pub fn statfs_of(vfs_tid: usize, handle: usize) -> Result<FsStat, u64> {
+    statfs_from(vfs_tid, handle as u64 + 1)
 }
 
 /// Make an open file `size` bytes long.

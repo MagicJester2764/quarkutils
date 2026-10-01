@@ -39,7 +39,8 @@ code in `data[0]`:
 | 17 | `DEADLOCK` | Waiting for this lock would wait for ever |
 | 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
 | 19 | `NO_PEER` | A named pipe opened to write, without waiting, that nobody is reading |
-| 20 | `BUSY` | A disk somebody else is using, or the one this system runs from |
+| 20 | `BUSY` | A disk somebody else is using, or the one this system runs from; a mounted filesystem something still uses |
+| 21 | `CROSS_DEVICE` | Two names in two filesystems, asked for as one file |
 
 Permission is checked against the caller's user and group, which the server
 asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
@@ -57,7 +58,9 @@ naming a path carries in `data[5]`: 0 is the calling program's working
 directory, and `h + 1` is the directory open as handle `h`. `RENAME` and
 `LINK` carry their second path's base in `data[4]`. A base that is not an
 open directory of the caller's program is `INVALID_HANDLE` or `NOT_DIR`; an
-absolute path ignores it.
+absolute path ignores it. FAT32 has no inodes to start from: a base that is
+an open directory there is turned back into its path, by its `..` entries,
+and the lookup starts from the root.
 
 A symbolic link met on the way is followed: its target takes the place of the
 part of the path that named it, from the root if the target starts with `/`
@@ -111,7 +114,7 @@ Every request below that takes a handle takes either kind.
 | 11 | `RMDIR` | `[len]` | path | — |
 | 12 | `RENAME` | `[from_len, to_len]` | both paths, end to end | — |
 | 13 | `TRUNCATE` | `[handle, size]` | — | — |
-| 14 | `STATFS` | — | 64 bytes to fill | `[64]` |
+| 14 | `STATFS` | `[handle + 1, or 0]` | 64 bytes to fill | `[64]` |
 | 15 | `LINK` | `[from_len, to_len, follow]` | both paths, end to end | — |
 | 16 | `SYMLINK` | `[target_len, path_len]` | the target, then the path | — |
 | 17 | `READLINK` | `[path_len, room]` | the path, then `room` bytes to fill | `[target_len]` |
@@ -125,6 +128,16 @@ Every request below that takes a handle takes either kind.
 | 25 | `SETATTR` | `[path_len, which, nofollow]` | path, then five words | — |
 | 26 | `MKNOD` | `[path_len, mode]` | path | — |
 | 27 | `DEVCTL` | `[handle, operation]` | — | per operation |
+| 28 | `ATTACH` | `[path_len, record_len, server]` | path, then the record; a capability offered | — |
+| 29 | `DETACH` | `[path_len]` | path | — |
+| 30 | `MOUNTS` | `[index]` | room for a record | `[record_len, kind, pid]` |
+| 31 | `ADOPT` | — | — | `[root id, kind, read_only]` |
+| 32 | `IDENTITY` | `[uid, gid]` | — | — |
+| 33 | `RETIRE` | — | — | — |
+| 34 | `PATH_OF` | `[handle]` | 4096 bytes to fill | `[len]` |
+
+28 to 30 are *Mounts*, below; 31 to 34 are what one file server says to
+another, and a client that says them is refused.
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -146,6 +159,7 @@ message and cut it to 40 bytes.
 | 128 | `READ` | The descriptor may read |
 | 256 | `WRITE` | The descriptor may write |
 | 512 | `NOWAIT` | The caller will not wait for what it opens: see *Named pipes* |
+| 1024 | `PROXIED` | From the server this filesystem is mounted in: `READ` and `WRITE` are checked as for a descriptor, and a handle is given |
 
 With `DESCRIPTOR` the reply's first word is `handle << 32 | descriptor`: the
 number the caller now has, the lowest free from 3, and the handle to name in
@@ -240,8 +254,13 @@ second name at the second. A link at the first path gets the name itself,
 unless `data[2]` has bit 0 set, which follows it. A directory is refused (`IS_DIR`), and so is a name
 that is taken (`EXISTS`) and a file with as many names as the filesystem
 allows (`TOO_MANY_LINKS`: 32000 on ext2, 65000 on ext4). The new name's
-directory needs write permission, as for `UNLINK`. FAT32 answers all five
-name-changing requests with `NOT_SUPPORTED`.
+directory needs write permission, as for `UNLINK`. FAT32 has one name to a
+file and no links: `UNLINK` and `RMDIR` remove a name and give back what it
+held — `BUSY` if the file is open, since there would be nowhere for it to go
+on being — and the other three are `NOT_SUPPORTED`.
+
+Two paths that lead into two filesystems — one mounted in the other, or two
+mounts — are `CROSS_DEVICE`, for `RENAME` and for `LINK`.
 
 ### SYMLINK and READLINK
 
@@ -261,8 +280,8 @@ reply is its whole length. A path that is not a link is `INVALID_PATH`.
 Sets a writable handle's regular file to `size` bytes, which must fit in 32
 bits. Growing it adds a hole, which reads as zeroes and takes no blocks until
 it is written. ext4 shortens only files whose extent tree fits in the inode;
-that, and FAT32 at all, is `NOT_SUPPORTED`. `OPEN_TRUNCATE` is the same
-operation to size 0.
+that is `NOT_SUPPORTED`. FAT32 shortens a file and does not lengthen one
+(`NOT_SUPPORTED`). `OPEN_TRUNCATE` is the same operation to size 0.
 
 ### READDIR_BULK
 
@@ -506,3 +525,82 @@ filesystem's magic (`0xEF53` for ext2 and ext4, `0x4d44` for FAT32), block
 size, block count, free blocks, blocks free to anyone (less those reserved
 for user 0), inodes, free inodes, and the longest name. FAT32 reports its
 cluster size and zeroes for the counts.
+
+`data[0]` is 0 for the server's own filesystem, or an open file's handle and
+one for the filesystem that file is in — which is how a client asks about a
+mounted one.
+
+## Mounts
+
+**A mount is a server.** A filesystem mounted in this one is served by a file
+server of its own — `vfs DRIVER VOLUME mount`, the same program started on
+another volume — and the server whose directory it is mounted on stands
+between it and every client. A path that walks into that directory goes on
+in the other server; a file opened there is a handle here that names a
+handle there. A client sees none of it: it calls the server it always
+called, with the requests above, and a descriptor is the root server's
+whatever is behind it.
+
+What a client can see:
+
+- **`STAT`'s `id` says which filesystem.** The low forty bits are the file's
+  number in its own filesystem; above them are the mounts it is under, four
+  bits to a mount, the innermost in the lowest four. 0 there is the root.
+  Directory entries' ids are the same numbers.
+- **A mounted filesystem's root takes the directory's place.** What the
+  directory held is out of sight until the filesystem is taken away. Its
+  name cannot be removed or renamed (`BUSY`).
+- **`..` at a mounted filesystem's root leads out where this server can see
+  it coming**: written straight after the mount's own name, or first in a
+  path that starts from that root. A path that goes down into the mount and
+  climbs back out past its root stays at the root.
+- **A symbolic link in a mounted filesystem whose target begins with `/`**
+  is followed from that filesystem's root, not the system's.
+- **`MAP` is `NOT_SUPPORTED`** for a file in a mounted filesystem, and so
+  are named pipes there: the memory object and the pipe would be the other
+  server's, and what a client is given is this one's.
+
+### ATTACH, DETACH and MOUNTS
+
+`ATTACH` mounts the filesystem a server serves on the directory at the path.
+The caller started that server and so may hand it on: the call offers a
+capability for it (`SYS_CALL_WITH`, which lends and offers at once), and
+`data[2]` is its task. After the path the caller lends a record — where the
+filesystem came from and where it is being put, each ended by a NUL — which
+is what `MOUNTS` gives back. Only user 0 mounts (`PERMISSION`). The
+directory must exist and be one (`NOT_FOUND`, `NOT_DIR`), must not be the
+root, `/dev` or mounted on already (`BUSY`), and must not be in a FAT32
+filesystem, which has no directory that could say what is on it
+(`NOT_SUPPORTED`). A server that does not answer `ADOPT` as a filesystem
+waiting to be mounted, within a third of a second, is not mounted (`IO`).
+
+`DETACH` takes the filesystem at the path away, and its server ends. `BUSY`
+while anything in it is open, a program is in it, or another filesystem is
+mounted inside it; `INVALID_PATH` for a directory nothing is mounted on.
+
+`MOUNTS` counts every mounted filesystem: the root first, then each mount
+followed by whatever is mounted inside it. The record is written into what
+is lent; `kind` is 1 ext2, 2 ext4, 3 FAT32, and `pid` the process that
+serves it. Past the last, the error is `NOT_FOUND` and its second word says
+how many there are.
+
+### Between servers
+
+A mounted filesystem's server has no name to be looked up by. It is called
+by whoever started it and by the server it was handed to, and by nobody
+else.
+
+- **`ADOPT`** makes the caller the server above. Only a server started to be
+  mounted accepts it (`PERMISSION` from the root's), and only once (`BUSY`).
+  When the server above goes, so does this one.
+- **`IDENTITY`** says whose requests follow. A server checks permissions as
+  that user, and believes it of the server above alone.
+- **`RETIRE`** has it let its volume go and end; `BUSY` while anything is
+  open or mounted in it.
+- **`PATH_OF`** is the path of an open directory from this filesystem's
+  root, which the server above puts after the mount's own path to answer
+  `GETCWD`.
+
+The server above passes each request on with a deadline of a minute, and
+takes a server that misses it, or that cannot be called, for one that has
+gone: everything through that mount is `IO` until it is detached.

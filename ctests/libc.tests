@@ -31,3 +31,4 @@ jobtest
 spawntest
 detachtest
 blktest
+mounttest

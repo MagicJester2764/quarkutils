@@ -193,6 +193,16 @@ does on Linux. What is different is at the edges:
   filesystem can be looked at. `BLKRRPART` wants a descriptor that writes
   the whole disk (`EACCES`, and `EINVAL` for a partition). Nothing is cached: a write is on the disk
   when it returns, and `fsync` and `BLKFLSBUF` have nothing to do.
+- **A mounted filesystem is another device.** `st_dev` is 1 for the root
+  and something else for each mount; `st_ino` and a directory entry's
+  `d_ino` are the file's number in its own filesystem. `rename` and `link`
+  across two say `EXDEV`. `statfs` and `fstatfs` answer for the filesystem
+  the file is in. `/etc/mtab` lists what is mounted, as `getmntent` reads
+  it; it is a file `mount`, `umount` and `init` write, not a view of the
+  truth. There is no `mount(2)`: mounting is a program's job
+  (`/usr/bin/mount`), because a mount is a server it has to start.
+  `mmap` of a file in a mounted filesystem fails, and a named pipe there
+  cannot be opened.
 - `mmap` of a file works, shared and private. Anonymous memory is given its
   pages when they are first touched.
 - **A named pipe** is made with `mkfifo` or `mknod`, on ext2 and ext4, and

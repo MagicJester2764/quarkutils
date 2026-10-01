@@ -83,6 +83,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_LOOP:           return -LX_ELOOP;
     case QUARK_VFS_NO_PEER:        return -LX_ENXIO;
     case QUARK_VFS_BUSY:           return -LX_EBUSY;
+    case QUARK_VFS_CROSS_DEVICE:   return -LX_EXDEV;
     default:                       return -LX_EIO;
     }
 }
@@ -531,8 +532,12 @@ struct lx_kstat {
 
 static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     bytes_zero(st, sizeof *st);
-    st->st_dev = 1;
-    st->st_ino = r->id;
+    /* A file in a mounted filesystem says so above the fortieth bit of its
+       id: which mount, and which inside that. Its device is not the root's,
+       and its number is the one its own filesystem gave it. */
+    unsigned long id = r->id & QUARK_VFS_ID_MASK;
+    st->st_dev = 1 + (r->id >> 40);
+    st->st_ino = id;
     st->st_nlink = r->links;
     st->st_mode = (unsigned int)r->mode;
     st->st_uid = (unsigned int)r->uid;
@@ -546,7 +551,7 @@ static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
     /* The server's devices, by the numbers Linux gives them: 1:3 null,
        1:5 zero, 1:7 full, 1:8 random, 1:9 urandom. */
     static const unsigned char minors[] = {3, 5, 7, 8, 9};
-    unsigned long dev = r->id - QUARK_VFS_DEVICE_ID;
+    unsigned long dev = id - QUARK_VFS_DEVICE_ID;
     if ((r->mode & 0170000) == 020000 && dev < sizeof minors) {
         st->st_rdev = (1ul << 8) | minors[dev];
     }
@@ -556,7 +561,7 @@ static void fill_stat(struct lx_kstat *st, const struct quark_vfs_stat *r) {
        the minor. The server numbers them thirty-two to a driver, disks
        first. */
     if ((r->mode & 0170000) == 060000) {
-        unsigned long n = r->id - QUARK_VFS_BLOCK_ID;
+        unsigned long n = id - QUARK_VFS_BLOCK_ID;
         st->st_size = 0;
         st->st_rdev = n < 4 * 32 ? (8ul << 8) | n : (1ul << 8) | (n - 4 * 32);
     }
@@ -775,7 +780,7 @@ long __quark_getdents(long fd, void *buf, unsigned long count) {
             break;
         }
         bytes_zero(out + put, lreclen);
-        wr(out + put, 8, rd(r, 8));           /* d_ino */
+        wr(out + put, 8, rd(r, 8) & QUARK_VFS_ID_MASK); /* d_ino, as stat says it */
         wr(out + put + 8, 8, rd(r + 8, 8));   /* d_off: where to resume after it */
         wr(out + put + 16, 2, lreclen);       /* d_reclen */
         out[put + 18] = r[26];                /* d_type */
@@ -885,9 +890,9 @@ long __quark_symlink(const char *target, long dirfd, const char *path) {
 
 /* Linux's struct statfs for x86-64: seven words, a two-int fsid, four more
    words and four spare. */
-static long fill_statfs(unsigned char *out) {
+static long fill_statfs(unsigned long handle, unsigned char *out) {
     struct quark_vfs_statfs fs;
-    int err = quark_vfs_statfs(&fs);
+    int err = quark_vfs_statfs_of(handle, &fs);
     if (err) {
         return vfs_errno(err);
     }
@@ -904,22 +909,25 @@ static long fill_statfs(unsigned char *out) {
     return 0;
 }
 
-/* One filesystem is mounted, so the path only has to exist. */
+/* The filesystem the path is in, which the file server knows from having
+   opened it: a mounted one answers for itself. */
 long __quark_statfs(const char *path, void *buf) {
     struct quark_vfs_file info;
     int err = quark_vfs_open(path, 0, &info);
     if (err) {
         return vfs_errno(err);
     }
+    long done = fill_statfs(info.handle, buf);
     quark_vfs_close(info.handle);
-    return fill_statfs(buf);
+    return done;
 }
 
 long __quark_fstatfs(long fd, void *buf) {
-    if (!is_file(fd, 0)) {
+    unsigned long h;
+    if (!is_file(fd, &h)) {
         return not_file(fd, -LX_ENOSYS);
     }
-    return fill_statfs(buf);
+    return fill_statfs(h, buf);
 }
 
 static int chdir_at(unsigned long base, const char *path) {

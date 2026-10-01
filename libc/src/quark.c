@@ -420,7 +420,8 @@ int quark_vfs_readdir(unsigned long handle, unsigned long start, void *buf, unsi
     return 0;
 }
 
-int quark_vfs_statfs(struct quark_vfs_statfs *out) {
+/* `word` is 0 for the root filesystem, or an open file's handle and one. */
+static int statfs_from(unsigned long word, struct quark_vfs_statfs *out) {
     struct quark_msg msg;
     struct quark_msg reply;
     struct quark_vfs_statfs rec;
@@ -428,12 +429,21 @@ int quark_vfs_statfs(struct quark_vfs_statfs *out) {
     zero(&msg, sizeof msg);
     zero(&rec, sizeof rec);
     msg.tag = QUARK_VFS_TAG_STATFS;
+    msg.data[0] = word;
     int err = vfs_call_lend(&msg, &reply, &rec, sizeof rec, QUARK_LEND_WRITE);
     if (err) {
         return err;
     }
     copy(out, &rec, sizeof rec);
     return 0;
+}
+
+int quark_vfs_statfs(struct quark_vfs_statfs *out) {
+    return statfs_from(0, out);
+}
+
+int quark_vfs_statfs_of(unsigned long handle, struct quark_vfs_statfs *out) {
+    return statfs_from(handle + 1, out);
 }
 
 int quark_vfs_stat(unsigned long handle, struct quark_vfs_stat *out) {

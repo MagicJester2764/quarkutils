@@ -995,6 +995,12 @@ fn spawn_session(
 fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
 
+    // What is mounted, written down where programs that were written for
+    // Unix look for it: the root, and nothing else yet. Whatever the last
+    // system to run from this disk left there described that system. A root
+    // that cannot be written goes without.
+    let _ = vfs::write_mtab(vfs_tid);
+
     // What the distribution asked for, if it asked: the programs to run
     // first, in order, and then the session.
     if let Some(config) = Config::read(vfs_tid) {

@@ -54,8 +54,37 @@ pub const TAG_MKNOD: u64 = 26;
 pub const TAG_DEVCTL: u64 = 27;
 /// DEVCTL: have a disk's driver read its partition table again.
 pub const DEVCTL_RESCAN: u64 = 1;
+/// Put the filesystem a server serves at a directory: `[path length, record
+/// length, the server's task]`, with the path lent and after it what is
+/// written down of the mount — where it came from and where it is, each
+/// ended by a NUL — and with a capability for the server offered.
+pub const TAG_ATTACH: u64 = 28;
+/// Take it away again: `[path length]`, the path of the directory.
+pub const TAG_DETACH: u64 = 29;
+/// What is mounted: `[index]`, with room lent for one mount's record. The
+/// reply is `[record length, kind, the server's process id]`; past the last
+/// mount it is an error whose second word is how many there are.
+pub const TAG_MOUNTS: u64 = 30;
+// Between a server and the one its filesystem is mounted in. Nobody else
+// can say these: a mounted filesystem's server is called by whoever started
+// it and by the server above it, and by nobody else.
+/// "You are mine": the caller is the server above. Reply: `[root id, kind,
+/// read-only]`. A server that was not started to be mounted refuses.
+pub const TAG_ADOPT: u64 = 31;
+/// Who the requests that follow are for: `[uid, gid]`.
+pub const TAG_IDENTITY: u64 = 32;
+/// Stop: let the volume go and end. Refused while anything is open.
+pub const TAG_RETIRE: u64 = 33;
+/// The path of a directory handle, from this filesystem's root, into what
+/// is lent.
+pub const TAG_PATH_OF: u64 = 34;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
+
+/// A mount's kind, as [`TAG_MOUNTS`] and [`TAG_ADOPT`] say it.
+pub const KIND_EXT2: u64 = 1;
+pub const KIND_EXT4: u64 = 2;
+pub const KIND_FAT: u64 = 3;
 
 /// OPEN makes the file if the name is free.
 pub const OPEN_CREATE: u64 = 1;
@@ -80,6 +109,10 @@ pub const OPEN_WRITE: u64 = 0x100;
 /// named pipe opened to write with nobody reading is refused
 /// ([`ERR_NO_PEER`]) rather than given an end.
 pub const OPEN_NOWAIT: u64 = 0x200;
+/// From the server above, for somebody else: [`OPEN_READ`] and [`OPEN_WRITE`]
+/// are checked as they are for a descriptor, and what is given is a handle.
+/// The descriptor is the server above's to make.
+pub const OPEN_PROXIED: u64 = 0x400;
 
 /// In a READ's or a WRITE's offset, or a READDIR_BULK's start: wherever the
 /// descriptor is. The position moves past what is transferred.
@@ -150,6 +183,12 @@ pub const ERR_NO_PEER: u64 = 19;
 /// A device that somebody else is using: a disk with a filesystem mounted
 /// from it, or the one this system is running from.
 pub const ERR_BUSY: u64 = 20;
+/// Two names in two filesystems, asked for as one file.
+pub const ERR_CROSS_DEVICE: u64 = 21;
+/// Never sent: what a lookup says when the path leaves this filesystem
+/// through a directory another is mounted on. Whoever asked reads where it
+/// went from [`crate::ext2_dir::crossing`].
+pub const ERR_ELSEWHERE: u64 = 0xE15E;
 
 pub const MAX_PATH: usize = 4095;
 /// What an ext2 directory entry's one-byte length allows.

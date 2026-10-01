@@ -15,6 +15,7 @@ pub mod ext2_ops;
 pub mod handles;
 pub mod journal;
 pub mod locks;
+pub mod mounts;
 pub mod pager;
 pub mod protocol;
 
@@ -36,6 +37,19 @@ quark_rt::manifest!([
 ]);
 
 pub const PAGE_SIZE: usize = 4096;
+
+/// A filesystem being mounted says nothing of how it started: whoever is at
+/// the terminal asked for a mount, not for an account of one. What goes
+/// wrong is said either way.
+static mut QUIET: bool = false;
+
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if !unsafe { QUIET } {
+            println!($($arg)*);
+        }
+    };
+}
 
 // The disk driver's protocol is `quark_rt::block`; `disk` is this server's
 // use of it.
@@ -75,7 +89,12 @@ pub fn journal_mut() -> &'static mut journal::Journal {
 /// local overflows this server's stack. `FS_TYPE` says whether it is mounted.
 static mut EXT2_STATE: ext2::Ext2State = ext2::Ext2State::empty();
 
-fn ext2_state() -> &'static ext2::Ext2State {
+/// Whether the filesystem here is one of the ext family, and not FAT32.
+pub(crate) fn is_ext2() -> bool {
+    unsafe { FS_TYPE == FsType::Ext2 }
+}
+
+pub(crate) fn ext2_state() -> &'static ext2::Ext2State {
     unsafe { &*core::ptr::addr_of!(EXT2_STATE) }
 }
 
@@ -247,6 +266,10 @@ struct Bpb {
     num_fats: u32,
     fat_size_32: u32,
     root_cluster: u32,
+    /// How many sectors the volume has, and which of them holds the counts
+    /// kept for whoever mounts it next (0 if none does).
+    total_sectors: u32,
+    fs_info: u32,
 }
 
 fn parse_bpb(data: &[u8]) -> Bpb {
@@ -257,8 +280,20 @@ fn parse_bpb(data: &[u8]) -> Bpb {
         num_fats: data[16] as u32,
         fat_size_32: read_u32(data, 36),
         root_cluster: read_u32(data, 44),
+        total_sectors: match read_u32(data, 32) {
+            0 => read_u16(data, 19) as u32,
+            n => n,
+        },
+        fs_info: read_u16(data, 48) as u32,
     }
 }
+
+/// Where the last cluster was taken: the next search for a free one starts
+/// after it, rather than at the front of the table every time.
+static mut FAT_HINT: u32 = 2;
+/// Clusters freed, less clusters taken, since the count on the disk was last
+/// brought up to date.
+static mut FAT_FREED: i64 = 0;
 
 pub fn read_u16(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([data[off], data[off + 1]])
@@ -272,7 +307,7 @@ pub fn read_u32(data: &[u8], off: usize) -> u32 {
 // Disk reader (communicates with disk driver via IPC)
 // ---------------------------------------------------------------------------
 
-struct DiskState {
+pub(crate) struct DiskState {
     disk_tid: usize,
     part_lba: u32,
     bpb: Bpb,
@@ -397,12 +432,24 @@ impl DiskState {
         Ok(())
     }
 
+    /// How many clusters the volume has. They are numbered from 2, and the
+    /// table may have room for more than there are.
+    fn cluster_count(&self) -> u32 {
+        let data_start = self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size_32;
+        let on_disk = self.bpb.total_sectors.saturating_sub(data_start) / self.bpb.sectors_per_cluster.max(1);
+        on_disk.min((self.bpb.fat_size_32 * 512 / 4).saturating_sub(2))
+    }
+
     /// Allocate a free cluster. Marks it as EOF in the FAT.
     fn fat_alloc(&self) -> Result<u32, ()> {
-        let total_data_clusters =
-            (self.bpb.fat_size_32 * 512 / 4) as u32;
-        // Scan FAT for a free entry (value == 0)
-        for cluster in 2..total_data_clusters {
+        let count = self.cluster_count();
+        if count == 0 {
+            return Err(());
+        }
+        let from = unsafe { FAT_HINT }.clamp(2, count + 1) - 2;
+        // Scan FAT for a free entry (value == 0), once round from the hint.
+        for step in 0..count {
+            let cluster = 2 + (from + step) % count;
             let fat_byte_off = (cluster as usize) * 4;
             let sector_in_fat = fat_byte_off / 512;
             let offset_in_sector = fat_byte_off % 512;
@@ -416,10 +463,67 @@ impl DiskState {
             if val == 0 {
                 // Mark as EOF
                 self.fat_set(cluster, 0x0FFF_FFFF)?;
+                unsafe {
+                    FAT_HINT = cluster + 1;
+                    FAT_FREED -= 1;
+                }
                 return Ok(cluster);
             }
         }
         Err(()) // disk full
+    }
+
+    /// Give back a file's clusters, from `first` to the end of its chain.
+    fn fat_free_chain(&self, first: u32) -> Result<(), ()> {
+        let end = self.cluster_count() + 2;
+        let mut cluster = first;
+        // No chain is longer than the volume: one that loops is damage, and
+        // is not followed for ever.
+        for _ in 0..end {
+            if cluster < 2 || cluster >= end {
+                break;
+            }
+            let next = self.fat_next(cluster);
+            self.fat_set(cluster, 0)?;
+            unsafe {
+                FAT_FREED += 1;
+                FAT_HINT = FAT_HINT.min(cluster);
+            }
+            match next {
+                Some(n) => cluster = n,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring the count of free clusters the filesystem keeps — for whoever
+    /// mounts it next, so that they need not count — up to date with what
+    /// has been taken and given back. Left alone it is wrong, and a checker
+    /// says so.
+    fn fat_sync_info(&self) {
+        let freed = unsafe { core::mem::take(&mut *core::ptr::addr_of_mut!(FAT_FREED)) };
+        let sector = self.bpb.fs_info;
+        if freed == 0 || sector == 0 || sector >= self.bpb.reserved_sectors {
+            return;
+        }
+        if self.read_sector(sector).is_err() {
+            return;
+        }
+        let data = self.sector_data_mut();
+        if read_u32(data, 0) != 0x4161_5252 || read_u32(data, 484) != 0x6141_7272 {
+            return;
+        }
+        // All ones is "nobody has counted", and stays that.
+        let free = read_u32(data, 488);
+        if free != 0xFFFF_FFFF {
+            let now = (free as i64 + freed).clamp(0, self.cluster_count() as i64) as u32;
+            data[488..492].copy_from_slice(&now.to_le_bytes());
+        }
+        data[492..496].copy_from_slice(&unsafe { FAT_HINT }.to_le_bytes());
+        if self.write_sector(sector).is_ok() {
+            unsafe { SECTOR_CACHE.invalidate(self.part_lba + sector) };
+        }
     }
 
     /// Extend a cluster chain by allocating a new cluster and linking it.
@@ -509,7 +613,7 @@ fn fat32_file(
 }
 
 /// The program a caller belongs to, or 0 if it has none (and so owns nothing).
-fn space_of(sender: usize) -> u64 {
+pub(crate) fn space_of(sender: usize) -> u64 {
     syscall::sys_task_space(sender).unwrap_or(0)
 }
 
@@ -517,7 +621,7 @@ fn space_of(sender: usize) -> u64 {
 /// descriptor it holds names. For the second the kernel is asked, and its
 /// answer is the whole of the authority — a task holds a cookie only by
 /// having been given a descriptor for it.
-fn get_handle(handle: usize, sender: usize) -> Option<&'static mut OpenFile> {
+pub(crate) fn get_handle(handle: usize, sender: usize) -> Option<&'static mut OpenFile> {
     if handles::is_descriptor(handle) {
         return if syscall::sys_fd_holds(sender, handle as u64) {
             handles::descriptor(handle)
@@ -740,8 +844,25 @@ fn read_file_data(
     if file.is_dir {
         return Err(ERR_IS_DIR);
     }
+    // What a handle knows of its file is what the directory said when it was
+    // opened. Before saying there is nothing more, ask again: another handle
+    // may have written since.
     if offset >= file.file_size {
-        return Ok(0);
+        if let FsFileData::Fat32 { first_cluster, cur_cluster, cur_cluster_offset, dir_cluster, fat_name } =
+            &mut file.fs
+        {
+            if let Ok(Some((cluster, size, false))) = find_entry(disk, *dir_cluster, fat_name) {
+                if *first_cluster != cluster {
+                    *first_cluster = cluster;
+                    *cur_cluster = cluster;
+                    *cur_cluster_offset = 0;
+                }
+                file.file_size = size;
+            }
+        }
+        if offset >= file.file_size {
+            return Ok(0);
+        }
     }
 
     let (first_cluster, cur_cluster, cur_cluster_offset) = match &file.fs {
@@ -922,11 +1043,16 @@ fn create_dir_entry(
         return Err(ERR_INVALID_PATH); // already exists
     }
 
-    // Allocate a cluster for the new file/dir
-    let new_cluster = disk.fat_alloc().map_err(|_| ERR_IO)?;
-
-    // Zero the new cluster
-    disk.zero_cluster(new_cluster).map_err(|_| ERR_IO)?;
+    // A directory has a cluster from the start, for `.` and `..`. A file has
+    // none until something is written to it: an empty file with a cluster is
+    // a file whose length and whose chain disagree, and a checker says so.
+    let new_cluster = if is_dir {
+        let cluster = disk.fat_alloc().map_err(|_| ERR_NO_SPACE)?;
+        disk.zero_cluster(cluster).map_err(|_| ERR_IO)?;
+        cluster
+    } else {
+        0
+    };
 
     // If creating a directory, write "." and ".." entries
     if is_dir {
@@ -1026,6 +1152,26 @@ fn update_dir_entry_size(
     name: &[u8; 11],
     new_size: u32,
 ) -> Result<(), u64> {
+    update_dir_entry(disk, dir_cluster, name, Change::Size(new_size))
+}
+
+/// What [`update_dir_entry`] does to an entry.
+#[derive(Clone, Copy)]
+enum Change {
+    Size(u32),
+    /// Where the file's first cluster is, and how long the file is.
+    Start(u32, u32),
+    /// The name is free again.
+    Remove,
+}
+
+/// Change the entry called `name` in a directory.
+fn update_dir_entry(
+    disk: &DiskState,
+    dir_cluster: u32,
+    name: &[u8; 11],
+    change: Change,
+) -> Result<(), u64> {
     let spc = disk.bpb.sectors_per_cluster;
     let mut cluster = dir_cluster;
 
@@ -1051,7 +1197,15 @@ fn update_dir_entry_size(
                     continue;
                 }
                 if &sec_buf[off..off + 11] == name {
-                    sec_buf[off + 28..off + 32].copy_from_slice(&new_size.to_le_bytes());
+                    match change {
+                        Change::Size(size) => sec_buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes()),
+                        Change::Start(cluster, size) => {
+                            sec_buf[off + 20..off + 22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+                            sec_buf[off + 26..off + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+                            sec_buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+                        }
+                        Change::Remove => sec_buf[off] = 0xE5,
+                    }
                     let data = disk.sector_data_mut();
                     data.copy_from_slice(&sec_buf);
                     disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
@@ -1084,14 +1238,37 @@ fn write_file_data(
         return Err(ERR_IS_DIR);
     }
 
-    let first_cluster = match &file.fs {
-        FsFileData::Fat32 { first_cluster, .. } => *first_cluster,
+    let (mut first_cluster, dir_cluster, fat_name) = match &file.fs {
+        FsFileData::Fat32 { first_cluster, dir_cluster, fat_name, .. } => (*first_cluster, *dir_cluster, *fat_name),
         _ => return Err(ERR_IO),
     };
 
     let to_write = len.min(PAGE_SIZE as u32);
     if to_write == 0 {
         return Ok(0);
+    }
+
+    // An empty file has no cluster. It is given its first here — unless the
+    // directory says another handle on it already has.
+    if first_cluster == 0 {
+        first_cluster = match find_entry(disk, dir_cluster, &fat_name)? {
+            Some((cluster, size, false)) if cluster != 0 => {
+                file.file_size = file.file_size.max(size);
+                cluster
+            }
+            Some((_, _, false)) => {
+                let cluster = disk.fat_alloc().map_err(|_| ERR_NO_SPACE)?;
+                disk.zero_cluster(cluster).map_err(|_| ERR_IO)?;
+                update_dir_entry(disk, dir_cluster, &fat_name, Change::Start(cluster, 0))?;
+                cluster
+            }
+            _ => return Err(ERR_NOT_FOUND),
+        };
+        if let FsFileData::Fat32 { first_cluster: fc, cur_cluster: cc, cur_cluster_offset: co, .. } = &mut file.fs {
+            *fc = first_cluster;
+            *cc = first_cluster;
+            *co = 0;
+        }
     }
 
     let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
@@ -1182,7 +1359,7 @@ fn write_file_data(
     Ok(written)
 }
 
-fn error_reply(sender: usize, err_code: u64) {
+pub(crate) fn error_reply(sender: usize, err_code: u64) {
     let reply = Message {
         sender: 0,
         tag: TAG_ERROR,
@@ -1222,7 +1399,16 @@ fn warm_cache(disk: &DiskState) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    println!("[vfs] Started.");
+    // `vfs DRIVER VOLUME mount` is a filesystem to be mounted in another:
+    // it has no name to be looked up by, and is called by whoever started
+    // it and by the server it is mounted in. The one with a name is the
+    // root.
+    let to_be_mounted = quark_rt::args::argv(3) == Some(b"mount");
+    unsafe { QUIET = to_be_mounted };
+    if to_be_mounted {
+        mounts::to_be_mounted();
+    }
+    say!("[vfs] Started.");
 
     // What to serve: `vfs DRIVER VOLUME`, a block driver by the name it
     // registered under and one of its volumes. Whoever starts this says;
@@ -1246,7 +1432,7 @@ pub extern "C" fn _start() -> ! {
         println!("[vfs] No volume to serve. Exiting.");
         syscall::sys_exit();
     };
-    println!(
+    say!(
         "[vfs] Serving volume {} of {} (TID {})",
         volume,
         core::str::from_utf8(driver).unwrap_or("?"),
@@ -1263,6 +1449,7 @@ pub extern "C" fn _start() -> ! {
     if syscall::sys_mmap(DISK_IO_BUF, 1).is_err()
         || syscall::sys_mmap(CLIENT_BUF, 1).is_err()
         || syscall::sys_mmap(protocol::PATH_BUF, protocol::PATH_BUF_PAGES).is_err()
+        || syscall::sys_mmap(mounts::RELAY_BUF, mounts::RELAY_PAGES).is_err()
         || syscall::sys_mmap(CACHE_BUF_BASE, CACHE_PAGES).is_err()
     {
         println!("[vfs] No memory for disk buffers.");
@@ -1281,7 +1468,7 @@ pub extern "C" fn _start() -> ! {
             match ext2::init_ext2(ext2_state_mut(), disk_tid, part_lba) {
                 Ok(()) => {
                     let state = ext2_state();
-                    println!(
+                    say!(
                         "[vfs] {} detected: blocks={} inodes={} block_size={} groups={}{}",
                         if state.is_ext4() { "ext4" } else { "ext2" },
                         state.total_blocks, state.total_inodes,
@@ -1306,7 +1493,7 @@ pub extern "C" fn _start() -> ! {
                                     println!("[vfs] could not clear the journal ({}); read-only", e);
                                     ext2_state_mut().read_only = true;
                                 } else {
-                                    println!("[vfs] journal ready");
+                                    say!("[vfs] journal ready");
                                 }
                             }
                             Ok(false) => {
@@ -1342,7 +1529,22 @@ pub extern "C" fn _start() -> ! {
         }
         let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let bpb = parse_bpb(data);
-        println!(
+        // Anything that is not ext2 was taken for FAT32, and a volume with
+        // nothing on it is neither: its first sector describes a filesystem
+        // of no sectors in clusters of none.
+        let plausible = data[510] == 0x55
+            && data[511] == 0xAA
+            && bpb.bytes_per_sector == 512
+            && bpb.sectors_per_cluster.is_power_of_two()
+            && bpb.num_fats >= 1
+            && bpb.fat_size_32 != 0
+            && bpb.root_cluster >= 2;
+        if !plausible {
+            println!("[vfs] No filesystem this knows on the volume. Exiting.");
+            let _ = quark_rt::block::release(disk_tid, volume);
+            syscall::sys_exit();
+        }
+        say!(
             "[vfs] FAT32: bps={} spc={} reserved={} root={}",
             bpb.bytes_per_sector, bpb.sectors_per_cluster,
             bpb.reserved_sectors, bpb.root_cluster
@@ -1366,6 +1568,8 @@ pub extern "C" fn _start() -> ! {
                 num_fats: 0,
                 fat_size_32: 0,
                 root_cluster: 0,
+                total_sectors: 0,
+                fs_info: 0,
             },
         }
     };
@@ -1377,8 +1581,17 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Register with nameserver
-    if nameserver::register(b"vfs").is_ok() {
+    // What this serves, for whoever asks what is mounted.
+    if is_ext2() {
+        let kind = if ext2_state().is_ext4() { KIND_EXT4 } else { KIND_EXT2 };
+        mounts::describe(driver, volume, ext2::EXT2_ROOT_INO as u64, kind);
+    } else {
+        mounts::describe(driver, volume, disk.bpb.root_cluster as u64, KIND_FAT);
+    }
+
+    if to_be_mounted {
+        // Nothing to register: see above.
+    } else if nameserver::register(b"vfs").is_ok() {
         println!("[vfs] Registered with nameserver.");
     } else {
         println!("[vfs] Failed to register with nameserver.");
@@ -1397,6 +1610,9 @@ pub extern "C" fn _start() -> ! {
         // gone, or a task that may have been waiting for a lock. The same
         // tags from anybody else are unknown requests.
         if let Some(space) = quark_rt::ipc::space_death_notice(&msg) {
+            // The server this is mounted in, if that is who it was: this
+            // ends with it.
+            mounts::program_gone(space);
             client_died(space);
             continue;
         }
@@ -1431,6 +1647,12 @@ pub extern "C" fn _start() -> ! {
             _ => msg,
         };
 
+        // A path that leads into a filesystem mounted here, or a word from
+        // the server this one is mounted in.
+        if mounts::intercept(&disk, sender, &msg) {
+            continue;
+        }
+
         match msg.tag {
             TAG_READ | TAG_WRITE if handles::is_descriptor(msg.data[0] as usize) => {
                 descriptor_io(&disk, sender, &msg)
@@ -1441,12 +1663,22 @@ pub extern "C" fn _start() -> ! {
             TAG_SETATTR => transacted(|| handle_setattr(sender, &msg)),
             _ => dispatch(&disk, sender, &msg),
         }
+        // What the request took and gave back, counted where a FAT
+        // filesystem keeps count.
+        if !is_ext2() {
+            disk.fat_sync_info();
+        }
     }
 }
 
 /// Every request that is not about where a descriptor is.
 fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
     match msg.tag {
+        TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
+            if mounts::is_ours(sender, msg) =>
+        {
+            mounts::serve(sender, msg)
+        }
         TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
             if devices::is_ours(sender, msg) =>
         {
@@ -1469,7 +1701,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_MKDIR => transacted(|| handle_mkdir(disk, sender, msg)),
         TAG_MKNOD => transacted(|| handle_mknod(sender, msg)),
         TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
-            transacted(|| handle_namespace(sender, msg))
+            transacted(|| handle_namespace(disk, sender, msg))
         }
         TAG_READLINK => handle_readlink(disk, sender, msg),
         TAG_CHDIR | TAG_FCHDIR => handle_chdir(disk, sender, msg),
@@ -1488,7 +1720,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
             transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
         }
-        TAG_TRUNCATE => transacted(|| handle_truncate(sender, msg)),
+        TAG_TRUNCATE => transacted(|| handle_truncate(disk, sender, msg)),
         TAG_STATFS => handle_statfs(sender),
         TAG_READDIR_BULK => handle_readdir_bulk(disk, sender, msg),
         quark_rt::ipc::TAG_PING => {
@@ -1523,6 +1755,7 @@ fn size_of(file: &OpenFile) -> Result<u64, u64> {
         }
         FsFileData::Fat32 { .. } => Ok(file.file_size as u64),
         FsFileData::Disk(ref disk) => Ok(devices::size_of(disk)),
+        FsFileData::Remote(ref remote) => mounts::size_of(remote),
         _ => Ok(0),
     }
 }
@@ -1730,7 +1963,7 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
         }
         open_ext2(sender, base, path, flags, given_mode(msg.data[2]));
     } else {
-        let path = match fat_path(sender, msg.data[5], path) {
+        let path = match fat_path(disk, sender, msg.data[5], path) {
             Ok(p) => p,
             Err(code) => return error_reply(sender, code),
         };
@@ -1744,18 +1977,34 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
 
 /// The ext2 directory a relative path starts from. `word` is 0 for the
 /// program's working directory, or one more than an open directory handle.
-fn base_of(sender: usize, word: u64) -> Result<u32, u64> {
+///
+/// A directory in a mounted filesystem is not one a path can be walked from
+/// here, and a path that starts from one has gone to that filesystem's
+/// server before any handler asks. What is left is a path that turns
+/// straight back out of the mount — which starts from the directory the
+/// mount is on — and an absolute one, which starts from nowhere.
+pub(crate) fn base_of(sender: usize, word: u64) -> Result<u32, u64> {
     if word == 0 {
-        return Ok(match cwd_of(sender).0 {
-            cwd::Where::Inode(ino) => ino,
-            _ => ext2::EXT2_ROOT_INO,
-        });
+        if let Some(remote) = mounts::cwd_remote(sender) {
+            return Ok(mounts::covered(&remote));
+        }
+        return Ok(local_cwd(sender));
     }
     let file = get_handle((word - 1) as usize, sender).ok_or(ERR_INVALID_HANDLE)?;
     match file.fs {
         FsFileData::Ext2 { inode_num } if file.is_dir => Ok(inode_num),
         FsFileData::DevDir if ext2_dir::dev_dir() != 0 => Ok(ext2_dir::dev_dir()),
+        FsFileData::Remote(ref remote) if file.is_dir => Ok(mounts::covered(remote)),
         _ => Err(ERR_NOT_DIR),
+    }
+}
+
+/// The directory of this filesystem `sender` is in: the root, if it is in
+/// none.
+pub(crate) fn local_cwd(sender: usize) -> u32 {
+    match cwd_of(sender).0 {
+        cwd::Where::Inode(ino) => ino,
+        _ => ext2::EXT2_ROOT_INO,
     }
 }
 
@@ -1769,14 +2018,68 @@ fn ext2_whole_path(base: u32, path: &'static [u8]) -> Result<&'static [u8], u64>
     cwd::join(dir, path)
 }
 
-/// A FAT32 path made absolute: FAT32 keeps a program's directory as a path,
-/// and has no handles to start from.
-fn fat_path(sender: usize, word: u64, path: &[u8]) -> Result<&'static [u8], u64> {
+/// A FAT32 path made absolute: FAT32 keeps a program's directory as a path.
+/// One that starts from an open directory starts from where that directory
+/// is found to be.
+fn fat_path(disk: &DiskState, sender: usize, word: u64, path: &[u8]) -> Result<&'static [u8], u64> {
     if word != 0 && path.first() != Some(&b'/') {
-        return Err(ERR_NOT_SUPPORTED);
+        let file = get_handle((word - 1) as usize, sender).ok_or(ERR_INVALID_HANDLE)?;
+        let cluster = match file.fs {
+            FsFileData::Fat32 { first_cluster, .. } if file.is_dir => first_cluster,
+            _ => return Err(ERR_NOT_DIR),
+        };
+        return cwd::join(fat_dir_path(disk, cluster)?, path);
     }
     let (_, dir) = cwd::get(space_of(sender));
     cwd::join(dir, path)
+}
+
+/// The path of a FAT32 directory, found the only way FAT32 allows: every
+/// directory but the root says where its parent is, and the parent is
+/// searched for the entry that leads back.
+pub(crate) fn fat_dir_path(disk: &DiskState, cluster: u32) -> Result<&'static [u8], u64> {
+    static mut OUT: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
+    let out = unsafe { &mut *core::ptr::addr_of_mut!(OUT) };
+    let root = disk.bpb.root_cluster;
+    let mut start = out.len();
+    let mut cur = cluster;
+    // As deep as a path can be.
+    for _ in 0..MAX_PATH / 2 {
+        if cur == root || cur == 0 {
+            if start == out.len() {
+                start -= 1;
+                out[start] = b'/';
+            }
+            return Ok(&out[start..]);
+        }
+        let parent = match find_entry(disk, cur, b"..         ")? {
+            // The root is written as no cluster at all.
+            Some((0, _, true)) => root,
+            Some((parent, _, true)) => parent,
+            _ => return Err(ERR_NOT_FOUND),
+        };
+        let mut name = [0u8; 12];
+        let mut len = 0;
+        for index in 0.. {
+            match read_dir_entry(disk, parent, index)? {
+                Some((entry, raw, _, true, _)) if entry == cur && raw[0] != b'.' => {
+                    len = fat_display_name(&raw, &mut name);
+                    break;
+                }
+                Some(_) => {}
+                None => return Err(ERR_NOT_FOUND),
+            }
+        }
+        if len + 1 > start {
+            return Err(ERR_NAME_TOO_LONG);
+        }
+        start -= len;
+        out[start..start + len].copy_from_slice(&name[..len]);
+        start -= 1;
+        out[start] = b'/';
+        cur = parent;
+    }
+    Err(ERR_LOOP)
 }
 
 /// The permission bits a word carries for something being made, if it
@@ -1785,7 +2088,7 @@ fn given_mode(word: u64) -> Option<u16> {
     (word & MODE_GIVEN != 0).then_some((word & 0o7777) as u16)
 }
 
-fn reply_opened(sender: usize, words: [u64; 6]) {
+pub(crate) fn reply_opened(sender: usize, words: [u64; 6]) {
     let reply = Message { sender: 0, tag: TAG_OK, data: words };
     let _ = syscall::sys_reply(sender, &reply);
 }
@@ -1832,10 +2135,11 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
     }
     // Only OPEN_NOFOLLOW gets this far with a link.
     let link = inode.is_symlink();
-    if flags & OPEN_DESCRIPTOR != 0 {
+    if flags & (OPEN_DESCRIPTOR | OPEN_PROXIED) != 0 {
         // A descriptor says what it is for, and is refused here if the file
         // does not allow it — not at the first write, a long way from the
-        // open that should have failed.
+        // open that should have failed. So does the server this filesystem
+        // is mounted in, for the descriptor it is about to make.
         if !link && flags & OPEN_READ != 0 && !ext2::check_permission(&inode, uid, gid, 4) {
             return error_reply(sender, ERR_PERMISSION);
         }
@@ -1945,12 +2249,100 @@ fn fat32_parent(disk: &DiskState, path: &[u8]) -> Result<(u32, [u8; 11]), u64> {
     Ok((cluster, fat_name))
 }
 
+/// Make a FAT32 file `size` bytes long, which is no longer than it is: the
+/// clusters past the new end are given back, and an empty file keeps none.
+fn fat32_truncate(disk: &DiskState, file: &mut OpenFile, size: u32) -> Result<(), u64> {
+    if file.is_dir {
+        return Err(ERR_IS_DIR);
+    }
+    let (dir_cluster, fat_name) = match &file.fs {
+        FsFileData::Fat32 { dir_cluster, fat_name, .. } => (*dir_cluster, *fat_name),
+        _ => return Err(ERR_INVALID_HANDLE),
+    };
+    // As the directory has it now, whatever this handle last knew.
+    let (first, current) = match find_entry(disk, dir_cluster, &fat_name)? {
+        Some((cluster, len, false)) => (cluster, len),
+        _ => return Err(ERR_NOT_FOUND),
+    };
+    // Longer would be clusters of zeroes to write, and nothing here asks.
+    if size > current {
+        return Err(ERR_NOT_SUPPORTED);
+    }
+    let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
+    let keep = size.div_ceil(cluster_bytes);
+    let mut start = first;
+    if size < current {
+        if keep == 0 {
+            // The entry first: a file that claims clusters the table says are
+            // free is worse than clusters nothing claims.
+            update_dir_entry(disk, dir_cluster, &fat_name, Change::Start(0, 0))?;
+            if first != 0 {
+                disk.fat_free_chain(first).map_err(|_| ERR_IO)?;
+            }
+            start = 0;
+        } else {
+            let mut last = first;
+            for _ in 1..keep {
+                last = disk.fat_next(last).ok_or(ERR_IO)?;
+            }
+            update_dir_entry(disk, dir_cluster, &fat_name, Change::Size(size))?;
+            if let Some(rest) = disk.fat_next(last) {
+                disk.fat_set(last, 0x0FFF_FFFF).map_err(|_| ERR_IO)?;
+                disk.fat_free_chain(rest).map_err(|_| ERR_IO)?;
+            }
+        }
+    }
+    file.file_size = size;
+    if let FsFileData::Fat32 { first_cluster, cur_cluster, cur_cluster_offset, .. } = &mut file.fs {
+        *first_cluster = start;
+        *cur_cluster = start;
+        *cur_cluster_offset = 0;
+    }
+    Ok(())
+}
+
+/// Whether a FAT32 directory holds nothing but `.` and `..`.
+fn fat32_dir_empty(disk: &DiskState, cluster: u32) -> Result<bool, u64> {
+    for index in 0.. {
+        match read_dir_entry(disk, cluster, index)? {
+            Some((_, name, _, _, _)) if name[0] == b'.' => {}
+            Some(_) => return Ok(false),
+            None => break,
+        }
+    }
+    Ok(true)
+}
+
+/// Remove a FAT32 file's name, or an empty directory's, and give back what
+/// it held. FAT has one name to a file, so the file goes with it — which is
+/// why one that is open is refused: there is nowhere for it to go on being.
+fn fat32_remove(disk: &DiskState, path: &[u8], dir: bool) -> Result<(), u64> {
+    let (cluster, _, is_dir, parent, name) = resolve_path(disk, path)?;
+    if parent == 0 {
+        // The root has no name to remove.
+        return Err(ERR_BUSY);
+    }
+    match (dir, is_dir) {
+        (true, false) => return Err(ERR_NOT_DIR),
+        (false, true) => return Err(ERR_IS_DIR),
+        _ => {}
+    }
+    if is_dir && !fat32_dir_empty(disk, cluster)? {
+        return Err(ERR_NOT_EMPTY);
+    }
+    if handles::fat_is_open(parent, &name) {
+        return Err(ERR_BUSY);
+    }
+    update_dir_entry(disk, parent, &name, Change::Remove)?;
+    if cluster != 0 {
+        disk.fat_free_chain(cluster).map_err(|_| ERR_IO)?;
+    }
+    Ok(())
+}
+
 fn open_fat32(disk: &DiskState, sender: usize, path: &[u8], flags: u64) {
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
     let wants_dir = flags & OPEN_DIRECTORY != 0 || trailing;
-    if flags & OPEN_TRUNCATE != 0 {
-        return error_reply(sender, ERR_NOT_SUPPORTED);
-    }
     let found = match resolve_path(disk, path) {
         Ok(found) => {
             if flags & OPEN_CREATE != 0 && flags & OPEN_EXCLUSIVE != 0 {
@@ -1975,7 +2367,17 @@ fn open_fat32(disk: &DiskState, sender: usize, path: &[u8], flags: u64) {
         return error_reply(sender, ERR_NOT_DIR);
     }
     let mode = if is_dir { FAT_DIR_MODE } else { FAT_FILE_MODE };
-    let file = fat32_file(sender, cluster, size, is_dir, dir_cluster, &fat_name);
+    let mut file = fat32_file(sender, cluster, size, is_dir, dir_cluster, &fat_name);
+    let mut size = size;
+    if flags & OPEN_TRUNCATE != 0 && !is_dir {
+        if let Err(code) = fat32_truncate(disk, &mut file, 0) {
+            return error_reply(sender, code);
+        }
+        size = 0;
+    }
+    // A file's id is its first cluster, and an empty one has none: the
+    // cluster its name is in, and where in it, would do, but nothing here
+    // needs an empty file told from another.
     opened(sender, flags, file, [0, size as u64, is_dir as u64, mode, FAT_ACCESS, cluster as u64]);
 }
 
@@ -1998,7 +2400,7 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
             })
         }
     } else {
-        match fat_path(sender, msg.data[5], path) {
+        match fat_path(disk, sender, msg.data[5], path) {
             Ok(path) if devices::refuses(path) => Err(ERR_PERMISSION),
             Ok(path) => fat32_mkdir(disk, path),
             Err(code) => Err(code),
@@ -2276,9 +2678,23 @@ fn settle(inodes: &[u32]) {
 /// TAG_LINK lend two, end to end, `data[0]` and `data[1]` long (LINK's
 /// `data[2]` may ask to follow a link at the source); TAG_SYMLINK lends the
 /// target, then the new path.
-fn handle_namespace(sender: usize, msg: &Message) {
+fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } != FsType::Ext2 {
-        return error_reply(sender, ERR_NOT_SUPPORTED);
+        // FAT32 has one name to a file and no links: a name can be removed,
+        // and that is all.
+        let done = match msg.tag {
+            TAG_UNLINK | TAG_RMDIR => protocol::lent_path(sender, 0, msg.data[0] as usize, 0)
+                .and_then(|path| fat_path(disk, sender, msg.data[5], path))
+                .and_then(|path| match devices::refuses(path) {
+                    true => Err(ERR_PERMISSION),
+                    false => fat32_remove(disk, path, msg.tag == TAG_RMDIR),
+                }),
+            _ => Err(ERR_NOT_SUPPORTED),
+        };
+        return match done {
+            Ok(()) => reply_opened(sender, [0; 6]),
+            Err(code) => error_reply(sender, code),
+        };
     }
     if ext2_state().read_only {
         return error_reply(sender, ERR_READ_ONLY);
@@ -2338,7 +2754,7 @@ fn handle_readlink(disk: &DiskState, sender: usize, msg: &Message) {
     };
     if unsafe { FS_TYPE } != FsType::Ext2 {
         // No links on FAT32: whatever is there is not one.
-        return match fat_path(sender, msg.data[5], path).and_then(|p| resolve_path(disk, p)) {
+        return match fat_path(disk, sender, msg.data[5], path).and_then(|p| resolve_path(disk, p)) {
             Ok(_) => error_reply(sender, ERR_INVALID_PATH),
             Err(code) => error_reply(sender, code),
         };
@@ -2396,7 +2812,7 @@ fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
         Err(ERR_NOT_SUPPORTED)
     } else {
         protocol::lent_path(sender, 0, msg.data[0] as usize, 0)
-            .and_then(|path| fat_path(sender, msg.data[5], path))
+            .and_then(|path| fat_path(disk, sender, msg.data[5], path))
             .and_then(|path| match resolve_path(disk, path)? {
                 (_, _, true, _, _) if path == b"/" => cwd::set(space, cwd::Where::Root, b""),
                 (_, _, true, _, _) => cwd::set(space, cwd::Where::Path(path.len()), path),
@@ -2448,9 +2864,12 @@ fn move_to(sender: usize, space: u64, ino: u32) -> Result<cwd::Where, u64> {
 
 /// TAG_GETCWD: 4096 bytes lent for writing. Reply: the path's length.
 fn handle_getcwd(sender: usize) {
-    let path = match cwd_of(sender) {
-        (cwd::Where::Inode(ino), _) => ext2_dir::path_of(ext2_state(), ino),
-        (_, path) => Ok(path),
+    let path = match (mounts::cwd_remote(sender), cwd_of(sender)) {
+        // In a mounted filesystem: where that is mounted, and then where
+        // its server says the directory is.
+        (Some(remote), _) => mounts::remote_path(&remote),
+        (None, (cwd::Where::Inode(ino), _)) => ext2_dir::path_of(ext2_state(), ino),
+        (None, (_, path)) => Ok(path),
     };
     match path {
         Ok(p) if syscall::sys_lent_write(sender, 0, p) == Ok(p.len()) => {
@@ -2493,12 +2912,18 @@ fn handle_give_cwd(sender: usize, msg: &Message) {
 }
 
 /// TAG_TRUNCATE: data[0] = handle, data[1] = the new size.
-fn handle_truncate(sender: usize, msg: &Message) {
+fn handle_truncate(disk: &DiskState, sender: usize, msg: &Message) {
     let Some(file) = get_handle(msg.data[0] as usize, sender) else {
         return error_reply(sender, ERR_INVALID_HANDLE);
     };
     if unsafe { FS_TYPE } != FsType::Ext2 {
-        return error_reply(sender, ERR_NOT_SUPPORTED);
+        if file.by_fd && !file.may_write {
+            return error_reply(sender, ERR_INVALID_HANDLE);
+        }
+        return match u32::try_from(msg.data[1]).map_err(|_| ERR_NOT_SUPPORTED).and_then(|size| fat32_truncate(disk, file, size)) {
+            Ok(()) => reply_opened(sender, [0; 6]),
+            Err(code) => error_reply(sender, code),
+        };
     }
     if file.by_fd && !file.may_write {
         return error_reply(sender, ERR_INVALID_HANDLE);
@@ -2560,7 +2985,11 @@ fn handle_stat(sender: usize, msg: &Message) {
                 block_size: e2.block_size as u64,
             }
         }
-        FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir | FsFileData::None => {
+        FsFileData::Device(_)
+        | FsFileData::Disk(_)
+        | FsFileData::Remote(_)
+        | FsFileData::DevDir
+        | FsFileData::None => {
             return error_reply(sender, ERR_INVALID_HANDLE)
         }
     };
@@ -2712,7 +3141,7 @@ fn fat_display_name(raw: &[u8], out: &mut [u8; 12]) -> usize {
 
 /// Reply to a bulk readdir: `used` bytes of records from `CLIENT_BUF` into
 /// what the caller lent, and where to carry on.
-fn reply_dirents(sender: usize, used: usize, next: u64, end: bool) {
+pub(crate) fn reply_dirents(sender: usize, used: usize, next: u64, end: bool) {
     if !lend_out(sender, used) {
         return error_reply(sender, ERR_IO);
     }
@@ -2754,7 +3183,21 @@ fn handle_statfs(sender: usize) {
 // ---------------------------------------------------------------------------
 
 pub fn get_sender_uid_gid(sender: usize) -> (u32, u32) {
+    // The server this filesystem is mounted in asks for somebody else, and
+    // has said who.
+    if let Some(who) = mounts::acting(sender) {
+        return who;
+    }
     syscall::sys_get_tuid(sender).unwrap_or((0, 0))
+}
+
+/// A program has been given the directory it is in as a descriptor: the
+/// record kept for it by program is let go, and with it the directory that
+/// record held.
+pub(crate) fn left_directory(space: u64) {
+    if let Ok(cwd::Where::Inode(ino)) = cwd::set(space, cwd::Where::Root, b"") {
+        settle(&[ino]);
+    }
 }
 
 

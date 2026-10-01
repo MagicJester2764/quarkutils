@@ -109,6 +109,24 @@ pub enum Found {
 /// serves one request at a time, so one is enough.
 static mut WALK: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
 
+/// Where the last lookup left this filesystem: the mount it went into, and
+/// the part of [`WALK`] it had not yet walked.
+static mut CROSSING: (usize, usize, usize) = (0, 0, 0);
+
+/// After a lookup has said [`ERR_ELSEWHERE`]: which mount the path went
+/// into, and what was left of it — nothing, or a path that begins with a
+/// slash. Good until the next lookup.
+pub fn crossing() -> (usize, &'static [u8]) {
+    let (mount, from, to) = unsafe { CROSSING };
+    (mount, unsafe { &(&*core::ptr::addr_of!(WALK))[from..to] })
+}
+
+/// Whether what is left of a path begins by going back up.
+pub fn goes_back(rest: &[u8]) -> bool {
+    let rest = &rest[rest.iter().take_while(|&&b| b == b'/').count()..];
+    rest == b".." || rest.starts_with(b"../")
+}
+
 /// Look `path` up from directory `base` (a path starting with `/` from the
 /// root), checking search permission on every directory it passes through.
 ///
@@ -117,6 +135,11 @@ static mut WALK: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
 /// from the directory holding the link if not. The last component is
 /// followed only if `follow_last` says so, or if a slash comes after it. More
 /// than [`MAX_LINKS`] links in one lookup is `ERR_LOOP`.
+///
+/// A directory another filesystem is mounted on is that filesystem's root to
+/// a path that goes into it or ends at it: the lookup stops there and says
+/// [`ERR_ELSEWHERE`]. A path that turns straight back with `..` never went
+/// in.
 pub fn resolve(
     ext2: &Ext2State,
     base: u32,
@@ -124,6 +147,21 @@ pub fn resolve(
     uid: u32,
     gid: u32,
     follow_last: bool,
+) -> Result<Found, u64> {
+    resolve_to(ext2, base, path, uid, gid, follow_last, true)
+}
+
+/// [`resolve`], for a caller that may mean a mount point itself rather than
+/// what is mounted there: with `cross_last` false, a path that *ends* at one
+/// finds the directory.
+pub fn resolve_to(
+    ext2: &Ext2State,
+    base: u32,
+    path: &[u8],
+    uid: u32,
+    gid: u32,
+    follow_last: bool,
+    cross_last: bool,
 ) -> Result<Found, u64> {
     if path.len() > MAX_PATH {
         return Err(ERR_NAME_TOO_LONG);
@@ -201,6 +239,13 @@ pub fn resolve(
                 holder = 0;
             }
             continue;
+        }
+
+        if let Some(mount) = crate::mounts::at(child_ino) {
+            if if last { cross_last } else { !goes_back(&walk[pos..len]) } {
+                unsafe { CROSSING = (mount, pos, len) };
+                return Err(crate::protocol::ERR_ELSEWHERE);
+            }
         }
 
         if last {
