@@ -15,6 +15,9 @@
 #define SYS_EXIT_PROGRAM    8
 #define SYS_UMASK           9
 #define SYS_WAIT_FOR        10
+#define SYS_SIG_ACTION      11
+#define SYS_SIG_RAISE       12
+#define SYS_SIG_TAKE        13
 #define SYS_YIELD           2
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21
@@ -123,6 +126,22 @@
 /* The working directory's descriptor, one past the ordinary numbers. */
 #define QUARK_FD_CWD        64UL
 #define QUARK_FD_CLOEXEC    1UL
+/* What a descriptor names, and above it a bit for "its other end has gone". */
+#define SYS_FD_KIND         230
+#define QUARK_FD_KIND(k)        ((k) & 0xFFUL)
+#define QUARK_FD_GONE           0x100UL
+#define QUARK_FD_KIND_ENDPOINT   1UL
+#define QUARK_FD_KIND_PIPE_READ  2UL
+#define QUARK_FD_KIND_PIPE_WRITE 3UL
+#define QUARK_FD_KIND_STREAM     4UL
+#define QUARK_FD_KIND_PTY_MASTER 5UL
+#define QUARK_FD_KIND_PTY_SLAVE  6UL
+#define QUARK_FD_KIND_TIMER      7UL
+#define QUARK_FD_KIND_EVENT      8UL
+#define QUARK_FD_KIND_POLLSET    9UL
+#define QUARK_FD_KIND_MEMORY     10UL
+#define QUARK_FD_KIND_SOCKET     11UL
+#define QUARK_FD_KIND_SERVED     12UL
 
 /* 0xF0  introspection */
 #define SYS_ABI_VERSION     240
@@ -140,6 +159,18 @@
    QUARK_WOULD_BLOCK rather than parking. */
 #define QUARK_DONTWAIT      1UL
 #define QUARK_WOULD_BLOCK   ((unsigned long)0xFFFFFFFEUL)
+
+/* What a read of a terminal, a poll or a pollset wait answers when a signal
+   this program handles arrived instead; a sleep (SYS_RECV_TIMEOUT on the
+   caller's own id) answers QUARK_SLEEP_INTERRUPTED, where 1 is the time
+   running out. The signal is collected with SYS_SIG_TAKE. */
+#define QUARK_INTERRUPTED       ((unsigned long)0xFFFFFFFDUL)
+#define QUARK_SLEEP_INTERRUPTED 2UL
+/* SYS_SIG_ACTION's second argument. */
+#define QUARK_SIG_DEFAULT   0UL
+#define QUARK_SIG_IGNORE    1UL
+#define QUARK_SIG_HANDLE    2UL
+#define QUARK_SIG_ASK       ((unsigned long)-1)
 
 /* The system call wrappers.
  *

@@ -66,6 +66,43 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     read_line_result(buf).unwrap_or(0)
 }
 
+/// What reading a line came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Line {
+    /// This many bytes, the newline among them if there was room.
+    Read(usize),
+    /// A read of nothing. From a terminal or a pipe that is the end; from the
+    /// input server it is a line that was interrupted.
+    Nothing,
+    /// There is no descriptor to read from.
+    Closed,
+    /// A signal this program handles arrived instead.
+    Interrupted,
+}
+
+/// Read a line and say which of four things happened.
+pub fn read_line_event(buf: &mut [u8]) -> Line {
+    let mut got = 0;
+    while got < buf.len() {
+        let ret = syscall::sys_fd_read(0, &mut buf[got..]);
+        if ret == syscall::INTERRUPTED {
+            return Line::Interrupted;
+        }
+        if ret == u64::MAX {
+            return if got == 0 { Line::Closed } else { Line::Read(got) };
+        }
+        let n = ret as usize;
+        if n == 0 {
+            break;
+        }
+        got += n;
+        if buf[got - 1] == b'\n' {
+            break;
+        }
+    }
+    if got == 0 { Line::Nothing } else { Line::Read(got) }
+}
+
 /// Read a line, distinguishing "nothing was typed" from "there is nowhere to
 /// read from".
 ///
@@ -80,22 +117,11 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 /// This reads until the newline, the end of `buf`, or a read that returns
 /// nothing after something was read.
 pub fn read_line_result(buf: &mut [u8]) -> Result<usize, ()> {
-    let mut got = 0;
-    while got < buf.len() {
-        let ret = syscall::sys_fd_read(0, &mut buf[got..]);
-        if ret == u64::MAX {
-            return if got == 0 { Err(()) } else { Ok(got) };
-        }
-        let n = ret as usize;
-        if n == 0 {
-            break;
-        }
-        got += n;
-        if buf[got - 1] == b'\n' {
-            break;
-        }
+    match read_line_event(buf) {
+        Line::Read(n) => Ok(n),
+        Line::Nothing | Line::Interrupted => Ok(0),
+        Line::Closed => Err(()),
     }
-    Ok(got)
 }
 
 #[macro_export]

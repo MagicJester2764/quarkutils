@@ -64,6 +64,11 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
+    // A terminal's Ctrl-C is raised for every program that has it open. It
+    // is for what the session runs, which this is not: this holds the
+    // terminal for it.
+    let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_IGNORE);
+    let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
     let mut line_buf = [0u8; 64];
 
     loop {

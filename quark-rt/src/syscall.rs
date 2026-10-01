@@ -21,6 +21,12 @@ pub const SYS_EXIT_PROGRAM: u64 = 8;
 pub const SYS_UMASK: u64 = 9;
 /// `SYS_WAIT` for one child, or without waiting.
 pub const SYS_WAIT_FOR: u64 = 10;
+/// What this program does about a signal.
+pub const SYS_SIG_ACTION: u64 = 11;
+/// Raise a signal for the program a task belongs to.
+pub const SYS_SIG_RAISE: u64 = 12;
+/// The signals raised for this program that it handles.
+pub const SYS_SIG_TAKE: u64 = 13;
 
 // --- 0x10  IPC ---
 pub const SYS_SEND: u64 = 16;
@@ -176,6 +182,8 @@ pub const SYS_FD_HOLDS: u64 = 226;
 pub const SYS_FD_COOKIE: u64 = 227;
 pub const SYS_FD_FLAGS: u64 = 228;
 pub const SYS_FD_REAP: u64 = 229;
+/// What a descriptor names, and whether its other end has gone.
+pub const SYS_FD_KIND: u64 = 230;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 64;
@@ -964,11 +972,23 @@ pub fn sleep_ticks(ticks: u64) {
     if ticks == 0 {
         return;
     }
-    // Block by doing a recv_timeout from our own TID — nobody will send to us specifically,
-    // so it always times out after the deadline.
+    // Block by doing a recv_timeout from our own TID — nobody will send to us
+    // specifically, so only the deadline ends it. Or a signal: one this
+    // program handles ends the sleep, and that is the sleep over, since the
+    // program asked to hear. A sleep that comes back early for any other
+    // reason — a sibling thread was the one a signal was for — goes back.
     let from = sys_getpid() as usize;
-    let mut msg = crate::ipc::Message::empty();
-    let _ = sys_recv_timeout(from, &mut msg, ticks);
+    let deadline = sys_ticks().saturating_add(ticks);
+    loop {
+        let now = sys_ticks();
+        if now >= deadline {
+            return;
+        }
+        let mut msg = crate::ipc::Message::empty();
+        if sys_recv_timeout(from, &mut msg, deadline - now) == Err(SLEEP_INTERRUPTED) {
+            return;
+        }
+    }
 }
 
 /// Sleep for approximately `ms` milliseconds.
@@ -1334,6 +1354,84 @@ pub fn sys_wait_nowait(tid: usize) -> Result<Option<(usize, i32)>, ()> {
     }
 }
 
+// Signals: Unix's, said to a program. Not the three task signals
+// (`SIG_INT` and its neighbours, with `sys_signal`), which are bits in one
+// task's notification word and older than these.
+pub const SIGHUP: u64 = 1;
+pub const SIGINT: u64 = 2;
+pub const SIGQUIT: u64 = 3;
+pub const SIGKILL: u64 = 9;
+pub const SIGTERM: u64 = 15;
+
+/// What a program does about a signal: what the signal does, nothing, or run
+/// a handler of its own.
+pub const SIG_DEFAULT: u64 = 0;
+pub const SIG_IGNORE: u64 = 1;
+pub const SIG_HANDLE: u64 = 2;
+
+/// What a read of a terminal or a poll answers when a signal this program
+/// handles arrived instead of what it was waiting for.
+pub const INTERRUPTED: u64 = 0xFFFF_FFFD;
+/// The same answer from [`sys_recv_timeout`] on the caller's own id — a
+/// sleep — where 1 is the time running out.
+pub const SLEEP_INTERRUPTED: u64 = 2;
+
+/// Say what this program does about signal `signo`, and learn what it did.
+///
+/// A program that handles one is told in three ways, and runs the handler
+/// itself: the word it gave [`sys_sig_take`] is set, the wait it was in ends
+/// early with [`INTERRUPTED`], and `sys_sig_take` returns the signal.
+pub fn sys_sig_action(signo: u64, what: u64) -> Result<u64, ()> {
+    let ret = unsafe { syscall2(SYS_SIG_ACTION, signo, what) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret) }
+}
+
+/// What this program does about `signo`, left as it is.
+pub fn sys_sig_action_get(signo: u64) -> Result<u64, ()> {
+    sys_sig_action(signo, u64::MAX)
+}
+
+/// Raise `signo` for the program `tid` is a task of. `signo` 0 raises
+/// nothing and says whether one could be.
+pub fn sys_sig_raise(tid: usize, signo: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SIG_RAISE, tid as u64, signo) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+/// The signals raised for this program that it handles, as a mask — bit
+/// `n - 1` for signal `n` — none of which is waiting afterwards. `word`, if
+/// given, is where the kernel writes 1 when the next arrives.
+pub fn sys_sig_take(word: Option<&'static core::sync::atomic::AtomicU32>) -> u64 {
+    let at = word.map_or(0, |w| w as *const _ as u64);
+    match unsafe { syscall1(SYS_SIG_TAKE, at) } {
+        u64::MAX => 0,
+        mask => mask,
+    }
+}
+
+/// What kind of thing a descriptor names: [`sys_fd_kind`]'s answers.
+pub const FD_KIND_ENDPOINT: u64 = 1;
+pub const FD_KIND_PIPE_READ: u64 = 2;
+pub const FD_KIND_PIPE_WRITE: u64 = 3;
+pub const FD_KIND_STREAM: u64 = 4;
+pub const FD_KIND_PTY_MASTER: u64 = 5;
+pub const FD_KIND_PTY_SLAVE: u64 = 6;
+pub const FD_KIND_TIMER: u64 = 7;
+pub const FD_KIND_EVENT: u64 = 8;
+pub const FD_KIND_POLLSET: u64 = 9;
+pub const FD_KIND_MEMORY: u64 = 10;
+pub const FD_KIND_SOCKET: u64 = 11;
+pub const FD_KIND_SERVED: u64 = 12;
+
+/// What descriptor `fd` names, and whether nothing is left at its other end.
+/// `None` if it names nothing.
+pub fn sys_fd_kind(fd: usize) -> Option<(u64, bool)> {
+    match unsafe { syscall1(SYS_FD_KIND, fd as u64) } {
+        u64::MAX => None,
+        ret => Some((ret & 0xFF, ret & 0x100 != 0)),
+    }
+}
+
 /// Set the permission bits this program leaves off a file or a directory it
 /// makes, and return what they were. Kept across a fork and an exec.
 pub fn sys_umask(mask: u32) -> u32 {
@@ -1666,7 +1764,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 2;
+pub const ABI_VERSION_MINOR: u32 = 3;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

@@ -5,7 +5,7 @@ use quark_rt::ipc::Message;
 use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{args, print, println, syscall, vfs};
-use quark_rt::stdio::read_line_result;
+use quark_rt::stdio::{read_line_event, Line};
 
 mod words;
 
@@ -427,6 +427,13 @@ fn set_status(name: &[u8], code: i32) {
     // signal Linux would have sent. Naming it is the difference between "it
     // failed" and "it executed an instruction it was not allowed to".
     match code {
+        // Interrupted from the terminal, which showed `^C` and nothing after
+        // it: the line is ended, and that says what happened.
+        -2 => println!(),
+        -3 => println!("{}: quit", s),
+        // Its reader went away, which is how a pipeline ends early.
+        -13 => {}
+        -15 => println!("{}: terminated", s),
         -4 => println!("{}: illegal instruction", s),
         -5 => println!("{}: trace trap", s),
         -7 => println!("{}: bus error", s),
@@ -534,19 +541,37 @@ pub extern "C" fn _start() -> ! {
     // prompt, or the terminal has gone. From the input server it is a line
     // that was interrupted, and the next read is the next line.
     let on_terminal = syscall::sys_pty_number(0).is_ok();
+    if on_terminal {
+        // A terminal's Ctrl-C is raised for every program that has it open,
+        // and this is one. What it is for is whatever is running in the
+        // foreground, which has said nothing about it and is ended. Handled
+        // here rather than ignored, so that at the prompt it ends the wait
+        // for a line: the line is abandoned and there is a fresh prompt.
+        let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_HANDLE);
+        let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
+    }
 
     // Main loop
     let mut line_buf = [0u8; 256];
     loop {
+        if on_terminal {
+            // Whatever was raised while a command ran was the command's.
+            let _ = syscall::sys_sig_take(None);
+        }
         print_prompt(vfs_tid);
 
-        let n = match read_line_result(&mut line_buf) {
-            Ok(n) => n,
+        let n = match read_line_event(&mut line_buf) {
+            Line::Read(n) => n,
+            Line::Nothing => 0,
+            Line::Interrupted => {
+                println!();
+                continue;
+            }
             // No descriptor on stdin. Nothing is ever going to be typed here,
             // so asking again is a spin — which is what running a shell under
             // a compositor used to be, a prompt printed as fast as the machine
             // could manage into a terminal that was not on the screen.
-            Err(()) => {
+            Line::Closed => {
                 println!("shell: no input available; exiting");
                 syscall::sys_exit_code(0);
             }

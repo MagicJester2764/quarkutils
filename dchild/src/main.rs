@@ -28,6 +28,10 @@
 //! `fdclient TID` is a client of a server at TID that serves descriptors: it
 //! asks for one, reads and writes through it, copies and closes it, and exits
 //! with a bit for each thing that worked.
+//! `sigstate` exits with what it was started doing about signals 2, 10 and
+//! 12, two bits each: a program a spawner made has said nothing, whatever its
+//! spawner had said. `sigignore` ignores signal 15, says so on descriptor 3,
+//! and sleeps.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -212,6 +216,16 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(0);
     }
     if quark_rt::args::argv(1) == Some(&b"sleep"[..]) {
+        syscall::sleep_ticks(1000);
+        syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"sigstate"[..]) {
+        let said = |signo| syscall::sys_sig_action_get(signo).unwrap_or(3) as i32;
+        syscall::sys_exit_code(said(2) | said(10) << 2 | said(12) << 4);
+    }
+    if quark_rt::args::argv(1) == Some(&b"sigignore"[..]) {
+        let _ = syscall::sys_sig_action(syscall::SIGTERM, syscall::SIG_IGNORE);
+        let _ = syscall::sys_fd_write(CONN, b"i");
         syscall::sleep_ticks(1000);
         syscall::sys_exit_code(0);
     }

@@ -63,6 +63,11 @@ fn open_terminal() -> Option<usize> {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // A terminal's Ctrl-C is raised for every program that has it open. It
+    // is for what the session runs, which this is not: this holds the
+    // terminal for it.
+    let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_IGNORE);
+    let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
     let program = quark_rt::args::argv(1).unwrap_or(b"/usr/bin/login");
     let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 50) else {
         println!("getty: no file server");

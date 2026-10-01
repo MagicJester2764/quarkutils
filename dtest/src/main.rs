@@ -891,6 +891,216 @@ fn test_pollset() {
 /// The waking thread's end of the pair, handed to it as descriptor 3.
 const WAKER_FD: usize = 3;
 
+/// Where the kernel says a signal has arrived for a handler.
+static SIG_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The master of the terminal `typist` types at.
+static TYPIST_MASTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Wait a while, then press Ctrl-C at the terminal. On a thread, so that the
+/// main task can be reading the terminal when it is pressed.
+extern "C" fn typist() -> ! {
+    syscall::sleep_ticks(20);
+    let master = TYPIST_MASTER.load(core::sync::atomic::Ordering::SeqCst);
+    let _ = syscall::sys_fd_write_nb(master, b"\x03");
+    syscall::sys_exit_code(0);
+}
+
+/// Signals: what a program says about one, what the kernel does when it has
+/// said nothing, and how it is told when it has a handler.
+fn test_signals() {
+    use core::sync::atomic::Ordering::SeqCst;
+    println!("signals:");
+    let me = syscall::sys_getpid() as usize;
+    const USR1: u64 = 10;
+    const USR2: u64 = 12;
+    let bit = |signo: u64| 1u64 << (signo - 1);
+
+    check("a program starts having said nothing", syscall::sys_sig_action_get(USR1) == Ok(syscall::SIG_DEFAULT));
+    check(
+        "ignoring a signal answers with what it was",
+        syscall::sys_sig_action(USR2, syscall::SIG_IGNORE) == Ok(syscall::SIG_DEFAULT)
+            && syscall::sys_sig_action_get(USR2) == Ok(syscall::SIG_IGNORE),
+    );
+    check(
+        "kill and stop cannot be ignored or handled",
+        syscall::sys_sig_action(syscall::SIGKILL, syscall::SIG_IGNORE).is_err()
+            && syscall::sys_sig_action(syscall::SIGKILL, syscall::SIG_HANDLE).is_err()
+            && syscall::sys_sig_action(19, syscall::SIG_IGNORE).is_err(),
+    );
+    check(
+        "0 and 65 are not signals",
+        syscall::sys_sig_action_get(0).is_err() && syscall::sys_sig_action_get(65).is_err(),
+    );
+    check("an ignored signal does nothing", syscall::sys_sig_raise(me, USR2).is_ok());
+    check(
+        "signal 0 asks and raises nothing",
+        syscall::sys_sig_raise(me, 0).is_ok() && syscall::sys_sig_raise(63, 0).is_err(),
+    );
+
+    // A handler. The kernel runs none: it says the signal is waiting, in a
+    // word of this program's and in the answer to the next take.
+    let _ = syscall::sys_sig_action(USR1, syscall::SIG_HANDLE);
+    SIG_WORD.store(0, SeqCst);
+    check("nothing is waiting to begin with", syscall::sys_sig_take(Some(&SIG_WORD)) == 0);
+    check("a handled signal is raised", syscall::sys_sig_raise(me, USR1).is_ok());
+    check("and the program's word says so", SIG_WORD.load(SeqCst) == 1);
+
+    // One wait is ended by it: the first to look.
+    let mut msg = quark_rt::ipc::Message::empty();
+    let before = syscall::sys_ticks();
+    let ended = syscall::sys_recv_timeout(me, &mut msg, 50);
+    check(
+        "a sleep ends at once, saying why",
+        ended == Err(syscall::SLEEP_INTERRUPTED) && syscall::sys_ticks() - before < 10,
+    );
+    let before = syscall::sys_ticks();
+    let ended = syscall::sys_recv_timeout(me, &mut msg, 10);
+    check(
+        "the next sleep is a sleep",
+        ended == Err(1) && syscall::sys_ticks() - before >= 9,
+    );
+    check("taking it gives the signal", syscall::sys_sig_take(None) == bit(USR1));
+    check("once", syscall::sys_sig_take(None) == 0);
+
+    // A forked child is a copy of the program, what it said about signals
+    // included, with nothing waiting.
+    let _ = syscall::sys_sig_raise(me, USR1);
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let same = syscall::sys_sig_action_get(USR1) == Ok(syscall::SIG_HANDLE)
+                && syscall::sys_sig_action_get(USR2) == Ok(syscall::SIG_IGNORE);
+            let nothing = syscall::sys_sig_take(None) == 0;
+            syscall::sys_exit_program(if same && nothing { 7 } else { 8 });
+        }
+        Ok(child) => check("a forked child says what its parent said", wait_for(child) == Some(7)),
+        Err(()) => check("fork", false),
+    }
+    check("and what was waiting stayed with the parent", syscall::sys_sig_take(None) == bit(USR1));
+
+    // A program a spawner makes is a new one, and has said nothing.
+    let fresh = load_child(&[b"dchild", b"sigstate"]).and_then(|c| {
+        let tid = c.tid;
+        c.start().ok().map(|()| tid)
+    });
+    check("a spawned program has said nothing", fresh.and_then(wait_for) == Some(0));
+
+    // Nothing said, and the signal does what it does: ends the program, with
+    // its number as the status.
+    let sleeper = load_child(&[b"dchild", b"sleep"]).and_then(|c| {
+        let tid = c.tid;
+        c.start().ok().map(|()| tid)
+    });
+    match sleeper {
+        Some(tid) => {
+            syscall::sleep_ticks(10);
+            check("a signal is raised for another program", syscall::sys_sig_raise(tid, syscall::SIGTERM).is_ok());
+            check("which ends with the signal's number", wait_for(tid) == Some(-15));
+        }
+        None => check("started a program to signal", false),
+    }
+    // Ignored, it does nothing; and 9 cannot be.
+    match (syscall::sys_socketpair(), load_child(&[b"dchild", b"sigignore"])) {
+        (Ok((mine, theirs)), Some(child)) => {
+            let tid = child.tid;
+            let _ = syscall::sys_fd_dup(tid, 3, theirs);
+            let _ = syscall::sys_fd_close(theirs);
+            let started = child.start().is_ok();
+            let mut said = [0u8; 1];
+            let ready = started && syscall::sys_fd_read(mine, &mut said) == 1;
+            let _ = syscall::sys_sig_raise(tid, syscall::SIGTERM);
+            syscall::sleep_ticks(10);
+            let alive = matches!(syscall::sys_task_info(tid), Ok((state, _, _)) if state != 3);
+            check("a program that ignores a signal is not ended by it", ready && alive);
+            let _ = syscall::sys_sig_raise(tid, syscall::SIGKILL);
+            check("and is by 9", wait_for(tid) == Some(-9));
+            let _ = syscall::sys_fd_close(mine);
+        }
+        _ => check("started a program that ignores a signal", false),
+    }
+
+    // A terminal. Its interrupt character raises signal 2 for every program
+    // that holds the slave, and this one does.
+    let pair = syscall::sys_pty_create().ok().and_then(|master| {
+        let number = syscall::sys_pty_number(master).ok()?;
+        Some((master, syscall::sys_pty_open(number).ok()?))
+    });
+    let Some((master, slave)) = pair else {
+        check("a terminal", false);
+        return;
+    };
+    let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_HANDLE);
+    SIG_WORD.store(0, SeqCst);
+    let _ = syscall::sys_fd_write_nb(master, b"abc\x03");
+    check(
+        "Ctrl-C at a terminal raises a signal for whoever holds it",
+        SIG_WORD.load(SeqCst) == 1 && syscall::sys_sig_take(None) == bit(syscall::SIGINT),
+    );
+
+    // Pressed while a read of the terminal is waiting, it ends the read.
+    TYPIST_MASTER.store(master, SeqCst);
+    match thread::spawn_with_stack(typist, 8) {
+        Ok(t) => {
+            let mut line = [0u8; 16];
+            let before = syscall::sys_ticks();
+            let got = syscall::sys_fd_read(slave, &mut line);
+            let waited = syscall::sys_ticks() - before;
+            check(
+                "a read of the terminal is ended by it",
+                got == syscall::INTERRUPTED && (10..200).contains(&waited),
+            );
+            check("and it is waiting to be taken", syscall::sys_sig_take(None) == bit(syscall::SIGINT));
+            let _ = t.join();
+        }
+        Err(_) => check("a thread to press the key", false),
+    }
+
+    // A program that holds the terminal and has said nothing is ended.
+    match load_child(&[b"dchild", b"sleep"]) {
+        Some(child) => {
+            let tid = child.tid;
+            let _ = syscall::sys_fd_dup(tid, 0, slave);
+            let started = child.start().is_ok();
+            syscall::sleep_ticks(10);
+            let _ = syscall::sys_fd_write_nb(master, b"\x03");
+            check("Ctrl-C ends a program that said nothing", started && wait_for(tid) == Some(-2));
+        }
+        None => check("started a program on the terminal", false),
+    }
+    let _ = syscall::sys_sig_take(None);
+
+    // What a descriptor is, and whether anybody is at the other end.
+    check(
+        "a terminal's two ends say which they are",
+        syscall::sys_fd_kind(master) == Some((syscall::FD_KIND_PTY_MASTER, false))
+            && syscall::sys_fd_kind(slave) == Some((syscall::FD_KIND_PTY_SLAVE, false)),
+    );
+    let _ = syscall::sys_fd_close(slave);
+    check(
+        "and a master whose slave has gone says so",
+        syscall::sys_fd_kind(master) == Some((syscall::FD_KIND_PTY_MASTER, true)),
+    );
+    let _ = syscall::sys_fd_close(master);
+    if let Ok((a, b)) = syscall::sys_socketpair() {
+        check("a stream is a stream", syscall::sys_fd_kind(a) == Some((syscall::FD_KIND_STREAM, false)));
+        let _ = syscall::sys_fd_close(b);
+        check(
+            "a write nobody can read fails, and the descriptor says why",
+            syscall::sys_fd_write(a, b"x") == u64::MAX
+                && syscall::sys_fd_kind(a) == Some((syscall::FD_KIND_STREAM, true)),
+        );
+        let _ = syscall::sys_fd_close(a);
+        check("a number that names nothing has no kind", syscall::sys_fd_kind(a).is_none());
+    } else {
+        check("a stream", false);
+    }
+
+    // As it was found.
+    for signo in [syscall::SIGINT, USR1, USR2] {
+        let _ = syscall::sys_sig_action(signo, syscall::SIG_DEFAULT);
+    }
+    let _ = syscall::sys_sig_take(None);
+}
+
 /// Sleep a little, then write. Run on a thread so that something can become
 /// ready while the main task is blocked in a wait — which is the whole of what
 /// Task 8 adds, and cannot be tested from one task.
@@ -2448,6 +2658,7 @@ pub extern "C" fn _start() -> ! {
         ("program", test_program_table),
         ("served", test_served),
         ("fdfiles", test_file_descriptors),
+        ("signals", test_signals),
         ("region", test_big_region),
         ("memfd", test_memfd),
         ("socketpair", test_socketpair),
