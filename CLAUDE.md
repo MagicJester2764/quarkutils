@@ -539,9 +539,12 @@ The rules that got it there, and that a further port should follow:
   with none; a working directory is the same. `weston-terminal` needs neither,
   and the next piece of this hole is making the VFS understand that one program
   is a copy of another.
-- There are **no signals**. `setsid` answers with the caller's own id,
-  `TIOCSCTTY` is accepted, and `sigaction` is accepted and remembered by
-  nobody. The kernel has none to deliver.
+- There are **no POSIX signals**. The kernel has three of its own — interrupt,
+  terminate and kill — and they are what Ctrl-C at the text console (`input`
+  sends interrupt to the foreground task), `qsh`'s `kill` and `shutdown` use.
+  A C program gets none of it: `sigaction` is accepted and remembered by
+  nobody, `setsid` answers with the caller's own id, `TIOCSCTTY` is accepted,
+  and in a pseudo-terminal Ctrl-C is a byte.
 - The compositor keeps no history of serials, so `xdg_toplevel.move` and
   `.resize` cannot check that the serial they are given was a recent press.
   What they check instead is that a button is down. Drag and drop, touch and

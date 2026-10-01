@@ -36,14 +36,23 @@ linux-abi/          The Linux system-call surface, answered by Quark. musl is
                     built on this, and every ported program on musl.
 
 login/  qsh/        Log in; the shell.
-ls/ cat/ echo/ ps/ ping/ httpget/ shutdown/ ...   Programs.
+ls/ cat/ echo/ ps/ ping/ shutdown/      Programs, in Rust without std.
+hello/  httpget/    Programs in Rust with std, built against the fork.
+cwc/  envtest/      Programs in C.
 dtest/  dchild/     267 checks of the kernel, made through the ABI.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
+fstest/ nettest/ socktest/ threadtest/ mousetest/ disktest/ ipcping/
+capdemo/ wmdemo/ wmtype/                One subsystem each, exercised.
 
+rootfs/             What goes in /etc.
 linker.ld           The link script every program here is linked with.
 x86_64-unknown-quark.json   The hosted Rust target.
+rust-std-patches/   The std fork's port to Quark, mirrored: the commit it left
+                    upstream at, a patch for the files upstream has, and the
+                    files it adds. Generated; see its README.
 docs/               The VFS protocol; the compositor.
 tools/check-abi.sh  The numbers here agree with each other and with the kernel.
+tools/std-patches.sh  The mirror above agrees with the fork.
 ```
 
 ## Building
@@ -84,6 +93,16 @@ make install DESTDIR=/tmp/stage          # finds /tmp/stage/usr/include/quark/ab
 
 With no kernel installed the comparison is skipped and said to be;
 `REQUIRE_ABI=1` makes that an error.
+
+The two repositories need not be at the same commit, only at compatible
+versions. The runtime says which ABI it was built for
+(`quark_rt::syscall::ABI_VERSION_MAJOR` and `_MINOR`), and the rule is the one
+`docs/abi.md` in the kernel gives: the major must be equal; a kernel whose
+minor is ahead has every call the runtime knows, where the runtime knows it;
+a kernel that is behind is refused. The build checks that against the
+installed header, and `init` checks it again against the kernel it is
+actually running on — and stops, saying so on the kernel's console, rather
+than start a userland on a kernel that numbers its calls differently.
 
 ## Running
 

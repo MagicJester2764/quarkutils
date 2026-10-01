@@ -1,14 +1,15 @@
 # The VFS protocol
 
-The contract between the file server and its clients. `user/vfs` is the
-server; `quark-rt`'s `vfs` module, Quark's C library (`include/quark/vfs.h`)
-and the Linux translation layer are clients. Each keeps its own copy of the
-numbers below; this document is the one they are checked against.
+The contract between the file server and its clients. `vfs` is the server and
+`vfs/src/protocol.rs` its copy of the numbers below; `quark-rt`'s `vfs`
+module, the C library (`libc/include/quark/vfs.h`) and the Linux translation
+layer (`linux-abi`) are clients, each with a copy of its own. This document is
+the one they are checked against.
 
 A client finds the server by looking up `vfs` with the nameserver, which also
 gives it the right to call it. Every request is a synchronous call. Where a
 request carries more than six words — a path, a record, file data — the client
-lends a buffer with the call (`SYS_CALL_LEND`, see `docs/abi.md`) and the
+lends a buffer with the call (`SYS_CALL_LEND`, in the kernel's `docs/abi.md`) and the
 server copies into or out of it before replying. The server never maps a
 client's memory and cannot reach a lent buffer once it has answered.
 
@@ -273,7 +274,8 @@ handle (`PERMISSION` otherwise). The caller maps it with `SYS_OBJECT_MAP` and
 may delete the capability after: the mapping keeps the object. Directories,
 links, devices and FAT32 files are `NOT_SUPPORTED`.
 
-The server is the object's pager (`docs/abi.md`, "Memory objects"): it answers
+The server is the object's pager (the kernel's `docs/abi.md`, "Memory
+objects"): it answers
 `TAG_PAGE_IN` with the page read from the file, zeroes past its end, and
 releases an object once the kernel says nothing maps it, having first
 written back every page written through a shared mapping; `TAG_OBJECT_SYNC`

@@ -49,7 +49,9 @@ pub extern "C" fn _start() -> ! {
             println!("shutdown: killed {} tasks", signaled);
         } else {
             println!("shutdown: sent SIGTERM to {} tasks, waiting...", signaled);
-            // Wait for tasks to exit gracefully (SIG_TERM has 2s kernel grace period)
+            // Give them two and a half seconds to go by themselves. The
+            // kernel would end each one five seconds after the signal anyway;
+            // the survivors are killed below rather than waited for.
             syscall::sleep_ms(2500);
         }
     }

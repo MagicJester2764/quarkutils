@@ -1330,7 +1330,7 @@ pub const SIG_KILL: u64 = 1 << 18;
 pub const SIG_MASK: u64 = SIG_INT | SIG_TERM | SIG_KILL;
 
 /// Send a signal to a task. SIG_KILL is immediate; SIG_INT/SIG_TERM give the
-/// task a 2-second grace period to handle the signal before being force-killed.
+/// task a 5-second grace period to handle the signal before being force-killed.
 /// Same permissions as sys_task_kill (CAP_TASK_MGMT or same UID).
 pub fn sys_signal(tid: usize, sig: u64) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_SIGNAL, tid as u64, sig) };

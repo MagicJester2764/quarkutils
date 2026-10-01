@@ -1,12 +1,13 @@
 # Wayland on Quark
 
-**Status: design.** Nothing here is implemented. This is the plan for Phase 8
-of `../../ROADMAP.md`, and it is written down before the code because the parts
-that are easy to get wrong are the ones nobody notices until a client from
-somewhere else refuses to run.
+`wm` is a Wayland compositor: the actual protocol and the actual wire format,
+so that a client built for Linux and never modified runs here. Upstream
+libwayland, weston's `weston-simple-shm` and `weston-terminal`, and GTK 4 all
+do, unpatched.
 
-Quark implements **Wayland**: the actual protocol, the actual wire format, with
-the goal that a client built for Linux and never modified will run here.
+This says what the compositor implements, the rules it keeps, and what it does
+not do. The code is `wm/src`, one module per part; the wire format both halves
+agree on is `quark-rt/src/wl`.
 
 ## Why the real thing
 
@@ -24,34 +25,39 @@ real Wayland actually was. Wayland assumes four things:
 3. memory addressable as a descriptor, which both sides map;
 4. `poll`, so one task can wait on several descriptors.
 
-Quark has none of them. And the draft's whole transport — a shared-memory ring,
-a futex wake, and an endpoint the compositor granted sideways into the input
-server so that a server could push — was machinery invented to work around
-exactly that absence. It was not a design; it was a series of detours around
-holes in the operating system.
+Quark had none of them, and the draft's whole transport — a shared-memory ring,
+a futex wake, an endpoint granted sideways so that a server could push — was
+machinery invented to work around exactly that absence. So the kernel grew the
+four instead: `SYS_SOCKETPAIR`, `SYS_FD_SEND` and `SYS_FD_RECV`,
+`SYS_MEMFD_CREATE`, and `SYS_POLL` with poll sets. They are what every
+Unix-shaped system has, and they were worth having whether or not anything was
+ever drawn.
 
-**So the four are Phase 10, and they are worth building whether or not anything
-is ever drawn on this machine.** A socketpair, descriptor passing, memory as an
-object, and a way to wait on more than one thing at once are what every
-Unix-shaped system has, and Quark has already bent two subsystems out of shape
-for want of them.
+## Running it
 
-## What Wayland needs, and where it comes from
+```
+wm "<program> [args]" ...
+```
 
-| Wayland requires | Quark today | Comes from |
-|---|---|---|
-| `AF_UNIX` `SOCK_STREAM` connection | pipes: unidirectional, 4 KiB, 8 per task | **Phase 10** — socketpair |
-| `SCM_RIGHTS` descriptor passing | nothing; `SYS_FD_DUP` pushes, needs `TaskMgmt` | **Phase 10** — passing, attached to the stream |
-| `memfd`/`shm_open` + `mmap` for `wl_shm` | `shmem` handles, not descriptors; `mmap` is anonymous | **Phase 10** — memory as a descriptor |
-| `poll()` on the connection | nothing at all | **Phase 10** |
-| `pthread_mutex`, `pthread_cond` in `wl_display` | futex only | **Phase 9** |
-| libffi, for dispatching into listeners | — | port; still a hard dependency at libwayland 1.26.90 |
-| libwayland-client | — | port, **unpatched** — see below |
-| an environment (`getenv`/`setenv`) | nothing at all | new; what makes the above unpatched |
+`wm` takes the display from whoever has it, starts up to four programs, and
+gives the display back when the last of them has gone or when Escape is
+pressed. It is a program a user runs, not something the system is built
+around: the machine boots into the text console, and `wm` is a client of the
+framebuffer device like the console is.
 
-The compositor is **our own code**. libwayland-server is not used, which is what
-keeps `epoll` off this list: it belongs to that library's event loop, not to the
-client's.
+Each program is given:
+
+- one end of a socketpair as descriptor 3, and `WAYLAND_SOCKET=3` in its
+  environment — the first thing `wl_display_connect` looks at, which is the
+  whole reason libwayland needs no patch and Quark needs no socket files;
+- `WM_SESSION=n`, saying which of the session's programs it is;
+- the rest of the compositor's own environment;
+- the compositor's standard output and error, so that what it prints goes to
+  the console underneath. Not standard input: a program in a session takes its
+  keys from the compositor.
+
+A program is granted what its own manifest asks for, out of what the
+compositor holds.
 
 ## What the compositor is
 
@@ -64,242 +70,213 @@ Six things have to happen for a window to be on a screen:
 5. Route input to whichever client it belongs to.
 6. Furniture and policy: title bars, focus, dragging, closing.
 
-**Job 1 is not Wayland's and stays where it is.** `user/fb` owns the framebuffer
-the way `/dev/fb0` does and lends the display by capability; clients never see
-it, and the compositor is one of its claimants. That is a cleaner separation
-than Linux has, where mode-setting is kernel code.
+**Job 1 is not Wayland's and is not the compositor's.** `fb` owns the
+framebuffer the way `/dev/fb0` does and lends the display by capability;
+clients never see it, and the compositor is one of its claimants.
 
 X11 split jobs 3 and 6 into a window-manager process separate from the server
-doing 1, 4 and 5, and the two disagreed in the gap between them — a window that
-flickers at the wrong size is that disagreement. Wayland collapsed them, so
-**"compositor" and "window manager" name one program**. `user/wm` is that
-program, and it already being both is the right shape rather than a shortcut.
+doing 1, 4 and 5, and the two disagreed in the gap between them. Wayland
+collapsed them, so "compositor" and "window manager" name one program.
 
-## Protocols implemented
+## Interfaces
 
 Versions are what the compositor advertises; a client binds no higher than the
-minimum of what it supports and what it is offered. Start low and raise a
-version only when a target client needs it — the exact minimum each of the
-three milestone clients demands is a thing to determine by running them, not by
-reading.
+minimum of what it supports and what it is offered. **A version is advertised
+only when every event of it is sent.**
 
-**MVP — everything `weston-simple-shm` touches:**
+| Global | Version | Why that one |
+|---|---|---|
+| `wl_compositor` | 4 | The buffer transform, the buffer scale and `damage_buffer` are read and checked. weston's toytoolkit binds 3 with no negotiation, so a compositor offering less is one every weston client dies against. |
+| `wl_shm` | 1 | `ARGB8888` and `XRGB8888`. |
+| `wl_output` | 2 | One output; `geometry`, `mode`, `scale` and `done`. |
+| `wl_seat` | 5 | A keyboard and a pointer. 5 is `wl_pointer.frame` and the axis events that go with it. |
+| `xdg_wm_base` | 1 | Toplevels. Popups and positioners are refused. |
+| `zxdg_decoration_manager_v1` | 1 | Always answers server-side. |
+| `wl_data_device_manager` | 1 | The clipboard. 2 and 3 are drag and drop. |
+| `zwp_primary_selection_device_manager_v1` | 1 | What the middle button pastes. |
 
-`wl_display`, `wl_registry`, `wl_callback`, `wl_compositor`, `wl_surface`,
-`wl_shm`, `wl_shm_pool`, `wl_buffer`, `wl_output`, and from `xdg-shell`:
-`xdg_wm_base`, `xdg_surface`, `xdg_toplevel`.
+Objects made from those: `wl_registry`, `wl_callback`, `wl_surface`,
+`wl_region`, `wl_shm_pool`, `wl_buffer`, `wl_keyboard`, `wl_pointer`,
+`xdg_surface`, `xdg_toplevel`, the toplevel decoration, and the data device,
+source and offer of each selection. An object made from another inherits its
+version, which is how a client that bound `wl_seat` at 4 gets a `wl_pointer`
+with no `frame`.
 
-No seat is needed to put a picture on the screen, which is what makes this the
-smallest honest claim that a real Wayland client runs here.
+`wl_region` exists so that clients may name it; its requests do nothing,
+because this compositor composites and routes the same either way.
+`wl_pointer.set_cursor` is read and checked and then let go: the compositor
+draws the pointer itself.
 
-**Near — what `weston-terminal` adds:**
+**Not implemented, and each for a reason:**
 
-`wl_seat`, `wl_keyboard`, `wl_pointer`, `wl_region`, and the clipboard:
-`wl_data_device_manager`, `wl_data_device`, `wl_data_source`, `wl_data_offer`.
-Plus `xdg_popup` for its menus, and `xdg-decoration` so the compositor keeps
-drawing the title bars rather than every client growing its own.
-
-**Deliberately not implemented, and each for a reason:**
-
+- `xdg_popup`, `xdg_positioner` — menus. `weston-terminal`'s are the one thing
+  of its it cannot show.
+- drag and drop — `wl_data_device_manager` 2 and 3. It needs a pointer grab
+  that follows a surface a client supplies.
 - `wl_touch` — no touch hardware, and nothing to test against.
 - `wl_subcompositor`, `wl_subsurface` — a client-side optimisation for
-  compositing video or GL under a widget tree; nothing here needs it.
+  compositing video or GL under a widget tree.
 - `wl_shell`, `wl_shell_surface` — deprecated in favour of `xdg-shell`.
 - output transforms, fractional scaling, `wl_drm`, `linux-dmabuf` — one output,
   one scale, no rotation, no GPU.
+- `wl_shm_pool.resize` — see "What is missing".
 
-## Rules the compositor must honour
+## Rules the compositor keeps
 
-These are not Quark's rules; they are the parts of Wayland that a compositor
-gets wrong quietly, where the client is correct and the picture is not. They
-survive from the earlier draft unchanged, because they were never about the
-transport.
+These are the parts of Wayland a compositor gets wrong quietly, where the
+client is correct and the picture is not.
+
+**A request is read inside the request.** Every argument comes through a cursor
+bounded by the size in the message's own header. Anything that cannot be
+honoured — an opcode the interface does not have, an object that is not there
+or is not what the request needs, a string that does not end in a NUL, a `bind`
+above the version advertised — is a `wl_display.error` naming the object and
+the reason, and then the connection ends. The compositor also prints why,
+because libwayland hands the reason to the program and most programs exit
+without repeating it.
+
+**A stream is not a message.** A read delivers whatever was in the buffer,
+which may be half of one request or three and a bit. Each connection keeps the
+bytes that have arrived and do not yet make a message.
+
+**A client cannot name another client's objects.** There is one id table per
+client, and the id a client sends is only ever looked up in its own.
 
 **A surface has no meaning until it is given a role.** A bare `wl_surface` is
-never displayed. `xdg_surface.get_toplevel` makes it an application window;
-`wl_pointer.set_cursor` makes another one a cursor; `xdg_popup` makes a third a
-menu. One surface type, one buffer path, one commit path, and no special case
-for any of them. Giving a surface a second role is a protocol error.
+never displayed; `xdg_surface.get_toplevel` makes it a window. Giving a surface
+a second role is a protocol error.
 
-**Surface state is double-buffered and applied atomically.** `attach`, `damage`,
-`frame`, `set_opaque_region` and the rest do nothing when they arrive — they
-accumulate *pending* state, and `commit` applies all of it at once. This is what
-makes a half-drawn or half-resized frame unrepresentable rather than merely
-unlikely, and a compositor that applies state as it arrives will look correct
-until the first resize.
+**Surface state is double-buffered and applied atomically.** `attach`,
+`damage`, `frame` and the rest change nothing a viewer could see — they
+accumulate pending state, and `commit` applies all of it at once. A half-drawn
+frame is not unlikely here; it is unrepresentable.
 
 **A buffer is lent, and must be released.** `wl_buffer.release` says the
 compositor has finished reading. A client with two buffers draws into one while
-the compositor reads the other; a client with one waits for the release before
-redrawing. Getting this wrong means the compositor reads memory the client is
-writing, and the tearing is real even when it is invisible.
+the compositor reads the other; a client with one waits for the release. A
+buffer destroyed while it is being shown becomes a zombie, and its pool stays
+mapped until nothing shows it.
 
-That release also carries a Quark-specific weight: a fullscreen 1280×800 buffer
-is 1000 pages, and two of them will not fit in one shared region under today's
-limits. Single-buffered clients are therefore a case that must actually work,
-not a degenerate one.
+**Every buffer is checked against its pool before anything reads a pixel.** The
+numbers in `create_buffer` are the client's arithmetic, and the compositor is
+the thing that would fault.
 
-**Frame callbacks are the throttle.** A client that draws only when its
-`wl_surface.frame` callback fires never draws faster than the screen updates.
-Its absence is why an animating client here used to keep the compositor too busy
-to read the keyboard.
+**A slot is not freed while an object still names it.** `xdg_toplevel.destroy`
+takes the role away and leaves the surface, because the client's `wl_surface`
+still names it. A surface slot freed under a live name is a slot the next
+client's surface takes, with the first client still able to attach to it.
+
+**Frame callbacks are the throttle.** A callback asked for with a commit is
+answered on the compositor's next pass rather than at once, so a client that
+draws only when its callback fires never draws faster than the compositor
+comes round. A callback is never dropped: one that is never sent is a client
+that never draws again.
+
+**A size is agreed, not imposed.** The compositor never resizes a window
+itself. It sends `xdg_toplevel.configure` with a size and the states, then
+`xdg_surface.configure` with a serial, and the window follows whatever buffer
+the client attaches. The two go together — one without the other leaves a
+client waiting for a serial that never comes — and a surface accepts any serial
+from the oldest unanswered one up to the newest sent, because a resize sends
+one per tick and answering one supersedes the older ones.
 
 **Keyboard focus and pointer focus are separate.** Keyboard focus is one
-surface, changed by policy. Pointer focus is whatever is under the cursor,
-regardless. Moving across an unfocused window still sends it `enter` and
-`motion` — that is how hover works without stealing focus. Every keyboard focus
-change is `leave` on the old surface *then* `enter` on the new, in that order,
-so no client can believe it holds focus twice.
+surface, changed by policy. Pointer focus is whatever is under the cursor.
+Moving across an unfocused window still sends it `enter` and `motion`, which is
+how hover works without stealing focus. A change of keyboard focus is `leave`
+on the old surface *then* `enter` on the new, so no client can believe it holds
+focus twice.
 
-**The implicit grab.** While any button is held, pointer events keep going to
-the surface where the press happened, even after the cursor leaves it. Without
-it, dragging breaks the moment the pointer moves off the window and a button
-un-presses if the pointer slides off before release.
+**The implicit grab.** While a button is held, pointer events keep going to the
+surface where the press happened, even after the cursor leaves it.
 
-**Serials.** Every input event carries a serial from one monotonic counter, and
-requests that must follow real input take one back — `set_cursor`,
-`xdg_toplevel.move`, `set_selection`. The compositor rejects a serial that names
-no recent event it sent. That is what stops a client grabbing the pointer or
-starting a drag nobody asked for.
+**Between a press on the compositor's own furniture and the release that ends
+it, the pointer is the compositor's.** A press on the title bar moves the
+window, one near an edge or corner resizes it, one on the close box asks the
+client to go, and two on the bar within half a second fill the screen. No
+client hears a motion while that goes on. `xdg_toplevel.move` and `.resize`
+start the same grabs for a client that draws its own decorations, and are
+refused unless a button is actually down.
 
-**Decorations are server-side.** `xdg_toplevel.move` does not ask the client to
-move itself: the compositor takes an interactive grab, follows the pointer, and
-repositions the window while the client does nothing. The title bar, its drag
-region and its close button belong to the compositor, negotiated through
-`xdg-decoration`. Wayland's default is the opposite; this inverts it because a
-client here may be a hundred and forty lines and should not have to reimplement
-a title bar to have one.
+**Decorations are server-side.** The title bar, its drag region and its close
+box belong to the compositor, and `xdg-decoration` says so to a client that
+asks. Wayland's default is the opposite; this inverts it because a client here
+may be a hundred and forty lines and should not have to reimplement a title bar
+to have one.
 
-**Compositor policy, and nowhere else.** Escape ends the session, Tab cycles
-focus, click focuses and raises. None of it reaches a client. This is job 6, and
-it lives in one place.
+**The selection follows keyboard focus, and the compositor never sees the
+data.** A client offering a selection hands over a source and the MIME types it
+can produce; a client taking it hands back a pipe, and the compositor passes
+that pipe to the source. A client that never has focus can never read the
+clipboard.
 
-## The Quark port of libwayland
+**The keymap is said once.** `wl_keyboard.keymap` carries an `XKB_V1` US
+layout in a memory descriptor, generated with `xkbcomp` rather than written by
+hand, and `repeat_info` says 25 a second after 400 ms. Repeating is the
+client's to do.
 
-**There is no patch.** That was the plan until `wayland-client.c` was actually
-read, and the first thing `wl_display_connect` does is:
+**The wheel is version 5's.** A detent arrives as `axis_source` (wheel),
+`axis_discrete` (the click count), `axis` (ten units per detent, as Weston
+sends) and a `frame`.
 
-```c
-connection = getenv("WAYLAND_SOCKET");
-if (connection) {
-        fd = strtol(connection, &end, 10);
-        ...
-        unsetenv("WAYLAND_SOCKET");
-} else {
-        fd = connect_to_socket(name);   /* $WAYLAND_DISPLAY, $XDG_RUNTIME_DIR */
-}
-return wl_display_connect_to_fd(fd);
-```
+**Compositor policy, and nowhere else.** Escape ends the session and Tab cycles
+focus; neither reaches a client, and nor does the release of either. A click
+focuses and raises the window under it.
 
-`WAYLAND_SOCKET` holds a **descriptor number**, already connected. It is the
-supported path for socket-activated clients, and it is exactly the shape Quark
-already has: the compositor creates a socketpair, installs one end in the
-client's descriptor table with `SYS_FD_DUP`, and spawns it with
-`WAYLAND_SOCKET=3`. Upstream libwayland, unmodified.
+**What the compositor has, each client has a share of.** Four clients; each may
+hold a quarter of the surfaces (16), pools (16) and buffers (64), and 64
+objects of its own. A client asking for them in a loop is a client, not a
+compositor.
 
-So no filesystem socket namespace is needed — no socket inodes in the VFS, no
-`bind`, `listen`, `accept` or `connect` by path. That is a large piece of work
-this does not have to do, and it can wait until something actually wants it.
+**No client can hold up the others.** Writes to a client are non-blocking. An
+event that will not fit in the four kilobytes waiting for a client that has
+stopped reading is not sent, and the compositor goes on to the next client.
 
-**What is needed instead is an environment,** which Quark has none of at all.
-That is much the smaller job and it is wanted regardless: `TERM`, `LANG`,
-`HOME` and `PATH` are asked for by essentially everything that will ever be
-ported here, and Phase 6 already records their absence as a gap. It means an
-`envp` block in what the spawner stages, inheritance across spawn, and `getenv`
-and `setenv`/`unsetenv` in both C libraries — `wl_display_connect` calls
-`unsetenv`, so the environment has to be mutable rather than a read-only image.
+## How it waits
 
-One detail that happens to work in our favour: the code calls
-`fcntl(fd, F_GETFD)` and only gives up on `-1` with `EBADF`. The translation
-layer already answers `fcntl` with 0, so it proceeds.
+The compositor's work comes from three places — IPC from the framebuffer
+device and the input server, streams from Wayland clients, and the clock — and
+the kernel has no single wait that covers IPC and descriptors together. So the
+loop receives with a one-tick timeout and, each time round, asks every
+connection whether it has anything (`SYS_POLL` with no wait) and reads the
+keyboard and pointer from `input`. That is a hundred passes a second on an
+idle screen, and it is the first thing to change if a wait that covers both
+ever exists.
 
-**`wl_shm` memory.** A client creates the pool with `memfd_create` or
-`shm_open` and mmaps it. Phase 10's memory-as-a-descriptor is that shape, so
-the work is in the translation layer answering `memfd_create`, not in
-libwayland.
+## The older protocol
 
-Everything else — the connection buffer, the closure marshalling, the proxy and
-listener machinery, the object id allocator — is portable C over `sendmsg`,
-`recvmsg`, `poll`, `mmap` and pthread, and should build once those exist.
+Before any of this, a window was seven IPC requests: create, commit, move,
+focus, the screen's size, destroy, and a poll for events. `quark_rt::wm` is
+the client half, and `wmdemo` and `wmtype` use it. It still works beside
+Wayland — the compositor composites both kinds of window — and nothing new
+should be written against it.
 
-## Budgets
+## What is missing
 
-Three limits will be hit, and two of them by the MVP:
+- **`wl_shm_pool.resize` is refused.** A pool may only grow, and growing means
+  new memory, which means a descriptor the request does not carry; a client
+  that drew past the old end would fault the compositor. A client that needs a
+  bigger pool makes a new one. Toolkits do call `resize`, so this is a real
+  gap rather than a preference.
+- **Serials are not remembered.** `xdg_toplevel.move`, `.resize` and
+  `set_selection` cannot check that the serial they are given was a recent
+  press; what `move` and `resize` check instead is that a button is down.
+- **Popups.** A menu is a surface with a role this compositor refuses.
+- **Fullscreen and minimise** are read and ignored. Maximise works.
+- **Focus has little policy.** Tab cycles, a new window takes it, and a click
+  raises the window under the pointer. There is no follow-mouse and no focus
+  stealing prevention.
+- **A client's cursor is not drawn.** The pointer is always the compositor's
+  own arrow.
+- **A client's damage is a yes or a no.** A commit that damaged anything
+  repaints its window's part of the screen, whichever part of the buffer the
+  client said had changed.
 
-- **Descriptor tables are eight entries.** A client holds stdin, stdout, stderr,
-  its compositor connection, and a memory object per pool — and a terminal adds
-  a clipboard pipe. Eight is not enough; raising it belongs in Phase 10.
-- **`MAX_SHMEM` is 32 regions system-wide**, which is half a region per task.
-  Linux's SysV limit is 4096 and its POSIX shared memory has no count limit at
-  all; macOS's 32 is a legacy knob nothing modern uses. 256 costs about 14 KB.
-- **`MAX_PAGES_PER_REGION` is 1024 and a region is one contiguous run.** A
-  fullscreen 1280×800 buffer is exactly 1000 pages. Raising the ceiling to 4096
-  covers 1920×1080 double-buffered, but the ceiling is only a promise the
-  allocator can keep if a region becomes a *list* of contiguous runs.
+## Testing it
 
-## Known holes this design touches
-
-**`sys_cap_grant` checks the source and not the destination.** It verifies the
-caller holds the capability being granted and that the target's slot is empty,
-and nothing else — so any task can fill any other task's sixteen CSpace slots.
-That cannot raise anyone's authority, but a service that can no longer be handed
-a capability can no longer be handed the display. Recorded against Phase 2 in
-the roadmap. Phase 10 reduces how much this matters, since a descriptor passed
-across a stream is a grant the receiver asked for.
-
-**The compositor cannot be given the band it needs.** `sys_task_priority` lets
-a caller make a task only equal to or worse than itself, and a compositor
-started from the shell inherits `PRIO_NORMAL` — the same band as the clients
-that block on it. The fix is a capability to grant a band without being in it,
-which `init` passes down to the shell: authority held and passed on but never
-exercised, which is how the rest of this system works. It widens what a shell
-may do to what it starts, which is the trade `startx` made by being setuid.
-
-## Milestones
-
-| | Client | What it proves | What it needs beyond the compositor |
-|---|---|---|---|
-| **MVP** | `weston-simple-shm` | a real Wayland client, unmodified, draws on Quark | libffi, libwayland-client, xdg-shell, an environment |
-| **Near** | `weston-terminal` | text, input, clipboard, menus | cairo, pixman, freetype, fontconfig |
-| **Mid to long** | GTK and Qt applications | a desktop is possible | glib, gio, pango, harfbuzz, and further |
-
-The MVP deliberately has **no seat**. It answers one question — can an
-unmodified client somebody else wrote run here — and input does not move that
-answer, while the highest-risk single item in this phase is the i8042
-keyboard/mouse demultiplex, which can wedge the keyboard. Coupling the two
-makes one failure look like the other. Verification does not need input either:
-`weston-simple-shm` is checked by screendump.
-
-The usual argument against deferring input is rework — if the compositor's wait
-loop has to be restructured to wait on a second thing, building it around one
-is wasted. Choosing an epoll-like object removes that argument: the loop waits
-on a *set*, and adding input later adds a descriptor to it.
-
-So input follows immediately rather than eventually:
-
-- **8a** transport, buffers, `xdg-shell` — `weston-simple-shm` draws.
-- **8b** `wl_seat` and `wl_keyboard` — mostly re-plumbing input that already
-  works onto the new protocol.
-- **8c** `wl_pointer` — the genuinely new work: the i8042 demultiplex, the
-  cursor surface, click-to-focus and drag.
-
-## Open questions
-
-**Answered since this was written:**
-
-- **Waiting is an epoll-like object**, decided 2026-09-10. It scales better
-  than an array-taking call and is the primitive worth having. But
-  libwayland-client calls `poll()`, so a one-shot `poll` taking an array ships
-  alongside it as a thin wrapper — otherwise every frame costs three system
-  calls to build and tear down a set for two descriptors.
-- **The text console stays a direct `user/fb` claimant**, and is renamed
-  `qtty`. Making it a Wayland client would mean a compositor must be running
-  for a machine to have a console, which is backwards for the thing it boots
-  into. `qterm` is Quark's own Wayland terminal, later; `weston-terminal` is
-  the ported client that proves the protocol first. The shell becomes `qsh`,
-  which is a different domain and can happen whenever.
-
-**Still open:**
-
-- **Which protocol versions the milestone clients actually demand.** Answerable
-  by running them and reading the error, and not before.
+`dtest` checks the wire format against bytes libwayland actually sent. The
+rest is done from outside, by clients built with the cross toolchain whose
+sources are in ExplOSion's `toolchain/`: `wlprobe` binds every global and
+prints what it was told, `wlfuzz` sends malformed requests and expects to be
+disconnected with a reason each time, and `wlclip` and `wlscroll` check the
+selections and the wheel.

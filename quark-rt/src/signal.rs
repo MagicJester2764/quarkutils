@@ -3,7 +3,7 @@
 /// Signals are delivered as notification badges (high bits) via the kernel's
 /// async notification system. Tasks receive them as `TAG_NOTIFICATION` messages
 /// via `sys_recv`. Use `extract_signal()` to check if a received notification
-/// contains signal bits, then handle gracefully before the kernel's 2-second
+/// contains signal bits, then handle gracefully before the kernel's 5-second
 /// force-kill deadline expires.
 
 use crate::ipc::Message;
