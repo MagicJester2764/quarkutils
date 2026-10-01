@@ -6,56 +6,70 @@
 //! where it lives in physical memory — which is what let both the driver and
 //! this server give up their authority over physical memory.
 //!
-//! Both filesystems used to carry their own copy of each request, down to the
-//! physical address they named.
+//! What this server has is a *volume* of the driver's: a partition, or a
+//! whole device with a filesystem straight on it. Sector 0 is the volume's
+//! first, whatever that is on the disk, and the driver refuses anything past
+//! its last. Which volume is decided once, when the server starts.
 
+use quark_rt::block;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 
-use crate::{DISK_IO_BUF, TAG_DISK_OK, TAG_READ_SECTOR, TAG_READ_SECTORS, TAG_WRITE_SECTOR};
-
-const TAG_DISK_CLAIM: u64 = 5;
+use crate::DISK_IO_BUF;
 
 /// Sectors one request may carry: as many as fill `DISK_IO_BUF`.
-pub const MAX_SECTORS: u32 = 8;
+pub const MAX_SECTORS: u32 = block::MAX_SECTORS;
 
-/// Take the disk driver for this server alone. It answers nobody else from
-/// then on.
-pub fn claim(disk_tid: usize) -> Result<(), ()> {
-    let msg = Message { sender: 0, tag: TAG_DISK_CLAIM, data: [0; 6] };
-    let mut reply = Message::empty();
-    match syscall::sys_call(disk_tid, &msg, &mut reply) {
-        Ok(()) if reply.tag == TAG_DISK_OK => Ok(()),
-        _ => Err(()),
-    }
+/// The volume this server was started on.
+static mut VOLUME: u64 = 0;
+
+/// Take `volume` of the driver for this server alone. Nobody else's reads
+/// or writes of it are answered from then on.
+pub fn claim(disk_tid: usize, volume: u64) -> Result<(), u64> {
+    block::claim(disk_tid, volume)?;
+    unsafe { VOLUME = volume };
+    Ok(())
 }
 
-/// Read `count` sectors (at most [`MAX_SECTORS`]) from the absolute `lba` into
-/// `DISK_IO_BUF`.
+fn volume() -> u64 {
+    unsafe { VOLUME }
+}
+
+/// How many sectors the volume has.
+pub fn sectors(disk_tid: usize) -> Option<u64> {
+    block::info(disk_tid, volume()).ok().map(|i| i.sectors)
+}
+
+/// Read `count` sectors (at most [`MAX_SECTORS`]) from `lba` of the volume
+/// into `DISK_IO_BUF`.
 pub fn read(disk_tid: usize, lba: u32, count: u32) -> Result<(), ()> {
     let count = count.clamp(1, MAX_SECTORS);
     let (tag, data) = if count == 1 {
-        (TAG_READ_SECTOR, [lba as u64, 0, 0, 0, 0, 0])
+        (block::TAG_READ_SECTOR, [lba as u64, volume(), 0, 0, 0, 0])
     } else {
-        (TAG_READ_SECTORS, [lba as u64, 0, count as u64, 0, 0, 0])
+        (block::TAG_READ_SECTORS, [lba as u64, volume(), count as u64, 0, 0, 0])
     };
     let buf = unsafe {
         core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, count as usize * 512)
     };
     let mut reply = Message::empty();
     match syscall::sys_call_lend_mut(disk_tid, &Message { sender: 0, tag, data }, &mut reply, buf) {
-        Ok(()) if reply.tag == TAG_DISK_OK => Ok(()),
+        Ok(()) if reply.tag == block::TAG_OK => Ok(()),
         _ => Err(()),
     }
 }
 
-/// Write the sector at the start of `DISK_IO_BUF` to the absolute `lba`.
+/// Write the sector at the start of `DISK_IO_BUF` to `lba` of the volume.
 pub fn write(disk_tid: usize, lba: u32) -> Result<(), ()> {
     let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-    let msg = Message { sender: 0, tag: TAG_WRITE_SECTOR, data: [lba as u64, 0, 0, 0, 0, 0] };
+    let msg = Message {
+        sender: 0,
+        tag: block::TAG_WRITE_SECTOR,
+        data: [lba as u64, volume(), 0, 0, 0, 0],
+    };
     let mut reply = Message::empty();
     match syscall::sys_call_lend(disk_tid, &msg, &mut reply, buf) {
-        Ok(()) if reply.tag == TAG_DISK_OK => Ok(()),
+        Ok(()) if reply.tag == block::TAG_OK => Ok(()),
         _ => Err(()),
     }
 }

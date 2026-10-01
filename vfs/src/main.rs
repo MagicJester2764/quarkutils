@@ -37,11 +37,8 @@ quark_rt::manifest!([
 
 pub const PAGE_SIZE: usize = 4096;
 
-// Disk driver protocol
-pub const TAG_READ_SECTOR: u64 = 1;
-pub const TAG_WRITE_SECTOR: u64 = 2;
-pub const TAG_DISK_OK: u64 = 0;
-pub const TAG_READ_SECTORS: u64 = 4;
+// The disk driver's protocol is `quark_rt::block`; `disk` is this server's
+// use of it.
 
 // The VFS protocol's own numbers live in `protocol`.
 
@@ -444,65 +441,6 @@ impl DiskState {
             unsafe { SECTOR_CACHE.invalidate(self.part_lba + start_lba + s); }
         }
         Ok(())
-    }
-
-    fn find_rootfs_partition(disk_tid: usize) -> Result<u32, ()> {
-        Self::raw_read_sector(disk_tid, 0)?;
-        let sec0 = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-
-        let has_mbr = sec0[510] == 0x55 && sec0[511] == 0xAA;
-        let bps = read_u16(sec0, 11);
-        let is_fat = bps == 512 || bps == 1024 || bps == 2048 || bps == 4096;
-
-        if !has_mbr || is_fat {
-            return Ok(0);
-        }
-
-        // Read GPT header (LBA 1)
-        Self::raw_read_sector(disk_tid, 1)?;
-        let hdr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-
-        if &hdr[0..8] != b"EFI PART" {
-            // Try MBR partition 1
-            Self::raw_read_sector(disk_tid, 0)?;
-            let mbr = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-            let p1_lba = read_u32(mbr, 446 + 8);
-            if p1_lba != 0 {
-                return Ok(p1_lba);
-            }
-            return Err(());
-        }
-
-        let entry_start_lba = read_u32(hdr, 72);
-        let entry_size = read_u32(hdr, 84);
-        if entry_size == 0 {
-            return Err(());
-        }
-
-        // Read partition entries, find partition 2 (index 1)
-        Self::raw_read_sector(disk_tid, entry_start_lba)?;
-        let entries = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-        let entries_per_sector = 512 / entry_size as usize;
-        let part_idx = 1;
-        let sector_of_entry = part_idx / entries_per_sector;
-        let offset_in_sector = (part_idx % entries_per_sector) * entry_size as usize;
-
-        if sector_of_entry > 0 {
-            Self::raw_read_sector(disk_tid, entry_start_lba + sector_of_entry as u32)?;
-        }
-
-        let data = if sector_of_entry > 0 {
-            unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) }
-        } else {
-            entries
-        };
-
-        let start_lba = read_u32(data, offset_in_sector + 32);
-        if start_lba == 0 {
-            return Err(());
-        }
-
-        Ok(start_lba)
     }
 }
 
@@ -1286,17 +1224,36 @@ fn warm_cache(disk: &DiskState) {
 pub extern "C" fn _start() -> ! {
     println!("[vfs] Started.");
 
-    // Discover disk service
-    let disk_tid = match nameserver::lookup_retry(b"disk", 20) {
+    // What to serve: `vfs DRIVER VOLUME`, a block driver by the name it
+    // registered under and one of its volumes. Whoever starts this says;
+    // with nothing said it is the first disk, and the volume a disk laid out
+    // the usual way keeps its root on.
+    let driver = quark_rt::args::argv(1).unwrap_or(b"disk0");
+    let disk_tid = match nameserver::lookup_retry(driver, 20) {
         Some(tid) => tid,
         None => {
-            println!("[vfs] Disk service not found. Exiting.");
+            println!("[vfs] No block driver called {}. Exiting.", core::str::from_utf8(driver).unwrap_or("?"));
             syscall::sys_exit();
         }
     };
-    println!("[vfs] Found disk at TID {}", disk_tid);
-    if disk::claim(disk_tid).is_err() {
-        println!("[vfs] The disk belongs to somebody else. Exiting.");
+    let volume = match quark_rt::args::argv(2) {
+        Some(arg) => arg.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64)),
+        // An EFI partition and then the root; or one partition; or no table
+        // at all, and the filesystem on the device itself.
+        None => quark_rt::block::info(disk_tid, 0).ok().map(|i| i.volumes.saturating_sub(1).min(2)),
+    };
+    let Some(volume) = volume else {
+        println!("[vfs] No volume to serve. Exiting.");
+        syscall::sys_exit();
+    };
+    println!(
+        "[vfs] Serving volume {} of {} (TID {})",
+        volume,
+        core::str::from_utf8(driver).unwrap_or("?"),
+        disk_tid
+    );
+    if let Err(why) = disk::claim(disk_tid, volume) {
+        println!("[vfs] The volume cannot be had ({}). Exiting.", why);
         syscall::sys_exit();
     }
 
@@ -1312,15 +1269,9 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Find rootfs partition
-    let part_lba = match DiskState::find_rootfs_partition(disk_tid) {
-        Ok(lba) => lba,
-        Err(()) => {
-            println!("[vfs] Failed to find rootfs partition.");
-            syscall::sys_exit();
-        }
-    };
-    println!("[vfs] Rootfs partition at LBA {}", part_lba);
+    // The volume begins at its own sector 0, wherever that is on the disk:
+    // the driver knows, and this does not need to.
+    let part_lba: u32 = 0;
 
     // Detect filesystem type: check for ext2 magic at partition offset 1024 (sector 2)
     if DiskState::raw_read_sector(disk_tid, part_lba + 2).is_ok() {
@@ -1385,11 +1336,9 @@ pub extern "C" fn _start() -> ! {
     // Create a dummy DiskState for FAT32 (needed even in ext2 mode for the service loop signature)
     let disk = if unsafe { FS_TYPE } == FsType::Fat32 {
         // Read BPB
-        if part_lba > 0 {
-            if DiskState::raw_read_sector(disk_tid, part_lba).is_err() {
-                println!("[vfs] Failed to read BPB.");
-                syscall::sys_exit();
-            }
+        if DiskState::raw_read_sector(disk_tid, part_lba).is_err() {
+            println!("[vfs] Failed to read BPB.");
+            syscall::sys_exit();
         }
         let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let bpb = parse_bpb(data);

@@ -2,7 +2,7 @@
 #![no_main]
 #![allow(dead_code)]
 
-use quark_rt::ipc::{death_notice, Message, TID_ANY};
+use quark_rt::block::{self, Device};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
@@ -20,19 +20,9 @@ quark_rt::manifest!([
     CapReq::irq(14),
 ]);
 
-// Disk IPC tags
-const TAG_READ_SECTOR: u64 = 1;
-const TAG_WRITE_SECTOR: u64 = 2;
-const TAG_DISK_INFO: u64 = 3;
-const TAG_READ_SECTORS: u64 = 4;
-/// Take the disk. From then on nobody else is answered, until the claimant
-/// dies: the filesystem server claims it before its first read, and a program
-/// that could write a sector could write anything on the disk.
-const TAG_DISK_CLAIM: u64 = 5;
-/// What anybody but the claimant is answered with.
-const ERR_NOT_CLAIMANT: u64 = 5;
-const TAG_OK: u64 = 0;
-const TAG_ERROR: u64 = u64::MAX;
+// What a client asks, and who may ask it, is `quark_rt::block`: volumes,
+// claims and the partition table are the same for every kind of disk. This
+// file is where the sectors are.
 
 // ATA PIO ports (primary channel)
 const ATA_DATA: u16 = 0x1F0;
@@ -254,14 +244,24 @@ fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
     true
 }
 
-/// The first `len` bytes of the driver's page.
-fn drive_buf(len: usize) -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts(DRIVE_BUF as *const u8, len) }
-}
+/// The drive on the primary channel, as a block device.
+struct Ata;
 
-/// A reply carrying a tag and one word: a length, or an error number.
-fn status(tag: u64, word: u64) -> Message {
-    Message { sender: 0, tag, data: [word, 0, 0, 0, 0, 0] }
+impl Device for Ata {
+    fn sectors(&self) -> u64 {
+        unsafe { DRIVE.lba28_sectors as u64 }
+    }
+
+    fn read(&mut self, lba: u64, count: u32, into: &mut [u8]) -> bool {
+        lba <= u32::MAX as u64 && ata_read_sectors(lba as u32, count, into.as_mut_ptr())
+    }
+
+    fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool {
+        if lba.checked_add(count as u64).is_none_or(|end| end > u32::MAX as u64) {
+            return false;
+        }
+        (0..count).all(|i| ata_write_sector(lba as u32 + i, unsafe { from.as_ptr().add(i as usize * 512) }))
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -280,113 +280,15 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // Register with nameserver
-    if nameserver::register(b"disk").is_ok() {
-        println!("[disk] Registered with nameserver.");
+    // The first disk. There is one channel here and one drive on it; a
+    // second driver would be `disk1`.
+    if nameserver::register(b"disk0").is_ok() {
+        println!("[disk] Registered with nameserver as disk0.");
     } else {
         println!("[disk] Failed to register with nameserver.");
     }
 
-    let mut claimant: usize = 0;
-
-    // Service loop
-    loop {
-        let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
-            continue;
-        }
-
-        if let Some(dead) = death_notice(&msg) {
-            if dead == claimant {
-                println!("[disk] claimant tid {} has gone", dead);
-                claimant = 0;
-            }
-            continue;
-        }
-        match msg.tag {
-            // Whether it is alive is anybody's business.
-            quark_rt::ipc::TAG_PING => {}
-            TAG_DISK_CLAIM => {
-                let reply = if claimant == 0 || claimant == msg.sender {
-                    claimant = msg.sender;
-                    let _ = syscall::sys_task_watch(claimant);
-                    println!("[disk] claimed by tid {}", claimant);
-                    status(TAG_OK, 0)
-                } else {
-                    status(TAG_ERROR, ERR_NOT_CLAIMANT)
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-                continue;
-            }
-            _ if msg.sender != claimant => {
-                let _ = syscall::sys_reply(msg.sender, &status(TAG_ERROR, ERR_NOT_CLAIMANT));
-                continue;
-            }
-            _ => {}
-        }
-
-        match msg.tag {
-            // Reads go into the driver's page and are copied into what the
-            // caller lent; a write is copied out of it first. Error 1 means
-            // the lent buffer could not be used, 2 a failed read, 3 a failed
-            // write.
-            TAG_READ_SECTOR | TAG_READ_SECTORS => {
-                let lba = msg.data[0] as u32;
-                let count = if msg.tag == TAG_READ_SECTOR {
-                    1
-                } else {
-                    (msg.data[2] as u32).clamp(1, MAX_SECTORS)
-                };
-                let len = count as usize * 512;
-                let reply = if !ata_read_sectors(lba, count, DRIVE_BUF as *mut u8) {
-                    status(TAG_ERROR, 2)
-                } else if syscall::sys_lent_write(msg.sender, 0, drive_buf(len)).is_err() {
-                    status(TAG_ERROR, 1)
-                } else {
-                    status(TAG_OK, len as u64)
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            TAG_WRITE_SECTOR => {
-                let lba = msg.data[0] as u32;
-                let buf = unsafe { core::slice::from_raw_parts_mut(DRIVE_BUF as *mut u8, 512) };
-                let reply = if syscall::sys_lent_read(msg.sender, 0, buf) != Ok(512) {
-                    status(TAG_ERROR, 1)
-                } else if !ata_write_sector(lba, DRIVE_BUF as *const u8) {
-                    status(TAG_ERROR, 3)
-                } else {
-                    status(TAG_OK, 512)
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            TAG_DISK_INFO => {
-                let sectors = unsafe { DRIVE.lba28_sectors };
-                let reply = Message {
-                    sender: 0,
-                    tag: TAG_OK,
-                    data: [sectors as u64, 512, 0, 0, 0, 0],
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            quark_rt::ipc::TAG_PING => {
-                // Liveness probe: reply immediately, do nothing else.
-                let reply = Message {
-                    sender: 0,
-                    tag: quark_rt::ipc::TAG_PING,
-                    data: [0; 6],
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-            _ => {
-                let reply = Message {
-                    sender: 0,
-                    tag: TAG_ERROR,
-                    data: [0xFF, 0, 0, 0, 0, 0], // unknown tag
-                };
-                let _ = syscall::sys_reply(msg.sender, &reply);
-            }
-        }
-    }
+    block::serve(&mut Ata, DRIVE_BUF)
 }
 
 #[panic_handler]

@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 425 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 439 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -580,6 +580,39 @@ Some things to know before changing any of it:
   a call blocks until the client replies, so a slow client would stall the
   server, and one that is itself calling the server would deadlock with it. A
   reply needs no capability, so every other hop here is the client asking.
+
+## Disks
+
+A disk driver serves *volumes* (`quark_rt::block`): volume 0 is the whole
+device and volume N its Nth partition, read from the GPT, or an MBR if
+there is no GPT. A request names a volume, and its sector numbers count
+from that volume's start; the driver refuses what is past its end. So a
+client given a partition cannot reach outside it and does not know where it
+is. `disk`, the ATA driver, registers as `disk0`.
+
+- **The protocol is one module, for both ends.** `block::serve` is the
+  driver's half — volumes, claims, the partition table — and a driver
+  supplies only where the sectors are (`block::Device`). A second kind of
+  disk is a second `Device`, not a second copy of who may read what.
+- **A volume has one client at a time**, which *claims* it. Reads and writes
+  are answered to the claimant and nobody else, and a claim goes when its
+  holder does. The whole device and a partition of it are the same sectors:
+  two different clients cannot hold one each. That is what stops a mounted
+  filesystem being written under its server.
+- **Only root claims.** A capability to call a driver is handed to anybody
+  who looks its name up, so being able to call cannot be the authority. The
+  driver asks the kernel who the caller is.
+- **The partition table is read again when whoever holds the whole device
+  asks**, and not while any partition is claimed: its holder was told where
+  it is.
+- **The file server is told what to serve**: `vfs DRIVER VOLUME`. `init`
+  passes what the boot module `root.cfg` says (`root disk0 2`), which is how
+  an installed system finds a root that is not where an image built
+  elsewhere puts it. With nothing said the server takes volume 2 of
+  `disk0`, or the only partition, or a device with no table at all.
+- **`qfuzz` does not send a disk driver a claim.** It runs as root, a volume
+  nobody has is one it would be given, and its next random write would be a
+  write.
 
 ## Files
 

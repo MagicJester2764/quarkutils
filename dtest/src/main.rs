@@ -2703,6 +2703,75 @@ extern "C" fn sync_worker() -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// A disk driver's volumes, and who may have one.
+///
+/// Asked of the first disk as an image built on another machine lays it
+/// out: an EFI partition, then the root, which the file server has. On a
+/// system running from memory there is no such disk, and nothing to ask.
+fn test_disks() {
+    use quark_rt::block;
+    println!("disks:");
+    let disk = nameserver::lookup(b"disk0");
+    let whole = disk.and_then(|d| block::info(d, 0).ok());
+    let (Some(disk), Some(whole)) = (disk, whole) else {
+        println!("  (no disk0 here; nothing to ask)");
+        return;
+    };
+    if whole.volumes < 3 {
+        println!("  (disk0 is not laid out as a root after an EFI partition; nothing to ask)");
+        return;
+    }
+    check("a disk is a volume, and has more", whole.sectors > 0 && whole.kind == block::KIND_WHOLE);
+    let efi = block::info(disk, 1);
+    let root = block::info(disk, 2);
+    check(
+        "its first partition is the EFI one, and nobody has it",
+        efi.is_ok_and(|v| v.kind == block::KIND_EFI && v.claimant == 0 && v.start > 0),
+    );
+    let vfs_pid = nameserver::lookup(b"vfs").and_then(syscall::sys_pid).unwrap_or(0);
+    check(
+        "its second is the file server's",
+        root.is_ok_and(|v| v.kind == block::KIND_DATA && v.claimant == vfs_pid && vfs_pid != 0),
+    );
+    check(
+        "each lies inside the disk, one after the other",
+        matches!((efi, root), (Ok(a), Ok(b)) if a.start + a.sectors <= b.start && b.start + b.sectors <= whole.sectors),
+    );
+    check("a volume that is not there is not there", block::info(disk, 16) == Err(block::ERR_NO_VOLUME));
+
+    let mut sector = [0u8; 512];
+    check(
+        "a volume is not read by somebody who has not claimed it",
+        block::read(disk, 1, 0, &mut sector) == Err(block::ERR_NOT_CLAIMANT),
+    );
+    check("the file server's is not anybody else's to claim", block::claim(disk, 2) == Err(block::ERR_BUSY));
+    check(
+        "nor is the whole disk, which is the same sectors",
+        block::claim(disk, 0) == Err(block::ERR_BUSY),
+    );
+    check("a partition nobody has can be claimed", block::claim(disk, 1).is_ok());
+    check(
+        "and read: the EFI partition begins as a FAT filesystem does",
+        block::read(disk, 1, 0, &mut sector).is_ok() && sector[510] == 0x55 && sector[511] == 0xAA,
+    );
+    let last = efi.map_or(0, |v| v.sectors);
+    check(
+        "to its last sector and not past it",
+        block::read(disk, 1, last - 1, &mut sector).is_ok()
+            && block::read(disk, 1, last, &mut sector) == Err(block::ERR_RANGE),
+    );
+    check(
+        "the partition table is read again only for whoever has the whole disk",
+        block::rescan(disk) == Err(block::ERR_NOT_CLAIMANT),
+    );
+    check("it is let go", block::release(disk, 1).is_ok());
+    check(
+        "and is then nobody's again",
+        block::read(disk, 1, 0, &mut sector) == Err(block::ERR_NOT_CLAIMANT)
+            && block::info(disk, 1).is_ok_and(|v| v.claimant == 0),
+    );
+}
+
 static FIFO_VFS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 const FIFO: &[u8] = b"/tmp/dtest.fifo";
 
@@ -3285,6 +3354,7 @@ pub extern "C" fn _start() -> ! {
         ("random", test_random),
         ("locks", test_locks),
         ("memory", test_memory),
+        ("disks", test_disks),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

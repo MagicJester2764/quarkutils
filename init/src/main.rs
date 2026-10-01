@@ -248,6 +248,75 @@ fn module_name(name: &[u8; 48]) -> &[u8] {
     &name[..len]
 }
 
+/// Where a small boot module is mapped to be read.
+const ROOT_CFG_BASE: usize = 0x8A_0000_0000;
+
+/// What the root filesystem is on: a block driver's name and one of its
+/// volumes, as text, to hand the file server.
+struct Root {
+    driver: [u8; 16],
+    driver_len: usize,
+    volume: [u8; 8],
+    volume_len: usize,
+}
+
+impl Root {
+    fn driver(&self) -> &[u8] {
+        &self.driver[..self.driver_len]
+    }
+
+    fn volume(&self) -> &[u8] {
+        &self.volume[..self.volume_len]
+    }
+}
+
+/// The boot module called `name`, whatever case the bootloader found it in.
+fn find_module(name: &[u8]) -> Option<(usize, usize)> {
+    let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+    for i in 0..info.module_count as usize {
+        let m = &info.modules[i];
+        if module_name(&m.name).eq_ignore_ascii_case(name) {
+            return Some((m.phys_start as usize, (m.phys_end - m.phys_start) as usize));
+        }
+    }
+    None
+}
+
+/// Where the root is, if whoever installed this system wrote it down.
+///
+/// The bootloader hands over every file beside the kernel, and one of them
+/// can be `root.cfg`: a line of text, `root DRIVER VOLUME`. An installer
+/// writes it, because only the installer knows which partition it put the
+/// system on. Without one the file server decides for itself, which is right
+/// for a disk laid out the way an image built on another machine is.
+fn root_from_config() -> Option<Root> {
+    let (phys, size) = find_module(b"root.cfg")?;
+    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if size == 0 || pages > 1 || syscall::sys_map_phys(phys, ROOT_CFG_BASE, pages).is_err() {
+        return None;
+    }
+    let text = unsafe { core::slice::from_raw_parts(ROOT_CFG_BASE as *const u8, size) };
+    let mut found = None;
+    for line in text.split(|&b| b == b'\n') {
+        let mut words = line
+            .split(|&b| b == b' ' || b == b'\t' || b == b'\r')
+            .filter(|w| !w.is_empty());
+        if words.next() != Some(&b"root"[..]) {
+            continue;
+        }
+        let (Some(driver), Some(volume)) = (words.next(), words.next()) else { continue };
+        if driver.len() > 16 || volume.len() > 8 || !volume.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let mut root = Root { driver: [0; 16], driver_len: driver.len(), volume: [0; 8], volume_len: volume.len() };
+        root.driver[..driver.len()].copy_from_slice(driver);
+        root.volume[..volume.len()].copy_from_slice(volume);
+        found = Some(root);
+    }
+    let _ = syscall::sys_munmap(ROOT_CFG_BASE, pages);
+    found
+}
+
 fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
@@ -688,7 +757,19 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         if input_tid != 0 {
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
                         }
-                        let _ = spawn::set_args(&info, &[b"vfs"], &SPAWN_SCRATCH);
+                        // Told where the root is, if anything says; left to
+                        // find it otherwise.
+                        let _ = match root_from_config() {
+                            Some(root) => {
+                                println!(
+                                    "[init] The root is volume {} of {}",
+                                    core::str::from_utf8(root.volume()).unwrap_or("?"),
+                                    core::str::from_utf8(root.driver()).unwrap_or("?")
+                                );
+                                spawn::set_args(&info, &[b"vfs", root.driver(), root.volume()], &SPAWN_SCRATCH)
+                            }
+                            None => spawn::set_args(&info, &[b"vfs"], &SPAWN_SCRATCH),
+                        };
                         println!("[init] Spawned vfs (TID {}, deferred start)", info.tid);
                         vfs_spawn = Some(info);
                     }

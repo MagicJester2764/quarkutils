@@ -100,7 +100,9 @@ const TARGETS: &[Target] = &[
         kind: Kind::Net,
         tags: &[0, 1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17],
     },
-    Target { name: b"disk", kind: Kind::Disk, tags: &[0, 1, 2, 3, 4, 5, 6] },
+    // Not 5, which claims a volume: this runs as root, and a volume nobody
+    // has is one it would be given — and then the writes below are writes.
+    Target { name: b"disk0", kind: Kind::Disk, tags: &[0, 1, 2, 3, 4, 6, 7, 8, 9] },
     Target { name: b"keyboard", kind: Kind::Keyboard, tags: &[0, 1, 2, 3, 4, 5, 6, 7, 8] },
 ];
 
@@ -438,7 +440,7 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
                 None => Err(("cannot ping 10.0.2.2 in time", 0)),
             }
         }
-        Kind::Disk => fail("answers a program that is not the VFS", !refused(tid, 3)),
+        Kind::Disk => fail("writes for a program that has claimed nothing", !refused(tid, 2)),
         Kind::Keyboard => fail("answers a program that is not input", !refused(tid, 5)),
     }
 }
@@ -539,7 +541,7 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     };
     // Refusing a harmless request is what makes the rest safe to send.
     let probe = match t.kind {
-        Kind::Disk => refused(tid, 3),
+        Kind::Disk => refused(tid, 2),
         Kind::Keyboard => refused(tid, 5),
         _ => true,
     };
