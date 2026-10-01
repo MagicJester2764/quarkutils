@@ -73,7 +73,14 @@ fn test_physical_authority() {
                 continue;
             }
             seen += 1;
-            if cap.param1.saturating_sub(cap.param0) > DEVICE_SPAN {
+            // A disk made of memory is a device whose memory is as big as
+            // the disk: a system running from one holds its whole root that
+            // way. What it may map is the size of what it serves, and no
+            // more.
+            let span = cap.param1.saturating_sub(cap.param0);
+            let is_ram_disk = nameserver::lookup(b"ram0") == Some(tid)
+                && quark_rt::block::info(tid, 0).is_ok_and(|i| (i.sectors * 512).div_ceil(4096) * 4096 == span);
+            if span > DEVICE_SPAN && !is_ram_disk {
                 println!("    tid {} may map {:#x}..{:#x}", tid, cap.param0, cap.param1);
                 broad += 1;
             }
@@ -1587,16 +1594,19 @@ static SPAWN_SCRATCH: spawn::Scratch = spawn::Scratch {
 /// program: the image comes through the VFS, `spawn::load` builds the address
 /// space, and the manifest decides what it is granted.
 fn load_child(args: &[&[u8]]) -> Option<spawn::Spawned> {
+    load_program(b"/usr/bin/dchild", b"/usr/bin/DCHILD.ELF", args)
+}
+
+/// Load a program by either of the names it may have on the disk.
+fn load_program(lower: &[u8], upper: &[u8], args: &[&[u8]]) -> Option<spawn::Spawned> {
     let vfs_tid = nameserver::lookup_retry(b"vfs", 20)?;
     // Lowercase for ext2, uppercase with .ELF for FAT32 — the two spellings
     // the shell already tries.
     let grant = |image: &[u8], tid: usize| {
         quark_rt::manifest::grant_image(tid, image, 12);
     };
-    let info = spawn::load_path(vfs_tid, b"/usr/bin/dchild", CHILD_IMAGE, &SPAWN_SCRATCH, grant)
-        .or_else(|()| {
-            spawn::load_path(vfs_tid, b"/usr/bin/DCHILD.ELF", CHILD_IMAGE, &SPAWN_SCRATCH, grant)
-        })
+    let info = spawn::load_path(vfs_tid, lower, CHILD_IMAGE, &SPAWN_SCRATCH, grant)
+        .or_else(|()| spawn::load_path(vfs_tid, upper, CHILD_IMAGE, &SPAWN_SCRATCH, grant))
         .ok()?;
     // Every program is started with an argument page; reading one that was
     // never mapped faults.
@@ -2772,6 +2782,108 @@ fn test_disks() {
     );
 }
 
+/// The RAM disk `ramdisk 4` has just made: the one of `ram0`..`ram7` that is
+/// four megabytes and nobody's.
+fn new_ram_disk() -> Option<usize> {
+    use quark_rt::block;
+    let mut name = *b"ram0";
+    (b'0'..=b'7').find_map(|digit| {
+        name[3] = digit;
+        let tid = nameserver::lookup(&name)?;
+        matches!(block::info(tid, 0), Ok(i) if i.sectors == 8192 && i.claimant == 0).then_some(tid)
+    })
+}
+
+/// A disk made of memory: the same protocol, and somewhere to write that
+/// nothing depends on.
+fn test_ram_disk() {
+    use quark_rt::block;
+    println!("a disk of memory:");
+    let started = load_program(b"/usr/bin/ramdisk", b"/usr/bin/RAMDISK.ELF", &[b"ramdisk", b"4"])
+        .and_then(|c| {
+            let tid = c.tid;
+            c.start().ok().map(|()| tid)
+        });
+    let Some(server) = started else {
+        check("start a RAM disk", false);
+        return;
+    };
+    // It registers when it has its memory; give it a moment to.
+    let mut disk = None;
+    for _ in 0..50 {
+        disk = new_ram_disk();
+        if disk.is_some() {
+            break;
+        }
+        syscall::sleep_ticks(2);
+    }
+    let Some(disk) = disk else {
+        check("a RAM disk of four megabytes appears", false);
+        let _ = syscall::sys_task_kill(server);
+        let _ = wait_for(server);
+        return;
+    };
+    check("a RAM disk of four megabytes appears", true);
+    check(
+        "it is one volume: nothing has written a partition table",
+        block::info(disk, 0).is_ok_and(|i| i.volumes == 1 && i.kind == block::KIND_WHOLE),
+    );
+    let mut sector = [0u8; 512];
+    let mut eight = [0u8; 4096];
+    check("it is claimed", block::claim(disk, 0).is_ok());
+    check(
+        "it begins empty",
+        block::read(disk, 0, 100, &mut sector).is_ok() && sector.iter().all(|&b| b == 0),
+    );
+    for (i, b) in eight.iter_mut().enumerate() {
+        *b = (i / 512) as u8 + 1;
+    }
+    check("eight sectors are written at once", block::write(disk, 0, 96, &eight).is_ok());
+    check(
+        "and each reads back as it was written",
+        block::read(disk, 0, 100, &mut sector).is_ok() && sector.iter().all(|&b| b == 5),
+    );
+    check(
+        "the last sector is there and the one after is not",
+        block::read(disk, 0, 8191, &mut sector).is_ok()
+            && block::read(disk, 0, 8192, &mut sector) == Err(block::ERR_RANGE)
+            && block::write(disk, 0, 8190, &eight) == Err(block::ERR_RANGE),
+    );
+    // A partition table of one's own making: a protective MBR is enough to
+    // have a partition, and the driver finds it when asked to look.
+    sector = [0u8; 512];
+    sector[446 + 4] = 0x83;
+    sector[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    sector[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+    check("a partition table is written", block::write(disk, 0, 0, &sector).is_ok());
+    check("the driver reads it when asked", block::rescan(disk) == Ok(2));
+    check(
+        "and there is a partition where the table says",
+        block::info(disk, 1).is_ok_and(|v| v.start == 2048 && v.sectors == 4096 && v.kind == block::KIND_DATA),
+    );
+    check("which is claimed too", block::claim(disk, 1).is_ok());
+    check(
+        "its sector 0 is the disk's 2048",
+        block::write(disk, 1, 0, &[7u8; 512]).is_ok()
+            && block::read(disk, 0, 2048, &mut sector).is_ok()
+            && sector.iter().all(|&b| b == 7),
+    );
+    check(
+        "and it ends where it ends",
+        block::read(disk, 1, 4096, &mut sector) == Err(block::ERR_RANGE),
+    );
+    check(
+        "the table is not read again while a partition is in use",
+        block::rescan(disk) == Err(block::ERR_BUSY),
+    );
+    let _ = block::release(disk, 1);
+    let _ = block::release(disk, 0);
+    let _ = syscall::sys_task_kill(server);
+    check("the disk goes with its server", wait_for(server) == Some(-9) && new_ram_disk().is_none());
+}
+
 static FIFO_VFS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 const FIFO: &[u8] = b"/tmp/dtest.fifo";
 
@@ -3355,6 +3467,7 @@ pub extern "C" fn _start() -> ! {
         ("locks", test_locks),
         ("memory", test_memory),
         ("disks", test_disks),
+        ("ramdisk", test_ram_disk),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

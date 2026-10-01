@@ -317,6 +317,30 @@ fn root_from_config() -> Option<Root> {
     found
 }
 
+/// The boot module a system that runs from memory keeps its root in: a whole
+/// filesystem, loaded by the bootloader as a file.
+const LIVE_MODULE: &[u8] = b"live.img";
+
+/// A number as `0x…`, into `buf`. Returns how much of it was used.
+fn hex(mut n: usize, buf: &mut [u8; 18]) -> usize {
+    let mut digits = [0u8; 16];
+    let mut count = 0;
+    loop {
+        digits[count] = b"0123456789abcdef"[n & 0xF];
+        count += 1;
+        n >>= 4;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..count {
+        buf[2 + i] = digits[count - 1 - i];
+    }
+    2 + count
+}
+
 fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
@@ -705,6 +729,62 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
+    // Pass 3b: a disk made of memory, if the bootloader brought a root
+    // filesystem with it. That is a system running from whatever it was
+    // booted off — a CD, a USB stick — without a driver for it: the whole
+    // root came as one file, and this serves it as a disk.
+    //
+    // It is granted the memory the file is in and nothing else, which is
+    // the one thing its manifest cannot ask for: only init knows where the
+    // file was put.
+    if let Some((phys, size)) = find_module(LIVE_MODULE) {
+        for i in 0..count {
+            let e = &entries[i];
+            if &e.name[0..8] != b"RAMDISK " || &e.name[8..11] != b"ELF" {
+                continue;
+            }
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn::load(data, &SPAWN_SCRATCH) {
+                    Ok(info) => {
+                        let end = (phys + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, phys as u64, end as u64);
+                        grant_caps_from_manifest(data, info.tid);
+                        if console_pipe != 0 {
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
+                        }
+                        let (mut at, mut len) = ([0u8; 18], [0u8; 18]);
+                        let (at_len, len_len) = (hex(phys, &mut at), hex(size, &mut len));
+                        let _ = spawn::set_args(
+                            &info,
+                            &[b"ramdisk", b"module", &at[..at_len], &len[..len_len]],
+                            &SPAWN_SCRATCH,
+                        );
+                        let _ = info.start();
+                        // And init's own right to that memory goes. It was
+                        // given it to read the module, as it is every
+                        // module, and it has handed it on; kept, it would be
+                        // a task that can map a hundred megabytes it has no
+                        // use for, and that is a filesystem.
+                        let me = syscall::sys_getpid() as usize;
+                        for slot in 0.. {
+                            let Ok(cap) = syscall::sys_cap_read(me, slot) else { break };
+                            if cap.cap_type == syscall::CAP_TYPE_PHYS_RANGE
+                                && cap.param0 == phys as u64
+                                && cap.param1 == end as u64
+                            {
+                                let _ = syscall::sys_cap_delete(slot);
+                            }
+                        }
+                        println!("[init] Spawned ramdisk (TID {}) on {} MiB of live image", info.tid, size >> 20);
+                    }
+                    Err(()) => println!("[init] FAILED to spawn ramdisk"),
+                }
+            }
+            break;
+        }
+    }
+
     // Pass 4: spawn INPUT.ELF (needs keyboard to be running)
     let mut input_tid: usize = 0;
     for i in 0..count {
@@ -758,8 +838,14 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
                         }
                         // Told where the root is, if anything says; left to
-                        // find it otherwise.
+                        // find it otherwise. A root that came with the
+                        // bootloader is the root, whatever a disk says.
+                        let live = find_module(LIVE_MODULE).is_some();
                         let _ = match root_from_config() {
+                            _ if live => {
+                                println!("[init] The root is the live image, in memory");
+                                spawn::set_args(&info, &[b"vfs", b"ram0", b"0"], &SPAWN_SCRATCH)
+                            }
                             Some(root) => {
                                 println!(
                                     "[init] The root is volume {} of {}",

@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 439 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 454 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -605,6 +605,14 @@ is. `disk`, the ATA driver, registers as `disk0`.
 - **The partition table is read again when whoever holds the whole device
   asks**, and not while any partition is claimed: its holder was told where
   it is.
+- **A RAM disk is a disk** (`ramdisk`): the same `block::serve`, with pages
+  where a platter would be. `ramdisk MEGABYTES` makes an empty one out of
+  its own memory, for anything that wants a disk nothing depends on — the
+  tests do. `ramdisk module PHYS BYTES` serves a file the bootloader loaded,
+  and is how a system runs from memory: when there is a boot module called
+  `live.img`, `init` starts `ramdisk` on it, grants it that memory and no
+  other, gives up its own right to it, and tells the file server its root
+  is `ram0`. Each registers as the first of `ram0`..`ram7` nobody has.
 - **The file server is told what to serve**: `vfs DRIVER VOLUME`. `init`
   passes what the boot module `root.cfg` says (`root disk0 2`), which is how
   an installed system finds a root that is not where an image built

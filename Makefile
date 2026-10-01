@@ -40,14 +40,14 @@ REQUIRE_ABI ?=
 # Programs, as source directory and the name they are installed under. The
 # directory is also the crate and the binary.
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
-                 input:INPUT disk:DISK vfs:VFS net:NET fb:FB
+                 input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
                  capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST \
                  fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE \
                  mousetest:MOUSETEST runtests:RUNTESTS nettest:NETTEST \
-                 setfont:SETFONT
+                 setfont:SETFONT ramdisk:RAMDISK
 
 # Programs written in C, built against libc/.
 C_PROGRAMS    := cwc:CWC envtest:ENVTEST
