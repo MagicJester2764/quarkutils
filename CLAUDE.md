@@ -637,7 +637,10 @@ The rules that got it there, and that a further port should follow:
   a process id, 64 or more, and `gettid` a task id, below 64. On Linux the
   two are equal in the first thread, and code that finds its main thread by
   comparing them, or signals it with `tgkill(getpid(), getpid(), …)`, is
-  wrong here. Nothing ported so far does either.
+  wrong here. Nothing ported so far does either. `docs/c-library.md` is
+  where this is said to somebody porting a program — with everything else
+  about C here that is not as Linux has it — and a deviation the layer gains
+  is written there in the commit that gains it.
 - The **plain console has its own Ctrl-C**, older than signals: `input` sends
   the foreground task one of the kernel's three task signals (`SYS_SIGNAL`),
   which `qsh`'s `kill` and `shutdown` use too. On a terminal it is signal 2,

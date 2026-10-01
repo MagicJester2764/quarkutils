@@ -55,7 +55,8 @@ x86_64-unknown-quark.json   The hosted Rust target.
 rust-std-patches/   The std fork's port to Quark, mirrored: the commit it left
                     upstream at, a patch for the files upstream has, and the
                     files it adds. Generated; see its README.
-docs/               The VFS protocol; the compositor.
+docs/               C on Quark, and where it is not Linux; the VFS
+                    protocol; the compositor.
 tools/check-abi.sh  The numbers here agree with each other and with the kernel.
 tools/std-patches.sh  The mirror above agrees with the fork.
 ```
