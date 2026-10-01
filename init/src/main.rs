@@ -822,6 +822,31 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
 pub extern "C" fn _start() -> ! {
     println!("[init] Starting init process.");
 
+    // The kernel is another repository, built at another time. Ask it which
+    // ABI it speaks before making any call whose number could have moved:
+    // with a different major every number after this one is a guess, and a
+    // guess here is a task created where a page was meant to be mapped.
+    match syscall::abi_check() {
+        Ok((major, minor)) => println!(
+            "[init] Kernel ABI {}.{}; this userland was built for {}.{}.",
+            major,
+            minor,
+            syscall::ABI_VERSION_MAJOR,
+            syscall::ABI_VERSION_MINOR
+        ),
+        Err((major, minor)) => {
+            println!(
+                "[init] Kernel ABI {}.{}, and this userland was built for {}.{}. Stopping:",
+                major,
+                minor,
+                syscall::ABI_VERSION_MAJOR,
+                syscall::ABI_VERSION_MINOR
+            );
+            println!("[init] the kernel and quarkutils have to be built for the same ABI.");
+            syscall::sys_exit();
+        }
+    }
+
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     let mod_count = info.module_count as usize;
 

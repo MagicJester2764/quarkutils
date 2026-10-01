@@ -1469,6 +1469,18 @@ pub const CAP_PHYS_ALLOC: u32 = 1 << 4;
 pub const CAP_SET_UID: u32 = 1 << 5;
 pub const CAP_ENDPOINT: u32 = 1 << 6;
 
+/// The ABI this runtime was written against: the kernel's `docs/abi.md` at
+/// this version is what the numbers above and the wrappers below were read
+/// from.
+///
+/// It is written down because the kernel is another repository now, built at
+/// another time. `tools/check-abi.sh` holds these against the header the
+/// kernel installs — the same major, a minor the kernel has reached, and at an
+/// equal version exactly the same calls — and `init` holds them against the
+/// kernel that is actually running, before it does anything else.
+pub const ABI_VERSION_MAJOR: u32 = 3;
+pub const ABI_VERSION_MINOR: u32 = 0;
+
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
 /// A program that cares should check the major and refuse to run against one
@@ -1476,6 +1488,24 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 pub fn sys_abi_version() -> (u32, u32) {
     let v = unsafe { syscall0(SYS_ABI_VERSION) };
     ((v >> 16) as u32, (v & 0xFFFF) as u32)
+}
+
+/// Is the running kernel one this runtime can talk to?
+///
+/// The same major, and a minor at least the one this was written against: a
+/// minor only adds calls, so a newer one still answers every call here, and an
+/// older one is missing some. `Ok` and `Err` both carry what the kernel said.
+///
+/// `SYS_ABI_VERSION` is the one call this may safely make without knowing the
+/// answer: its number has not moved since 1.0 and its block holds nothing
+/// else.
+pub fn abi_check() -> Result<(u32, u32), (u32, u32)> {
+    let (major, minor) = sys_abi_version();
+    if major == ABI_VERSION_MAJOR && minor >= ABI_VERSION_MINOR {
+        Ok((major, minor))
+    } else {
+        Err((major, minor))
+    }
 }
 
 /// The address space this task is running in.

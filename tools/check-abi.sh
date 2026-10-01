@@ -60,7 +60,23 @@ else
     echo "abi: the C header agrees ($(wc -l < "$T/h") numbers)"
 fi
 
+# The version this tree says it was written against.
+rt_major=$(sed -nE 's/^pub const ABI_VERSION_MAJOR: u32 = ([0-9]+);/\1/p' "$RT")
+rt_minor=$(sed -nE 's/^pub const ABI_VERSION_MINOR: u32 = ([0-9]+);/\1/p' "$RT")
+if [ -z "$rt_major" ] || [ -z "$rt_minor" ]; then
+    echo "abi: $RT does not say which ABI version it was written against" >&2
+    fail=1
+fi
+
 # And the kernel's own table, if the kernel has been installed somewhere.
+#
+# The rule is the one the version number promises. A major is a different
+# interface; a minor only adds calls. So against a kernel of the same version
+# the two tables are equal, call for call — a call the kernel has and this
+# lacks, at one version, is a call somebody added without saying so — and
+# against a kernel whose minor is ahead, every call here must be there with
+# the same number and the kernel may have more. A kernel that is behind is
+# missing calls this tree will make.
 if [ -z "$INSTALLED" ]; then
     if [ -n "$REQUIRE_ABI" ]; then
         echo "abi: no installed kernel ABI to compare against, and one is required" >&2
@@ -76,12 +92,40 @@ else
     grep -E '^#define SYS_[A-Z_0-9]+[[:space:]]+[0-9]+' "$INSTALLED" \
       | sed -E 's/#define[[:space:]]+(SYS_[A-Z_0-9]+)[[:space:]]+([0-9]+).*/\2 \1/' \
       | sort -k1,1n -k2,2 > "$T/k"
-    if d=$(diff "$T/k" "$T/rt"); then
-        echo "abi: quark-rt and the installed kernel agree ($(wc -l < "$T/k") calls)"
-    else
-        echo "abi: MISMATCH between quark-rt and the kernel's installed ABI ($INSTALLED):" >&2
-        echo "$d" | sed -n 's/^< \(.*\)/  the kernel has, quark-rt has not: \1/p; s/^> \(.*\)/  quark-rt has, the kernel has not: \1/p' >&2
+    k_major=$(sed -nE 's/^#define QUARK_ABI_VERSION_MAJOR[[:space:]]+([0-9]+).*/\1/p' "$INSTALLED")
+    k_minor=$(sed -nE 's/^#define QUARK_ABI_VERSION_MINOR[[:space:]]+([0-9]+).*/\1/p' "$INSTALLED")
+
+    if [ -z "$k_major" ] || [ -z "$k_minor" ]; then
+        echo "abi: $INSTALLED does not say which version it is" >&2
         fail=1
+    elif [ "$k_major" != "$rt_major" ]; then
+        echo "abi: the installed kernel speaks $k_major.$k_minor and quark-rt was written for $rt_major.$rt_minor" >&2
+        echo "     a different major is a different interface" >&2
+        fail=1
+    elif [ "$k_minor" -lt "$rt_minor" ]; then
+        echo "abi: the installed kernel speaks $k_major.$k_minor, which is older than the $rt_major.$rt_minor quark-rt was written for" >&2
+        fail=1
+    elif [ "$k_minor" -eq "$rt_minor" ]; then
+        if d=$(diff "$T/k" "$T/rt"); then
+            echo "abi: quark-rt and the installed kernel agree ($(wc -l < "$T/k") calls, ABI $k_major.$k_minor)"
+        else
+            echo "abi: MISMATCH between quark-rt and the kernel's installed ABI ($INSTALLED), both $k_major.$k_minor:" >&2
+            echo "$d" | sed -n 's/^< \(.*\)/  the kernel has, quark-rt has not: \1/p; s/^> \(.*\)/  quark-rt has, the kernel has not: \1/p' >&2
+            echo "     at one version the two tables are the same table" >&2
+            fail=1
+        fi
+    else
+        # The kernel has grown. Everything here must still be there.
+        missing=$(awk 'NR == FNR { k[$0] = 1; next } !($0 in k)' "$T/k" "$T/rt")
+        if [ -n "$missing" ]; then
+            echo "abi: quark-rt names calls the installed kernel ($k_major.$k_minor) does not have:" >&2
+            echo "$missing" | sed 's/^/  /' >&2
+            fail=1
+        else
+            extra=$(awk 'NR == FNR { rt[$0] = 1; next } !($0 in rt)' "$T/rt" "$T/k" | wc -l)
+            echo "abi: the installed kernel is $k_major.$k_minor, ahead of the $rt_major.$rt_minor quark-rt was written for:"
+            echo "     every call here is there, and it has $extra this does not use"
+        fi
     fi
 fi
 
