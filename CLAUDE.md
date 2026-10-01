@@ -43,8 +43,21 @@ catastrophic — a program calls one number and the kernel runs another.
   builds on a machine with no kernel on it. `REQUIRE_ABI=1` makes the skip an
   error; ExplOSion sets it, because the build that has both is the one place
   the comparison must not be skipped.
+- **The runtime says which ABI it was written against.**
+  `quark_rt::syscall::ABI_VERSION_MAJOR` and `_MINOR`, and the check holds them
+  to the kernel's header by the rule the version number promises: a different
+  major is a different interface; at an equal version the two tables are the
+  same table; against a kernel whose minor is ahead, every call here must be
+  there and the kernel may have more; a kernel that is behind fails.
+- **`init` asks the kernel that is actually running**, before any call whose
+  number could have moved, and stops if the major differs or the kernel is
+  older than this was built for. The message is on the kernel's own console,
+  which is the only thing drawing at that point; on a good boot the line is
+  wiped a moment later, when the text console claims the display.
 - **A new system call is added in the kernel first**, with its row in the
-  document, and here second. The stage fails until both agree.
+  document and a new minor version, and here second: the constant in
+  `quark-rt` (and the C header if C needs it), and `ABI_VERSION_MINOR` raised
+  to the version that has it. The stage fails until both agree.
 
 ## Toolchain
 
