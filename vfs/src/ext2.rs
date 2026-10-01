@@ -27,10 +27,12 @@ pub const S_IFMT: u16 = 0xF000;
 pub const S_IFDIR: u16 = 0x4000;
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFLNK: u16 = 0xA000;
+pub const S_IFIFO: u16 = 0x1000;
 
 // Directory entry file types
 pub const FT_REG_FILE: u8 = 1;
 pub const FT_DIR: u8 = 2;
+pub const FT_FIFO: u8 = 5;
 pub const FT_SYMLINK: u8 = 7;
 
 /// The directory-entry type for an inode, from its mode.
@@ -41,7 +43,7 @@ pub fn file_type_of(inode: &Ext2Inode) -> u8 {
         S_IFLNK => FT_SYMLINK,
         0x2000 => 3, // character device
         0x6000 => 4, // block device
-        0x1000 => 5, // FIFO
+        S_IFIFO => FT_FIFO,
         0xC000 => 6, // socket
         _ => 0,
     }
@@ -111,6 +113,11 @@ impl Ext2Inode {
 
     pub fn is_regular(&self) -> bool {
         self.i_mode & S_IFMT == S_IFREG
+    }
+
+    /// A named pipe: a name for a pipe the kernel keeps. It has no blocks.
+    pub fn is_fifo(&self) -> bool {
+        self.i_mode & S_IFMT == S_IFIFO
     }
 
     pub fn is_symlink(&self) -> bool {

@@ -99,6 +99,8 @@ waits a program sits in are ended early by a signal as they are on Linux:
   with `EINTR` whatever the handler asked for — as on Linux, where none of
   them is ever restarted.
 
+So is an `open` of a named pipe that is waiting for its other end.
+
 Other waits are **not** ended by a signal: a read of a pipe, a socket or a
 file, a `wait` for a child, a lock. The handler runs when the call returns.
 A program that wants a signal to interrupt one of those waits with `poll`
@@ -142,6 +144,15 @@ Also different:
   terminals.
 - `mmap` of a file works, shared and private. Anonymous memory is given its
   pages when they are first touched.
+- **A named pipe** is made with `mkfifo` or `mknod`, on ext2 and ext4, and
+  opened like any file. Opening one waits for the other end to be opened,
+  as on Linux, unless `O_NONBLOCK` is given: then a reader is let in at
+  once, and a writer with nobody reading gets `ENXIO`. A signal ends the
+  wait (`EINTR`, or the open goes on if the handler was installed with
+  `SA_RESTART`). **It cannot be opened `O_RDWR`** — Linux allows it, and
+  POSIX leaves it undefined; here a descriptor is one end of a pipe, and the
+  open fails with `EOPNOTSUPP`. `mknod` makes nothing else: a device is
+  `EPERM`.
 
 ## Terminals
 

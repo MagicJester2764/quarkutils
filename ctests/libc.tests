@@ -26,3 +26,4 @@ timertest
 shelltest
 cxxtest
 polltest
+fifotest

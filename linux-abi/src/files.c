@@ -80,6 +80,7 @@ static long vfs_errno(int code) {
     case QUARK_VFS_NO_SPACE:       return -LX_ENOSPC;
     case QUARK_VFS_TOO_MANY_LINKS: return -LX_EMLINK;
     case QUARK_VFS_LOOP:           return -LX_ELOOP;
+    case QUARK_VFS_NO_PEER:        return -LX_ENXIO;
     default:                       return -LX_EIO;
     }
 }
@@ -275,6 +276,9 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
     if (flags & LX_O_APPEND) {
         how |= QUARK_VFS_OPEN_APPEND;
     }
+    if (flags & LX_O_NONBLOCK) {
+        how |= QUARK_VFS_OPEN_NOWAIT;
+    }
     struct quark_vfs_file info;
     long fd = -1;
     int err = quark_vfs_open_fd(base, path, how,
@@ -289,7 +293,31 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
         __syscall1(SYS_FD_CLOSE, (unsigned long)fd);
         return -LX_ELOOP;
     }
-    if (fd >= 0 && fd < MAX_FDS) {
+    if ((info.mode & 0170000) == 0010000 && (how & (QUARK_VFS_OPEN_READ | QUARK_VFS_OPEN_WRITE))) {
+        /* A named pipe: what came back is an end of a pipe, and the kernel's
+           from here on. Opening one waits for somebody to open the other
+           end, unless it was asked not to — a reader that went ahead would
+           find no writer, which is how a pipe says it has ended. `info.size`
+           is what to wait on, and nothing if the other end is there. */
+        if (fd >= 0 && fd < MAX_FDS) {
+            kind[fd] = KERNELS;
+        }
+        while (info.size && !(flags & LX_O_NONBLOCK)) {
+            unsigned long r = __syscall2(SYS_PIPE_PEER, (unsigned long)fd, info.size);
+            if (r == 0) {
+                break;
+            }
+            /* A signal ended the wait. The open is made again from where it
+               was if the handler asked for that, and is over if it did not:
+               the end goes back, so that nobody is left waiting for a
+               program that has stopped opening it. */
+            if (r != QUARK_INTERRUPTED || (__quark_sig_interrupted() & QUARK_SIG_EINTR)) {
+                __syscall1(SYS_FD_CLOSE, (unsigned long)fd);
+                return r == QUARK_INTERRUPTED ? -LX_EINTR : -LX_EIO;
+            }
+        }
+        __quark_fd_set_nonblock(fd, (flags & LX_O_NONBLOCK) != 0);
+    } else if (fd >= 0 && fd < MAX_FDS) {
         handle_of[fd] = (unsigned short)info.handle;
         kind[fd] = A_FILE;
     }
@@ -297,6 +325,39 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
         __syscall3(SYS_FD_FLAGS, (unsigned long)fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
     }
     return fd;
+}
+
+/* mknod, mknodat and so mkfifo. A named pipe is the one thing there is to
+   make: a device is not a file anybody can create here, and the type bits
+   left at zero mean a regular file, which is made by opening it. */
+long __quark_mknodat(long dirfd, const char *path, long mode) {
+    if (!path || !*path) {
+        return -LX_ENOENT;
+    }
+    switch (mode & 0170000) {
+    case 0010000:
+        break;
+    case 0:
+    case 0100000: {
+        long fd = __quark_openat(dirfd, path, LX_O_CREAT | LX_O_EXCL | LX_O_WRONLY, mode & 07777);
+        if (fd < 0) {
+            return fd;
+        }
+        __quark_close(fd);
+        return 0;
+    }
+    default:
+        return -LX_EPERM;
+    }
+    unsigned long base;
+    long bad = base_for(dirfd, path, &base);
+    if (bad) {
+        return bad;
+    }
+    unsigned long mask = __syscall1(SYS_UMASK, ~0UL);
+    int err = quark_vfs_mknod(base, path, 0010000 | ((unsigned long)mode & 07777 & ~mask));
+    /* A filesystem with no such thing — FAT — says what Linux's says. */
+    return err == QUARK_VFS_NOT_SUPPORTED ? -LX_EPERM : err ? vfs_errno(err) : 0;
 }
 
 long __quark_close(long fd) {
@@ -1405,10 +1466,16 @@ long __quark_fcntl(long fd, long cmd, long arg) {
             long flags = (how & 3) == 3 ? LX_O_RDWR : (how & 2) ? LX_O_WRONLY : 0;
             return flags | ((how & 4) ? LX_O_APPEND : 0);
         }
-        if (!is_open(fd)) {
+        /* An end of a pipe reads or writes and never both, and a program
+           that asks is usually asking which. */
+        unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+        if (k == QUARK_ERR) {
             return -LX_EBADF;
         }
-        return LX_O_RDWR | (__quark_fd_is_nonblock(fd) ? LX_O_NONBLOCK : 0);
+        long access = QUARK_FD_KIND(k) == QUARK_FD_KIND_PIPE_READ    ? 0
+                      : QUARK_FD_KIND(k) == QUARK_FD_KIND_PIPE_WRITE ? LX_O_WRONLY
+                                                                     : LX_O_RDWR;
+        return access | (__quark_fd_is_nonblock(fd) ? LX_O_NONBLOCK : 0);
     }
     case LX_F_SETFL:
         if (!is_open(fd)) {

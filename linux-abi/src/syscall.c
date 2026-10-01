@@ -1404,10 +1404,11 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_fremovexattr:
         return -LX_EOPNOTSUPP;
 
-    /* Devices and pipes are not made on the disk here. */
+    /* A named pipe can be made, and a device cannot. */
     case LX_mknod:
+        return __quark_mknodat(LX_AT_FDCWD, (const char *)a1, a2);
     case LX_mknodat:
-        return -LX_EPERM;
+        return __quark_mknodat(a1, (const char *)a2, a3);
 
     case LX_unlink:
         return __quark_unlink(LX_AT_FDCWD, (const char *)a1);

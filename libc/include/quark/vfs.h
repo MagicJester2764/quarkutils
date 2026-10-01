@@ -39,6 +39,7 @@
 #define QUARK_VFS_TAG_MAP     23
 #define QUARK_VFS_TAG_SEEK    24
 #define QUARK_VFS_TAG_SETATTR 25
+#define QUARK_VFS_TAG_MKNOD   26
 
 /* QUARK_VFS_TAG_LOCK's flags: wait to be granted; the lock belongs to the
    handle, not the program; grant nothing and say what is in the way. */
@@ -62,6 +63,7 @@
 #define QUARK_VFS_OPEN_APPEND   64UL  /* every write goes to the end */
 #define QUARK_VFS_OPEN_READ    128UL  /* the descriptor may read */
 #define QUARK_VFS_OPEN_WRITE   256UL  /* the descriptor may write */
+#define QUARK_VFS_OPEN_NOWAIT  512UL  /* a named pipe: do not wait for the other end */
 
 /* Set in a word of permission bits to say they are meant: a word of 0 is a
    caller that says nothing, and gets 0644 for a file and 0755 for a
@@ -105,6 +107,7 @@
 #define QUARK_VFS_WOULD_BLOCK   16
 #define QUARK_VFS_DEADLOCK      17
 #define QUARK_VFS_TOO_MANY_LINKS 18
+#define QUARK_VFS_NO_PEER       19 /* a named pipe opened to write, unread, by one who will not wait */
 
 /* The server's devices have ids from here up, in the order null, zero, full,
    random, urandom. */
@@ -241,6 +244,15 @@ int quark_vfs_close(unsigned long handle);
    for a file this makes, with QUARK_VFS_MODE_GIVEN, or 0. */
 int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
                       unsigned long mode, struct quark_vfs_file *out, long *fd);
+/* Make something that is neither a file nor a directory. `mode` is a mode
+   word with its type bits, and a named pipe (S_IFIFO, 0010000) is the only
+   type there is.
+
+   A named pipe opened with quark_vfs_open_fd for reading or for writing is
+   an end of a pipe, not a file: `out->handle` means nothing, and `out->size`
+   is what to wait on — 0 if somebody holds the other end, and otherwise the
+   number SYS_PIPE_PEER takes to wait for it to be opened. */
+int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode);
 /* mkdir with the permission bits said; `mode` as for quark_vfs_open_fd. */
 int quark_vfs_mkdir_mode(unsigned long base, const char *path, unsigned long mode);
 /* Move a descriptor's position; `*pos` is where it now is, and `*how`, if

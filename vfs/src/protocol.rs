@@ -47,6 +47,9 @@ pub const TAG_MAP: u64 = 23;
 pub const TAG_SEEK: u64 = 24;
 /// Change what a file's inode says of it — mode, owner, times.
 pub const TAG_SETATTR: u64 = 25;
+/// Make something that is not a file or a directory: `[path length, mode]`,
+/// where the mode's type says what. A named pipe is the only kind there is.
+pub const TAG_MKNOD: u64 = 26;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 
@@ -69,6 +72,10 @@ pub const OPEN_APPEND: u64 = 0x40;
 /// mode, and again on every read and write.
 pub const OPEN_READ: u64 = 0x80;
 pub const OPEN_WRITE: u64 = 0x100;
+/// The caller will not wait for what it opens. It matters for one thing: a
+/// named pipe opened to write with nobody reading is refused
+/// ([`ERR_NO_PEER`]) rather than given an end.
+pub const OPEN_NOWAIT: u64 = 0x200;
 
 /// In a READ's or a WRITE's offset, or a READDIR_BULK's start: wherever the
 /// descriptor is. The position moves past what is transferred.
@@ -133,6 +140,9 @@ pub const ERR_WOULD_BLOCK: u64 = 16;
 pub const ERR_DEADLOCK: u64 = 17;
 /// The file has as many names as the filesystem allows.
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
+/// A named pipe, opened to write by somebody who will not wait, that nobody
+/// has open to read.
+pub const ERR_NO_PEER: u64 = 19;
 
 pub const MAX_PATH: usize = 4095;
 /// What an ext2 directory entry's one-byte length allows.

@@ -38,6 +38,7 @@ code in `data[0]`:
 | 16 | `WOULD_BLOCK` | A lock is held that keeps this one out |
 | 17 | `DEADLOCK` | Waiting for this lock would wait for ever |
 | 18 | `TOO_MANY_LINKS` | The file has as many names as it can |
+| 19 | `NO_PEER` | A named pipe opened to write, without waiting, that nobody is reading |
 
 Permission is checked against the caller's user and group, which the server
 asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
@@ -121,6 +122,7 @@ Every request below that takes a handle takes either kind.
 | 23 | `MAP` | `[handle, flags]` | — | `[slot, size]` |
 | 24 | `SEEK` | `[handle, offset, whence]` | — | `[position, how]` |
 | 25 | `SETATTR` | `[path_len, which, nofollow]` | path, then five words | — |
+| 26 | `MKNOD` | `[path_len, mode]` | path | — |
 
 Numbers are never reused. 4 was `READDIR`, which returned one entry per call
 and cut its name to 32 bytes. 7 was `CREATE`, which carried its path in the
@@ -141,6 +143,7 @@ message and cut it to 40 bytes.
 | 64 | `APPEND` | Every write through the descriptor goes to the end of the file |
 | 128 | `READ` | The descriptor may read |
 | 256 | `WRITE` | The descriptor may write |
+| 512 | `NOWAIT` | The caller will not wait for what it opens: see *Named pipes* |
 
 With `DESCRIPTOR` the reply's first word is `handle << 32 | descriptor`: the
 number the caller now has, the lowest free from 3, and the handle to name in
@@ -400,6 +403,43 @@ also anybody's who may write the file. Every change sets the change time.
 Owners and groups are sixteen bits (`INVALID_PATH` beyond). `/dev` and what
 is in it are the server's and stay as they are (`PERMISSION`); FAT32 has
 none of this (`NOT_SUPPORTED`).
+
+### MKNOD and named pipes
+
+`MKNOD` makes something that is neither a file nor a directory. `data[1]` is
+a mode with its type bits, and the only type there is is a named pipe
+(`0o010000`): anything else is `PERMISSION`, a device because the ones there
+are are the server's own, and a regular file because that is made by opening
+it. `EXISTS` if the name is taken; `NOT_SUPPORTED` on FAT32.
+
+A named pipe is an inode and nothing else: a name, an owner, a mode and
+times, and no blocks. The pipe is the kernel's, made when the name is first
+opened and gone, with whatever was in it, when its last end is closed
+(`SYS_FD_SERVE_PIPE`, keyed by the inode number). What the server does is
+decide who may open it.
+
+`OPEN` of one with `DESCRIPTOR` and `READ` or `WRITE` — not both, which is
+`NOT_SUPPORTED` — is checked against the inode's mode like any open, and
+answered with an end of that pipe in place of a handle:
+
+| Word | |
+|---|---|
+| `data[0]` | the descriptor; there is no handle above it |
+| `data[1]` | what to wait on: 0 if the other end is held, else the number `SYS_PIPE_PEER` takes |
+| `data[3]`, `[4]`, `[5]` | mode, access and id, as for a file |
+
+The server sees no more of it: not what is read or written, and not the
+close. Waiting for the other end is the caller's to do, since a server
+cannot wait; with `NOWAIT` the caller is saying it will not, and then a
+writer with nobody reading is refused (`NO_PEER`) rather than given an end
+— a reader waiting for a writer would otherwise have seen one come and go.
+A reader is given its end either way. `TRUNCATE` and `APPEND` mean nothing
+to a pipe and are ignored, and one may be opened to write on a filesystem
+mounted read-only: nothing is written to the disk.
+
+Opened any other way — without `DESCRIPTOR`, or for neither reading nor
+writing — a named pipe is an inode to ask about: `STAT` answers, and a read
+finds it empty.
 
 ### Devices
 

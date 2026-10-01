@@ -106,6 +106,7 @@ void __quark_sig_pipe(void);
    or a value on success, and a negated errno on failure. */
 long __quark_open(const char *path, long flags, long mode);
 long __quark_openat(long dirfd, const char *path, long flags, long mode);
+long __quark_mknodat(long dirfd, const char *path, long mode);
 long __quark_close(long fd);
 long __quark_read(long fd, void *buf, unsigned long n);
 long __quark_write(long fd, const void *buf, unsigned long n);

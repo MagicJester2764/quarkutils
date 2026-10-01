@@ -112,6 +112,45 @@ pub fn create(
     Ok((ino, inode))
 }
 
+/// Make a named pipe: an inode that is a name, an owner and a mode, and no
+/// more. The pipe itself is the kernel's, made when the name is opened and
+/// gone when the last end of it is closed; nothing of it is on the disk.
+///
+/// No blocks, and on a volume with extents no extent tree either: a special
+/// file's `i_block` is not a map of anything.
+pub fn make_fifo(
+    e2: &mut Ext2State,
+    base: u32,
+    path: &[u8],
+    uid: u32,
+    gid: u32,
+    mode: u16,
+) -> Result<(), u64> {
+    let (parent_path, name) = split_path(path)?;
+    let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
+    if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
+        return Err(ERR_EXISTS);
+    }
+    let ino = ext2_alloc::alloc_inode(e2)?;
+    ext2::zero_inode(e2, ino)?;
+
+    let t = ext2::now();
+    let mut inode = Ext2Inode::empty();
+    inode.i_mode = ext2::S_IFIFO | (mode & 0o7777);
+    inode.i_uid = uid as u16;
+    inode.i_gid = gid as u16;
+    inode.i_links_count = 1;
+    inode.i_atime = t;
+    inode.i_ctime = t;
+    inode.i_mtime = t;
+    ext2::write_inode(e2, ino, &inode)?;
+    ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, ext2::FT_FIFO)?;
+    parent.i_mtime = t;
+    parent.i_ctime = t;
+    ext2::write_inode(e2, parent_ino, &parent)?;
+    Ok(())
+}
+
 /// What SETATTR asks for: `which` says which of the rest to use.
 pub struct Attrs {
     pub which: u64,

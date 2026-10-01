@@ -158,6 +158,11 @@
 #define QUARK_FD_KIND_MEMORY     10UL
 #define QUARK_FD_KIND_SOCKET     11UL
 #define QUARK_FD_KIND_SERVED     12UL
+/* A named pipe. A server gives a client an end of the pipe a key names, and
+   whoever was given one waits here for the other end to be opened, with the
+   number that came with it. */
+#define SYS_FD_SERVE_PIPE   231
+#define SYS_PIPE_PEER       232
 
 /* 0xF0  introspection */
 #define SYS_ABI_VERSION     240

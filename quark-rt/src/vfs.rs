@@ -30,6 +30,7 @@ const TAG_TRUNCATE: u64 = 13;
 const TAG_STATFS: u64 = 14;
 const TAG_SEEK: u64 = 24;
 const TAG_SETATTR: u64 = 25;
+const TAG_MKNOD: u64 = 26;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most one read or write carries.
@@ -57,6 +58,10 @@ pub const OPEN_APPEND: u64 = 0x40;
 /// What the descriptor may do.
 pub const OPEN_READ: u64 = 0x80;
 pub const OPEN_WRITE: u64 = 0x100;
+/// Do not wait for what is opened. A named pipe opened to write with nobody
+/// reading is then refused ([`ERR_NO_PEER`]), and one opened to read is
+/// given at once.
+pub const OPEN_NOWAIT: u64 = 0x200;
 /// Set in a mode word to say the permission bits below it are meant.
 pub const MODE_GIVEN: u64 = 1 << 16;
 
@@ -103,12 +108,18 @@ pub const LOCK_WAIT: u64 = 1;
 pub const LOCK_OFD: u64 = 2;
 pub const LOCK_QUERY: u64 = 4;
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
+pub const ERR_NO_PEER: u64 = 19;
+/// A signal the program handles ended the wait for the other end of a named
+/// pipe. This side's own: the server never says it.
+pub const ERR_INTERRUPTED: u64 = 254;
 
 /// File-type bits of a mode, as [`Stat::mode`] carries them.
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
+/// A named pipe.
+pub const S_IFIFO: u32 = 0o010000;
 
 /// What [`open_with`] learns about the file it opened.
 #[derive(Clone, Copy, Debug)]
@@ -237,10 +248,38 @@ pub fn open_with(vfs_tid: usize, path: &[u8], flags: u64) -> Result<Opened, u64>
 /// forked child and kept across an exec. `flags` are the `OPEN_*` ones, of
 /// which [`OPEN_READ`] and [`OPEN_WRITE`] say what it is for; `mode` is the
 /// permission bits for a file this makes.
+///
+/// A named pipe opened this way is an end of a pipe, and the open waits for
+/// somebody to open the other end unless `flags` say [`OPEN_NOWAIT`].
 pub fn open_fd(vfs_tid: usize, path: &[u8], flags: u64, mode: u32) -> Result<usize, u64> {
+    let (fd, wait) = open_end(vfs_tid, path, flags, mode)?;
+    if wait != 0 && flags & OPEN_NOWAIT == 0 {
+        if let Err(signal) = syscall::sys_pipe_peer(fd, wait) {
+            let _ = syscall::sys_fd_close(fd);
+            return Err(if signal { ERR_INTERRUPTED } else { ERR_IO });
+        }
+    }
+    Ok(fd)
+}
+
+/// [`open_fd`] without the wait: the descriptor, and for an end of a named
+/// pipe whose other end nobody holds, what [`syscall::sys_pipe_peer`] takes
+/// to wait for it. 0 for anything else.
+pub fn open_end(vfs_tid: usize, path: &[u8], flags: u64, mode: u32) -> Result<(usize, u64), u64> {
     let words = [0, flags | OPEN_DESCRIPTOR, MODE_GIVEN | (mode as u64 & 0o7777), 0, 0, 0];
     let r = call_with_path(vfs_tid, TAG_OPEN, path, words)?;
-    Ok((r.data[0] & 0xFFFF_FFFF) as usize)
+    let fd = (r.data[0] & 0xFFFF_FFFF) as usize;
+    // For a pipe the reply's second word is what to wait on, where a file's
+    // size would be.
+    let is_pipe = r.data[3] as u32 & S_IFMT == S_IFIFO && flags & (OPEN_READ | OPEN_WRITE) != 0;
+    Ok((fd, if is_pipe { r.data[1] } else { 0 }))
+}
+
+/// Make a named pipe: a name two programs open to be given the two ends of
+/// one pipe. `mode` is its permission bits.
+pub fn mkfifo(vfs_tid: usize, path: &[u8], mode: u32) -> Result<(), u64> {
+    let words = [0, (S_IFIFO | (mode & 0o7777)) as u64, 0, 0, 0, 0];
+    call_with_path(vfs_tid, TAG_MKNOD, path, words).map(|_| ())
 }
 
 /// The server's handle behind descriptor `fd`, if it is one of `vfs_tid`'s.

@@ -557,6 +557,15 @@ int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
     return 0;
 }
 
+int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.data[1] = mode;
+    return vfs_path_call(QUARK_VFS_TAG_MKNOD, base, path, &msg, &reply);
+}
+
 int quark_vfs_mkdir_mode(unsigned long base, const char *path, unsigned long mode) {
     struct quark_msg msg;
     struct quark_msg reply;

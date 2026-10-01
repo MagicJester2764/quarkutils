@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 376 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 397 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -588,6 +588,16 @@ change here: it has found what reading the code did not.
   `{ a; b; } > file` needs — and closes the handle when the kernel says the
   last descriptor has gone. `dup`, `fork` and `exec` never reach it. A handle
   opened the old way, by a program for itself, is still its program's.
+- **A named pipe is the server's name for a pipe the kernel keeps.** The
+  inode is a name, an owner and a mode; it has no blocks, and on ext4 no
+  extent tree, so nothing that walks a file's blocks may be pointed at one.
+  Opening it for reading or for writing checks the mode and hands the caller
+  an end of the pipe the kernel has for that inode number
+  (`SYS_FD_SERVE_PIPE`). The server never sees the bytes or the close, and
+  never waits for the other end — the opener does (`SYS_PIPE_PEER`), in its
+  own time, with the number the open came back with. That number is what
+  makes the wait right: a writer that opened, wrote and closed between the
+  open and the wait has still been.
 - **A mapping asks what the descriptor was opened for.** A descriptor opened
   to read is not one that writes because it was mapped shared.
 - **A journaled write never lets a prefetch cache the old copy.** While a

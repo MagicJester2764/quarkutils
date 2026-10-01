@@ -1517,6 +1517,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_STAT => handle_stat(sender, msg),
         TAG_WRITE => transacted(|| handle_write(disk, sender, msg)),
         TAG_MKDIR => transacted(|| handle_mkdir(disk, sender, msg)),
+        TAG_MKNOD => transacted(|| handle_mknod(sender, msg)),
         TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
             transacted(|| handle_namespace(sender, msg))
         }
@@ -1889,7 +1890,8 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
             if inode.is_dir() {
                 return error_reply(sender, ERR_IS_DIR);
             }
-            if ext2_state().read_only {
+            // What is written to a named pipe is not written to the disk.
+            if ext2_state().read_only && !inode.is_fifo() {
                 return error_reply(sender, ERR_READ_ONLY);
             }
             if link || !ext2::check_permission(&inode, uid, gid, 2) {
@@ -1898,6 +1900,39 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
         }
     } else if !link && !ext2::check_permission(&inode, uid, gid, 4) {
         return error_reply(sender, ERR_PERMISSION);
+    }
+    // A named pipe, opened to read or to write: an end of the pipe the
+    // kernel keeps for this inode while anybody has it open. The permissions
+    // were checked above, as for a file; what is handed over is not a file,
+    // and this server sees no more of it — not the bytes, and not the close.
+    //
+    // Opened for neither (to be asked about, or as the start of a path) it
+    // is an inode like any other, and falls through.
+    if inode.is_fifo() && flags & OPEN_DESCRIPTOR != 0 && flags & (OPEN_READ | OPEN_WRITE) != 0 {
+        // One end to an open. Linux lets a named pipe be opened for both,
+        // which is two ends in one descriptor, and a descriptor here is one.
+        if flags & OPEN_READ != 0 && flags & OPEN_WRITE != 0 {
+            return error_reply(sender, ERR_NOT_SUPPORTED);
+        }
+        let write = flags & OPEN_WRITE != 0;
+        // A writer that will not wait is not given an end nobody is reading:
+        // for a moment there would have been a writer, and a reader waiting
+        // for one would have gone on to read the end of nothing.
+        let only_with_peer = write && flags & OPEN_NOWAIT != 0;
+        return match syscall::sys_fd_serve_pipe(sender, ino as u64, write, only_with_peer) {
+            // The second word is what the opener should wait on, where a
+            // file's size would be.
+            syscall::PipeEnd::Given(fd, wait) => reply_opened(sender, [
+                fd as u64,
+                wait,
+                0,
+                inode.i_mode as u64,
+                access_bits(&inode, uid, gid),
+                ino as u64,
+            ]),
+            syscall::PipeEnd::NoPeer => error_reply(sender, ERR_NO_PEER),
+            syscall::PipeEnd::Failed => error_reply(sender, ERR_TOO_MANY_OPEN),
+        };
     }
     let writable =
         !link && !ext2_state().read_only && ext2::check_permission(&inode, uid, gid, 2);
@@ -2015,6 +2050,36 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
             Ok(path) => fat32_mkdir(disk, path),
             Err(code) => Err(code),
         }
+    };
+    match made {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(code) => error_reply(sender, code),
+    }
+}
+
+/// Make a named pipe. A device is not a file anybody can make — the ones
+/// there are, are this server's own — and a regular file is made by opening
+/// it.
+fn handle_mknod(sender: usize, msg: &Message) {
+    let path = match protocol::lent_path(sender, 0, msg.data[0] as usize, 0) {
+        Ok(p) => p,
+        Err(code) => return error_reply(sender, code),
+    };
+    let mode = msg.data[1] as u16;
+    let made = if unsafe { FS_TYPE } != FsType::Ext2 {
+        // FAT has files and directories and nothing else.
+        Err(ERR_NOT_SUPPORTED)
+    } else if mode & ext2::S_IFMT != ext2::S_IFIFO {
+        Err(ERR_PERMISSION)
+    } else if ext2_state().read_only {
+        Err(ERR_READ_ONLY)
+    } else if ext2_dir::dev_dir() == 0 && devices::refuses(path) {
+        Err(ERR_PERMISSION)
+    } else {
+        let (uid, gid) = get_sender_uid_gid(sender);
+        base_of(sender, msg.data[5]).and_then(|base| {
+            ext2_ops::make_fifo(ext2_state_mut(), base, path, uid, gid, mode)
+        })
     };
     match made {
         Ok(()) => reply_opened(sender, [0; 6]),

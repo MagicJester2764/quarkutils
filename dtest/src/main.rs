@@ -2520,6 +2520,167 @@ extern "C" fn sync_worker() -> ! {
     syscall::sys_exit_code(0);
 }
 
+static FIFO_VFS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const FIFO: &[u8] = b"/tmp/dtest.fifo";
+
+/// Open the pipe to write a fifth of a second after the test began waiting
+/// for somebody to, say something, and go.
+extern "C" fn fifo_writer() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    syscall::sleep_ticks(20);
+    if let Ok(w) = vfs::open_fd(FIFO_VFS.load(SeqCst), FIFO, vfs::OPEN_WRITE, 0) {
+        let _ = syscall::sys_fd_write(w, b"by name");
+        let _ = syscall::sys_fd_close(w);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// A named pipe: the file server's name for a pipe the kernel keeps.
+fn test_named_pipes() {
+    use core::sync::atomic::Ordering::SeqCst;
+    println!("named pipes:");
+    let Some(vfs_tid) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the VFS", false);
+        return;
+    };
+    let nowait = |how: u64| vfs::open_fd(vfs_tid, FIFO, how | vfs::OPEN_NOWAIT, 0);
+    let mut buf = [0u8; 16];
+
+    let _ = vfs::unlink(vfs_tid, FIFO);
+    check("make one", vfs::mkfifo(vfs_tid, FIFO, 0o600).is_ok());
+    check(
+        "a second by the same name is refused",
+        vfs::mkfifo(vfs_tid, FIFO, 0o600) == Err(vfs::ERR_EXISTS),
+    );
+    let seen = vfs::open_with(vfs_tid, FIFO, 0);
+    check(
+        "it is there, and says it is a pipe",
+        seen.as_ref().is_ok_and(|o| o.mode & vfs::S_IFMT == vfs::S_IFIFO && o.mode & 0o777 == 0o600),
+    );
+    if let Ok(o) = seen {
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+
+    // The ends, taken by somebody who will not wait for the other.
+    check(
+        "a writer that will not wait is refused while nobody reads",
+        nowait(vfs::OPEN_WRITE) == Err(vfs::ERR_NO_PEER),
+    );
+    let (Ok(r), w) = (nowait(vfs::OPEN_READ), nowait(vfs::OPEN_WRITE)) else {
+        check("a reader that will not wait is given its end", false);
+        return;
+    };
+    check("a reader that will not wait is given its end, and then a writer is", w.is_ok());
+    let w = w.unwrap_or(usize::MAX);
+    check(
+        "they are the two ends of one pipe",
+        syscall::sys_fd_write(w, b"same") == 4
+            && syscall::sys_fd_read(r, &mut buf) == 4
+            && &buf[..4] == b"same",
+    );
+    check(
+        "a second reader is given the same pipe",
+        nowait(vfs::OPEN_READ).is_ok_and(|r2| {
+            let got = syscall::sys_fd_write(w, b"2") == 1 && syscall::sys_fd_read(r2, &mut buf) == 1;
+            let _ = syscall::sys_fd_close(r2);
+            got
+        }),
+    );
+    check(
+        "opening it for both at once is refused",
+        nowait(vfs::OPEN_READ | vfs::OPEN_WRITE) == Err(vfs::ERR_NOT_SUPPORTED),
+    );
+    // What is in it goes with its last end: the name is somewhere to meet.
+    let _ = syscall::sys_fd_write(w, b"left");
+    let _ = syscall::sys_fd_close(w);
+    let _ = syscall::sys_fd_close(r);
+    let (Ok(r), Ok(w)) = (nowait(vfs::OPEN_READ), nowait(vfs::OPEN_WRITE)) else {
+        check("both ends again", false);
+        return;
+    };
+    check(
+        "what was left in it went with its last end",
+        syscall::sys_fd_read_nb(r, &mut buf) == syscall::WOULD_BLOCK,
+    );
+    let _ = syscall::sys_fd_close(w);
+    let mut fds = [syscall::PollFd::new(r, syscall::POLL_READABLE)];
+    check(
+        "a writer that has gone is the end of it, and a poll says so",
+        syscall::sys_poll(&mut fds, 5) == Ok(1) && fds[0].revents & syscall::POLL_HANGUP != 0,
+    );
+    let _ = syscall::sys_fd_close(r);
+
+    // A reader with no writer *yet* has not been hung up on.
+    let Ok((r, wait)) = vfs::open_end(vfs_tid, FIFO, vfs::OPEN_READ, 0) else {
+        check("a reader's end, and what to wait on", false);
+        return;
+    };
+    check("a reader's end comes with something to wait on", wait != 0);
+    let mut fds = [syscall::PollFd::new(r, syscall::POLL_READABLE)];
+    check(
+        "before any writer, a poll finds nothing: it has not ended",
+        syscall::sys_poll(&mut fds, 5) == Ok(0),
+    );
+    check(
+        "though a read answers as a pipe with no writer does",
+        syscall::sys_fd_read_nb(r, &mut buf) == 0,
+    );
+    // A writer comes and goes before the reader gets round to waiting. It
+    // has still been: the wait is for an opening, not for an end to be held.
+    if let Ok(w) = nowait(vfs::OPEN_WRITE) {
+        let _ = syscall::sys_fd_write(w, b"gone");
+        let _ = syscall::sys_fd_close(w);
+    }
+    check(
+        "a writer that came and went before the reader waited has still been",
+        syscall::sys_pipe_peer(r, wait) == Ok(()),
+    );
+    check(
+        "and what it left is read, and then the end",
+        syscall::sys_fd_read(r, &mut buf) == 4
+            && &buf[..4] == b"gone"
+            && syscall::sys_fd_read(r, &mut buf) == 0,
+    );
+    let _ = syscall::sys_fd_close(r);
+
+    // An open that waits.
+    FIFO_VFS.store(vfs_tid, SeqCst);
+    match thread::spawn_with_stack(fifo_writer, 8) {
+        Ok(t) => {
+            let before = syscall::sys_ticks();
+            let r = vfs::open_fd(vfs_tid, FIFO, vfs::OPEN_READ, 0);
+            let waited = syscall::sys_ticks() - before;
+            check("opening to read waits for somebody to open it to write", r.is_ok() && waited >= 15);
+            if let Ok(r) = r {
+                check(
+                    "and what the writer says arrives",
+                    syscall::sys_fd_read(r, &mut buf) == 7 && &buf[..7] == b"by name",
+                );
+                let _ = syscall::sys_fd_close(r);
+            }
+            let _ = t.join();
+        }
+        Err(_) => check("start a thread to write", false),
+    }
+
+    // The kernel's own rules, asked directly.
+    check(
+        "an end is given only to a task that is calling",
+        matches!(syscall::sys_fd_serve_pipe(vfs_tid, 1, false, false), syscall::PipeEnd::Failed),
+    );
+    check("a wait for the other end of nothing fails", syscall::sys_pipe_peer(63, 1) == Err(false));
+    check(
+        "unlinking takes the name away",
+        vfs::unlink(vfs_tid, FIFO).is_ok() && vfs::open(vfs_tid, FIFO).err() == Some(vfs::ERR_NOT_FOUND),
+    );
+    // One is left where it is, for whatever checks the disk afterwards to
+    // find: an inode that is a pipe has to be one e2fsck agrees with.
+    check(
+        "and one stays behind for the filesystem check",
+        matches!(vfs::mkfifo(vfs_tid, b"/tmp/dtest.kept-fifo", 0o644), Ok(()) | Err(vfs::ERR_EXISTS)),
+    );
+}
+
 fn test_sync() {
     println!("locks:");
     // Uncontended, which is the path that must cost no system call at all.
@@ -2941,6 +3102,7 @@ pub extern "C" fn _start() -> ! {
         ("locks", test_locks),
         ("memory", test_memory),
         ("files", test_files),
+        ("fifo", test_named_pipes),
         ("sync", test_sync),
         ("fpu", test_fpu),
         ("flags", test_flags),

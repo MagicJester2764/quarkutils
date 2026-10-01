@@ -188,6 +188,10 @@ pub const SYS_FD_FLAGS: u64 = 228;
 pub const SYS_FD_REAP: u64 = 229;
 /// What a descriptor names, and whether its other end has gone.
 pub const SYS_FD_KIND: u64 = 230;
+/// A server gives a task that is calling it an end of the pipe a key names.
+pub const SYS_FD_SERVE_PIPE: u64 = 231;
+/// Wait for the other end of a named pipe to be opened.
+pub const SYS_PIPE_PEER: u64 = 232;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 64;
@@ -1308,6 +1312,41 @@ pub fn sys_fd_serve(client: usize, cookie: u64, at: usize) -> Result<usize, ()> 
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
+/// What giving a client an end of a named pipe came to.
+pub enum PipeEnd {
+    /// The client's descriptor, and what it should wait on: 0 if the other
+    /// end is held, and otherwise a number for [`sys_pipe_peer`].
+    Given(usize, u64),
+    /// It was to be given only if the other end is held, and it is not.
+    NoPeer,
+    /// The client is not calling, or a table is full.
+    Failed,
+}
+
+/// Give `client`, which must be in a call to this task, one end of the pipe
+/// that `key` names: the same pipe for everybody given the same key, for as
+/// long as any of them holds an end. `only_with_peer` refuses instead of
+/// giving an end whose other end nobody holds.
+pub fn sys_fd_serve_pipe(client: usize, key: u64, write: bool, only_with_peer: bool) -> PipeEnd {
+    let how = write as u64 | (only_with_peer as u64) << 1;
+    match unsafe { syscall3(SYS_FD_SERVE_PIPE, client as u64, key, how) } {
+        u64::MAX => PipeEnd::Failed,
+        WOULD_BLOCK => PipeEnd::NoPeer,
+        ret => PipeEnd::Given((ret & 0xFFFF_FFFF) as usize, ret >> 32),
+    }
+}
+
+/// Wait until the other end of the named pipe `fd` is an end of has been
+/// opened, if it has not been since `wait` was given with the descriptor.
+/// `Err(true)` if a signal the program handles ended the wait.
+pub fn sys_pipe_peer(fd: usize, wait: u64) -> Result<(), bool> {
+    match unsafe { syscall2(SYS_PIPE_PEER, fd as u64, wait) } {
+        0 => Ok(()),
+        INTERRUPTED => Err(true),
+        _ => Err(false),
+    }
+}
+
 /// Which server one of this program's descriptors is an object of, and the
 /// server's cookie for it. `Err` if the descriptor names something the kernel
 /// keeps itself, or its server has gone.
@@ -1830,7 +1869,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 6;
+pub const ABI_VERSION_MINOR: u32 = 7;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
