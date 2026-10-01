@@ -147,8 +147,15 @@ Also different:
 
 A terminal is a pseudo-terminal in the kernel, with a line discipline:
 `termios` is stored whole, and what is acted on is canonical mode and its
-editing characters, echo, the newline translations and the characters that
-raise signals. `openpty`, `forkpty`, `isatty`, `ttyname`, `tcgetattr` and
+editing characters, echo, the newline translations, the characters that
+raise signals, and `IUTF8` — which is set on a new terminal, so that erasing
+takes back a character and not a byte of one.
+
+The console is UTF-8, and a character on it is as wide as `wcwidth` says. A
+program still has to be told: in the C locale musl takes every byte for a
+character. Any other locale name is UTF-8 — `LANG=C.UTF-8` is the usual one.
+A combining mark is not drawn, and what a character looks like depends on
+the font the console was given at boot. `openpty`, `forkpty`, `isatty`, `ttyname`, `tcgetattr` and
 `tcsetattr` work unchanged.
 
 ## Time

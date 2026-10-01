@@ -23,10 +23,19 @@
 //! With a terminal to feed, the console holds the keyboard the way a
 //! compositor does — whoever owns the screen owns the keys — and a compositor
 //! that takes the display claims it above the console's, as it always has.
+//!
+//! What is written to it is UTF-8. A cell holds a character, not a byte; a
+//! character is as wide as the program printing it believes it is (`width`),
+//! which for most of East Asia is two cells; and what it looks like comes
+//! from the font that was loaded, where one has been (`glyphs`). A byte that
+//! is not part of any character is drawn as U+FFFD rather than guessed at.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
+
+mod glyphs;
+mod width;
 
 // A server: programs are usually blocked waiting on this, so it runs
 // ahead of them and behind the drivers. No capabilities — everything
@@ -160,7 +169,29 @@ const CURSOR_BLINK_TICKS: u64 = 50; // 500ms at 100 Hz
 const MAX_CELL_COLS: usize = 320;
 const MAX_CELL_ROWS: usize = 200;
 
-static mut CELL_CH: [u8; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
+/// The character in each cell: a code point, 0 for none, or `TAIL` for the
+/// right half of a character two cells wide, which is drawn with its left.
+static mut CELL_CH: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
+const TAIL: u32 = u32::MAX;
+
+/// A character being put together from its bytes: how many more it needs,
+/// what there is of it, and the least it may come to — a character spelt in
+/// more bytes than it needs is not that character, it is a way round whoever
+/// was checking for it.
+static mut UTF8_LEFT: u8 = 0;
+static mut UTF8_CP: u32 = 0;
+static mut UTF8_MIN: u32 = 0;
+/// What is drawn for bytes that are not UTF-8.
+const REPLACEMENT: u32 = 0xFFFD;
+
+/// A font, loaded by a program that read it from a file: `setfont`.
+const TAG_FONT: u64 = 0x120;
+const FONT_BEGIN: u64 = 1;
+const FONT_GLYPHS: u64 = 2;
+const FONT_END: u64 = 3;
+/// As much of a font file as arrives in one call.
+const FONT_CHUNK: usize = 32768;
+static mut FONT_TEXT: [u8; FONT_CHUNK] = [0; FONT_CHUNK];
 static mut CELL_FG: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
 static mut CELL_BG: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
 static mut DIRTY_MIN: usize = usize::MAX;
@@ -475,6 +506,46 @@ fn redraw_all() {
     flush_dirty();
 }
 
+/// One step of loading a font: begin, a piece of the file, or end. Returns
+/// how many characters the font has so far.
+///
+/// From root and nobody else. What the console's characters look like is
+/// what everything on it is read by, and a program that could change them
+/// could make a prompt say anything.
+///
+/// The console does not read the file. A server that called the file server
+/// would be waiting on something that may be waiting to print on it; so the
+/// file is read by whoever is loading the font, and lent here a piece at a
+/// time, whole lines to a piece.
+fn load_font(msg: &Message) -> Option<usize> {
+    let (uid, _) = syscall::sys_get_tuid(msg.sender).ok()?;
+    if uid != 0 {
+        return None;
+    }
+    match msg.data[0] {
+        FONT_BEGIN => glyphs::clear(),
+        FONT_GLYPHS => {
+            let len = msg.data[1] as usize;
+            if len > FONT_CHUNK {
+                return None;
+            }
+            let text = unsafe { &mut FONT_TEXT[..len] };
+            let mut have = 0;
+            while have < len {
+                match syscall::sys_lent_read(msg.sender, have, &mut text[have..]) {
+                    Ok(n) if n > 0 => have += n,
+                    _ => return None,
+                }
+            }
+            glyphs::load_hex(text).ok()?;
+        }
+        // Everything on the screen is drawn again, in the font it has now.
+        FONT_END => redraw_all(),
+        _ => return None,
+    }
+    Some(glyphs::count())
+}
+
 /// Answer whoever is calling, waiting up to `ticks` for somebody to.
 ///
 /// Two callers matter. The framebuffer device says when the display is taken
@@ -529,6 +600,13 @@ fn serve(ticks: u64) {
             };
             let _ = syscall::sys_reply(msg.sender, &reply);
         }
+        TAG_FONT => {
+            let reply = match load_font(&msg) {
+                Some(count) => Message { sender: 0, tag: 0, data: [count as u64, 0, 0, 0, 0, 0] },
+                None => Message { sender: 0, tag: u64::MAX, data: [0; 6] },
+            };
+            let _ = syscall::sys_reply(msg.sender, &reply);
+        }
         // From the kernel, about a program this watched to see whether the
         // terminal was free: nothing to answer.
         _ if msg.sender == 0 => {}
@@ -554,6 +632,13 @@ fn write_bytes(s: &[u8]) {
 fn putc(c: u8) {
     unsafe {
         match ESC_STATE {
+            // A control in the middle of a character ends it there: what
+            // there was of it was not one.
+            NORMAL if UTF8_LEFT != 0 && !(0x80..=0xbf).contains(&c) => {
+                UTF8_LEFT = 0;
+                put_char(REPLACEMENT);
+                return putc(c);
+            }
             NORMAL => match c {
                 0x1b => ESC_STATE = ESCAPE,
                 b'\n' => {
@@ -578,26 +663,28 @@ fn putc(c: u8) {
                 // The bell, and the rest of the controls nothing here acts
                 // on: not characters, so not drawn.
                 0..=0x1f | 0x7f => {}
-                byte => {
-                    if WRAP_PENDING {
-                        WRAP_PENDING = false;
-                        COL = 0;
-                        ROW += 1;
-                        if ROW >= ROWS {
-                            scroll();
+                0x20..=0x7e => put_char(c as u32),
+                // The rest of a character.
+                0x80..=0xbf => {
+                    if UTF8_LEFT == 0 {
+                        put_char(REPLACEMENT);
+                    } else {
+                        UTF8_CP = UTF8_CP << 6 | (c & 0x3f) as u32;
+                        UTF8_LEFT -= 1;
+                        if UTF8_LEFT == 0 {
+                            let cp = UTF8_CP;
+                            let real = cp >= UTF8_MIN
+                                && cp <= 0x10FFFF
+                                && !(0xD800..=0xDFFF).contains(&cp);
+                            put_char(if real { cp } else { REPLACEMENT });
                         }
                     }
-                    let idx = cell_idx(COL, ROW);
-                    CELL_CH[idx] = byte;
-                    CELL_FG[idx] = FG_COLOR;
-                    CELL_BG[idx] = BG_COLOR;
-                    mark_dirty(ROW);
-                    if COL + 1 >= COLS {
-                        WRAP_PENDING = true;
-                    } else {
-                        COL += 1;
-                    }
                 }
+                // The first byte of one, which says how many follow.
+                0xc0..=0xdf => (UTF8_LEFT, UTF8_CP, UTF8_MIN) = (1, (c & 0x1f) as u32, 0x80),
+                0xe0..=0xef => (UTF8_LEFT, UTF8_CP, UTF8_MIN) = (2, (c & 0x0f) as u32, 0x800),
+                0xf0..=0xf7 => (UTF8_LEFT, UTF8_CP, UTF8_MIN) = (3, (c & 0x07) as u32, 0x10000),
+                _ => put_char(REPLACEMENT),
             },
             ESCAPE => match c {
                 b'[' => {
@@ -682,24 +769,115 @@ fn putc(c: u8) {
     }
 }
 
-fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32, bg: u32) {
-    if !unsafe { HAVE_DISPLAY } {
+/// Put a character where the cursor is and move the cursor past it.
+///
+/// A character that combines with the one before it takes no cell, and there
+/// is nowhere here to draw two characters in one, so it is dropped. One that
+/// is two cells wide and has only one left on the line goes on the next, as
+/// it would on any terminal: half a character is not a character.
+unsafe fn put_char(cp: u32) {
+    unsafe {
+        // The C1 controls, as characters: nothing to draw and nothing to do.
+        if (0x80..0xa0).contains(&cp) {
+            return;
+        }
+        let wide = match width::of(cp) {
+            0 => return,
+            w => w == 2 && COLS >= 2,
+        };
+        if WRAP_PENDING || (wide && COL + 1 >= COLS) {
+            WRAP_PENDING = false;
+            COL = 0;
+            ROW += 1;
+            if ROW >= ROWS {
+                scroll();
+            }
+        }
+        set_cell(COL, ROW, cp);
+        let cells = if wide {
+            set_cell(COL + 1, ROW, TAIL);
+            2
+        } else {
+            1
+        };
+        if COL + cells >= COLS {
+            COL = COLS - 1;
+            WRAP_PENDING = true;
+        } else {
+            COL += cells;
+        }
+    }
+}
+
+/// Is the cell at `col` the left half of a character two cells wide?
+unsafe fn is_head(col: usize, row: usize) -> bool {
+    unsafe { col + 1 < COLS && CELL_CH[cell_idx(col + 1, row)] == TAIL }
+}
+
+/// Empty one cell, and with it the other half of a wide character it was
+/// half of: neither half means anything alone.
+unsafe fn clear_cell(col: usize, row: usize) {
+    unsafe {
+        let was_tail = CELL_CH[cell_idx(col, row)] == TAIL;
+        let was_head = is_head(col, row);
+        for c in [Some(col), (was_tail && col > 0).then(|| col - 1), was_head.then(|| col + 1)]
+            .into_iter()
+            .flatten()
+        {
+            let idx = cell_idx(c, row);
+            CELL_CH[idx] = 0;
+            CELL_FG[idx] = 0;
+            CELL_BG[idx] = 0;
+        }
+    }
+}
+
+/// Put `ch` in a cell, in the colours characters are being drawn in.
+unsafe fn set_cell(col: usize, row: usize, ch: u32) {
+    unsafe {
+        clear_cell(col, row);
+        let idx = cell_idx(col, row);
+        CELL_CH[idx] = ch;
+        CELL_FG[idx] = FG_COLOR;
+        CELL_BG[idx] = BG_COLOR;
+        mark_dirty(row);
+    }
+}
+
+/// Draw the character in a cell. One that is two cells wide is drawn from its
+/// left cell across both; its right cell draws nothing of its own.
+fn draw_glyph(col: usize, row: usize, ch: u32, fg: u32, bg: u32) {
+    if !unsafe { HAVE_DISPLAY } || ch == TAIL {
         return;
     }
-    let glyph = &quark_rt::font::FONT[ch as usize];
+    let wide_cell = unsafe { is_head(col, row) };
+    let (rows, glyph_wide): (&[u8], bool) = match glyphs::of(ch) {
+        glyphs::Glyph::Narrow(r) => (r, false),
+        glyphs::Glyph::Wide(r) => (r, true),
+    };
 
     let pixel_x = col * GLYPH_W;
     let pixel_y = row * GLYPH_H;
+    // As many pixels across as the character has cells. A wide glyph in one
+    // cell shows its left half, and a narrow one in two is followed by a
+    // blank: the cells are what the program was told, and the font may
+    // disagree with them.
+    let across = if wide_cell { 2 * GLYPH_W } else { GLYPH_W };
 
     unsafe {
         let bytes_per_pixel = BPP / 8;
 
-        for (gy, &glyph_row) in glyph.iter().enumerate() {
+        for gy in 0..GLYPH_H {
+            let bits: u16 = if glyph_wide {
+                (rows[2 * gy] as u16) << 8 | rows[2 * gy + 1] as u16
+            } else {
+                (rows[gy] as u16) << 8
+            };
             let y = pixel_y + gy;
             let row_base = FB + y * PITCH + pixel_x * bytes_per_pixel;
 
-            for gx in 0..8 {
-                let on = (glyph_row >> (7 - gx)) & 1 != 0;
+            for gx in 0..across {
+                let on = (bits >> (15 - gx)) & 1 != 0;
                 let color = if on { fg } else { bg };
                 let px = row_base + gx * bytes_per_pixel;
 
@@ -724,10 +902,7 @@ unsafe fn encode_color(r: u8, g: u8, b: u8) -> u32 {
 unsafe fn erase(row: usize, from: usize, to: usize) {
     unsafe {
         for c in from..to.min(COLS) {
-            let idx = cell_idx(c, row);
-            CELL_CH[idx] = 0;
-            CELL_FG[idx] = 0;
-            CELL_BG[idx] = 0;
+            clear_cell(c, row);
         }
         mark_dirty(row);
     }
@@ -1056,8 +1231,11 @@ unsafe fn hide_cursor() {
     }
     if !INITIALIZED { return; }
     if COL < COLS && ROW < ROWS {
-        let idx = cell_idx(COL, ROW);
-        draw_glyph(COL, ROW, CELL_CH[idx], CELL_FG[idx], CELL_BG[idx]);
+        // On the right half of a wide character, what is under the cursor is
+        // that character's, and it is drawn from its left.
+        let col = if CELL_CH[cell_idx(COL, ROW)] == TAIL && COL > 0 { COL - 1 } else { COL };
+        let idx = cell_idx(col, ROW);
+        draw_glyph(col, ROW, CELL_CH[idx], CELL_FG[idx], CELL_BG[idx]);
     }
 }
 

@@ -1218,6 +1218,18 @@ fn test_signals() {
         syscall::sys_fd_kind(master) == Some((syscall::FD_KIND_PTY_MASTER, false))
             && syscall::sys_fd_kind(slave) == Some((syscall::FD_KIND_PTY_SLAVE, false)),
     );
+    // What is typed is UTF-8, and erasing takes back a character of it and
+    // not a byte: é is two bytes and 中 is three, and each goes whole.
+    check(
+        "a new terminal expects UTF-8",
+        syscall::sys_pty_get_termios(master).is_ok_and(|t| t.c_iflag & 0o40000 != 0),
+    );
+    let _ = syscall::sys_fd_write_nb(master, "aé中".as_bytes());
+    let _ = syscall::sys_fd_write_nb(master, b"\x7f\x7fz\n");
+    let mut line = [0u8; 16];
+    let got = syscall::sys_fd_read(slave, &mut line);
+    check("erasing at a terminal takes back a whole character", got == 3 && &line[..3] == b"az\n");
+
     let _ = syscall::sys_fd_close(slave);
     check(
         "and a master whose slave has gone says so",

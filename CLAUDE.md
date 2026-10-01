@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 374 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 376 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -351,7 +351,9 @@ number. Rust is unchanged: `quark_rt` spawns, waits and kills by task id, and
 shows both.
 
 **A session runs on a terminal when the distribution says so.** `init` reads
-`/etc/init.conf`, and `session <path>` there names what it starts once the
+`/etc/init.conf`: `run <path> [arguments]` lines name programs to run to
+their end, in order, before anybody is let in — loading the console's font
+is the first use — and `session <path>` there names what it starts once the
 filesystem is up. With no such file that is `login`, on the console as it
 always was: standard input a message to `input`, output the console's pipe.
 A distribution that names `getty` gets a real terminal instead: `getty` asks
@@ -382,7 +384,36 @@ while that one lives: whoever holds the slave reads what is typed. What it
 understands of ECMA-48 is what `qtty/termcap` says, which is installed as
 `/etc/termcap`: a capability goes there when the console acts on it and not
 before. A sequence it does not act on is read to its end and dropped, never
-drawn. `wm` is a compositor you *run*: `wm <program>` takes the
+drawn.
+
+**The console is UTF-8.** A cell holds a character and not a byte, and three
+things about that are rules:
+
+- *A character is as wide as `wcwidth` says.* A program lays out its output
+  by asking its C library, and a console that disagrees draws the cursor
+  where the program does not think it is. `qtty/src/width.rs` is generated
+  from the Unicode data (`tools/gen-width.py`), like the C library's own
+  table, and is regenerated when that moves. Two cells for most of East
+  Asia; none for a combining mark, which is dropped, because a cell has room
+  for one character.
+- *What a character looks like comes from a font the console is given.* It
+  was built with ASCII and has nothing else. `setfont FILE` reads a font in
+  GNU Unifont's `.hex` format and lends it to the console a piece at a time;
+  `init` runs it at boot when `/etc/init.conf` has a `run` line for it. The
+  console does not read the file itself: a server that called the file
+  server would be waiting on something that may be waiting to print on it.
+  It takes a font from root only — whoever draws the characters can make a
+  prompt say anything. A character no font has is drawn as its nearest
+  ASCII, or as a box, and never as nothing.
+- *The screen is read by what it was drawn in.* The tests read a screenshot
+  back as text by matching cells against glyphs, so a test of an image that
+  loads a font names that font (`QUARK_FONT_HEX`).
+
+The keyboard still types ASCII: there is one layout, and it is US. The
+kernel's line discipline knows a character from a byte (`IUTF8`) and rubs a
+whole one out.
+
+`wm` is a compositor you *run*: `wm <program>` takes the
 display, starts that program, composites its windows, and gives the display back
 when it exits.
 

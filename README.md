@@ -28,6 +28,7 @@ net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
 fb/                 The framebuffer device: owns the display, decides who draws.
 qtty/               The text console. What the machine boots into, and to
                     a session a terminal; `termcap` beside it says which.
+                    It is UTF-8, and draws what `setfont` gives it a font for.
 input/              Line discipline for whoever reads, raw events for whoever
                     has claimed the keyboard.
 vfs/                ext2, ext4 and FAT32, and the pager for mapped files.
@@ -39,10 +40,10 @@ linux-abi/          The Linux system-call surface, answered by Quark. musl is
 
 getty/              Put a session on the console's terminal.
 login/  qsh/        Log in; the shell.
-ls/ cat/ echo/ ps/ ping/ shutdown/      Programs, in Rust without std.
+ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     374 checks of the kernel, made through the ABI.
+dtest/  dchild/     376 checks of the kernel, made through the ABI.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
