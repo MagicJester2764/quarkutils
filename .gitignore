@@ -1,0 +1,9 @@
+/*/target
+/*/Cargo.lock
+/rootfs
+/dist
+
+# Editor scratch files. One of these was committed once.
+*.swp
+*.swo
+*~
