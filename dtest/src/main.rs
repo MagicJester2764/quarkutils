@@ -2803,6 +2803,217 @@ fn ram_disk_of(sectors: u64) -> Option<(usize, [u8; 4])> {
     })
 }
 
+/// Start `ramdisk MEGABYTES` and wait for the disk it makes: its server, its
+/// driver and its name.
+fn start_ram_disk(megabytes: &[u8], sectors: u64) -> Option<(usize, usize, [u8; 4])> {
+    let server = load_program(b"/usr/bin/ramdisk", b"/usr/bin/RAMDISK.ELF", &[b"ramdisk", megabytes])
+        .and_then(|c| {
+            let tid = c.tid;
+            c.start().ok().map(|()| tid)
+        })?;
+    for _ in 0..50 {
+        if let Some((disk, name)) = ram_disk_of(sectors) {
+            return Some((server, disk, name));
+        }
+        syscall::sleep_ticks(2);
+    }
+    let _ = syscall::sys_task_kill(server);
+    let _ = wait_for(server);
+    None
+}
+
+/// `/dev/` and a disk's name, and a partition's number if there is one.
+fn dev_path(name: &[u8], volume: u64, out: &mut [u8; 16]) -> usize {
+    out[..5].copy_from_slice(b"/dev/");
+    out[5..5 + name.len()].copy_from_slice(name);
+    let mut len = 5 + name.len();
+    if volume > 0 {
+        out[len] = b'p';
+        out[len + 1] = b'0' + volume as u8;
+        len += 2;
+    }
+    len
+}
+
+/// A disk as a file under `/dev`: who holds it while it is open, and what a
+/// handle may do. (The reading and writing is `blktest`'s, in C.)
+fn test_disk_files() {
+    use quark_rt::block;
+    use quark_rt::vfs::{self as files, OPEN_WRITE};
+    println!("disks as files:");
+    let Some(vfs) = nameserver::lookup(b"vfs") else {
+        check("find the file server", false);
+        return;
+    };
+    let vfs_pid = syscall::sys_pid(vfs).unwrap_or(0);
+    let Some((server, disk, name)) = start_ram_disk(b"2", 4096) else {
+        check("start a RAM disk", false);
+        return;
+    };
+    let mut text = [0u8; 16];
+    let len = dev_path(&name, 0, &mut text);
+    let path = &text[..len];
+    let holder = |disk: usize| block::info(disk, 0).map_or(u64::MAX, |i| i.claimant);
+    let mut sector = [0u8; 512];
+
+    // Looking takes nothing.
+    let looking = files::open_with(vfs, path, 0);
+    check(
+        "a disk opens to read, and says how long it is",
+        looking.as_ref().is_ok_and(|o| o.size == 2 << 20 && o.mode & 0o170000 == 0o060000),
+    );
+    let looking = looking.map_or(usize::MAX, |o| o.handle);
+    check("which claims nothing", holder(disk) == 0);
+    check("it is read", files::read(vfs, looking, &mut sector, 0) == Ok(512));
+    check(
+        "and not written through a handle that did not ask to",
+        files::write(vfs, looking, &sector, 0) == Err(files::ERR_READ_ONLY),
+    );
+    check(
+        "nor told to read its partition table again",
+        files::devctl(vfs, looking, files::DEVCTL_RESCAN) == Err(files::ERR_PERMISSION),
+    );
+
+    // Writing takes the volume, for as long as anything writes.
+    let first = files::open_with(vfs, path, OPEN_WRITE).map(|o| o.handle);
+    check("opened to write, it is the file server's", first.is_ok() && holder(disk) == vfs_pid && vfs_pid != 0);
+    check(
+        "and nobody else's to claim",
+        block::claim(disk, 0) == Err(block::ERR_BUSY),
+    );
+    sector[..4].copy_from_slice(b"disk");
+    check(
+        "what is written through the file is on the disk",
+        first.is_ok_and(|h| files::write(vfs, h, &sector, 512) == Ok(512))
+            && block::read(disk, 0, 1, &mut sector).is_ok()
+            && &sector[..4] == b"disk",
+    );
+    let second = files::open_with(vfs, path, OPEN_WRITE).map(|o| o.handle);
+    check("a second handle that writes shares the claim", second.is_ok() && holder(disk) == vfs_pid);
+    check(
+        "which outlasts the first of them",
+        first.is_ok_and(|h| files::close(vfs, h).is_ok()) && holder(disk) == vfs_pid,
+    );
+    check(
+        "and goes with the last",
+        second.is_ok_and(|h| files::close(vfs, h).is_ok()) && holder(disk) == 0,
+    );
+
+    // Somebody else's: a mounted filesystem's server holds its volume so.
+    check("the disk is claimed by somebody else", block::claim(disk, 0).is_ok());
+    check(
+        "and then does not open to write",
+        files::open_with(vfs, path, OPEN_WRITE).err() == Some(files::ERR_BUSY),
+    );
+    sector.fill(0);
+    check(
+        "but is still read, through the handle that was looking",
+        files::read(vfs, looking, &mut sector, 512) == Ok(512) && &sector[..4] == b"disk",
+    );
+    check("and still opens to read", files::open_with(vfs, path, 0).is_ok_and(|o| files::close(vfs, o.handle).is_ok()));
+    let _ = block::release(disk, 0);
+
+    // A partition is a file of its own, and a table is read through the
+    // whole disk's.
+    let mut mbr = [0u8; 512];
+    mbr[446 + 4] = 0x83;
+    mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(&1024u32.to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    let whole = files::open_with(vfs, path, OPEN_WRITE).map(|o| o.handle);
+    check(
+        "a partition table is written, and the driver told to read it",
+        whole.is_ok_and(|h| {
+            files::write(vfs, h, &mbr, 0) == Ok(512) && files::devctl(vfs, h, files::DEVCTL_RESCAN) == Ok(2)
+        }),
+    );
+    let mut part_text = [0u8; 16];
+    let part_len = dev_path(&name, 1, &mut part_text);
+    let part = files::open_with(vfs, &part_text[..part_len], OPEN_WRITE);
+    check("the partition is a file, as long as the table says", part.as_ref().is_ok_and(|o| o.size == 1024 * 512));
+    let part = part.map_or(usize::MAX, |o| o.handle);
+    check(
+        "which has no table of its own to read",
+        files::devctl(vfs, part, files::DEVCTL_RESCAN) == Err(files::ERR_INVALID_PATH),
+    );
+    check(
+        "and the table is not read again while it is in use",
+        whole.is_ok_and(|h| files::devctl(vfs, h, files::DEVCTL_RESCAN) == Err(files::ERR_BUSY)),
+    );
+    let _ = files::close(vfs, part);
+    if let Ok(h) = whole {
+        let _ = files::close(vfs, h);
+    }
+    check(
+        "both are nobody's when they are closed",
+        holder(disk) == 0 && block::info(disk, 1).is_ok_and(|i| i.claimant == 0),
+    );
+
+    // A handle that outlives its driver. The next disk of memory takes the
+    // name, and may take the task's number.
+    let stale = files::open_with(vfs, path, OPEN_WRITE).map_or(usize::MAX, |o| o.handle);
+    let _ = syscall::sys_task_kill(server);
+    let _ = wait_for(server);
+    let Some((server, disk, again)) = start_ram_disk(b"2", 4096) else {
+        check("start a second RAM disk", false);
+        return;
+    };
+    check("a second disk takes the first one's name", again == name);
+    check(
+        "a handle on the first reads nothing and writes nothing",
+        files::read(vfs, stale, &mut sector, 0) == Err(files::ERR_IO)
+            && files::write(vfs, stale, &sector, 0) == Err(files::ERR_IO)
+            && files::read(vfs, looking, &mut sector, 0) == Err(files::ERR_IO),
+    );
+    check("and its claim is not on the second", holder(disk) == 0);
+    let fresh = files::open_with(vfs, path, OPEN_WRITE).map(|o| o.handle);
+    check("which opens to write", fresh.is_ok() && holder(disk) == vfs_pid);
+    check(
+        "and is not let go when the stale handle closes",
+        files::close(vfs, stale).is_ok() && holder(disk) == vfs_pid,
+    );
+    check("but when its own does", fresh.is_ok_and(|h| files::close(vfs, h).is_ok()) && holder(disk) == 0);
+    let _ = files::close(vfs, looking);
+
+    // The disk the system is running from: the one the file server holds.
+    let mut root = None;
+    'find: for driver in [&b"disk0"[..], b"disk1", b"ram0", b"ram1", b"ram2", b"ram3"] {
+        let Some(tid) = nameserver::lookup(driver) else { continue };
+        let volumes = block::info(tid, 0).map_or(0, |i| i.volumes);
+        for volume in 0..volumes {
+            if block::info(tid, volume).is_ok_and(|i| i.claimant == vfs_pid) {
+                root = Some((tid, driver, volume));
+                break 'find;
+            }
+        }
+    }
+    let Some((root_disk, root_name, root_volume)) = root else {
+        check("the file server holds a volume", false);
+        return;
+    };
+    let whole_len = dev_path(root_name, 0, &mut text);
+    let before = holder(root_disk);
+    check(
+        "the disk the system runs from does not open to write",
+        files::open_with(vfs, &text[..whole_len], OPEN_WRITE).err() == Some(files::ERR_BUSY),
+    );
+    let part_len = dev_path(root_name, root_volume, &mut part_text);
+    check(
+        "nor does the volume its root is on",
+        files::open_with(vfs, &part_text[..part_len], OPEN_WRITE).err() == Some(files::ERR_BUSY),
+    );
+    let look = files::open_with(vfs, &text[..whole_len], 0).map(|o| o.handle);
+    check(
+        "it opens to read, and is read",
+        look.is_ok_and(|h| files::read(vfs, h, &mut sector, 0) == Ok(512) && files::close(vfs, h).is_ok()),
+    );
+    check("and is whose it was afterwards", holder(root_disk) == before);
+
+    let _ = syscall::sys_task_kill(server);
+    let _ = wait_for(server);
+}
+
 /// The CRC a GPT is checked with.
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -3625,6 +3836,7 @@ pub extern "C" fn _start() -> ! {
         ("disks", test_disks),
         ("ramdisk", test_ram_disk),
         ("parts", test_parts),
+        ("diskfiles", test_disk_files),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

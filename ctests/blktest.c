@@ -5,6 +5,7 @@
  * else. The disk is one made of memory for the purpose (`ramdisk 8`), so
  * that nothing depends on what is written to it. */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -134,7 +135,50 @@ int main(void) {
     check("whose first byte is the disk's at its start",
           pwrite(pfd, "P", 1, 0) == 1 && pread(fd, in, 1, 2048 * 512) == 1 && in[0] == 'P');
     close(pfd);
+
+    /* A descriptor that only reads is not one a disk is changed through. */
+    int ro = open(path, O_RDONLY);
+    errno = 0;
+    check("a descriptor opened to read does not write",
+          ro >= 0 && pwrite(ro, out, 512, 0) == -1 && errno == EBADF);
+    errno = 0;
+    check("or have the table read again", ioctl(ro, BLKRRPART) == -1 && errno == EACCES);
+    close(ro);
     close(fd);
+
+    /* The disk this is running from is one of the disks, and is not written:
+       of everything under /dev, something says it is busy, and still opens
+       to read. */
+    int busy = 0, readable = 0;
+    DIR *dev = opendir("/dev");
+    struct dirent *e;
+    while (dev && (e = readdir(dev))) {
+        char other[280];
+        if (e->d_type != DT_BLK) {
+            continue;
+        }
+        snprintf(other, sizeof other, "/dev/%s", e->d_name);
+        errno = 0;
+        int w = open(other, O_RDWR);
+        if (w >= 0) {
+            close(w);
+            continue;
+        }
+        if (errno != EBUSY) {
+            continue;
+        }
+        busy++;
+        int r = open(other, O_RDONLY);
+        if (r >= 0 && pread(r, in, 512, 0) == 512) {
+            readable++;
+        }
+        close(r);
+    }
+    if (dev) {
+        closedir(dev);
+    }
+    check("the disk this runs from is busy to anything that would write it", busy >= 1);
+    check("and is read all the same", readable == busy);
 
     kill(disk, SIGKILL);
     int status = 0;

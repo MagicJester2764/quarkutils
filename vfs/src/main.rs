@@ -1522,7 +1522,7 @@ fn size_of(file: &OpenFile) -> Result<u64, u64> {
             ext2::read_inode(ext2_state(), inode_num).map(|inode| inode.size64())
         }
         FsFileData::Fat32 { .. } => Ok(file.file_size as u64),
-        FsFileData::Device(dev) => Ok(devices::size_of(dev)),
+        FsFileData::Disk(ref disk) => Ok(devices::size_of(disk)),
         _ => Ok(0),
     }
 }
@@ -1562,7 +1562,7 @@ fn descriptor_io(disk: &DiskState, sender: usize, msg: &Message) {
     // A file here is at most four gigabytes: past that there is nothing to
     // read and nowhere to write. A disk is not a file, and is as long as it
     // is.
-    let is_disk = matches!(file.fs, FsFileData::Device(dev) if devices::is_block(dev));
+    let is_disk = matches!(file.fs, FsFileData::Disk(_));
     if at > u32::MAX as u64 && !is_disk {
         return if writing { error_reply(sender, ERR_NO_SPACE) } else { reply_count(sender, 0) };
     }
@@ -1663,7 +1663,7 @@ fn handle_setattr(sender: usize, msg: &Message) {
             Some(file) => match file.fs {
                 FsFileData::Ext2 { inode_num } => Ok(inode_num),
                 // The devices are the server's, and are what they are.
-                FsFileData::Device(_) | FsFileData::DevDir => Err(ERR_PERMISSION),
+                FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir => Err(ERR_PERMISSION),
                 _ => Err(ERR_NOT_SUPPORTED),
             },
             None => Err(ERR_INVALID_HANDLE),
@@ -2560,7 +2560,7 @@ fn handle_stat(sender: usize, msg: &Message) {
                 block_size: e2.block_size as u64,
             }
         }
-        FsFileData::Device(_) | FsFileData::DevDir | FsFileData::None => {
+        FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir | FsFileData::None => {
             return error_reply(sender, ERR_INVALID_HANDLE)
         }
     };

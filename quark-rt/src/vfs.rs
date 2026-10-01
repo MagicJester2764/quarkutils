@@ -31,7 +31,12 @@ const TAG_STATFS: u64 = 14;
 const TAG_SEEK: u64 = 24;
 const TAG_SETATTR: u64 = 25;
 const TAG_MKNOD: u64 = 26;
+const TAG_DEVCTL: u64 = 27;
 const TAG_ERROR: u64 = u64::MAX;
+
+/// [`devctl`]'s operations: have a disk's driver read its partition table
+/// again.
+pub const DEVCTL_RESCAN: u64 = 1;
 
 /// The most one read or write carries.
 pub const MAX_IO: usize = 4096;
@@ -109,6 +114,8 @@ pub const LOCK_OFD: u64 = 2;
 pub const LOCK_QUERY: u64 = 4;
 pub const ERR_TOO_MANY_LINKS: u64 = 18;
 pub const ERR_NO_PEER: u64 = 19;
+/// A disk somebody else is using, or the one the system is running from.
+pub const ERR_BUSY: u64 = 20;
 /// A signal the program handles ended the wait for the other end of a named
 /// pipe. This side's own: the server never says it.
 pub const ERR_INTERRUPTED: u64 = 254;
@@ -363,6 +370,21 @@ pub fn read(vfs_tid: usize, handle: usize, buf: &mut [u8], offset: u32) -> Resul
         return Err(reply.data[0]);
     }
     Ok(reply.data[0] as u32)
+}
+
+/// Ask something of the device `handle` is open on: a `DEVCTL_*`. The answer
+/// is the operation's — for [`DEVCTL_RESCAN`], how many volumes the disk now
+/// has.
+pub fn devctl(vfs_tid: usize, handle: usize, operation: u64) -> Result<u64, u64> {
+    let msg = Message { sender: 0, tag: TAG_DEVCTL, data: [handle as u64, operation, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(vfs_tid, &msg, &mut reply).is_err() {
+        return Err(ERR_IO);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(reply.data[0])
 }
 
 /// Close an open file/directory handle.

@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 474 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 504 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -626,10 +626,15 @@ is. `disk`, the ATA driver, registers as `disk0`.
   from its driver while anybody has the device open to write, so the
   driver's rule is the rule here too: what is mounted cannot be opened to
   write. The exception is the file server's own root, which it holds
-  itself and so has to refuse itself. A handle on a disk is given back to
-  the driver when it closes — `handles.rs` has one place every way of
-  closing goes through, because a volume left claimed is a disk nobody can
-  format.
+  itself and so has to refuse itself. Opening to read claims nothing: the
+  first version claimed for every open, so `stat` of a mounted partition
+  was refused as busy and one look at the root's disk left it claimed for
+  good. A claim is given back when the last handle that writes closes —
+  `handles.rs` has one place every way a handle goes comes through,
+  *including a handle that was never made*, because a volume left claimed
+  is a disk nobody can format. And a handle remembers its driver as a
+  program, not as a task or a name: a RAM disk is killed and another takes
+  both.
 - **`qfuzz` does not send a disk driver a claim.** It runs as root, a volume
   nobody has is one it would be given, and its next random write would be a
   write.

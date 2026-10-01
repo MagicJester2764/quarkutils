@@ -490,10 +490,14 @@ Only root opens one (`PERMISSION`).
 - **The disk this server's own root is on is read-only here** — its
   volume, and the whole disk around it (`BUSY` for a write). The server
   holds that claim itself, so the driver would not refuse it.
+- **A handle is on the driver it was opened on.** If that driver goes, the
+  handle reads and writes nothing (`IO`), whatever has taken its name or its
+  task's number since; the handle still closes.
 - **`DEVCTL` operation 1** has the driver of a whole disk read its
-  partition table again, for a handle open on that disk: what a program
-  does after it has written one. `BUSY` if a partition is in use. The reply
-  is how many volumes there now are.
+  partition table again: what a program does after it has written one. The
+  handle is one that was opened to write the whole disk — `PERMISSION` for
+  one that only reads, `INVALID_PATH` for a partition's. `BUSY` if a
+  partition is in use. The reply is how many volumes there now are.
 
 ### STATFS
 

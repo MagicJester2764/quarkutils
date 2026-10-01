@@ -47,6 +47,8 @@ pub enum FsFileData {
     },
     /// One of `/dev`'s devices, which no disk holds.
     Device(crate::devices::Device),
+    /// A disk, or a partition of one, open as a file under `/dev`.
+    Disk(crate::devices::Disk),
     /// `/dev` itself.
     DevDir,
     None,
@@ -119,33 +121,45 @@ fn table() -> &'static mut [OpenFile; MAX_OPEN_FILES] {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLE) }
 }
 
-/// Put `file` in the table and return its handle, or None if it is full.
+/// Put `file` in the table and return its handle, or None if there is no
+/// room. A file that is given no handle has still been opened, and what it
+/// held is let go here as it would be when a handle closes.
 pub fn alloc(file: OpenFile) -> Option<usize> {
+    let Some(i) = room_for(&file) else {
+        gone(&file);
+        return None;
+    };
     let t = table();
-    if file.by_fd {
-        // No share to keep to: a program holds no more of these than its
-        // descriptor table has room for, and the kernel keeps that.
-        let i = t.iter().position(|f| !f.in_use)?;
-        t[i] = file;
-        t[i].in_use = true;
-        t[i].owner = 0;
-        return Some(i);
-    }
-    let owner = file.owner;
-    if owner == 0 {
-        return None;
-    }
-    if t.iter().filter(|f| f.in_use && !f.by_fd && f.owner == owner).count() >= MAX_PER_PROGRAM {
-        return None;
-    }
-    let i = t.iter().position(|f| !f.in_use)?;
+    let (by_fd, owner) = (file.by_fd, file.owner);
     t[i] = file;
     t[i].in_use = true;
-    // Told when the program is gone, so its handles go with it. Watching a
-    // program twice is the same as watching it once, and a program already
-    // gone cannot be calling.
-    let _ = syscall::sys_space_watch(owner);
+    if by_fd {
+        t[i].owner = 0;
+    } else {
+        // Told when the program is gone, so its handles go with it. Watching
+        // a program twice is the same as watching it once, and a program
+        // already gone cannot be calling.
+        let _ = syscall::sys_space_watch(owner);
+    }
     Some(i)
+}
+
+/// A free place in the table that `file` may have.
+fn room_for(file: &OpenFile) -> Option<usize> {
+    let t = table();
+    // A descriptor's has no share to keep to: a program holds no more of
+    // these than its descriptor table has room for, and the kernel keeps
+    // that.
+    if !file.by_fd {
+        let owner = file.owner;
+        if owner == 0 {
+            return None;
+        }
+        if t.iter().filter(|f| f.in_use && !f.by_fd && f.owner == owner).count() >= MAX_PER_PROGRAM {
+            return None;
+        }
+    }
+    t.iter().position(|f| !f.in_use)
 }
 
 /// Program `space`'s handle `handle`, if it is one.
@@ -177,17 +191,13 @@ pub fn release(handle: usize) -> Option<u32> {
 }
 
 /// A handle is about to be forgotten: whatever it held besides a file's
-/// inode is let go. A disk opened as a device is claimed from its driver for
-/// as long as anybody has it open.
+/// inode is let go. A disk opened to write is claimed from its driver until
+/// the last such handle has gone, and every way a handle goes comes through
+/// here — a volume left claimed is a disk nobody can format.
 fn gone(f: &OpenFile) {
-    if let FsFileData::Device(dev) = f.fs {
-        crate::devices::closed(dev);
+    if let FsFileData::Disk(disk) = &f.fs {
+        crate::devices::closed(disk);
     }
-}
-
-/// How many handles there are, of either kind.
-pub fn count() -> usize {
-    table().iter().filter(|f| f.in_use).count()
 }
 
 /// Close program `space`'s handle `handle`. Returns the inode it named (0 for
@@ -238,6 +248,7 @@ pub fn lock_key(file: &OpenFile) -> Option<u32> {
             Some(0x8000_0000 | h)
         }
         FsFileData::Device(dev) => Some(crate::devices::id_of(*dev) as u32),
+        FsFileData::Disk(disk) => Some(crate::devices::id_of(disk.dev) as u32),
         FsFileData::DevDir => Some(crate::devices::DIR_ID as u32),
         FsFileData::None => None,
     }

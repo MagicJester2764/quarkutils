@@ -12,11 +12,14 @@
 //! written at any offset, which is what a program that makes a filesystem or
 //! a partition table needs.
 //!
-//! Opening one claims the volume from its driver for as long as it is open,
-//! and that is the whole of the protection: a volume a file server has
-//! mounted is that server's, the driver refuses a second claim, and the open
-//! fails as busy. The one case the driver cannot see is this server's own
-//! root, which it holds itself — so that is refused here, for writing.
+//! Opening one *to write* claims the volume from its driver until the last
+//! such handle has closed, and that is the whole of the protection: a volume
+//! a file server has mounted is that server's, the driver refuses a second
+//! claim, and the open fails as busy. The one case the driver cannot see is
+//! this server's own root, which it holds itself — so that is refused here.
+//! Opening one to read claims nothing and is refused nothing: a driver lets
+//! root read what somebody else holds, and looking at a disk that is in use
+//! is what a check of its filesystem does.
 
 use crate::handles::{FsFileData, OpenFile};
 use crate::protocol::*;
@@ -42,18 +45,44 @@ const DRIVERS: [&[u8]; 12] = [
     b"ram6", b"ram7",
 ];
 
-/// A volume this server has claimed for somebody who has its device open.
+/// A disk that is open: what a handle on a block device is.
+#[derive(Clone, Copy)]
+pub struct Disk {
+    /// Which device it is, as `/dev` names it.
+    pub dev: Device,
+    /// The driver it was opened on: the task, and the program that task is.
+    /// A task's number is used again and a program's is not, so a handle
+    /// that has outlived its driver finds nobody — rather than whichever
+    /// driver has the number, or the name, now.
+    tid: usize,
+    space: u64,
+    volume: u64,
+    /// How long the volume was when it was opened.
+    sectors: u64,
+    /// It was opened to write, and has a share of this server's claim on the
+    /// volume.
+    claimed: bool,
+}
+
+impl Disk {
+    /// Whether its driver is still the program it was opened on.
+    fn there(&self) -> bool {
+        syscall::sys_task_space(self.tid) == Ok(self.space)
+    }
+}
+
+/// A volume this server has claimed, for the handles that write it.
 #[derive(Clone, Copy)]
 struct Held {
-    tid: usize,
-    volume: u8,
-    /// How many handles there are for it. 0 is a free entry.
+    /// The driver's program: see [`Disk`].
+    space: u64,
+    volume: u64,
+    /// How many handles have a share. 0 is a free entry.
     opens: u16,
-    sectors: u64,
 }
 
 const MAX_HELD: usize = 16;
-static mut HELD: [Held; MAX_HELD] = [Held { tid: 0, volume: 0, opens: 0, sectors: 0 }; MAX_HELD];
+static mut HELD: [Held; MAX_HELD] = [Held { space: 0, volume: 0, opens: 0 }; MAX_HELD];
 
 fn held() -> &'static mut [Held; MAX_HELD] {
     unsafe { &mut *core::ptr::addr_of_mut!(HELD) }
@@ -116,26 +145,53 @@ fn under_root(tid: usize, volume: u64) -> bool {
     tid == root_tid && (volume == 0 || root_volume == 0 || volume == root_volume)
 }
 
-/// How many bytes a block device has; 0 if it has gone.
-pub fn size_of(dev: Device) -> u64 {
-    driver_of(dev)
-        .and_then(|(tid, volume)| block::info(tid, volume).ok())
-        .map_or(0, |i| i.sectors * block::SECTOR as u64)
+/// How many bytes an open disk has.
+pub fn size_of(disk: &Disk) -> u64 {
+    disk.sectors * block::SECTOR as u64
 }
 
-pub fn is_block(dev: Device) -> bool {
-    matches!(dev, Device::Block { .. })
+/// Open a block device: find its driver, and for a handle that will write,
+/// take a share of the claim on its volume.
+fn open_disk(dev: Device, to_write: bool) -> Result<Disk, u64> {
+    let (tid, volume) = driver_of(dev).ok_or(ERR_NOT_FOUND)?;
+    let space = syscall::sys_task_space(tid).map_err(|_| ERR_NOT_FOUND)?;
+    let info = block::info(tid, volume).map_err(|_| ERR_NOT_FOUND)?;
+    if to_write {
+        // The disk this server's own root is on is read, and not written:
+        // nothing here can tell a write that would be harmless from one that
+        // takes the root from under everything running.
+        if under_root(tid, volume) {
+            return Err(ERR_BUSY);
+        }
+        let table = held();
+        match table.iter_mut().find(|h| h.opens > 0 && h.space == space && h.volume == volume) {
+            Some(h) => h.opens += 1,
+            None => {
+                let free = table.iter_mut().find(|h| h.opens == 0).ok_or(ERR_TOO_MANY_OPEN)?;
+                block::claim(tid, volume).map_err(|why| match why {
+                    block::ERR_BUSY => ERR_BUSY,
+                    block::ERR_NOT_ALLOWED => ERR_PERMISSION,
+                    _ => ERR_IO,
+                })?;
+                *free = Held { space, volume, opens: 1 };
+            }
+        }
+    }
+    Ok(Disk { dev, tid, space, volume, sectors: info.sectors, claimed: to_write })
 }
 
-/// A handle on a block device has gone: the volume is let go with the last.
-pub fn closed(dev: Device) {
-    let Some((tid, volume)) = driver_of(dev) else { return };
-    if let Some(h) = held().iter_mut().find(|h| h.opens > 0 && h.tid == tid && h.volume as u64 == volume) {
+/// A handle on a disk has gone, or was never made. If it had a share of a
+/// claim, that is one fewer, and the volume is let go with the last.
+pub fn closed(disk: &Disk) {
+    if !disk.claimed {
+        return;
+    }
+    let found = held().iter_mut().find(|h| h.opens > 0 && h.space == disk.space && h.volume == disk.volume);
+    if let Some(h) = found {
         h.opens -= 1;
-        // This server's own root stays claimed: it was never claimed for the
-        // sake of the device.
-        if h.opens == 0 && !under_root(tid, volume) {
-            let _ = block::release(tid, volume);
+        // A driver that has gone took its claims with it.
+        if h.opens == 0 && disk.there() {
+            let _ = block::release(disk.tid, disk.volume);
         }
     }
 }
@@ -233,6 +289,7 @@ fn index_of(dev: Device) -> usize {
 /// `Elsewhere`.
 pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
+    let must_be_new = flags & OPEN_CREATE != 0 && flags & OPEN_EXCLUSIVE != 0;
     let mut size = 0;
     let mut writable = true;
     let (is_dir, fs, id, mode, access) = match found {
@@ -241,23 +298,23 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
             if trailing || flags & OPEN_DIRECTORY != 0 {
                 return error_reply(sender, ERR_NOT_DIR);
             }
-            // Root's, and nobody else's: whoever can write a disk can write
-            // anything on it.
+            if must_be_new {
+                return error_reply(sender, ERR_EXISTS);
+            }
+            // Root's, and nobody else's: whoever can read a disk can read
+            // every file on it, whatever the files' modes say.
             if crate::get_sender_uid_gid(sender).0 != 0 {
                 return error_reply(sender, ERR_PERMISSION);
             }
-            // A descriptor says what it is for. A handle a program holds for
-            // itself says nothing, and is taken to be for reading unless the
-            // device may be written.
-            let wants_write = flags & OPEN_WRITE != 0;
-            match hold(dev, wants_write) {
-                Ok((sectors, may_write)) => {
-                    size = sectors * block::SECTOR as u64;
-                    writable = may_write;
-                }
+            // A handle says whether it is for writing, or it is not: a
+            // program that only looks claims nothing.
+            let disk = match open_disk(dev, flags & OPEN_WRITE != 0) {
+                Ok(disk) => disk,
                 Err(code) => return error_reply(sender, code),
-            }
-            (false, FsFileData::Device(dev), id_of(dev), BLOCK_MODE, 6)
+            };
+            size = size_of(&disk);
+            writable = disk.claimed;
+            (false, FsFileData::Disk(disk), id_of(dev), BLOCK_MODE, 6)
         }
         Lookup::Device(dev) => {
             if trailing || flags & OPEN_DIRECTORY != 0 {
@@ -269,10 +326,7 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
         Lookup::Missing if flags & OPEN_CREATE != 0 => return error_reply(sender, ERR_PERMISSION),
         _ => return error_reply(sender, ERR_NOT_FOUND),
     };
-    if flags & OPEN_CREATE != 0 && flags & OPEN_EXCLUSIVE != 0 {
-        if let FsFileData::Device(dev) = fs {
-            closed(dev);
-        }
+    if must_be_new {
         return error_reply(sender, ERR_EXISTS);
     }
     let file = OpenFile {
@@ -283,61 +337,24 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
         fs,
         ..OpenFile::empty()
     };
-    // If the handle cannot be made, `opened` has answered, and a volume
-    // claimed for it has nobody holding it.
-    let before = crate::handles::count();
+    // If no handle comes of this, the table lets go of what the file held.
     crate::opened(sender, flags, file, [0, size, is_dir as u64, mode, access, id]);
-    if crate::handles::count() == before {
-        if let Lookup::Device(dev @ Device::Block { .. }) = found {
-            closed(dev);
-        }
-    }
-}
-
-/// Claim a block device's volume for one more handle. Answers with its size
-/// in sectors and whether it may be written.
-fn hold(dev: Device, wants_write: bool) -> Result<(u64, bool), u64> {
-    let (tid, volume) = driver_of(dev).ok_or(ERR_NOT_FOUND)?;
-    let info = block::info(tid, volume).map_err(|_| ERR_NOT_FOUND)?;
-    // The disk this server's own root is on is read, and not written:
-    // nothing here can tell a write that would be harmless from one that
-    // takes the root from under everything running.
-    let may_write = !under_root(tid, volume);
-    if wants_write && !may_write {
-        return Err(ERR_BUSY);
-    }
-    let table = held();
-    if let Some(h) = table.iter_mut().find(|h| h.opens > 0 && h.tid == tid && h.volume as u64 == volume) {
-        h.opens += 1;
-        return Ok((info.sectors, may_write));
-    }
-    let free = table.iter_mut().find(|h| h.opens == 0).ok_or(ERR_TOO_MANY_OPEN)?;
-    // Already this server's, if it is the root's own volume.
-    let (root_tid, root_volume) = crate::disk::root();
-    if !(tid == root_tid && volume == root_volume) {
-        block::claim(tid, volume).map_err(|why| match why {
-            block::ERR_BUSY => ERR_BUSY,
-            block::ERR_NOT_ALLOWED => ERR_PERMISSION,
-            _ => ERR_IO,
-        })?;
-    }
-    *free = Held { tid, volume: volume as u8, opens: 1, sectors: info.sectors };
-    Ok((info.sectors, may_write))
 }
 
 /// TAG_DEVCTL: `[handle, operation]`. Operation 1 has a disk's driver read
-/// its partition table again, for whoever has just written one; the handle
-/// has to be for the whole disk.
+/// its partition table again, for whoever has just written one: the handle
+/// is one that writes the whole disk.
 pub fn control(sender: usize, msg: &Message) {
-    let dev = match crate::get_handle(msg.data[0] as usize, sender).map(|f| &f.fs) {
-        Some(FsFileData::Device(dev @ Device::Block { volume: 0, .. })) => *dev,
+    let disk = match crate::get_handle(msg.data[0] as usize, sender).map(|f| &f.fs) {
+        Some(FsFileData::Disk(disk)) => *disk,
         _ => return error_reply(sender, ERR_INVALID_HANDLE),
     };
-    let Some((tid, _)) = driver_of(dev) else {
-        return error_reply(sender, ERR_IO);
-    };
     match msg.data[1] {
-        DEVCTL_RESCAN => match block::rescan(tid) {
+        // A partition has no table of its own.
+        DEVCTL_RESCAN if disk.volume != 0 => error_reply(sender, ERR_INVALID_PATH),
+        DEVCTL_RESCAN if !disk.claimed => error_reply(sender, ERR_PERMISSION),
+        DEVCTL_RESCAN if !disk.there() => error_reply(sender, ERR_IO),
+        DEVCTL_RESCAN => match block::rescan(disk.tid) {
             Ok(volumes) => reply_opened(sender, [volumes, 0, 0, 0, 0, 0]),
             Err(block::ERR_BUSY) => error_reply(sender, ERR_BUSY),
             Err(_) => error_reply(sender, ERR_IO),
@@ -350,7 +367,7 @@ pub fn control(sender: usize, msg: &Message) {
 pub fn is_ours(sender: usize, msg: &Message) -> bool {
     matches!(
         crate::get_handle(msg.data[0] as usize, sender).map(|f| &f.fs),
-        Some(FsFileData::Device(_) | FsFileData::DevDir)
+        Some(FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir)
     )
 }
 
@@ -363,16 +380,20 @@ pub fn serve(sender: usize, msg: &Message) {
     let target = match file.fs {
         FsFileData::Device(dev) => Some(dev),
         FsFileData::DevDir => None,
+        FsFileData::Disk(disk) => {
+            return match msg.tag {
+                TAG_READ => block_io(sender, &disk, false, msg.data[2], msg.data[3] as usize),
+                TAG_WRITE if !disk.claimed => error_reply(sender, ERR_READ_ONLY),
+                TAG_WRITE => block_io(sender, &disk, true, msg.data[2], msg.data[3] as usize),
+                TAG_STAT => stat(sender, Some(disk.dev), size_of(&disk)),
+                TAG_READDIR_BULK => error_reply(sender, ERR_NOT_DIR),
+                TAG_TRUNCATE => error_reply(sender, ERR_INVALID_PATH),
+                _ => error_reply(sender, ERR_NOT_SUPPORTED),
+            };
+        }
         _ => return error_reply(sender, ERR_INVALID_HANDLE),
     };
     match (msg.tag, target) {
-        (TAG_READ | TAG_WRITE, Some(dev @ Device::Block { .. })) => {
-            let writing = msg.tag == TAG_WRITE;
-            if writing && !file.writable {
-                return error_reply(sender, ERR_READ_ONLY);
-            }
-            block_io(sender, dev, writing, msg.data[2], msg.data[3] as usize)
-        }
         (TAG_READ, Some(dev)) => read(sender, dev, msg.data[3] as usize),
         (TAG_READ, None) => error_reply(sender, ERR_IS_DIR),
         (TAG_WRITE, Some(Device::Full)) => error_reply(sender, ERR_NO_SPACE),
@@ -380,7 +401,7 @@ pub fn serve(sender: usize, msg: &Message) {
         // written to random; nothing here needs to.
         (TAG_WRITE, Some(_)) => crate::reply_count(sender, msg.data[3].min(PAGE_SIZE as u64)),
         (TAG_WRITE, None) => error_reply(sender, ERR_IS_DIR),
-        (TAG_STAT, _) => stat(sender, target),
+        (TAG_STAT, _) => stat(sender, target, 0),
         (TAG_READDIR_BULK, None) => list(sender, msg.data[1], msg.data[2] as usize),
         (TAG_READDIR_BULK, Some(_)) => error_reply(sender, ERR_NOT_DIR),
         (TAG_TRUNCATE, Some(_)) => error_reply(sender, ERR_INVALID_PATH),
@@ -415,14 +436,15 @@ fn read(sender: usize, dev: Device, want: usize) {
     }
 }
 
-/// Read or write a block device at any offset: whole sectors go straight
+/// Read or write an open disk at any offset: whole sectors go straight
 /// through, and a sector only partly covered is read first, so that the rest
 /// of it is written back as it was.
-fn block_io(sender: usize, dev: Device, writing: bool, offset: u64, len: usize) {
-    let Some((tid, volume)) = driver_of(dev) else {
+fn block_io(sender: usize, disk: &Disk, writing: bool, offset: u64, len: usize) {
+    if !disk.there() {
         return error_reply(sender, ERR_IO);
-    };
-    let size = size_of(dev);
+    }
+    let (tid, volume) = (disk.tid, disk.volume);
+    let size = size_of(disk);
     if offset >= size {
         // Past the end there is nothing to read and nowhere to write.
         return if writing { error_reply(sender, ERR_NO_SPACE) } else { crate::reply_count(sender, 0) };
@@ -484,7 +506,7 @@ fn block_io(sender: usize, dev: Device, writing: bool, offset: u64, len: usize) 
     }
 }
 
-fn stat(sender: usize, target: Option<Device>) {
+fn stat(sender: usize, target: Option<Device>, size: u64) {
     let now = syscall::unix_time();
     let (id, mode, links) = match target {
         Some(dev @ Device::Block { .. }) => (id_of(dev), BLOCK_MODE, 1),
@@ -493,7 +515,7 @@ fn stat(sender: usize, target: Option<Device>) {
     };
     let record = StatRecord {
         id,
-        size: target.map_or(0, size_of),
+        size,
         mode,
         links,
         uid: 0,
