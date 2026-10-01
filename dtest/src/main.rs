@@ -2788,13 +2788,166 @@ fn test_disks() {
 /// The RAM disk `ramdisk 4` has just made: the one of `ram0`..`ram7` that is
 /// four megabytes and nobody's.
 fn new_ram_disk() -> Option<usize> {
+    ram_disk_of(8192).map(|(tid, _)| tid)
+}
+
+/// The RAM disk of `sectors` sectors that nobody has, and what it is called.
+fn ram_disk_of(sectors: u64) -> Option<(usize, [u8; 4])> {
     use quark_rt::block;
     let mut name = *b"ram0";
     (b'0'..=b'7').find_map(|digit| {
         name[3] = digit;
         let tid = nameserver::lookup(&name)?;
-        matches!(block::info(tid, 0), Ok(i) if i.sectors == 8192 && i.claimant == 0).then_some(tid)
+        matches!(block::info(tid, 0), Ok(i) if i.sectors == sectors && i.claimant == 0)
+            .then_some((tid, name))
     })
+}
+
+/// The CRC a GPT is checked with.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Run `/usr/bin/parts` with `args` and say how it ended.
+fn parts(args: &[&[u8]]) -> Option<i32> {
+    let mut argv: [&[u8]; 6] = [b"parts"; 6];
+    argv[1..1 + args.len()].copy_from_slice(args);
+    let child = load_program(b"/usr/bin/parts", b"/usr/bin/PARTS.ELF", &argv[..1 + args.len()])?;
+    let tid = child.tid;
+    child.start().ok()?;
+    wait_for(tid)
+}
+
+/// A partition table made by `parts`, read back off the disk it was made on
+/// and checked the way firmware would check it.
+fn test_parts() {
+    use quark_rt::block;
+    println!("a partition table:");
+    const SECTORS: u64 = 16 * 2048;
+    let server = load_program(b"/usr/bin/ramdisk", b"/usr/bin/RAMDISK.ELF", &[b"ramdisk", b"16"])
+        .and_then(|c| {
+            let tid = c.tid;
+            c.start().ok().map(|()| tid)
+        });
+    let Some(server) = server else {
+        check("start a RAM disk", false);
+        return;
+    };
+    let mut found = None;
+    for _ in 0..50 {
+        found = ram_disk_of(SECTORS);
+        if found.is_some() {
+            break;
+        }
+        syscall::sleep_ticks(2);
+    }
+    let Some((disk, name)) = found else {
+        check("a RAM disk of sixteen megabytes appears", false);
+        let _ = syscall::sys_task_kill(server);
+        let _ = wait_for(server);
+        return;
+    };
+
+    check("a partition is refused a disk with no table", parts(&[&name, b"new", b"root"]) == Some(1));
+    check("a table is made", parts(&[&name, b"init"]) == Some(0));
+    check("an EFI partition of four megabytes", parts(&[&name, b"new", b"efi", b"4M"]) == Some(0));
+    check("and a root in what is left", parts(&[&name, b"new", b"root"]) == Some(0));
+    check("after which there is no room for another", parts(&[&name, b"new", b"data"]) == Some(1));
+    check("and no such type as that", parts(&[&name, b"new", b"swap"]) == Some(2));
+
+    // The driver has been told to look, and has.
+    let (efi, root) = (block::info(disk, 1), block::info(disk, 2));
+    check(
+        "the disk now has two partitions",
+        block::info(disk, 0).is_ok_and(|v| v.volumes == 3),
+    );
+    check(
+        "the first is the EFI one, on the first megabyte, four long",
+        efi.is_ok_and(|v| v.kind == block::KIND_EFI && v.start == 2048 && v.sectors == 4 * 2048),
+    );
+    // What is left after the tables at each end, in whole megabytes.
+    let rest = (SECTORS - 34 - (2048 + 4 * 2048) + 1) / 2048 * 2048;
+    check(
+        "the second follows it and takes the rest, in whole megabytes",
+        root.is_ok_and(|v| v.kind == block::KIND_DATA && v.start == 5 * 2048 && v.sectors == rest),
+    );
+
+    // The table itself, as it is on the disk.
+    let mut header = [0u8; 512];
+    let mut backup = [0u8; 512];
+    let mut sector = [0u8; 512];
+    let word = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let long = |b: &[u8], at: usize| word(b, at) as u64 | (word(b, at + 4) as u64) << 32;
+    let sound = |h: &[u8; 512]| {
+        let mut copy = *h;
+        copy[16..20].fill(0);
+        &h[..8] == b"EFI PART" && word(h, 12) == 92 && crc32(&copy[..92]) == word(h, 16)
+    };
+    let read = block::read(disk, 0, 1, &mut header).is_ok()
+        && block::read(disk, 0, SECTORS - 1, &mut backup).is_ok()
+        && block::read(disk, 0, 0, &mut sector).is_ok();
+    check("the header is a GPT's, and its checksum is right", read && sound(&header));
+    check("so is the copy at the end of the disk", read && sound(&backup));
+    check(
+        "each says where the other is",
+        long(&header, 24) == 1
+            && long(&header, 32) == SECTORS - 1
+            && long(&backup, 24) == SECTORS - 1
+            && long(&backup, 32) == 1,
+    );
+    check(
+        "and they are the same disk's",
+        header[56..72] == backup[56..72] && header[56..72].iter().any(|&b| b != 0),
+    );
+    check(
+        "an MBR in front says the disk is taken",
+        sector[446 + 4] == 0xEE && sector[510] == 0x55 && sector[511] == 0xAA,
+    );
+    // The entries: thirty-two sectors of them, checked as one.
+    let entries_ok = |at: u64, want: u32| {
+        let mut crc = !0u32;
+        let mut piece = [0u8; 4096];
+        for i in 0..4 {
+            if block::read(disk, 0, at + i * 8, &mut piece).is_err() {
+                return false;
+            }
+            for &byte in piece.iter() {
+                crc ^= byte as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                }
+            }
+        }
+        !crc == want
+    };
+    check(
+        "the entries are where each header says, with the checksum it says",
+        long(&header, 72) == 2
+            && long(&backup, 72) == SECTORS - 33
+            && entries_ok(2, word(&header, 88))
+            && entries_ok(SECTORS - 33, word(&backup, 88)),
+    );
+
+    // A partition keeps its number when another goes.
+    check("the first partition is deleted", parts(&[&name, b"delete", b"1"]) == Some(0));
+    check(
+        "and the second is still the second",
+        block::info(disk, 1) == Err(block::ERR_NO_VOLUME)
+            && block::info(disk, 2).is_ok_and(|v| v.start == 5 * 2048),
+    );
+    // A disk with a partition in use is not repartitioned under it.
+    check("a partition is claimed", block::claim(disk, 2).is_ok());
+    check("and the table is then not anybody's to change", parts(&[&name, b"init"]) == Some(1));
+    let _ = block::release(disk, 2);
+    let _ = syscall::sys_task_kill(server);
+    let _ = wait_for(server);
 }
 
 /// A disk made of memory: the same protocol, and somewhere to write that
@@ -3471,6 +3624,7 @@ pub extern "C" fn _start() -> ! {
         ("memory", test_memory),
         ("disks", test_disks),
         ("ramdisk", test_ram_disk),
+        ("parts", test_parts),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

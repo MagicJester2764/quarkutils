@@ -25,6 +25,7 @@ keyboard/           The i8042: keyboard and PS/2 mouse, one driver for both.
 disk/               ATA PIO: `disk0`, the whole disk and each partition as a volume.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
+parts/              A disk's partition table: print it, make one, add to it.
 net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
 
 fb/                 The framebuffer device: owns the display, decides who draws.
@@ -45,7 +46,7 @@ login/  qsh/        Log in; the shell.
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     455 checks of the kernel, made through the ABI.
+dtest/  dchild/     474 checks of the kernel, made through the ABI.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
