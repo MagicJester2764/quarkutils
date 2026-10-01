@@ -1,0 +1,30 @@
+# The text console, as termcap describes a terminal.
+#
+# A capability here is one `qtty` acts on: a sequence it only reads to its end
+# and drops is not listed, because a program that is told a terminal can
+# insert a character and finds that it cannot draws the wrong line. What is
+# missing, a line editor makes up for by redrawing.
+#
+# It is called `linux` because that is the nearest thing it is, and because
+# the name is what programs that keep their own list of terminals look for:
+# GNU ls prints no colour on a terminal it has not heard of.
+#
+#   am xn   wraps at the right-hand edge, when the next character arrives
+#   ms      moving the cursor in standout mode is safe
+#   AF AB   eight colours, foreground and background; md is bold, as bright
+#   cm ch cv ho, UP DO LE RI and the single steps   cursor movement
+#   cl cd ce cb   clear the screen, to its end, to the end and start of a line
+#   sc rc   save and restore the cursor;  vi ve   hide and show it
+#   k?      what the keys with no character send
+linux|quark|the Quark text console:\
+	:am:xn:ms:\
+	:co#80:li#25:Co#8:pa#64:\
+	:AF=\E[3%dm:AB=\E[4%dm:op=\E[39;49m:\
+	:md=\E[1m:mr=\E[7m:so=\E[7m:se=\E[27m:me=\E[0m:\
+	:cr=^M:nw=^M^J:do=^J:le=^H:nd=\E[C:up=\E[A:bl=^G:ta=^I:\
+	:DO=\E[%dB:LE=\E[%dD:RI=\E[%dC:UP=\E[%dA:\
+	:cm=\E[%i%d;%dH:ch=\E[%i%dG:cv=\E[%i%dd:ho=\E[H:\
+	:cl=\E[H\E[2J:cd=\E[J:ce=\E[K:cb=\E[1K:\
+	:sc=\E7:rc=\E8:vi=\E[?25l:ve=\E[?25h:\
+	:kb=\177:kD=\E[3~:kI=\E[2~:kh=\E[1~:@7=\E[4~:kP=\E[5~:kN=\E[6~:\
+	:ku=\E[A:kd=\E[B:kr=\E[C:kl=\E[D:

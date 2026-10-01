@@ -632,13 +632,47 @@ fn handle_scancode(
         *extended = true;
         return;
     }
+    let press = raw & 0x80 == 0;
     if *extended {
-        // Ignore extended scancodes for now
         *extended = false;
+        // The keys set 1 says with a prefix: the arrows and the block above
+        // them, and the right-hand Ctrl and Alt. They were dropped, so no
+        // program ever saw an arrow key.
+        //
+        // Each is reported under its Linux evdev code. For an unprefixed key
+        // the scancode already *is* that code, which is what a compositor
+        // sends its clients; these are the ones where the two differ, and
+        // their codes are above every unprefixed one, so nothing collides.
+        let (code, ascii) = match raw & 0x7F {
+            0x1C => (96, b'\n'), // keypad Enter
+            0x1D => (97, 0),     // right Ctrl
+            0x35 => (98, b'/'),  // keypad /
+            0x38 => (100, 0),    // right Alt
+            0x47 => (102, 0),    // Home
+            0x48 => (103, 0),    // Up
+            0x49 => (104, 0),    // Page Up
+            0x4B => (105, 0),    // Left
+            0x4D => (106, 0),    // Right
+            0x4F => (107, 0),    // End
+            0x50 => (108, 0),    // Down
+            0x51 => (109, 0),    // Page Down
+            0x52 => (110, 0),    // Insert
+            0x53 => (111, 0),    // Delete
+            // A fake shift the controller sends around some of the above,
+            // and keys this has no name for.
+            _ => return,
+        };
+        match code {
+            97 if press => *modifiers |= MOD_CTRL,
+            97 => *modifiers &= !MOD_CTRL,
+            100 if press => *modifiers |= MOD_ALT,
+            100 => *modifiers &= !MOD_ALT,
+            _ => {}
+        }
+        deliver(KeyEvent { press, ascii, scancode: code, modifiers: *modifiers }, keybuf, claimant, waiting_client);
         return;
     }
 
-    let press = raw & 0x80 == 0;
     let scancode = raw & 0x7F;
 
     // Update modifier state
@@ -685,10 +719,23 @@ fn handle_scancode(
         ascii &= 0x1F;
     }
 
-    let ev = KeyEvent { press, ascii, scancode, modifiers: *modifiers };
+    deliver(
+        KeyEvent { press, ascii, scancode, modifiers: *modifiers },
+        keybuf,
+        claimant,
+        waiting_client,
+    );
+}
 
+/// Hand a key to whoever is waiting for one, or keep it until somebody asks.
+fn deliver(
+    ev: KeyEvent,
+    keybuf: &mut KeyBuffer,
+    claimant: usize,
+    waiting_client: &mut Option<usize>,
+) {
     // If a client is blocked waiting, reply immediately
-    if press {
+    if ev.press {
         if let Some(client_tid) = waiting_client.take() {
             let reply = make_key_reply(&ev);
             let _ = syscall::sys_reply(client_tid, &reply);
@@ -696,12 +743,12 @@ fn handle_scancode(
         }
     }
 
+    let ctrl_c = ev.press && ev.ascii == 0x03;
     keybuf.push(ev);
 
     // Told after the key is there to take: the claimant wakes and asks.
     if claimant != 0 {
-        let ctrl_c = if press && ascii == 0x03 { NOTIFY_CTRL_C } else { 0 };
-        let _ = syscall::sys_notify(claimant, NOTIFY_KEY | ctrl_c);
+        let _ = syscall::sys_notify(claimant, NOTIFY_KEY | if ctrl_c { NOTIFY_CTRL_C } else { 0 });
     }
 }
 

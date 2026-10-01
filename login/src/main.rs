@@ -176,17 +176,62 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
         let _ = syscall::sys_cap_delete(SCRATCH);
 
-        // The shell starts where login is, and moves itself home.
-        let _ = vfs::give_cwd(vfs_tid, tid);
-
         // Wire file descriptors
         let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin
         let _ = syscall::sys_fd_dup(tid, 1, 1); // stdout
         let _ = syscall::sys_fd_dup(tid, 2, 2); // stderr
 
-        // Pass shell name and home directory as argv
         let home = entry.home();
-        let _ = spawn::set_args(&info, &[shell_path, home], &SPAWN_SCRATCH);
+        let name = shell_path.rsplit(|&b| b == b'/').next().unwrap_or(shell_path);
+        if name.eq_ignore_ascii_case(b"qsh") || name.eq_ignore_ascii_case(b"qsh.elf") {
+            // Quark's own shell is told where home is and goes there itself,
+            // and makes the environment its programs run in.
+            let _ = vfs::give_cwd(vfs_tid, tid);
+            let _ = spawn::set_args(&info, &[shell_path, home], &SPAWN_SCRATCH);
+        } else {
+            // Anybody else's shell is started the way login starts one on any
+            // Unix: at home, with the environment that says who and where,
+            // and under a name with a dash in front — which is the only way a
+            // shell is told it is a login shell and should read its profile.
+            let at_home = vfs::chdir(vfs_tid, home).is_ok();
+            let _ = vfs::give_cwd(vfs_tid, tid);
+            if at_home {
+                let _ = vfs::chdir(vfs_tid, b"/");
+            }
+            let mut argv0 = [0u8; 65];
+            argv0[0] = b'-';
+            let n = name.len().min(64);
+            argv0[1..1 + n].copy_from_slice(&name[..n]);
+            let mut vars = [[0u8; 80]; 5];
+            let mut lens = [0usize; 5];
+            for (i, (key, value)) in [
+                (&b"HOME="[..], home),
+                (&b"USER="[..], entry.username()),
+                (&b"LOGNAME="[..], entry.username()),
+                (&b"SHELL="[..], shell_path),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let v = &value[..value.len().min(80 - key.len())];
+                vars[i][..key.len()].copy_from_slice(key);
+                vars[i][key.len()..key.len() + v.len()].copy_from_slice(v);
+                lens[i] = key.len() + v.len();
+            }
+            // What the terminal understands, if this is one. A program told
+            // nothing assumes nothing, and prints no colour.
+            let term: &[u8] =
+                if syscall::sys_pty_number(0).is_ok() { b"TERM=linux" } else { b"TERM=dumb" };
+            let env: [&[u8]; 6] = [
+                &vars[0][..lens[0]],
+                &vars[1][..lens[1]],
+                &vars[2][..lens[2]],
+                &vars[3][..lens[3]],
+                b"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                term,
+            ];
+            let _ = spawn::set_args_env(&info, &[&argv0[..1 + n]], &env, &SPAWN_SCRATCH);
+        }
 
         // Start shell and wait for it to exit
         if info.start().is_err() {

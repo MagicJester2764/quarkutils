@@ -17,7 +17,8 @@ quark-rt/           The Rust runtime: system calls, IPC, the allocator, stdio,
                     The std fork's PAL for x86_64-unknown-quark is built on it.
 
 init/               The first program. Loads the services from the boot image,
-                    grants each what its manifest asks for, starts login.
+                    grants each what its manifest asks for, and starts a
+                    session: `login`, or what `/etc/init.conf` names.
 nameserver/         Register a name, look one up, be granted the endpoint.
 
 keyboard/           The i8042: keyboard and PS/2 mouse, one driver for both.
@@ -25,7 +26,8 @@ disk/               ATA PIO.
 net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
 
 fb/                 The framebuffer device: owns the display, decides who draws.
-qtty/               The text console. What the machine boots into.
+qtty/               The text console. What the machine boots into, and to
+                    a session a terminal; `termcap` beside it says which.
 input/              Line discipline for whoever reads, raw events for whoever
                     has claimed the keyboard.
 vfs/                ext2, ext4 and FAT32, and the pager for mapped files.
@@ -35,6 +37,7 @@ libc/               A small C library against the raw ABI.
 linux-abi/          The Linux system-call surface, answered by Quark. musl is
                     built on this, and every ported program on musl.
 
+getty/              Put a session on the console's terminal.
 login/  qsh/        Log in; the shell.
 ls/ cat/ echo/ ps/ ping/ shutdown/      Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.

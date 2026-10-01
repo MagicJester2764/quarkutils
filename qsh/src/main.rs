@@ -530,6 +530,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     let input_tid = nameserver::lookup(b"input").unwrap_or(0);
+    // On a terminal, a read of nothing is the end: Ctrl-D was typed at the
+    // prompt, or the terminal has gone. From the input server it is a line
+    // that was interrupted, and the next read is the next line.
+    let on_terminal = syscall::sys_pty_number(0).is_ok();
 
     // Main loop
     let mut line_buf = [0u8; 256];
@@ -548,6 +552,13 @@ pub extern "C" fn _start() -> ! {
             }
         };
         if n == 0 {
+            if on_terminal {
+                // Asking again would be answered the same way, for ever: a
+                // shell whose terminal emulator had gone sat printing prompts
+                // at nothing, as fast as the machine would run it.
+                println!();
+                syscall::sys_exit_code(0);
+            }
             continue;
         }
 

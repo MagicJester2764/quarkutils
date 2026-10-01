@@ -42,7 +42,7 @@ REQUIRE_ABI ?=
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
-                 login:LOGIN ps:PS ipcping:IPCPING ping:PING \
+                 login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
                  capdemo:CAPDEMO threadtest:THREADTEST socktest:SOCKTEST \
                  fstest:FSTEST wm:WM wmdemo:WMDEMO wmtype:WMTYPE \
@@ -199,6 +199,9 @@ else
 	 done
 endif
 	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
+	@# What the console is, to a program that asks: the entry is the console's
+	@# and is kept beside it.
+	@cp qtty/termcap $(DESTDIR)/etc/termcap
 	@echo "installed to $(DESTDIR)"
 
 clean:

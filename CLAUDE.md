@@ -303,6 +303,20 @@ here, ahead of the VFS: `/dev/ptmx` and `/dev/pts/N` in `linux-abi/src/pty.c`,
 the way a Linux kernel catches them ahead of its filesystems. musl's `openpty`
 and `forkpty` run unpatched on top.
 
+**A session runs on a terminal when the distribution says so.** `init` reads
+`/etc/init.conf`, and `session <path>` there names what it starts once the
+filesystem is up. With no such file that is `login`, on the console as it
+always was: standard input a message to `input`, output the console's pipe.
+A distribution that names `getty` gets a real terminal instead: `getty` asks
+the console for its pty (`TAG_TTY_OPEN`), opens the slave, and runs `login`
+with it as descriptors 0, 1 and 2, so that everything below has a tty —
+`isatty` is true, `tcsetattr` works, and a shell that edits its own command
+line can turn the echo off. `getty` keeps the slave open between sessions, so
+the terminal never sees its last holder go. `login` reads `/etc/passwd` in
+Unix's seven fields or the five this began with, and starts any shell but
+`qsh` the way a Unix login does: in the home directory, with `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `PATH` and `TERM`, under a name with a dash in front.
+
 ## The screen
 
 `fb` is the framebuffer device: it owns the hardware the way `/dev/fb0`
@@ -310,7 +324,18 @@ does, knows the mode, and decides who draws. It has no opinion about windows.
 
 Everything else is a client of it. `qtty` is the text console: it claims
 the display at boot and draws fullscreen — that is what the machine boots into,
-a plain TTY. `wm` is a compositor you *run*: `wm <program>` takes the
+a plain TTY. To the services started before there are users it is a pipe, and
+what they write down it is drawn. To a session it is a terminal: asked
+(`TAG_TTY_OPEN`), it makes a pseudo-terminal, keeps the master, draws what
+comes out of it and types into it what is typed. It holds the keyboard for
+that the way a compositor does — a claim on `input`, under the compositor's
+when one is running — and turns keys into the bytes a Linux console sends for
+them. It gives its terminal to the first program that asks and to nobody else
+while that one lives: whoever holds the slave reads what is typed. What it
+understands of ECMA-48 is what `qtty/termcap` says, which is installed as
+`/etc/termcap`: a capability goes there when the console acts on it and not
+before. A sequence it does not act on is read to its end and dropped, never
+drawn. `wm` is a compositor you *run*: `wm <program>` takes the
 display, starts that program, composites its windows, and gives the display back
 when it exits.
 
@@ -554,8 +579,13 @@ The rules that got it there, and that a further port should follow:
   terminate and kill — and they are what Ctrl-C at the text console (`input`
   sends interrupt to the foreground task), `qsh`'s `kill` and `shutdown` use.
   A C program gets none of it: `sigaction` is accepted and remembered by
-  nobody, `setsid` answers with the caller's own id, `TIOCSCTTY` is accepted,
-  and in a pseudo-terminal Ctrl-C is a byte.
+  nobody, `setsid` answers with the caller's own id, and `TIOCSCTTY` is
+  accepted. On a terminal, Ctrl-C is taken out of what is typed and shown as
+  `^C`, and the program is not told.
+- A program started by `fork` and `exec` **holds what its parent held**: the
+  kernel copies capabilities at a fork and keeps them across an exec, and
+  nothing narrows them to what the new program's manifest asks for, as a
+  spawner does. A shell that execs is as trusted as everything it runs.
 - The compositor keeps no history of serials, so `xdg_toplevel.move` and
   `.resize` cannot check that the serial they are given was a recent press.
   What they check instead is that a button is down. Drag and drop, touch and

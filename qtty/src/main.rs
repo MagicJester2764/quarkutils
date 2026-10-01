@@ -2,6 +2,28 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+//! The text console: what the machine boots into.
+//!
+//! It draws characters on the whole of the display, and it is two things to
+//! the programs that print on it.
+//!
+//! To the services started before there are files or users, it is a pipe:
+//! what they write down it is drawn. That is all it was.
+//!
+//! To a session it is a *terminal*. Asked for one (`TAG_TTY_OPEN`), it makes
+//! a pseudo-terminal, keeps the master, and says which. Whatever opens the
+//! slave has a real tty on its standard descriptors: `isatty` is true,
+//! `tcsetattr` works, the kernel's line discipline echoes and edits, and a
+//! program that wants raw keys — a shell with a line editor — turns the
+//! editing off and gets them. What comes out of the master is drawn; what is
+//! typed goes into it. Before this a program's standard input was a message
+//! to the input server and its output this pipe, and neither was a terminal:
+//! bash would not have shown a prompt.
+//!
+//! With a terminal to feed, the console holds the keyboard the way a
+//! compositor does — whoever owns the screen owns the keys — and a compositor
+//! that takes the display claims it above the console's, as it always has.
+
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
@@ -50,13 +72,84 @@ const TAG_FB_LOST: u64 = 0x100;
 const TAG_FB_GAINED: u64 = 0x101;
 const TAG_FB_ERROR: u64 = u64::MAX;
 
-// ANSI escape sequence state machine
-static mut ESC_STATE: u8 = 0;       // 0=normal, 1=got ESC, 2=got CSI
-static mut ESC_PARAMS: [u16; 4] = [0; 4];
-static mut ESC_PARAM_COUNT: usize = 0;
+/// Give the caller the console's terminal: the reply's first word is the
+/// pty's number, whose slave it then opens.
+const TAG_TTY_OPEN: u64 = 0x110;
 
-// Foreground color (set via SGR escape codes)
+// The input server, as a claimant sees it.
+const TAG_INPUT_CLAIM: u64 = 0x200;
+const TAG_INPUT_POLL: u64 = 0x202;
+const TAG_INPUT_KEY: u64 = 0x203;
+
+/// The master of the console's terminal, once somebody has asked for one.
+static mut TTY_MASTER: usize = usize::MAX;
+static mut TTY_NUMBER: usize = 0;
+/// The program the terminal was given to. Nobody else is given it while that
+/// one lives: whoever holds a terminal's slave reads what is typed.
+static mut TTY_OWNER: u64 = 0;
+static mut INPUT_TID: usize = 0;
+
+// Escape sequences: ECMA-48's shape. After ESC [ come parameter bytes
+// (0x30-0x3F: digits, `;`, and the private markers `<=>?`), intermediate
+// bytes (0x20-0x2F), and one final byte (0x40-0x7E) that says what it was.
+const NORMAL: u8 = 0;
+const ESCAPE: u8 = 1;
+const CSI: u8 = 2;
+/// ESC and one intermediate: the next byte finishes it (a character set).
+const ESC_ONE_MORE: u8 = 3;
+/// An operating system command: a title. Everything to BEL or ESC \.
+const OSC: u8 = 4;
+const OSC_ESC: u8 = 5;
+static mut ESC_STATE: u8 = NORMAL;
+const MAX_PARAMS: usize = 16;
+static mut ESC_PARAMS: [u16; MAX_PARAMS] = [0; MAX_PARAMS];
+static mut ESC_PARAM_COUNT: usize = 0;
+/// The sequence began `ESC [ ?`: a private mode, most of which are not ours.
+static mut ESC_PRIVATE: bool = false;
+
+/// A colour a program asked for: one of the sixteen, or one it spelled out.
+/// The sixteen are kept as numbers so that bold can brighten whichever is
+/// current, in whichever order the two arrive.
+#[derive(Clone, Copy)]
+enum Colour {
+    Index(u8),
+    Rgb(u8, u8, u8),
+}
+
+const DEFAULT_FG: Colour = Colour::Index(7);
+const DEFAULT_BG: Colour = Colour::Index(0);
+static mut FG: Colour = DEFAULT_FG;
+static mut BG: Colour = DEFAULT_BG;
+static mut BOLD: bool = false;
+static mut REVERSE: bool = false;
 static mut FG_COLOR: u32 = 0;
+static mut BG_COLOR: u32 = 0;
+/// Where `ESC [ s` left the cursor.
+static mut SAVED: (usize, usize) = (0, 0);
+/// A program asked for the cursor not to be drawn (`ESC [ ? 25 l`).
+static mut CURSOR_HIDDEN: bool = false;
+/// The last column has been written and the cursor has not moved on.
+///
+/// A terminal does not wrap when a character lands in its last column; it
+/// wraps when the *next* one arrives. The difference is a line exactly as
+/// wide as the screen followed by a newline: wrapped at once, that is a blank
+/// line after every full one, and `ls` fills lines to the edge.
+static mut WRAP_PENDING: bool = false;
+/// What is being drawn came out of the terminal rather than down the pipe.
+///
+/// The two differ in what a line feed is. A service printing down the pipe
+/// means a new line by it. A terminal's output has been through the line
+/// discipline, which puts a carriage return in front where the program wants
+/// one — so here a line feed alone is what it says: down, same column.
+static mut FROM_TTY: bool = false;
+
+/// The sixteen colours of a PC console: eight, and their bright halves.
+const PALETTE: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00), (0xCC, 0x00, 0x00), (0x00, 0xCC, 0x00), (0xCC, 0xCC, 0x00),
+    (0x00, 0x00, 0xCC), (0xCC, 0x00, 0xCC), (0x00, 0xCC, 0xCC), (0xCC, 0xCC, 0xCC),
+    (0x66, 0x66, 0x66), (0xFF, 0x55, 0x55), (0x55, 0xFF, 0x55), (0xFF, 0xFF, 0x55),
+    (0x5C, 0x5C, 0xFF), (0xFF, 0x55, 0xFF), (0x55, 0xFF, 0xFF), (0xFF, 0xFF, 0xFF),
+];
 
 // Cursor blink state
 static mut CURSOR_VISIBLE: bool = true;
@@ -69,6 +162,7 @@ const MAX_CELL_ROWS: usize = 200;
 
 static mut CELL_CH: [u8; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
 static mut CELL_FG: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
+static mut CELL_BG: [u32; MAX_CELL_COLS * MAX_CELL_ROWS] = [0; MAX_CELL_COLS * MAX_CELL_ROWS];
 static mut DIRTY_MIN: usize = usize::MAX;
 static mut DIRTY_MAX: usize = 0;
 
@@ -100,45 +194,196 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { CURSOR_LAST_TOGGLE = syscall::sys_ticks(); }
 
-    // Main loop: non-blocking read from pipe, blink cursor on idle
+    // Main loop: draw what has been written, type what has been typed, and
+    // when there is neither, wait a tick and blink.
+    //
+    // Waiting a tick rather than yielding in a loop. There is no way to block
+    // on a pipe, a terminal and IPC at once, so idling here means asking each
+    // again shortly — but a yield loop asks as fast as the machine will go,
+    // forever. That is a whole core spent on an idle terminal, and it was
+    // enough to keep the keyboard driver from being scheduled while somebody
+    // typed.
+    let mut pipe_open = true;
+    let mut passes = 0u32;
     loop {
         let mut buf = [0u8; 256];
-        let n = syscall::sys_fd_read_nb(0, &mut buf);
-        if n == 0 {
-            break; // EOF
-        } else if n == syscall::WOULD_BLOCK || n == u64::MAX {
-            // Nothing to print. A good moment to notice the display changing
-            // hands, and to blink.
-            //
-            // Waiting a tick rather than yielding in a loop. There is no way
-            // to block on the pipe and on IPC at once, so idling here means
-            // asking the pipe again shortly — but a yield loop asks it as fast
-            // as the machine will go, four system calls at a time, forever.
-            // That is a whole core spent on an idle terminal, and it was
-            // enough to keep the keyboard driver from being scheduled while
-            // somebody typed.
-            poll_display_handover(1);
-            let now = syscall::sys_ticks();
-            unsafe {
-                if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
-                    CURSOR_VISIBLE = !CURSOR_VISIBLE;
-                    CURSOR_LAST_TOGGLE = now;
-                    draw_cursor();
+        let mut busy = false;
+
+        if pipe_open {
+            match syscall::sys_fd_read_nb(0, &mut buf) {
+                // Every writer has gone. That is the end of the pipe and not
+                // of this program: it is a server with a name, and somebody
+                // may yet ask it for its terminal.
+                0 => pipe_open = false,
+                n if n == syscall::WOULD_BLOCK || n == u64::MAX => {}
+                n => {
+                    draw(&buf[..n as usize], false);
+                    busy = true;
                 }
             }
-        } else {
-            // Got data — hide cursor, write, show cursor
-            unsafe { hide_cursor(); }
-            write_bytes(&buf[..n as usize]);
-            unsafe {
-                CURSOR_VISIBLE = true;
-                CURSOR_LAST_TOGGLE = syscall::sys_ticks();
+        }
+
+        let master = unsafe { TTY_MASTER };
+        if master != usize::MAX {
+            match syscall::sys_fd_read_nb(master, &mut buf) {
+                // 0 is every slave closed: a session between two logins.
+                0 => {}
+                n if n == syscall::WOULD_BLOCK || n == u64::MAX => {}
+                n => {
+                    draw(&buf[..n as usize], true);
+                    busy = true;
+                }
+            }
+            if unsafe { HAVE_DISPLAY } && pump_keys(master) {
+                busy = true;
+            }
+        }
+
+        if busy {
+            // Still look for word from the framebuffer device, and for
+            // somebody asking for the terminal: a program printing without
+            // pause must not be able to hold the display against a
+            // compositor that has been given it.
+            passes += 1;
+            if passes >= 16 {
+                passes = 0;
+                serve(0);
+            }
+            continue;
+        }
+        passes = 0;
+        serve(1);
+        let now = syscall::sys_ticks();
+        unsafe {
+            if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
+                CURSOR_VISIBLE = !CURSOR_VISIBLE;
+                CURSOR_LAST_TOGGLE = now;
                 draw_cursor();
             }
         }
     }
+}
 
-    syscall::sys_exit();
+/// Draw what a program wrote, with the cursor out of the way while it is.
+fn draw(bytes: &[u8], from_tty: bool) {
+    unsafe {
+        FROM_TTY = from_tty;
+        hide_cursor();
+    }
+    write_bytes(bytes);
+    unsafe {
+        CURSOR_VISIBLE = true;
+        CURSOR_LAST_TOGGLE = syscall::sys_ticks();
+        draw_cursor();
+    }
+}
+
+/// The console's terminal, made the first time somebody asks for it.
+fn tty_number() -> Option<usize> {
+    unsafe {
+        if TTY_MASTER != usize::MAX {
+            return Some(TTY_NUMBER);
+        }
+        let master = syscall::sys_pty_create().ok()?;
+        let Ok(number) = syscall::sys_pty_number(master) else {
+            let _ = syscall::sys_fd_close(master);
+            return None;
+        };
+        // How big it is, for the program that lays itself out to fit: `ls`
+        // asks, and so does a shell's line editor.
+        let _ = syscall::sys_pty_set_size(master, ROWS as u16, COLS as u16);
+        TTY_MASTER = master;
+        TTY_NUMBER = number;
+        Some(number)
+    }
+}
+
+/// What a key is to a terminal: the bytes a program reads when it is pressed.
+///
+/// A character is itself — the driver has already applied Shift and Ctrl —
+/// except that Return is a carriage return, which the line discipline turns
+/// into the newline a program expects, and Backspace is DEL, which is what
+/// terminals send. A key with no character is the escape sequence a Linux
+/// console sends for it. Alt sends an escape first, which is how a line
+/// editor is told "meta".
+fn key_bytes(ascii: u8, code: u8, modifiers: u8, out: &mut [u8; 8]) -> usize {
+    const ALT: u8 = 1 << 2;
+    let seq: &[u8] = match (ascii, code) {
+        (b'\n', _) => b"\r",
+        (8, _) => b"\x7f",
+        (0, 103) => b"\x1b[A",  // Up
+        (0, 108) => b"\x1b[B",  // Down
+        (0, 106) => b"\x1b[C",  // Right
+        (0, 105) => b"\x1b[D",  // Left
+        (0, 102) => b"\x1b[1~", // Home
+        (0, 110) => b"\x1b[2~", // Insert
+        (0, 111) => b"\x1b[3~", // Delete
+        (0, 107) => b"\x1b[4~", // End
+        (0, 104) => b"\x1b[5~", // Page Up
+        (0, 109) => b"\x1b[6~", // Page Down
+        (0, _) => b"",
+        _ => {
+            let mut n = 0;
+            if modifiers & ALT != 0 {
+                out[n] = 0x1b;
+                n += 1;
+            }
+            out[n] = ascii;
+            return n + 1;
+        }
+    };
+    out[..seq.len()].copy_from_slice(seq);
+    seq.len()
+}
+
+/// Take what has been typed and write it into the terminal. True if anything
+/// was.
+///
+/// Bounded, so that a key held down cannot keep this from getting back to
+/// drawing. What is left stays with the driver and arrives next time round.
+fn pump_keys(master: usize) -> bool {
+    let input = unsafe {
+        if INPUT_TID == 0 {
+            // The input server is started after this one. Ask once a pass
+            // until it is there; then say the keys are ours while the display
+            // is.
+            let Some(tid) = nameserver::lookup(b"input") else {
+                return false;
+            };
+            let claim = Message { sender: 0, tag: TAG_INPUT_CLAIM, data: [0; 6] };
+            let mut reply = Message::empty();
+            if syscall::sys_call(tid, &claim, &mut reply).is_err() || reply.tag == u64::MAX {
+                return false;
+            }
+            INPUT_TID = tid;
+        }
+        INPUT_TID
+    };
+    let mut typed = false;
+    for _ in 0..32 {
+        let poll = Message { sender: 0, tag: TAG_INPUT_POLL, data: [0; 6] };
+        let mut reply = Message::empty();
+        // Timed: a keyboard that has stopped answering costs the keys, not
+        // the screen.
+        match syscall::sys_call_timeout(input, &poll, &mut reply, 20) {
+            syscall::CallOutcome::Replied if reply.tag == TAG_INPUT_KEY => {}
+            // Nothing typed — or the keys are somebody else's for now, which
+            // is the same answer to this.
+            _ => break,
+        }
+        if reply.data[0] == 0 {
+            continue; // a release
+        }
+        let mut bytes = [0u8; 8];
+        let n = key_bytes(reply.data[1] as u8, reply.data[2] as u8, reply.data[3] as u8, &mut bytes);
+        if n > 0 {
+            // A terminal whose program is not reading drops what does not
+            // fit, as a full keyboard buffer does.
+            let _ = syscall::sys_fd_write_nb(master, &bytes[..n]);
+            typed = true;
+        }
+    }
+    typed
 }
 
 /// Take the display and start drawing on it.
@@ -190,9 +435,9 @@ fn adopt_mode(reply: &Message) -> bool {
         B_POS = (reply.data[2] & 0xFF) as u8;
         COLS = (w / GLYPH_W).min(MAX_CELL_COLS);
         ROWS = (h / GLYPH_H).min(MAX_CELL_ROWS);
-        if FG_COLOR == 0 {
-            FG_COLOR = encode_color(0xCC, 0xCC, 0xCC);
-        }
+        // The pixel layout may have changed with the mode; the attributes
+        // have not.
+        recolor();
         HAVE_DISPLAY = true;
         INITIALIZED = true;
     }
@@ -230,14 +475,13 @@ fn redraw_all() {
     flush_dirty();
 }
 
-/// Answer the framebuffer device when the display changes hands.
+/// Answer whoever is calling, waiting up to `ticks` for somebody to.
 ///
-/// Polled rather than waited for, since the main loop's real job is draining
-/// the pipe. A zero timeout is a poll: nothing to collect, nothing lost.
-/// Notice the display changing hands, waiting up to `ticks` for word of it.
-///
-/// Zero polls and returns; anything else is how this server idles.
-fn poll_display_handover(ticks: u64) {
+/// Two callers matter. The framebuffer device says when the display is taken
+/// and when it comes back; and whatever is going to run a session asks for
+/// the console's terminal. Zero polls and returns; anything else is how this
+/// server idles.
+fn serve(ticks: u64) {
     let mut msg = Message::empty();
     if syscall::sys_recv_timeout(TID_ANY, &mut msg, ticks).is_err() {
         return;
@@ -269,6 +513,25 @@ fn poll_display_handover(ticks: u64) {
                 redraw_all();
             }
         }
+        TAG_TTY_OPEN => {
+            // To the first program that asks, and to nobody else while that
+            // one lives: the terminal's slave is where what is typed goes.
+            let asker = syscall::sys_task_space(msg.sender).unwrap_or(0);
+            let free = unsafe {
+                TTY_OWNER == 0 || TTY_OWNER == asker || syscall::sys_space_watch(TTY_OWNER).is_err()
+            };
+            let reply = match (free && asker != 0).then(tty_number).flatten() {
+                Some(number) => {
+                    unsafe { TTY_OWNER = asker };
+                    Message { sender: 0, tag: 0, data: [number as u64, 0, 0, 0, 0, 0] }
+                }
+                None => Message { sender: 0, tag: u64::MAX, data: [0; 6] },
+            };
+            let _ = syscall::sys_reply(msg.sender, &reply);
+        }
+        // From the kernel, about a program this watched to see whether the
+        // terminal was free: nothing to answer.
+        _ if msg.sender == 0 => {}
         _ => {
             let ack = Message { sender: 0, tag: u64::MAX, data: [0; 6] };
             let _ = syscall::sys_reply(msg.sender, &ack);
@@ -291,56 +554,135 @@ fn write_bytes(s: &[u8]) {
 fn putc(c: u8) {
     unsafe {
         match ESC_STATE {
-            0 => match c {
-                0x1b => { ESC_STATE = 1; }
-                b'\n' => { COL = 0; ROW += 1; }
-                b'\r' => { COL = 0; }
+            NORMAL => match c {
+                0x1b => ESC_STATE = ESCAPE,
+                b'\n' => {
+                    if !FROM_TTY {
+                        COL = 0;
+                    }
+                    ROW += 1;
+                    WRAP_PENDING = false;
+                }
+                b'\r' => {
+                    COL = 0;
+                    WRAP_PENDING = false;
+                }
                 b'\t' => {
                     let next = (COL + 8) & !7;
                     COL = if next < COLS { next } else { COLS - 1 };
                 }
                 0x08 => {
-                    if COL > 0 { COL -= 1; }
+                    COL = COL.saturating_sub(1);
+                    WRAP_PENDING = false;
                 }
+                // The bell, and the rest of the controls nothing here acts
+                // on: not characters, so not drawn.
+                0..=0x1f | 0x7f => {}
                 byte => {
+                    if WRAP_PENDING {
+                        WRAP_PENDING = false;
+                        COL = 0;
+                        ROW += 1;
+                        if ROW >= ROWS {
+                            scroll();
+                        }
+                    }
                     let idx = cell_idx(COL, ROW);
                     CELL_CH[idx] = byte;
                     CELL_FG[idx] = FG_COLOR;
+                    CELL_BG[idx] = BG_COLOR;
                     mark_dirty(ROW);
-                    COL += 1;
-                    if COL >= COLS { COL = 0; ROW += 1; }
-                }
-            },
-            1 => {
-                if c == b'[' {
-                    ESC_STATE = 2;
-                    ESC_PARAMS = [0; 4];
-                    ESC_PARAM_COUNT = 0;
-                } else {
-                    ESC_STATE = 0;
-                }
-            },
-            2 => {
-                if c >= b'0' && c <= b'9' {
-                    let idx = ESC_PARAM_COUNT;
-                    if idx < 4 {
-                        ESC_PARAMS[idx] = ESC_PARAMS[idx] * 10 + (c - b'0') as u16;
+                    if COL + 1 >= COLS {
+                        WRAP_PENDING = true;
+                    } else {
+                        COL += 1;
                     }
-                } else if c == b';' {
-                    if ESC_PARAM_COUNT < 3 { ESC_PARAM_COUNT += 1; }
-                } else {
-                    if ESC_PARAM_COUNT < 4 { ESC_PARAM_COUNT += 1; }
-                    dispatch_csi(c);
-                    ESC_STATE = 0;
                 }
             },
-            _ => { ESC_STATE = 0; }
+            ESCAPE => match c {
+                b'[' => {
+                    ESC_STATE = CSI;
+                    ESC_PARAMS = [0; MAX_PARAMS];
+                    ESC_PARAM_COUNT = 0;
+                    ESC_PRIVATE = false;
+                }
+                b']' => ESC_STATE = OSC,
+                // A character set, or a line attribute: one more byte.
+                b'(' | b')' | b'*' | b'+' | b'#' | b'%' => ESC_STATE = ESC_ONE_MORE,
+                b'7' => {
+                    SAVED = (COL, ROW);
+                    ESC_STATE = NORMAL;
+                }
+                b'8' => {
+                    (COL, ROW) = SAVED;
+                    WRAP_PENDING = false;
+                    ESC_STATE = NORMAL;
+                }
+                // Reset: as it was when it started.
+                b'c' => {
+                    reset_attributes();
+                    for row in 0..ROWS {
+                        erase(row, 0, COLS);
+                    }
+                    (COL, ROW) = (0, 0);
+                    WRAP_PENDING = false;
+                    CURSOR_HIDDEN = false;
+                    ESC_STATE = NORMAL;
+                }
+                // Anything else is a two-byte sequence this does nothing
+                // with, and it is over.
+                _ => ESC_STATE = NORMAL,
+            },
+            ESC_ONE_MORE => ESC_STATE = NORMAL,
+            // A title, for a window this has not got. Swallowed whole: it
+            // ends at a bell, or at ESC \.
+            OSC => match c {
+                0x07 => ESC_STATE = NORMAL,
+                0x1b => ESC_STATE = OSC_ESC,
+                _ => {}
+            },
+            OSC_ESC => ESC_STATE = if c == b'\\' { NORMAL } else { OSC },
+            CSI => match c {
+                b'0'..=b'9' => {
+                    if ESC_PARAM_COUNT < MAX_PARAMS {
+                        let p = &mut ESC_PARAMS[ESC_PARAM_COUNT];
+                        *p = p.saturating_mul(10).saturating_add((c - b'0') as u16);
+                    }
+                }
+                // A colon separates the parts of one parameter where a
+                // semicolon separates parameters; the only sequences that use
+                // one are colours, which are read the same either way.
+                b';' | b':' => {
+                    if ESC_PARAM_COUNT < MAX_PARAMS {
+                        ESC_PARAM_COUNT += 1;
+                    }
+                }
+                // A private marker: the sequence is somebody's extension.
+                // Read to its end like any other, and acted on only where
+                // this knows what it means. It used to be taken for the end
+                // of the sequence, and the rest of it drawn as text.
+                b'<' | b'=' | b'>' | b'?' => ESC_PRIVATE = true,
+                // Intermediates: part of the sequence, saying nothing here.
+                0x20..=0x2f => {}
+                0x40..=0x7e => {
+                    if ESC_PARAM_COUNT < MAX_PARAMS {
+                        ESC_PARAM_COUNT += 1;
+                    }
+                    dispatch_csi(c);
+                    ESC_STATE = NORMAL;
+                }
+                // Not part of any sequence: give up on this one.
+                _ => ESC_STATE = NORMAL,
+            },
+            _ => ESC_STATE = NORMAL,
         }
-        if ROW >= ROWS { scroll(); }
+        if ROW >= ROWS {
+            scroll();
+        }
     }
 }
 
-fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
+fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32, bg: u32) {
     if !unsafe { HAVE_DISPLAY } {
         return;
     }
@@ -358,7 +700,7 @@ fn draw_glyph(col: usize, row: usize, ch: u8, fg: u32) {
 
             for gx in 0..8 {
                 let on = (glyph_row >> (7 - gx)) & 1 != 0;
-                let color = if on { fg } else { 0 };
+                let color = if on { fg } else { bg };
                 let px = row_base + gx * bytes_per_pixel;
 
                 if bytes_per_pixel == 4 {
@@ -378,56 +720,213 @@ unsafe fn encode_color(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) << R_POS | (g as u32) << G_POS | (b as u32) << B_POS
 }
 
+/// Empty the cells of `row` from `from` up to `to`.
+unsafe fn erase(row: usize, from: usize, to: usize) {
+    unsafe {
+        for c in from..to.min(COLS) {
+            let idx = cell_idx(c, row);
+            CELL_CH[idx] = 0;
+            CELL_FG[idx] = 0;
+            CELL_BG[idx] = 0;
+        }
+        mark_dirty(row);
+    }
+}
+
+/// The colour a program means by a number: the sixteen, then a cube of six
+/// levels of each of red, green and blue, then twenty-four greys.
+fn indexed(n: u8) -> (u8, u8, u8) {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match n {
+        0..=15 => PALETTE[n as usize],
+        16..=231 => {
+            let n = n - 16;
+            (LEVELS[(n / 36) as usize], LEVELS[(n / 6 % 6) as usize], LEVELS[(n % 6) as usize])
+        }
+        _ => {
+            let grey = 8 + 10 * (n - 232);
+            (grey, grey, grey)
+        }
+    }
+}
+
+/// What the next character is drawn in, worked out from the attributes.
+unsafe fn recolor() {
+    unsafe {
+        let rgb = |c: Colour| match c {
+            Colour::Index(i) => indexed(i),
+            Colour::Rgb(r, g, b) => (r, g, b),
+        };
+        // Bold is bright, as on every PC console: the font has one weight.
+        let fg = match FG {
+            Colour::Index(i) if BOLD && i < 8 => Colour::Index(i + 8),
+            other => other,
+        };
+        let (fg, bg) = if REVERSE { (BG, fg) } else { (fg, BG) };
+        let (r, g, b) = rgb(fg);
+        FG_COLOR = encode_color(r, g, b);
+        let (r, g, b) = rgb(bg);
+        BG_COLOR = encode_color(r, g, b);
+    }
+}
+
+unsafe fn reset_attributes() {
+    unsafe {
+        FG = DEFAULT_FG;
+        BG = DEFAULT_BG;
+        BOLD = false;
+        REVERSE = false;
+        recolor();
+    }
+}
+
+/// Answer a program that asked the terminal something: the answer is typed
+/// at it, which is how a terminal says anything.
+fn answer(bytes: &[u8]) {
+    unsafe {
+        if FROM_TTY && TTY_MASTER != usize::MAX {
+            let _ = syscall::sys_fd_write_nb(TTY_MASTER, bytes);
+        }
+    }
+}
+
+/// `n` in decimal at `out[at..]`; returns where the digits end.
+fn put_number(out: &mut [u8], mut at: usize, n: usize) -> usize {
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    let mut n = n;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    while len > 0 && at < out.len() {
+        len -= 1;
+        out[at] = digits[len];
+        at += 1;
+    }
+    at
+}
+
 fn dispatch_csi(cmd: u8) {
     unsafe {
         let p0 = ESC_PARAMS[0] as usize;
         let p1 = ESC_PARAMS[1] as usize;
+        if ESC_PRIVATE {
+            // The one private mode that is this console's to honour: whether
+            // the cursor is drawn. The rest — bracketed paste, alternate
+            // screens, mouse reporting — are accepted and mean nothing here.
+            if p0 == 25 && (cmd == b'h' || cmd == b'l') {
+                CURSOR_HIDDEN = cmd == b'l';
+            }
+            return;
+        }
+        // Everything that moves the cursor leaves the right-hand edge.
+        if matches!(cmd, b'A'..=b'H' | b'a' | b'd' | b'e' | b'f' | b'`' | b'u') {
+            WRAP_PENDING = false;
+        }
         match cmd {
-            b'A' => { ROW = ROW.saturating_sub(p0.max(1)); }
-            b'B' => { ROW = (ROW + p0.max(1)).min(ROWS - 1); }
-            b'C' => { COL = (COL + p0.max(1)).min(COLS - 1); }
-            b'D' => { COL = COL.saturating_sub(p0.max(1)); }
-            b'H' => {
-                ROW = if p0 > 0 { (p0 - 1).min(ROWS - 1) } else { 0 };
-                COL = if p1 > 0 { (p1 - 1).min(COLS - 1) } else { 0 };
+            b'A' => ROW = ROW.saturating_sub(p0.max(1)),
+            b'B' | b'e' => ROW = (ROW + p0.max(1)).min(ROWS - 1),
+            b'C' | b'a' => COL = (COL + p0.max(1)).min(COLS - 1),
+            b'D' => COL = COL.saturating_sub(p0.max(1)),
+            b'E' => {
+                ROW = (ROW + p0.max(1)).min(ROWS - 1);
+                COL = 0;
             }
-            b'J' => {
-                if p0 == 2 {
-                    // Clear cell buffer
-                    for i in 0..(ROWS * MAX_CELL_COLS) {
-                        CELL_CH[i] = 0;
-                        CELL_FG[i] = 0;
+            b'F' => {
+                ROW = ROW.saturating_sub(p0.max(1));
+                COL = 0;
+            }
+            b'G' | b'`' => COL = p0.max(1).min(COLS) - 1,
+            b'd' => ROW = p0.max(1).min(ROWS) - 1,
+            b'H' | b'f' => {
+                ROW = p0.max(1).min(ROWS) - 1;
+                COL = p1.max(1).min(COLS) - 1;
+            }
+            b'J' => match p0 {
+                // From the cursor to the end of the screen.
+                0 => {
+                    erase(ROW, COL, COLS);
+                    for row in ROW + 1..ROWS {
+                        erase(row, 0, COLS);
                     }
-                    // Clear framebuffer directly, if it is still ours: a
-                    // console without the display has nothing mapped there.
-                    if HAVE_DISPLAY {
-                        let buf = FB as *mut u8;
-                        let total = HEIGHT * PITCH;
-                        for i in 0..total { buf.add(i).write_volatile(0); }
-                    }
-                    ROW = 0; COL = 0;
-                    DIRTY_MIN = usize::MAX;
-                    DIRTY_MAX = 0;
                 }
-            }
-            b'K' => {
-                if p0 == 0 {
-                    for c in COL..COLS {
-                        let idx = cell_idx(c, ROW);
-                        CELL_CH[idx] = 0;
-                        CELL_FG[idx] = 0;
+                // From the start of the screen to the cursor.
+                1 => {
+                    for row in 0..ROW {
+                        erase(row, 0, COLS);
                     }
-                    mark_dirty(ROW);
+                    erase(ROW, 0, COL + 1);
                 }
-            }
+                // All of it. The cursor stays where it is: a program that
+                // wants it at the top says so, and every one of them does.
+                _ => {
+                    for row in 0..ROWS {
+                        erase(row, 0, COLS);
+                    }
+                }
+            },
+            b'K' => match p0 {
+                0 => erase(ROW, COL, COLS),
+                1 => erase(ROW, 0, COL + 1),
+                _ => erase(ROW, 0, COLS),
+            },
             b'm' => {
-                for i in 0..ESC_PARAM_COUNT {
-                    apply_sgr(ESC_PARAMS[i]);
+                let params = &ESC_PARAMS[..ESC_PARAM_COUNT];
+                let mut i = 0;
+                while i < params.len() {
+                    // 38 and 48 are a colour spelled out, and what follows
+                    // them is the colour, not more attributes: 5 and a
+                    // number, or 2 and three. Read as attributes, `38;5;1`
+                    // is bold.
+                    let spelled = match (params[i], params.get(i + 1)) {
+                        (38 | 48, Some(5)) if i + 2 < params.len() => {
+                            Some((Colour::Index(params[i + 2] as u8), 3))
+                        }
+                        (38 | 48, Some(2)) if i + 4 < params.len() => Some((
+                            Colour::Rgb(params[i + 2] as u8, params[i + 3] as u8, params[i + 4] as u8),
+                            5,
+                        )),
+                        // Cut short: nothing after it can be trusted.
+                        (38 | 48, _) => break,
+                        _ => None,
+                    };
+                    match spelled {
+                        Some((colour, used)) => {
+                            if params[i] == 38 {
+                                FG = colour;
+                            } else {
+                                BG = colour;
+                            }
+                            i += used;
+                        }
+                        None => {
+                            apply_sgr(params[i]);
+                            i += 1;
+                        }
+                    }
                 }
-                if ESC_PARAM_COUNT == 0 {
-                    apply_sgr(0);
-                }
+                recolor();
             }
+            // "Where is the cursor?", "are you there?" and "what are you?"
+            // are asked by programs that then wait for an answer.
+            b'n' if p0 == 6 => {
+                let mut out = [0u8; 16];
+                out[..2].copy_from_slice(b"\x1b[");
+                let mut at = put_number(&mut out, 2, ROW + 1);
+                out[at] = b';';
+                at = put_number(&mut out, at + 1, COL + 1);
+                out[at] = b'R';
+                answer(&out[..at + 1]);
+            }
+            b'n' if p0 == 5 => answer(b"\x1b[0n"),
+            b'c' if p0 == 0 => answer(b"\x1b[?6c"),
+            b's' => SAVED = (COL, ROW),
+            b'u' => (COL, ROW) = SAVED,
             _ => {}
         }
     }
@@ -436,17 +935,24 @@ fn dispatch_csi(cmd: u8) {
 fn apply_sgr(code: u16) {
     unsafe {
         match code {
-            0  => { FG_COLOR = encode_color(0xCC, 0xCC, 0xCC); }
-            1  => { FG_COLOR = encode_color(0xFF, 0xFF, 0xFF); }
-            30 => { FG_COLOR = encode_color(0x00, 0x00, 0x00); }
-            31 => { FG_COLOR = encode_color(0xCC, 0x00, 0x00); }
-            32 => { FG_COLOR = encode_color(0x00, 0xCC, 0x00); }
-            33 => { FG_COLOR = encode_color(0xCC, 0xCC, 0x00); }
-            34 => { FG_COLOR = encode_color(0x00, 0x00, 0xCC); }
-            35 => { FG_COLOR = encode_color(0xCC, 0x00, 0xCC); }
-            36 => { FG_COLOR = encode_color(0x00, 0xCC, 0xCC); }
-            37 => { FG_COLOR = encode_color(0xCC, 0xCC, 0xCC); }
-            _  => {}
+            0 => {
+                FG = DEFAULT_FG;
+                BG = DEFAULT_BG;
+                BOLD = false;
+                REVERSE = false;
+            }
+            1 => BOLD = true,
+            7 => REVERSE = true,
+            22 => BOLD = false,
+            27 => REVERSE = false,
+            30..=37 => FG = Colour::Index((code - 30) as u8),
+            39 => FG = DEFAULT_FG,
+            40..=47 => BG = Colour::Index((code - 40) as u8),
+            49 => BG = DEFAULT_BG,
+            90..=97 => FG = Colour::Index((code - 90) as u8 + 8),
+            100..=107 => BG = Colour::Index((code - 100) as u8 + 8),
+            // Underline, blink, italics: nothing this font can show.
+            _ => {}
         }
     }
 }
@@ -476,12 +982,18 @@ fn scroll() {
             CELL_FG.as_mut_ptr(),
             used - stride,
         );
+        core::ptr::copy(
+            CELL_BG.as_ptr().add(stride),
+            CELL_BG.as_mut_ptr(),
+            used - stride,
+        );
 
         // Clear last cell row
         let last = (ROWS - 1) * stride;
         for i in last..last + COLS {
             CELL_CH[i] = 0;
             CELL_FG[i] = 0;
+            CELL_BG[i] = 0;
         }
 
         // Scroll framebuffer pixels up by one text row instead of a full
@@ -517,7 +1029,7 @@ fn flush_dirty() {
         for row in min..=max {
             for col in 0..COLS {
                 let idx = cell_idx(col, row);
-                draw_glyph(col, row, CELL_CH[idx], CELL_FG[idx]);
+                draw_glyph(col, row, CELL_CH[idx], CELL_FG[idx], CELL_BG[idx]);
             }
         }
         DIRTY_MIN = usize::MAX;
@@ -528,7 +1040,7 @@ fn flush_dirty() {
 /// Draw cursor block at current position.
 unsafe fn draw_cursor() {
     if !INITIALIZED || !HAVE_DISPLAY { return; }
-    if CURSOR_VISIBLE {
+    if CURSOR_VISIBLE && !CURSOR_HIDDEN {
         // Draw a solid block at (COL, ROW) using FG_COLOR
         draw_cursor_block(FG_COLOR);
     } else {
@@ -545,7 +1057,7 @@ unsafe fn hide_cursor() {
     if !INITIALIZED { return; }
     if COL < COLS && ROW < ROWS {
         let idx = cell_idx(COL, ROW);
-        draw_glyph(COL, ROW, CELL_CH[idx], CELL_FG[idx]);
+        draw_glyph(COL, ROW, CELL_CH[idx], CELL_FG[idx], CELL_BG[idx]);
     }
 }
 

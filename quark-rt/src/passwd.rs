@@ -1,6 +1,10 @@
 /// Parser for /etc/passwd files.
 ///
-/// Format: username:uid:gid:home:shell (one entry per line)
+/// One entry a line, in either of two shapes. Unix's seven fields —
+/// `name:password:uid:gid:comment:home:shell` — which is what every C library
+/// reads to turn a file's owner into a name; or the five this started with,
+/// `name:uid:gid:home:shell`. Which one a line is, is said by how many fields
+/// it has. The password field is not looked at: nothing here asks for one.
 
 pub struct PasswdEntry {
     pub username: [u8; 32],
@@ -53,28 +57,22 @@ pub fn lookup_user(data: &[u8], username: &[u8]) -> Option<PasswdEntry> {
 }
 
 fn parse_line(line: &[u8]) -> Option<PasswdEntry> {
-    let mut fields = [&[][..]; 5];
+    let mut fields = [&[][..]; 7];
     let mut field_count = 0;
-    let mut start = 0;
-
-    for i in 0..line.len() {
-        if line[i] == b':' {
-            if field_count < 5 {
-                fields[field_count] = &line[start..i];
-                field_count += 1;
-            }
-            start = i + 1;
+    for field in line.split(|&b| b == b':') {
+        if field_count == fields.len() {
+            return None; // more than a passwd line has
         }
-    }
-    // Last field (no trailing colon)
-    if field_count < 5 {
-        fields[field_count] = &line[start..];
+        fields[field_count] = field;
         field_count += 1;
     }
-
-    if field_count < 5 {
-        return None;
-    }
+    // Where each thing is, in whichever shape this is.
+    let (uid, gid, home, shell) = match field_count {
+        7 => (2, 3, 5, 6),
+        5 => (1, 2, 3, 4),
+        _ => return None,
+    };
+    let fields = [fields[0], fields[uid], fields[gid], fields[home], fields[shell]];
 
     let uid = parse_u32(fields[1])?;
     let gid = parse_u32(fields[2])?;

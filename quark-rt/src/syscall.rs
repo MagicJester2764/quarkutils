@@ -881,6 +881,12 @@ pub fn sys_fd_read_nb(fd: usize, buf: &mut [u8]) -> u64 {
 
 pub const WOULD_BLOCK: u64 = 0xFFFF_FFFE;
 
+/// Write without waiting: what was taken, [`WOULD_BLOCK`] if nothing could
+/// be, or `u64::MAX`.
+pub fn sys_fd_write_nb(fd: usize, buf: &[u8]) -> u64 {
+    unsafe { syscall3(SYS_FD_WRITE_NB, fd as u64, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
 pub fn sys_fd_set(tid: usize, fd: usize, service_tid: usize, tag: u64) -> Result<(), ()> {
     let ret = unsafe { syscall4(SYS_FD_SET, tid as u64, fd as u64, service_tid as u64, tag) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
@@ -1209,6 +1215,60 @@ pub fn sys_memfd_truncate(fd: usize, bytes: usize) -> Result<usize, ()> {
 pub fn sys_mmap_fd(fd: usize, vaddr: usize) -> Result<usize, ()> {
     let ret = unsafe { syscall2(SYS_MMAP_FD, fd as u64, vaddr as u64) };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// A terminal's settings, in Linux's layout: four flag words, a line
+/// discipline byte and nineteen control characters. The kernel acts on a
+/// handful of the bits and stores the rest.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
+
+/// Make a pseudo-terminal and return a descriptor for its master: what a
+/// terminal emulator holds. What is written to it is typing; what is read
+/// from it is what the program in the terminal printed.
+pub fn sys_pty_create() -> Result<usize, ()> {
+    let ret = unsafe { syscall0(SYS_PTY_CREATE) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// A descriptor for pty `number`'s slave: what the program in the terminal
+/// holds as its standard input, output and error.
+pub fn sys_pty_open(number: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall1(SYS_PTY_OPEN, number as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Which pty a descriptor for either end names.
+pub fn sys_pty_number(fd: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall3(SYS_PTY_CTL, fd as u64, 4, 0) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+pub fn sys_pty_get_termios(fd: usize) -> Result<Termios, ()> {
+    let mut t = Termios { c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0, c_line: 0, c_cc: [0; 19] };
+    let ret = unsafe { syscall3(SYS_PTY_CTL, fd as u64, 0, &mut t as *mut Termios as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(t) }
+}
+
+pub fn sys_pty_set_termios(fd: usize, t: &Termios) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_PTY_CTL, fd as u64, 1, t as *const Termios as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// Say how big the terminal is, in characters. Stored, and handed to
+/// whichever program asks.
+pub fn sys_pty_set_size(fd: usize, rows: u16, cols: u16) -> Result<(), ()> {
+    let size = [rows, cols, 0u16, 0u16];
+    let ret = unsafe { syscall3(SYS_PTY_CTL, fd as u64, 3, size.as_ptr() as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Give the task calling this one a descriptor for one of this server's

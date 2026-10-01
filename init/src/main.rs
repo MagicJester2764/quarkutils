@@ -731,8 +731,81 @@ impl DeferredTasks {
     }
 }
 
+/// What `/etc/init.conf` says to start a session with, if it says.
+///
+/// One directive: `session PATH`. A distribution that wants its users on a
+/// terminal names `getty` there; one with no such file gets `login`, started
+/// straight onto the console as it always was. Which of those a system is, is
+/// the distribution's to say and not this program's to guess.
+fn configured_session(vfs_tid: usize, out: &mut [u8; 64]) -> Option<usize> {
+    let (handle, size, is_dir) = vfs::open(vfs_tid, b"/etc/init.conf").ok()?;
+    let mut text = [0u8; 512];
+    let want = (size as usize).min(text.len());
+    let got = if is_dir { 0 } else { vfs::read(vfs_tid, handle, &mut text[..want], 0).unwrap_or(0) };
+    let _ = vfs::close(vfs_tid, handle);
+    for line in text[..got as usize].split(|&b| b == b'\n') {
+        let mut words = line
+            .split(|&b| b == b' ' || b == b'\t' || b == b'\r')
+            .filter(|w| !w.is_empty());
+        if words.next() != Some(&b"session"[..]) {
+            continue; // a comment, a blank line, or a directive from the future
+        }
+        let path = words.next()?;
+        if path.len() > out.len() || !path.starts_with(b"/") {
+            return None;
+        }
+        out[..path.len()].copy_from_slice(path);
+        return Some(path.len());
+    }
+    None
+}
+
+/// Load the program a session starts with and wire it to the console, to be
+/// started when everything else has been.
+fn spawn_session(
+    vfs_tid: usize,
+    path: &[u8],
+    what: &str,
+    console_pipe: usize,
+    input_tid: usize,
+    deferred: &mut DeferredTasks,
+) -> bool {
+    // Read it through the VFS into memory of this task's, and load it.
+    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
+    match spawn::load_path(vfs_tid, path, VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) {
+        Ok(info) => {
+            let tid = info.tid;
+            if console_pipe != 0 {
+                let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
+                let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
+            }
+            if input_tid != 0 {
+                let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
+            }
+            let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+            let _ = spawn::set_args(&info, &[name], &SPAWN_SCRATCH);
+            println!("[init] Spawned {} (TID {}, deferred start)", what, tid);
+            if deferred.count < MAX_DEFERRED {
+                deferred.spawns[deferred.count] = Some(info);
+                deferred.count += 1;
+            }
+            true
+        }
+        Err(()) => false,
+    }
+}
+
 fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
+
+    // What the distribution asked for, if it asked.
+    let mut session = [0u8; 64];
+    if let Some(len) = configured_session(vfs_tid, &mut session) {
+        if spawn_session(vfs_tid, &session[..len], "session", console_pipe, input_tid, &mut deferred) {
+            return deferred;
+        }
+        println!("[init] /etc/init.conf names a session program that will not load.");
+    }
 
     // Open /usr/bin directory via VFS
     let (dir_handle, _, _) = match vfs::open(vfs_tid, b"/usr/bin") {
@@ -788,26 +861,8 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
     let path_len = prefix.len() + namelen;
 
-    // Read it through the VFS into memory of this task's, and load it.
-    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
-    match spawn::load_path(vfs_tid, &path[..path_len], VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) {
-        Ok(info) => {
-            let tid = info.tid;
-            if console_pipe != 0 {
-                let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
-                let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
-            }
-            if input_tid != 0 {
-                let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
-            }
-            let _ = spawn::set_args(&info, &[&namebuf[..namelen]], &SPAWN_SCRATCH);
-            println!("[init] Spawned {} (TID {}, deferred start)", loading_name, tid);
-            if deferred.count < MAX_DEFERRED {
-                deferred.spawns[deferred.count] = Some(info);
-                deferred.count += 1;
-            }
-        }
-        Err(()) => println!("[init]   FAILED to spawn"),
+    if !spawn_session(vfs_tid, &path[..path_len], loading_name, console_pipe, input_tid, &mut deferred) {
+        println!("[init]   FAILED to spawn");
     }
 
     deferred

@@ -869,10 +869,16 @@ fn test_pollset() {
         "watching an empty descriptor is refused",
         syscall::sys_pollset_add(set, 30, syscall::POLL_READABLE, 0xC).is_err(),
     );
+    // An IPC endpoint is one of those: nothing says when a server would
+    // answer. Made here for the purpose — standard input is one only where
+    // the console is not a terminal, and a terminal is a thing to wait on.
+    let me = syscall::sys_getpid() as usize;
+    let endpoint = syscall::sys_fd_set(me, 29, me, 1).is_ok();
     check(
-        "watching stdin, an IPC endpoint, is refused",
-        syscall::sys_pollset_add(set, 0, syscall::POLL_READABLE, 0xD).is_err(),
+        "watching an IPC endpoint is refused",
+        endpoint && syscall::sys_pollset_add(set, 29, syscall::POLL_READABLE, 0xD).is_err(),
     );
+    let _ = syscall::sys_fd_close(29);
     check(
         "watching stdout, which really is a pipe, is allowed",
         syscall::sys_pollset_add(set, 1, syscall::POLL_WRITABLE, 0xE).is_ok(),
