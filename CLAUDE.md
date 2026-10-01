@@ -625,6 +625,11 @@ The rules that got it there, and that a further port should follow:
   and so is `timer_create`, which every program asked falls back from. A
   signal that is blocked and has no handler is not held back. The mask is the program's
   rather than a thread's, and is not kept across an exec.
+- **A program's first thread is not numbered as its process.** `getpid` is
+  a process id, 64 or more, and `gettid` a task id, below 64. On Linux the
+  two are equal in the first thread, and code that finds its main thread by
+  comparing them, or signals it with `tgkill(getpid(), getpid(), …)`, is
+  wrong here. Nothing ported so far does either.
 - The **plain console has its own Ctrl-C**, older than signals: `input` sends
   the foreground task one of the kernel's three task signals (`SYS_SIGNAL`),
   which `qsh`'s `kill` and `shutdown` use too. On a terminal it is signal 2,
