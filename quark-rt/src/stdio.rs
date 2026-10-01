@@ -3,22 +3,25 @@ use crate::syscall;
 
 const BUF_SIZE: usize = 256;
 
+/// What a `print!` is gathered in on its way to a descriptor, so that a
+/// formatted line is one write and not one per piece.
 struct BufWriter {
     buf: [u8; BUF_SIZE],
     pos: usize,
+    fd: usize,
 }
 
 impl BufWriter {
-    const fn new() -> Self {
-        BufWriter { buf: [0; BUF_SIZE], pos: 0 }
+    const fn new(fd: usize) -> Self {
+        BufWriter { buf: [0; BUF_SIZE], pos: 0, fd }
     }
 
-    fn flush(&mut self, fd: usize) {
+    fn flush(&mut self) {
         if self.pos == 0 {
             return;
         }
         let data = &self.buf[..self.pos];
-        let ret = syscall::sys_fd_write(fd, data);
+        let ret = syscall::sys_fd_write(self.fd, data);
         if ret == u64::MAX {
             syscall::sys_write(data);
         }
@@ -29,10 +32,12 @@ impl BufWriter {
 impl fmt::Write for BufWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
-            if self.pos >= BUF_SIZE {
-                // Buffer full — shouldn't happen for typical prints,
-                // but avoid overflow silently
-                break;
+            if self.pos == BUF_SIZE {
+                // Full: what has been gathered goes, and the rest follows.
+                // It used to be dropped, on the grounds that nothing prints
+                // that much at once — and `cat` printed a file a page at a
+                // time, so it showed the first 256 bytes of every 4096.
+                self.flush();
             }
             self.buf[self.pos] = b;
             self.pos += 1;
@@ -43,16 +48,16 @@ impl fmt::Write for BufWriter {
 
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    let mut w = BufWriter::new();
+    let mut w = BufWriter::new(1);
     let _ = w.write_fmt(args);
-    w.flush(1);
+    w.flush();
 }
 
 pub fn _eprint(args: fmt::Arguments) {
     use fmt::Write;
-    let mut w = BufWriter::new();
+    let mut w = BufWriter::new(2);
     let _ = w.write_fmt(args);
-    w.flush(2);
+    w.flush();
 }
 
 /// Read a line from stdin (fd 0) into `buf`. Returns the number of bytes read.
