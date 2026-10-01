@@ -2556,6 +2556,113 @@ fn test_fpu() {
     );
 }
 
+/// Where the pages first touched with the direction flag set go.
+const BACKWARDS_AT: usize = 0xA8_0000_0000;
+const BACKWARDS_PAGES: usize = 16;
+
+fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    (hi as u64) << 32 | lo as u64
+}
+
+fn test_flags() {
+    println!("the flags a program leaves set:");
+    // The direction flag says which way a string instruction runs, and a
+    // program may have it set when the kernel is entered: a C library sets it
+    // for as long as a copy that must run backwards takes (musl's `memmove`),
+    // and an interrupt or a page fault arrives where it arrives. The kernel's
+    // own code is compiled to find the flag clear. Entered with it set, the
+    // kernel cleared a new page's frame backwards from its first word — the
+    // page before it, whoever's that was — and a tick's first `memset` ran
+    // down the stack over its own return address.
+    //
+    // Everything done with the flag set is done inside one block of assembly:
+    // this program's own code is compiled to find it clear too.
+
+    // A page first touched while it is set. The frames come from pages this
+    // has just filled and given back, so that one handed over uncleared shows.
+    let len = BACKWARDS_PAGES * 4096;
+    let filled = syscall::sys_map_anon(BACKWARDS_AT, BACKWARDS_PAGES, false).is_ok();
+    if filled {
+        unsafe { core::ptr::write_bytes(BACKWARDS_AT as *mut u8, 0xAA, len) };
+        let _ = syscall::sys_munmap(BACKWARDS_AT, BACKWARDS_PAGES);
+    }
+    let again = filled && syscall::sys_map_anon(BACKWARDS_AT, BACKWARDS_PAGES, false).is_ok();
+    let mut clear = again;
+    if again {
+        for i in 0..BACKWARDS_PAGES {
+            let page = BACKWARDS_AT + i * 4096;
+            unsafe {
+                core::arch::asm!(
+                    "std",
+                    "mov byte ptr [{at}], 1",
+                    "cld",
+                    at = in(reg) page + 2048,
+                    options(nostack),
+                );
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 4096) };
+            if bytes.iter().enumerate().any(|(j, &b)| b != (j == 2048) as u8) {
+                clear = false;
+            }
+        }
+        let _ = syscall::sys_munmap(BACKWARDS_AT, BACKWARDS_PAGES);
+    }
+    check("a page first touched with the direction flag set is given clear", clear);
+
+    // A system call made with it set: answered, and the flag is still the
+    // program's when it comes back.
+    let before = syscall::sys_ticks();
+    let (answer, flags): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "std",
+            "syscall",
+            "pushfq",
+            "pop {flags}",
+            "cld",
+            flags = out(reg) flags,
+            inlateout("rax") syscall::SYS_TICKS => answer,
+            out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+        );
+    }
+    check("a system call made with it set is answered", answer >= before && answer < before + 100);
+    check("and comes back with it set", flags & 0x400 != 0);
+
+    // And the timer, which is the kernel entered at no instruction of the
+    // program's choosing. Long enough with the flag set for several ticks to
+    // land on it; the processor's own count says how long that is, because
+    // asking the kernel would be a system call, and that clears the flag for
+    // as long as the kernel runs.
+    let t0 = rdtsc();
+    syscall::sleep_ticks(3);
+    let per_tick = (rdtsc() - t0) / 3;
+    let until = rdtsc() + per_tick * 6;
+    let ticks0 = syscall::sys_ticks();
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "std",
+            "2:",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "cmp rax, {until}",
+            "jb 2b",
+            "pushfq",
+            "pop {flags}",
+            "cld",
+            until = in(reg) until,
+            flags = out(reg) flags,
+            out("rax") _, out("rdx") _,
+        );
+    }
+    let landed = syscall::sys_ticks() - ticks0;
+    check("timer ticks land on a program with it set, and the machine goes on", landed >= 2);
+    check("and it is still set afterwards", flags & 0x400 != 0);
+}
+
 fn test_wire() {
     println!("wayland wire format:");
     // wl_display.get_registry as libwayland actually sent it down a Quark
@@ -2680,6 +2787,7 @@ pub extern "C" fn _start() -> ! {
         ("files", test_files),
         ("sync", test_sync),
         ("fpu", test_fpu),
+        ("flags", test_flags),
         ("wire", test_wire),
     ];
     let only = quark_rt::args::argv(1);
