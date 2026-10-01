@@ -25,10 +25,17 @@ LIBS    := $(LIBC)/src/start.o $(LIBC)/libquark.a
 DEPS    := $(LIBC)/libquark.a $(LIBC)/src/start.o
 endif
 
-cwc: main.c $(DEPS)
+# Relinked every time. Under the cross compiler nothing on the command line
+# names the C library or the link script — the target knows where they are —
+# so make has no file to compare this against, and a binary linked before
+# either changed went on being installed: a month-old copy without the frame
+# tables the link script had since started keeping. One C file is cheap.
+cwc: main.c $(DEPS) FORCE
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(firstword $(LIBS)) main.c $(wordlist 2,99,$(LIBS))
 
 clean:
 	rm -f cwc
 
-.PHONY: clean
+FORCE:
+
+.PHONY: clean FORCE
