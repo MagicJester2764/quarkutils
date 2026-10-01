@@ -8,6 +8,7 @@
  * `sigsuspend`, for a SIGCHLD; a shell's `read -t` never timed out. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -110,6 +111,25 @@ int main(int argc, char **argv) {
     alarm(1);
     unsigned unslept = sleep(3);
     check("an alarm ends a sleep, which says what was left", alarms == 1 && unslept >= 1 && unslept <= 2);
+
+    /* And so does a handler set with `signal`, which asks for the calls it
+       interrupts to be made again. A read is; a sleep and a poll are not,
+       ever — which is what lets `signal`, `alarm` and `sleep` be a deadline,
+       as they have been for as long as there has been an `alarm`. */
+    signal(SIGALRM, on_alarm);
+    alarms = 0;
+    alarm(1);
+    unslept = sleep(3);
+    check("a handler that asks for restarting still ends a sleep",
+          alarms == 1 && unslept >= 1 && unslept <= 2);
+    alarms = 0;
+    alarm(1);
+    start();
+    errno = 0;
+    r = poll(NULL, 0, 3000);
+    took = ms();
+    check("and still ends a poll", r == -1 && errno == EINTR && alarms == 1 && took < 2000);
+    sigaction(SIGALRM, &sa, NULL);
 
     /* What the signal does to a program that has said nothing. */
     start();

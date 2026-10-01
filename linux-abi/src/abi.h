@@ -75,8 +75,12 @@ long __quark_kill(long pid, long sig);
 long __quark_tkill(long tid, long sig);
 /* Is there a handler to run on the way out of a call, and run them. */
 int __quark_sig_due(void);
+/* What `__quark_sig_deliver` and `__quark_sig_interrupted` answer: a handler
+   ran, and one that ran wants a restartable call to fail instead. */
+#define QUARK_SIG_RAN   1
+#define QUARK_SIG_EINTR 2
 int __quark_sig_deliver(void);
-/* A wait the kernel ended for a signal: 1 to say EINTR, 0 to wait again. */
+/* A wait the kernel ended for a signal: what ran, as above; 0 to wait again. */
 int __quark_sig_interrupted(void);
 unsigned long __quark_sig_swap_mask(unsigned long mask);
 void __quark_sig_forked(void);

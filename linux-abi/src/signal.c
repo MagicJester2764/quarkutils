@@ -96,8 +96,9 @@ static struct lx_ksigaction *action_of(long sig) {
     return &actions[sig];
 }
 
-/* Call the handler for `sig`. Returns 1 if a call it cut short should say so
-   rather than be made again. */
+/* Call the handler for `sig`. Says whether one ran (QUARK_SIG_RAN), and
+   whether a call it cut short that *can* be made again should say EINTR
+   instead (QUARK_SIG_EINTR): the handler was not installed with SA_RESTART. */
 static int run(long sig) {
     struct lx_ksigaction a = *action_of(sig);
     if (a.handler == LX_SIG_IGN) {
@@ -141,7 +142,7 @@ static int run(long sig) {
        with is its program's to put right — which is what sigsetjmp saves it
        for. */
     blocked = saved;
-    return !(a.flags & LX_SA_RESTART);
+    return QUARK_SIG_RAN | ((a.flags & LX_SA_RESTART) ? 0 : QUARK_SIG_EINTR);
 }
 
 /* Is there anything to do on the way out of a call? */
@@ -149,8 +150,18 @@ int __quark_sig_due(void) {
     return hint || (pending & ~blocked);
 }
 
-/* Run every handler that may run now. Nonzero if one of them wants the call
-   it interrupted to fail with EINTR. */
+/* Run every handler that may run now. The answer is what the call that was
+   cut short does about it, and there are two kinds of call.
+
+   A read can be made again, so it is — unless a handler that ran was
+   installed without SA_RESTART (QUARK_SIG_EINTR).
+
+   A wait for a time or for readiness cannot: a sleep, a poll, a select, an
+   epoll_wait. Linux ends those with EINTR whenever a handler has run
+   (QUARK_SIG_RAN), whatever the handler asked for, and programs lean on it:
+   `signal()` — which asks for restarting — then `alarm()` and `sleep()` is
+   how a program has been given a deadline since before `sigaction` existed.
+   Restarted, the sleep ran to its end and the alarm was for nothing. */
 int __quark_sig_deliver(void) {
     int interrupts = 0;
     if (hint) {
@@ -168,8 +179,9 @@ int __quark_sig_deliver(void) {
     return interrupts;
 }
 
-/* The kernel ended a wait for a signal. Take it and run what may run; 1 if
-   the call should say EINTR, 0 if it should wait again. */
+/* The kernel ended a wait for a signal. Take it and run what may run; the
+   answer is `__quark_sig_deliver`'s, and 0 — nothing ran, the signal is
+   blocked or was somebody else's — is a wait to go back to. */
 int __quark_sig_interrupted(void) {
     take();
     return __quark_sig_deliver();

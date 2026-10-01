@@ -372,10 +372,10 @@ long __quark_poll(void *fds, long nfds, long timeout_ms) {
         if (n != QUARK_INTERRUPTED) {
             break;
         }
-        /* A signal ended the wait. A handler that ran makes that the answer;
-           one that asked for the call to go on, or a signal that is blocked,
-           leaves what is left of the wait to do. */
-        if (__quark_sig_interrupted()) {
+        /* A signal ended the wait. A handler that ran makes that the answer,
+           whatever it asked for: a poll is never made again. A signal that
+           is blocked leaves what is left of the wait to do. */
+        if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
             return -LX_EINTR;
         }
         if (timeout_ms >= 0) {
@@ -485,7 +485,7 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms
         if (n != QUARK_INTERRUPTED) {
             break;
         }
-        if (__quark_sig_interrupted()) {
+        if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
             return -LX_EINTR;
         }
         if (timeout_ms >= 0) {

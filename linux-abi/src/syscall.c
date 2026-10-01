@@ -413,10 +413,12 @@ static long do_sleep(long clock, long flags, const struct lx_timespec *req,
     while ((now = __syscall0(SYS_TICKS)) < deadline) {
         struct quark_msg m;
         unsigned long r = __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, deadline - now);
-        /* A signal ended the sleep. If a handler ran and did not ask for the
-           call to go on, that is the sleep over, with what was left of it
-           said; otherwise there is the rest of it still to do. */
-        if (r == QUARK_SLEEP_INTERRUPTED && __quark_sig_interrupted()) {
+        /* A signal ended the sleep. If a handler ran, that is the sleep over,
+           with what was left of it said — a sleep is never taken up again,
+           whatever the handler asked for. If none did, the signal is blocked
+           or was not this thread's to take, and there is the rest of the
+           sleep still to do. */
+        if (r == QUARK_SLEEP_INTERRUPTED && (__quark_sig_interrupted() & QUARK_SIG_RAN)) {
             if (rem && !(flags & LX_TIMER_ABSTIME)) {
                 now = __syscall0(SYS_TICKS);
                 unsigned long left = now < deadline ? deadline - now : 0;
@@ -673,7 +675,7 @@ static long set_identity(unsigned long how, int shift, long id) {
             return (wait);                                               \
         }                                                                \
         unsigned long saved_ = __quark_sig_swap_mask(*under_);           \
-        long r_ = __quark_sig_deliver() ? -LX_EINTR : (wait);            \
+        long r_ = (__quark_sig_deliver() & QUARK_SIG_RAN) ? -LX_EINTR : (wait); \
         __quark_sig_swap_mask(saved_);                                   \
         return r_;                                                       \
     } while (0)

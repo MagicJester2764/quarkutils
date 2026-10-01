@@ -1008,7 +1008,7 @@ long __quark_read(long fd, void *buf, unsigned long n) {
             }
             /* A read of a terminal that a signal ended. If a handler ran and
                did not ask for the read to go on, the read is over. */
-            if (__quark_sig_interrupted()) {
+            if (__quark_sig_interrupted() & QUARK_SIG_EINTR) {
                 return -LX_EINTR;
             }
         }
