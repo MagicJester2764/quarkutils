@@ -135,8 +135,19 @@ typedef unsigned long size_t;
 #define LX_fchdir           81
 #define LX_getuid          102
 #define LX_getgid          104
+#define LX_setuid          105
+#define LX_setgid          106
 #define LX_geteuid         107
 #define LX_getegid         108
+#define LX_setreuid        113
+#define LX_setregid        114
+#define LX_setgroups       116
+#define LX_setresuid       117
+#define LX_getresuid       118
+#define LX_setresgid       119
+#define LX_getresgid       120
+#define LX_setfsuid        122
+#define LX_setfsgid        123
 #define LX_arch_prctl      158
 #define LX_sched_getaffinity 204
 #define LX_futex           202
@@ -584,6 +595,21 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
     return count;
 }
 
+/* setuid and its relations: become `id`, by the kernel's call `how`, whose
+   answer for this task is `shift` bits up in what SYS_GET_UID says. */
+static long set_identity(unsigned long how, int shift, long id) {
+    if ((int)id == -1) {
+        return 0;
+    }
+    unsigned int now = (unsigned int)(__syscall0(SYS_GET_UID) >> shift);
+    if ((unsigned int)id == now) {
+        return 0;
+    }
+    return __syscall2(how, __syscall0(SYS_GETPID), (unsigned long)(unsigned int)id) == QUARK_ERR
+               ? -LX_EPERM
+               : 0;
+}
+
 /* Wait under another signal mask, as ppoll and pselect do: the mask goes in,
    whatever it lets through that was already waiting runs — and is an
    interruption, with no wait at all — and the mask comes back out. */
@@ -795,10 +821,10 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return a1 ? a1 : (long)__syscall0(SYS_GETPID);
     case LX_setpgid:
         return 0;
-    /* One user, in one group. */
+    /* In one group, its own. */
     case LX_getgroups:
         if (a1 > 0 && a2) {
-            *(unsigned int *)a2 = 0;
+            *(unsigned int *)a2 = (unsigned int)(__syscall0(SYS_GET_UID) & 0xFFFFFFFFUL);
         }
         return 1;
     case LX_getpriority:
@@ -848,12 +874,49 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return child == QUARK_ERR ? -LX_EAGAIN : (long)child;
     }
 
-    /* One user, and it is the one that started the program. */
+    /* Who this is. The kernel keeps one user and one group for a task, and
+       there is no set-user-id here to make the effective one differ: the
+       real, effective and saved ids are all that one. It answered 0 to all
+       four whoever asked, and never answered the three-at-once form at all —
+       which is the one bash asks, so its prompt was for nobody. */
     case LX_getuid:
     case LX_geteuid:
+        return (long)(__syscall0(SYS_GET_UID) >> 32);
     case LX_getgid:
     case LX_getegid:
+        return (long)(__syscall0(SYS_GET_UID) & 0xFFFFFFFFUL);
+    case LX_getresuid:
+    case LX_getresgid: {
+        unsigned long who = __syscall0(SYS_GET_UID);
+        unsigned int id = n == LX_getresuid ? (unsigned int)(who >> 32) : (unsigned int)who;
+        unsigned int *out[3] = { (unsigned int *)a1, (unsigned int *)a2, (unsigned int *)a3 };
+        for (int i = 0; i < 3; i++) {
+            if (!out[i]) {
+                return -LX_EFAULT;
+            }
+            *out[i] = id;
+        }
         return 0;
+    }
+    /* Becoming somebody else is a capability's to allow, and the kernel
+       says no without it. Asking to be who one already is is always fine,
+       which is all a program dropping privileges it has not got is doing.
+       -1 in the forms that take several means "leave this one". */
+    case LX_setuid:
+    case LX_setfsuid:
+        return set_identity(SYS_SET_UID, 32, a1);
+    case LX_setgid:
+    case LX_setfsgid:
+        return set_identity(SYS_SET_GID, 0, a1);
+    case LX_setreuid:
+    case LX_setresuid:
+        return set_identity(SYS_SET_UID, 32, (int)a2 != -1 ? a2 : a1);
+    case LX_setregid:
+    case LX_setresgid:
+        return set_identity(SYS_SET_GID, 0, (int)a2 != -1 ? a2 : a1);
+    case LX_setgroups:
+        /* One group, the task's own. */
+        return a1 <= 1 ? 0 : -LX_EPERM;
 
     case LX_exit:
         /* One thread: `pthread_exit`, and what a thread's start routine
