@@ -40,6 +40,7 @@ quark_rt::manifest!([
     CapReq::ioport(0xB004, 0xB004),
     CapReq::ioport(0xCF9, 0xCF9),
     CapReq::clock(),
+    CapReq::power(),
 ]);
 
 /// The slot a capability is made in before it is handed over.
@@ -317,6 +318,9 @@ fn bless(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> 
         give(child, syscall::CAP_TYPE_TASK_MGMT, 0, 0);
     }
     if may.has(Rights::POWER) {
+        give(child, syscall::CAP_TYPE_POWER, 0, 0);
+        // And the three ports a machine whose firmware says nothing of
+        // power is turned off by, where it is one that listens to them.
         for port in [0x604u64, 0xB004, 0xCF9] {
             give(child, syscall::CAP_TYPE_IOPORT, port, port);
         }

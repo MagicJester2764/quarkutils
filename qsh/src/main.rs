@@ -26,6 +26,8 @@ quark_rt::manifest!([
     CapReq::set_uid(),
     // And the right to set the clock, for `date -s`.
     CapReq::clock(),
+    // And to turn the machine off, for `shutdown`.
+    CapReq::power(),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

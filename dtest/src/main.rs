@@ -5339,6 +5339,17 @@ fn test_msi() {
     check("and every time it sends one", again == 3);
 }
 
+/// Turning the machine off is for whoever holds the right to, and this
+/// program does not: it asks for none in its manifest, and neither does the
+/// one it starts to try. That the checks are reached at all is most of what
+/// they say.
+fn test_power() {
+    println!("power:");
+    let tried = run(b"dchild", &[b"power"]);
+    check("a program that does not hold the right cannot turn the machine off, or start it again", tried.is_some());
+    check("and cannot make itself the right to", tried == Some(0));
+}
+
 /// The latest time any thread of this program has been told, how many times
 /// one was told an earlier time than that, and how many threads have
 /// finished asking.
@@ -5745,6 +5756,7 @@ pub extern "C" fn _start() -> ! {
         ("threads", test_threads),
         ("msi", test_msi),
         ("clock", test_clock),
+        ("power", test_power),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);

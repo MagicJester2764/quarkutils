@@ -56,6 +56,7 @@ typedef unsigned long size_t;
 #define LX_setpriority     141
 #define LX_setrlimit       160
 #define LX_sync            162
+#define LX_reboot          169
 #define LX_setxattr        188
 #define LX_lsetxattr       189
 #define LX_fsetxattr       190
@@ -1658,6 +1659,31 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return __quark_utimens(a1, (const char *)a2, (const long *)a3,
                                (a4 & LX_AT_SYMLINK_NOFOLLOW) != 0);
+
+    /* Off, and on again. The kernel does either for a program that holds
+       the right to — root's shell does, and what it starts — and what has
+       been written is this program's to have had recorded first (`sync`),
+       as it is on Linux. Linux also takes a command here that says what
+       Ctrl-Alt-Del is to do; there is nothing here for that to change. */
+    case LX_reboot: {
+        if ((unsigned int)a1 != 0xfee1dead) {
+            return -LX_EINVAL;
+        }
+        switch ((unsigned int)a3) {
+        case 0x01234567: /* restart */
+            __syscall1(SYS_POWER, 1);
+            return -LX_EPERM;
+        case 0x4321fedc: /* power off */
+        case 0xcdef0123: /* halt */
+            __syscall1(SYS_POWER, 0);
+            return -LX_EPERM;
+        case 0x89abcdef: /* Ctrl-Alt-Del restarts */
+        case 0x00000000: /* Ctrl-Alt-Del signals init */
+            return 0;
+        default:
+            return -LX_EINVAL;
+        }
+    }
 
     /* A write is answered before the filesystem has recorded it for good:
        its data is on the disk, and what says the file is that long waits a

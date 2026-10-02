@@ -5,10 +5,16 @@ use quark_rt::{args, println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// Signals every task to exit, then writes the ACPI poweroff ports — or, to
-// start the machine again, the reset control register.
+// Signals every task to exit, then asks the kernel to turn the machine off
+// or to start it again, which it does the way the firmware's tables say.
+//
+// The three ports are what this did before the kernel could, and what it
+// still does on a machine whose firmware says nothing of power: they are
+// the ones the machine QEMU pretends to be listens on, and on any other
+// they do nothing.
 quark_rt::manifest!([
     CapReq::task_mgmt(0),
+    CapReq::power(),
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
     CapReq::ioport(RESET_CONTROL, RESET_CONTROL),
@@ -20,11 +26,11 @@ const RESET_CONTROL: u16 = 0xCF9;
 
 const MAX_TASKS: usize = 64;
 
-/// ACPI PM1a Control register port (QEMU PIIX4 / i440fx).
+/// The power-management control register of the machine QEMU pretends to
+/// be (PIIX4), for a machine with no tables to say where its own is.
 const ACPI_PM1A_CNT: u16 = 0x604;
 
-/// S5 sleep value: SLP_EN (bit 13) | SLP_TYP=S5 (bits 10-12, value varies).
-/// QEMU i440fx/PIIX4 uses SLP_TYP=0 for S5, so just SLP_EN.
+/// "Sleep now", with the kind of sleep that machine calls off: 0.
 const ACPI_S5_VALUE: u16 = 1 << 13;
 
 #[unsafe(no_mangle)]
@@ -42,14 +48,11 @@ pub extern "C" fn _start() -> ! {
     }
     let my_tid = syscall::sys_getpid() as usize;
 
-    // Turning a machine off is a capability — the port that does it — and a
-    // session holds it or does not. Said before anything is ended: this used
-    // to end what it could, fail to turn the machine off, and leave whoever
-    // ran it with no session.
-    let port = if again { RESET_CONTROL } else { ACPI_PM1A_CNT } as u64;
+    // Turning a machine off is a capability, and a session holds it or does
+    // not. Said before anything is ended: this used to end what it could,
+    // fail to turn the machine off, and leave whoever ran it with no session.
     let may = (0..64).any(|slot| {
-        matches!(syscall::sys_cap_read(my_tid, slot), Ok(c) if c.valid
-            && c.cap_type == syscall::CAP_TYPE_IOPORT && c.param0 <= port && port <= c.param1)
+        matches!(syscall::sys_cap_read(my_tid, slot), Ok(c) if c.valid && c.cap_type == syscall::CAP_TYPE_POWER)
     });
     if !may {
         println!(
@@ -111,6 +114,9 @@ pub extern "C" fn _start() -> ! {
     }
 
     if again {
+        // The kernel's to do, and it always can. What follows is for a
+        // kernel that would not.
+        syscall::sys_restart();
         // A hard reset: say which kind, then ask for it.
         syscall::sys_ioport_write(RESET_CONTROL, 0x02);
         syscall::sys_ioport_write(RESET_CONTROL, 0x06);
@@ -118,14 +124,14 @@ pub extern "C" fn _start() -> ! {
         println!("shutdown: the machine would not reset; turning it off instead");
     }
 
-    // Phase 3: ACPI S5 power-off
+    // Phase 3: off. The kernel, by the firmware's tables; and where they do
+    // not say how, or it did not work, the ports.
+    syscall::sys_power_off();
     syscall::sys_ioport_write16(ACPI_PM1A_CNT, ACPI_S5_VALUE);
-
-    // If ACPI didn't work, try alternate QEMU ports
     syscall::sys_ioport_write16(0xB004, ACPI_S5_VALUE);
 
     // Last resort: HLT loop
-    println!("shutdown: ACPI power-off failed, system halted");
+    println!("shutdown: the machine would not turn off; it is halted");
     loop {
         core::hint::spin_loop();
     }

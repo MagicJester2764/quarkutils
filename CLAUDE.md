@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 708 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 710 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
@@ -260,11 +260,14 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   bootloader at runtime, so `init` grants it directly.
 - **A request a spawner cannot mint is skipped, and nothing says so.** A
   program that needs a capability needs it in every spawner above it:
-  `shutdown -r` writes the reset control register (port 0xCF9), and asked
+  `shutdown -r` wrote the reset control register (port 0xCF9), and asked
   for it, and the machine turned off instead — the port stopped at `login`,
   which handed the shell its ports one at a time, by hand. A session's
   capabilities come from `auth` now, so the chain is `auth`'s manifest, the
-  shell's (`qsh`) and `shutdown`'s. A program that "does nothing" is the
+  shell's (`qsh`) and `shutdown`'s — for the right to turn the machine off
+  (`CapReq::power()`), which is what `shutdown` asks the kernel with now,
+  as much as for the three ports it still falls back on where the
+  firmware's tables say nothing of power. A program that "does nothing" is the
   first thing to suspect of this — and a program that needs a capability
   looks for it and says so (`shutdown`: "this account may not turn the
   machine off") rather than trying and doing nothing.

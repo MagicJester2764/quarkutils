@@ -744,6 +744,17 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"quit"[..]) {
         syscall::sys_exit_code(0);
     }
+    // Try to turn the machine off, and to start it again, holding nothing
+    // that says this may — and to make itself something that does. A bit
+    // for each that was not refused, though one that was not is a machine
+    // that is no longer there to say so.
+    if quark_rt::args::argv(1) == Some(&b"power"[..]) {
+        const TRIAL_SLOT: usize = 40;
+        let made = syscall::sys_cap_mint(TRIAL_SLOT, syscall::CAP_TYPE_POWER, 0, 0).is_ok();
+        syscall::sys_power_off();
+        syscall::sys_restart();
+        syscall::sys_exit_code(made as i32);
+    }
     // Try to set the clock, an hour on, holding nothing that says this may:
     // 0 if it was refused, and 1 — having put it back — if it was not.
     if quark_rt::args::argv(1) == Some(&b"clockset"[..]) {

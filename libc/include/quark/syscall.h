@@ -219,6 +219,9 @@
 #define SYS_PIPE_PEER       232
 
 /* 0xF0  introspection */
+/* Turn the machine off (0) or start it again (1): for a holder of the right
+   to. It returns only if the machine is still on. In the hardware block. */
+#define SYS_POWER           119
 #define SYS_ABI_VERSION     240
 
 /* What the kernel returns for "no". Not an errno: each call says what it

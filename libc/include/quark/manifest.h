@@ -26,6 +26,7 @@
 #define QUARK_CAP_PHYS_ALLOC 5UL
 #define QUARK_CAP_SET_UID    6UL
 #define QUARK_CAP_CLOCK      11UL
+#define QUARK_CAP_POWER      12UL
 
 /* Each request is three words: what kind, and up to two parameters. */
 #define QUARK_CAP_IOPORT_RANGE(first, last) QUARK_CAP_IOPORT, (first), (last)

@@ -107,6 +107,13 @@ impl CapReq {
     pub const fn clock() -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_CLOCK, param0: 0, param1: 0 }
     }
+
+    /// Turn the machine off, and start it again (`sys_power_off`,
+    /// `sys_restart`). A session holds it if its account has the `power`
+    /// right.
+    pub const fn power() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_POWER, param0: 0, param1: 0 }
+    }
 }
 
 /// A manifest as it sits in the image: a header the scanner can recognise,

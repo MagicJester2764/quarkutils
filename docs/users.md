@@ -145,7 +145,7 @@ that the passwords are at no moment anybody's to read under either name.
 
 | Right | What a session of the account is handed |
 |---|---|
-| `power` | the ports that turn the machine off and restart it, and authority over every task (ending them is part of turning a machine off) |
+| `power` | the right to turn the machine off and restart it (and the three ports that do it on a machine whose firmware does not say how), and authority over every task (ending them is part of turning a machine off) |
 | `tasks` | authority over every task: ending anybody's program |
 | `become` | nothing at login. It lets `BLESS` with `OWN` succeed: the account becomes another on its own password |
 | `clock` | the right to set the date (`date -s`), which is the machine's and everybody's |
@@ -212,7 +212,7 @@ it started, whoever's.
   echoing for one line, on a pty and on the old console both. Zero the
   buffer when it has been used.
 - **A program that needs a capability its account was not given says so.**
-  `shutdown` looks for the port before it does anything and says "this
+  `shutdown` looks for the right before it does anything and says "this
   account may not turn the machine off". A program that just tries, and does
   nothing, is indistinguishable from one that is broken.
 - **Never decide by user id what a program may do.** A check of

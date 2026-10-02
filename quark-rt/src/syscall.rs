@@ -147,6 +147,7 @@ pub const SYS_IOPORT_REP: u64 = 115;
 pub const SYS_GETRANDOM: u64 = 116;
 pub const SYS_CPUS: u64 = 117;
 pub const SYS_MSI_ALLOC: u64 = 118;
+pub const SYS_POWER: u64 = 119;
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
@@ -1067,6 +1068,22 @@ pub fn sys_clock_wall() -> u64 {
 /// that keeps time while the machine is off.
 pub fn sys_clock_set(nanos: u64) -> Result<(), ()> {
     if unsafe { syscall1(SYS_CLOCK_SET, nanos) } == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Turn the machine off, the way its firmware says to. For a holder of the
+/// right (`CAP_TYPE_POWER`).
+///
+/// It comes back only if the machine is still on: the caller may not, or
+/// the firmware's tables do not say how. What the machine owes its disks
+/// is the caller's to see to first — `vfs::sync` — because the file servers
+/// are programs and the kernel stops nothing but what it runs.
+pub fn sys_power_off() {
+    unsafe { syscall1(SYS_POWER, 0) };
+}
+
+/// Start the machine again. It comes back only if the caller may not.
+pub fn sys_restart() {
+    unsafe { syscall1(SYS_POWER, 1) };
 }
 
 /// A timer that is a descriptor: readable once its time has come, and read
@@ -2072,6 +2089,9 @@ pub const CAP_TYPE_MEMOBJECT: u64 = 9;
 pub const CAP_TYPE_DEVICE_MEMORY: u64 = 10;
 /// The right to say what time it is (`sys_clock_set`).
 pub const CAP_TYPE_CLOCK: u64 = 11;
+/// The right to turn the machine off and to start it again
+/// (`sys_power_off`, `sys_restart`).
+pub const CAP_TYPE_POWER: u64 = 12;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -2199,7 +2219,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 15;
+pub const ABI_VERSION_MINOR: u32 = 16;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
