@@ -155,7 +155,12 @@ typedef unsigned long size_t;
 #define LX_futex           202
 #define LX_gettid          186
 #define LX_set_tid_address 218
+#define LX_clock_settime   227
 #define LX_clock_gettime   228
+#define LX_clock_getres    229
+#define LX_gettimeofday     96
+#define LX_settimeofday    164
+#define LX_time            201
 #define LX_exit_group      231
 #define LX_openat          257
 #define LX_faccessat       269
@@ -434,10 +439,23 @@ static long job_answer(unsigned long r) {
     return (long)r;
 }
 
+/* Which timer descriptors were made on the clock that says the date: a bit
+   for each descriptor. */
+static unsigned long timer_wall;
+
+/* Is `clock` one that says the date, rather than how long the machine has
+   been on? */
+static int wall_clock(long clock) {
+    return clock == LX_CLOCK_REALTIME || clock == LX_CLOCK_REALTIME_COARSE || clock == LX_CLOCK_TAI;
+}
+
 /* Sleep until `req` has passed on `clock` — or, with TIMER_ABSTIME, until
-   the clock reads `req`. Time here is a 100 Hz tick, so a sleep is rounded
-   up to whole ticks and one more, never ending early. It waits by receiving
-   from itself, which nobody sends to. */
+   the clock reads `req`. The kernel keeps the time to the nanosecond and
+   never ends a wait early, so what is asked for is what is waited. It waits
+   by receiving from itself, which nobody sends to.
+
+   A time on the clock that says the date is turned into how long from now
+   when the sleep begins: the date being set meanwhile does not move it. */
 static long do_sleep(long clock, long flags, const struct lx_timespec *req,
                      struct lx_timespec *rem) {
     if (!req) {
@@ -449,28 +467,26 @@ static long do_sleep(long clock, long flags, const struct lx_timespec *req,
     if (clock == LX_CLOCK_PROCESS_CPUTIME || clock == LX_CLOCK_THREAD_CPUTIME || clock < 0) {
         return -LX_EINVAL;
     }
-    unsigned long now = __syscall0(SYS_TICKS);
-    unsigned long ticks = (unsigned long)req->tv_sec * 100 +
-                          ((unsigned long)req->tv_nsec + 9999999UL) / 10000000UL;
+    unsigned long now = quark_now();
+    unsigned long asked = quark_nanos((unsigned long)req->tv_sec, (unsigned long)req->tv_nsec);
     unsigned long deadline;
     if (flags & LX_TIMER_ABSTIME) {
-        long boot = 0;
-        if (clock == LX_CLOCK_REALTIME || clock == LX_CLOCK_REALTIME_COARSE || clock == LX_CLOCK_TAI) {
-            boot = (long)__syscall0(SYS_BOOT_TIME);
-        }
-        long since_boot = req->tv_sec - boot;
-        if (since_boot < 0) {
+        unsigned long reads = wall_clock(clock) ? __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL) : now;
+        if (asked <= reads) {
             return 0;
         }
-        deadline = (unsigned long)since_boot * 100 +
-                   ((unsigned long)req->tv_nsec + 9999999UL) / 10000000UL;
+        deadline = now + (asked - reads);
     } else {
-        deadline = now + ticks + (ticks ? 1 : 0);
+        deadline = now + asked;
+    }
+    if (deadline < now) {
+        deadline = ~0UL;
     }
     unsigned long self = __syscall0(SYS_GETPID);
-    while ((now = __syscall0(SYS_TICKS)) < deadline) {
+    while ((now = quark_now()) < deadline) {
         struct quark_msg m;
-        unsigned long r = __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, deadline - now);
+        unsigned long r = __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m,
+                                     quark_span(deadline - now));
         /* A signal ended the sleep. If a handler ran, that is the sleep over,
            with what was left of it said — a sleep is never taken up again,
            whatever the handler asked for. If none did, the signal is blocked
@@ -478,10 +494,10 @@ static long do_sleep(long clock, long flags, const struct lx_timespec *req,
            sleep still to do. */
         if (r == QUARK_SLEEP_INTERRUPTED && (__quark_sig_interrupted() & QUARK_SIG_RAN)) {
             if (rem && !(flags & LX_TIMER_ABSTIME)) {
-                now = __syscall0(SYS_TICKS);
+                now = quark_now();
                 unsigned long left = now < deadline ? deadline - now : 0;
-                rem->tv_sec = (long)(left / 100);
-                rem->tv_nsec = (long)(left % 100) * 10000000L;
+                rem->tv_sec = (long)(left / 1000000000UL);
+                rem->tv_nsec = (long)(left % 1000000000UL);
             }
             return -LX_EINTR;
         }
@@ -588,10 +604,25 @@ static long do_sysinfo(unsigned long *out) {
     return 0;
 }
 
+/* How long a wait is, as `__quark_poll` and `__quark_epoll_wait` take it:
+   nanoseconds, and for ever when it is negative. From seconds and
+   nanoseconds, which are never for ever; and from the milliseconds `poll`
+   and `epoll_wait` say it in, which are when they are negative. */
+static long wait_ns(long sec, long nsec) {
+    if (sec < 0 || nsec < 0) {
+        return 0;
+    }
+    return (long)quark_nanos((unsigned long)sec, (unsigned long)nsec);
+}
+
+static long wait_ms(int ms) {
+    return ms < 0 ? -1 : (long)ms * 1000000L;
+}
+
 /* select, over the same wait poll uses. An fd_set is an array of words, one
    bit a descriptor. */
 static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned long *ex,
-                      long timeout_ms) {
+                      long timeout_ns) {
     struct { int fd; short events; short revents; } p[32];
     long n = 0;
     if (nfds < 0 || nfds > 1024) {
@@ -621,7 +652,7 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
         p[n].revents = 0;
         n++;
     }
-    long got = __quark_poll(p, n, timeout_ms);
+    long got = __quark_poll(p, n, timeout_ns);
     if (got < 0) {
         return got;
     }
@@ -656,20 +687,14 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
     return count;
 }
 
-/* A length of time as ticks, for an alarm: rounded up to a whole tick and
-   then one more, because the tick under way is part of the way through and a
-   timer must not run out early. No time at all is no ticks, which is how an
-   alarm is turned off. */
-static unsigned long time_ticks(unsigned long sec, unsigned long usec) {
-    unsigned long ticks = sec * 100 + (usec + 9999) / 10000;
-    return ticks ? ticks + 1 : 0;
-}
-
-/* And the ticks left of an alarm as the time left of it: without that one
-   more, or `alarm(10)` asked at once how long it has would say eleven. One
-   tick left is still one: none means there is no alarm. */
-static unsigned long ticks_left(unsigned long ticks) {
-    return ticks > 1 ? ticks - 1 : ticks;
+/* Set the program's alarm for `first` nanoseconds from now and every
+   `every` after that — or, with `ask`, leave it — and say how it stood, in
+   nanoseconds: what was left of it, and what it repeated at. No time at all
+   is no alarm, which is how one is turned off. */
+static unsigned long do_alarm(unsigned long first, unsigned long every, int ask, unsigned long was[2]) {
+    was[0] = was[1] = 0;
+    return __syscall4(SYS_SIG_ALARM, first ? quark_span(first) : 0, every ? quark_span(every) : 0,
+                      ask ? QUARK_ALARM_ASK : 0, (unsigned long)was);
 }
 
 /* setitimer and getitimer. An itimerval is two timevals, the interval and
@@ -681,29 +706,28 @@ static long do_itimer(long which, const long *set, long *old) {
     if (which != 0 /* ITIMER_REAL */) {
         return -LX_EINVAL;
     }
-    unsigned long was;
+    unsigned long was[2], r;
     if (set) {
         if (set[0] < 0 || set[2] < 0 || set[1] < 0 || set[1] >= 1000000 || set[3] < 0
             || set[3] >= 1000000) {
             return -LX_EINVAL;
         }
-        /* A repeat is a period and not a wait: no tick is added to it, or a
-           timer asked to go every fifty milliseconds would go every sixty. */
-        unsigned long every = (unsigned long)set[0] * 100 + ((unsigned long)set[1] + 9999) / 10000;
-        was = __syscall3(SYS_SIG_ALARM,
-                         time_ticks((unsigned long)set[2], (unsigned long)set[3]), every, 0);
+        r = do_alarm(quark_nanos((unsigned long)set[2], (unsigned long)set[3] * 1000UL),
+                     quark_nanos((unsigned long)set[0], (unsigned long)set[1] * 1000UL), 0, was);
     } else {
-        was = __syscall3(SYS_SIG_ALARM, 0, 0, QUARK_ALARM_ASK);
+        r = do_alarm(0, 0, 1, was);
     }
-    if (was == QUARK_ERR) {
+    if (r == QUARK_ERR) {
         return -LX_EINVAL;
     }
     if (old) {
-        unsigned long left = ticks_left(was & 0xFFFFFFFFUL), every = was >> 32;
-        old[0] = (long)(every / 100);
-        old[1] = (long)(every % 100) * 10000;
-        old[2] = (long)(left / 100);
-        old[3] = (long)(left % 100) * 10000;
+        /* In microseconds, rounded up: time still to come is never said to
+           be none. */
+        unsigned long left = (was[0] + 999) / 1000, every = (was[1] + 999) / 1000;
+        old[0] = (long)(every / 1000000);
+        old[1] = (long)(every % 1000000);
+        old[2] = (long)(left / 1000000);
+        old[3] = (long)(left % 1000000);
     }
     return 0;
 }
@@ -1186,11 +1210,9 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             unsigned long r;
             if (a4) {
                 const struct lx_timespec *ts = (const struct lx_timespec *)a4;
-                /* Rounded up: the PIT ticks at 100 Hz, and a wait that came
-                   back early would be a wait that did not happen. */
-                unsigned long ticks =
-                    (unsigned long)ts->tv_sec * 100 + (unsigned long)((ts->tv_nsec + 9999999) / 10000000);
-                r = __syscall3(SYS_FUTEX_WAIT_TIMEOUT, (unsigned long)a1, (unsigned long)a3, ticks);
+                unsigned long span =
+                    quark_span(quark_nanos((unsigned long)ts->tv_sec, (unsigned long)ts->tv_nsec));
+                r = __syscall3(SYS_FUTEX_WAIT_TIMEOUT, (unsigned long)a1, (unsigned long)a3, span);
             } else {
                 r = __syscall2(SYS_FUTEX_WAIT, (unsigned long)a1, (unsigned long)a3);
             }
@@ -1217,17 +1239,72 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (!ts) {
             return -LX_EFAULT;
         }
-        /* A 100 Hz tick counter, and the date the kernel read at boot. The
-           real-time clocks add that date; every other clock counts from boot,
-           which is what a monotonic clock is for. */
-        unsigned long ticks = __syscall0(SYS_TICKS);
-        long base = 0;
-        if (a1 == LX_CLOCK_REALTIME || a1 == LX_CLOCK_REALTIME_COARSE || a1 == LX_CLOCK_TAI) {
-            base = (long)__syscall0(SYS_BOOT_TIME);
+        /* The kernel's clock, in nanoseconds. The real-time clocks are the
+           date — the one read at boot, or set since — and every other clock
+           counts from boot, which is what a monotonic clock is for. On a
+           machine with no clock to say the date, the date is how long it
+           has been on. */
+        unsigned long now = wall_clock(a1) ? __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL) : 0;
+        if (!now) {
+            now = quark_now();
         }
-        ts->tv_sec = base + (long)(ticks / 100);
-        ts->tv_nsec = (long)((ticks % 100) * 10000000L);
+        ts->tv_sec = (long)(now / 1000000000UL);
+        ts->tv_nsec = (long)(now % 1000000000UL);
         return 0;
+    }
+    case LX_clock_getres: {
+        /* What the clock is kept in. How fine it really is depends on the
+           machine, and on one with nothing better it moves ten milliseconds
+           at a time; Linux says a nanosecond of a clock like that too. */
+        struct lx_timespec *ts = (struct lx_timespec *)a2;
+        if (ts) {
+            ts->tv_sec = 0;
+            ts->tv_nsec = 1;
+        }
+        return 0;
+    }
+    case LX_gettimeofday: {
+        long *tv = (long *)a1;
+        if (tv) {
+            unsigned long now = __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL);
+            if (!now) {
+                now = quark_now();
+            }
+            tv[0] = (long)(now / 1000000000UL);
+            tv[1] = (long)(now % 1000000000UL / 1000);
+        }
+        return 0;
+    }
+    case LX_time: {
+        unsigned long now = __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL);
+        if (!now) {
+            now = quark_now();
+        }
+        if (a1) {
+            *(long *)a1 = (long)(now / 1000000000UL);
+        }
+        return (long)(now / 1000000000UL);
+    }
+    /* Setting the date. It is the machine's, and whoever may set it holds
+       the capability to: a session of an account with the `clock` right,
+       and what such a session starts. The kernel writes it through to the
+       clock that keeps time while the machine is off. */
+    case LX_clock_settime:
+    case LX_settimeofday: {
+        const long *t = (const long *)(n == LX_clock_settime ? a2 : a1);
+        if (n == LX_clock_settime && !wall_clock(a1)) {
+            return -LX_EINVAL;
+        }
+        if (!t) {
+            /* settimeofday with only a time zone to say: there is none. */
+            return n == LX_settimeofday ? 0 : -LX_EFAULT;
+        }
+        long sub = n == LX_clock_settime ? t[1] : t[1] * 1000;
+        if (t[0] < 1 || t[0] >= 7258118400L || t[1] < 0 || sub >= 1000000000L) {
+            return -LX_EINVAL;
+        }
+        unsigned long r = __syscall1(SYS_CLOCK_SET, (unsigned long)t[0] * 1000000000UL + (unsigned long)sub);
+        return r == QUARK_ERR ? -LX_EPERM : 0;
     }
 
     case LX_nanosleep:
@@ -1256,14 +1333,26 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_ioctl(a1, (unsigned long)(unsigned int)a2, (unsigned long)a3);
     /* A deadline as a descriptor.
      *
-     * The clock and the flags are read and not honoured: there is one clock
-     * here, the tick, and a timerfd that is not close-on-exec is a
-     * distinction this system does not draw. The resolution is ten
-     * milliseconds, so anything asked for below that fires at the next tick —
-     * which is the next time anything happens at all. */
+     * The flags are read and not honoured: a timerfd that is not
+     * close-on-exec is a distinction this system does not draw. The kernel
+     * keeps its times to the nanosecond and fires it when it is due. Which
+     * clock it was made on matters for one thing, a time given as what the
+     * clock will read: the kernel's timers all count from boot, so a time
+     * on the clock that says the date is turned into how far off it is
+     * when it is set, and the date being set afterwards does not move it. */
     case LX_timerfd_create: {
         unsigned long fd = __syscall0(SYS_TIMER_CREATE);
-        return fd == QUARK_ERR ? -LX_EMFILE : (long)fd;
+        if (fd == QUARK_ERR) {
+            return -LX_EMFILE;
+        }
+        if (fd < MAX_FDS) {
+            if (wall_clock(a1)) {
+                __atomic_fetch_or(&timer_wall, 1UL << fd, __ATOMIC_SEQ_CST);
+            } else {
+                __atomic_fetch_and(&timer_wall, ~(1UL << fd), __ATOMIC_SEQ_CST);
+            }
+        }
+        return (long)fd;
     }
     case LX_timerfd_settime: {
         /* itimerspec: interval seconds and nanoseconds, then the same for the
@@ -1273,40 +1362,45 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             return -LX_EINVAL;
         }
         const long *it = (const long *)a3;
-        unsigned long interval = (unsigned long)(it[0] * 100 + it[1] / 10000000);
-        unsigned long first_s = (unsigned long)it[2];
-        unsigned long first_n = (unsigned long)it[3];
-        unsigned long first = first_s * 100 + first_n / 10000000;
-        if ((first_s || first_n) && first == 0) {
-            first = 1; /* sooner than a tick is the next tick */
+        if (it[0] < 0 || it[2] < 0 || it[1] < 0 || it[1] >= 1000000000L || it[3] < 0
+            || it[3] >= 1000000000L) {
+            return -LX_EINVAL;
         }
-        if (a2 & 1 /* TFD_TIMER_ABSTIME */) {
-            unsigned long now = __syscall0(SYS_TICKS);
-            first = first > now ? first - now : 1;
+        unsigned long interval = quark_nanos((unsigned long)it[0], (unsigned long)it[1]);
+        unsigned long first = quark_nanos((unsigned long)it[2], (unsigned long)it[3]);
+        if (first && (a2 & 1 /* TFD_TIMER_ABSTIME */)) {
+            /* What the timer's clock will read. A time already past is a
+               timer that fires at once. */
+            int wall = a1 >= 0 && a1 < MAX_FDS
+                       && (__atomic_load_n(&timer_wall, __ATOMIC_SEQ_CST) >> a1 & 1);
+            unsigned long reads = wall ? __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL) : quark_now();
+            first = first > reads ? first - reads : 1;
         }
         if (a4) {
             long *old = (long *)a4;
-            unsigned long left = __syscall1(SYS_TIMER_GET, (unsigned long)a1);
-            old[0] = (long)((left >> 32) / 100);
-            old[1] = (long)(((left >> 32) % 100) * 10000000);
-            old[2] = (long)((left & 0xFFFFFFFF) / 100);
-            old[3] = (long)(((left & 0xFFFFFFFF) % 100) * 10000000);
+            unsigned long was[2] = { 0, 0 };
+            __syscall2(SYS_TIMER_GET, (unsigned long)a1, (unsigned long)was);
+            old[0] = (long)(was[1] / 1000000000UL);
+            old[1] = (long)(was[1] % 1000000000UL);
+            old[2] = (long)(was[0] / 1000000000UL);
+            old[3] = (long)(was[0] % 1000000000UL);
         }
-        return __syscall3(SYS_TIMER_SET, (unsigned long)a1, first, interval) == QUARK_ERR
+        return __syscall3(SYS_TIMER_SET, (unsigned long)a1, first ? quark_span(first) : 0,
+                          interval ? quark_span(interval) : 0) == QUARK_ERR
                    ? -LX_EINVAL
                    : 0;
     }
     case LX_timerfd_gettime: {
-        unsigned long left = __syscall1(SYS_TIMER_GET, (unsigned long)a1);
-        if (left == QUARK_ERR) {
+        unsigned long was[2] = { 0, 0 };
+        if (__syscall2(SYS_TIMER_GET, (unsigned long)a1, (unsigned long)was) == QUARK_ERR) {
             return -LX_EINVAL;
         }
         if (a2) {
             long *out = (long *)a2;
-            out[0] = (long)((left >> 32) / 100);
-            out[1] = (long)(((left >> 32) % 100) * 10000000);
-            out[2] = (long)((left & 0xFFFFFFFF) / 100);
-            out[3] = (long)(((left & 0xFFFFFFFF) % 100) * 10000000);
+            out[0] = (long)(was[1] / 1000000000UL);
+            out[1] = (long)(was[1] % 1000000000UL);
+            out[2] = (long)(was[0] / 1000000000UL);
+            out[3] = (long)(was[0] % 1000000000UL);
         }
         return 0;
     }
@@ -1344,8 +1438,11 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
        out. musl's `alarm` is a `setitimer`; the call of that name is here for
        a program that makes it itself. */
     case LX_alarm: {
-        unsigned long was = __syscall3(SYS_SIG_ALARM, time_ticks((unsigned int)a1, 0), 0, 0);
-        return was == QUARK_ERR ? 0 : (long)((ticks_left(was & 0xFFFFFFFFUL) + 99) / 100);
+        /* What was left of the one before, in whole seconds: rounded up,
+           so that an alarm still to come is never said to be none. */
+        unsigned long was[2];
+        unsigned long r = do_alarm((unsigned long)(unsigned int)a1 * 1000000000UL, 0, 0, was);
+        return r == QUARK_ERR ? 0 : (long)((was[0] + 999999999UL) / 1000000000UL);
     }
     case LX_setitimer:
         return do_itimer(a1, (const long *)a2, (long *)a3);
@@ -1391,15 +1488,15 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_select: {
         const long *tv = (const long *)a5;
         return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4,
-                         tv ? tv[0] * 1000 + tv[1] / 1000 : -1);
+                         tv ? wait_ns(tv[0], tv[1] * 1000) : -1);
     }
     case LX_pselect6: {
         const long *ts = (const long *)a5;
-        long ms = ts ? ts[0] * 1000 + ts[1] / 1000000 : -1;
+        long ns = ts ? wait_ns(ts[0], ts[1]) : -1;
         /* The sixth argument is a pointer to a mask and its size. */
         const unsigned long *const *sixth = (const unsigned long *const *)a6;
         WAIT_UNDER(sixth ? sixth[0] : NULL,
-                   do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4, ms));
+                   do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4, ns));
     }
 
     /* The kernel's generator never blocks, so GRND_NONBLOCK, GRND_RANDOM
@@ -1697,21 +1794,21 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_recvmsg:
         return __quark_recvmsg(a1, (void *)a2, a3);
     case LX_poll:
-        return __quark_poll((void *)a1, a2, a3);
+        return __quark_poll((void *)a1, a2, wait_ms((int)a3));
     case LX_ppoll: {
         /* A timespec rather than milliseconds, and a mask to wait under. */
         const long *ts = (const long *)a3;
-        long ms = ts ? ts[0] * 1000 + ts[1] / 1000000 : -1;
-        WAIT_UNDER((const unsigned long *)a4, __quark_poll((void *)a1, a2, ms));
+        long ns = ts ? wait_ns(ts[0], ts[1]) : -1;
+        WAIT_UNDER((const unsigned long *)a4, __quark_poll((void *)a1, a2, ns));
     }
     case LX_epoll_pwait:
-        WAIT_UNDER((const unsigned long *)a5, __quark_epoll_wait(a1, (void *)a2, a3, a4));
+        WAIT_UNDER((const unsigned long *)a5, __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4)));
     case LX_epoll_create1:
         return __quark_epoll_create();
     case LX_epoll_ctl:
         return __quark_epoll_ctl(a1, a2, a3, (void *)a4);
     case LX_epoll_wait:
-        return __quark_epoll_wait(a1, (void *)a2, a3, a4);
+        return __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4));
 
     /* statx carries more than the VFS knows, and musl falls back to the plain
        stat calls when it is refused. */

@@ -1040,7 +1040,7 @@ removed.
   signal.c`), and one that handles a signal and then computes without a call
   is not interrupted by it. Nothing is raised when a terminal changes size.
   `alarm` and `setitimer` are the kernel's one alarm for a program, in real
-  time, to the tick: the timers that count time spent running are refused,
+  time, to the nanosecond: the timers that count time spent running are refused,
   and so is `timer_create`, which every program asked falls back from. A
   signal that is blocked and has no handler is not held back. The mask is the program's
   rather than a thread's, and is not kept across an exec.

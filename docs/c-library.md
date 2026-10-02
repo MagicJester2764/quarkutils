@@ -293,10 +293,24 @@ the font the console was given at boot. `openpty`, `forkpty`, `isatty`, `ttyname
 
 ## Time
 
-The clock ticks a hundred times a second, and every wait — a sleep, a
-timeout, an alarm — is rounded up to a tick. `clock_gettime` is finer than
-that only as far as counting ticks allows. The date is read from the machine's
-clock at boot, as UTC, and cannot be set.
+The clock is the kernel's, in nanoseconds: `clock_gettime` says what it
+says, and a wait — a sleep, a timeout, a timer, an alarm — is as long as was
+asked and no longer, where the machine can wake a program between two of the
+hundred ticks a second it used to wait for. (Where it cannot — a processor
+with no counter the kernel trusts — every time is a multiple of ten
+milliseconds and every wait ends on a tick, as they all once did.)
+`clock_getres` says a nanosecond either way, as Linux does of a clock like
+that.
+
+`CLOCK_MONOTONIC` counts from boot and `CLOCK_REALTIME` is the date, read
+from the machine's clock at boot as UTC. `clock_settime` and `settimeofday`
+set it, for a program that holds the right to — root's shell does, and what
+it starts — and are `EPERM` for one that does not. Setting the date moves no
+wait: a sleep until a time on the clock that says the date is turned into
+how long that is when the sleep begins. The clocks that count the time a
+program has spent running read as the time since boot.
+
+There is no time zone but what `TZ` spells out.
 
 ## What is refused
 

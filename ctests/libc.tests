@@ -37,3 +37,4 @@ idtest
 crypttest
 smptest
 watchtest
+clocktest

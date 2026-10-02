@@ -296,12 +296,12 @@ long __quark_sigpending(unsigned long *set, unsigned long size) {
     return 0;
 }
 
-/* Sleep until a signal arrives or `ticks` pass. The kernel ends this sleep
-   for a signal with a handler, including one raised a moment before it
-   began. */
-static void doze(unsigned long ticks) {
+/* Sleep until a signal arrives or `span` passes: ticks, or nanoseconds from
+   quark_span. The kernel ends this sleep for a signal with a handler,
+   including one raised a moment before it began. */
+static void doze(unsigned long span) {
     struct quark_msg m;
-    __syscall3(SYS_RECV_TIMEOUT, self(), (unsigned long)&m, ticks);
+    __syscall3(SYS_RECV_TIMEOUT, self(), (unsigned long)&m, span);
 }
 
 /* sigsuspend, and pause with no mask: wait, under `mask`, until a handler has
@@ -321,7 +321,7 @@ long __quark_sigsuspend(const unsigned long *mask, unsigned long size) {
         if ((pending & ~blocked) && (__quark_sig_deliver() & QUARK_SIG_RAN)) {
             break;
         }
-        doze(0xFFFFFFFFUL);
+        doze(~0UL);
     }
     __atomic_store_n(&blocked, saved, __ATOMIC_SEQ_CST);
     return -LX_EINTR;
@@ -338,8 +338,7 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
     unsigned long want = *set;
     unsigned long deadline = 0;
     if (timeout) {
-        deadline = __syscall0(SYS_TICKS) + (unsigned long)timeout[0] * 100 +
-                   ((unsigned long)timeout[1] + 9999999UL) / 10000000UL;
+        deadline = quark_now() + quark_nanos((unsigned long)timeout[0], (unsigned long)timeout[1]);
     }
     for (;;) {
         if (hint) {
@@ -366,13 +365,13 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
             __quark_sig_deliver();
             return -LX_EINTR;
         }
-        unsigned long left = 0xFFFFFFFFUL;
+        unsigned long left = ~0UL;
         if (timeout) {
-            unsigned long now = __syscall0(SYS_TICKS);
+            unsigned long now = quark_now();
             if (now >= deadline) {
                 return -LX_EAGAIN;
             }
-            left = deadline - now;
+            left = quark_span(deadline - now);
         }
         doze(left);
     }

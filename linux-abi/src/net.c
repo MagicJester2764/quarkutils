@@ -330,7 +330,7 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
     return total;
 }
 
-long __quark_poll(void *fds, long nfds, long timeout_ms) {
+long __quark_poll(void *fds, long nfds, long timeout_ns) {
     struct lx_pollfd *p = fds;
     if (nfds < 0 || (!p && nfds > 0)) {
         return -LX_EFAULT;
@@ -356,19 +356,13 @@ long __quark_poll(void *fds, long nfds, long timeout_ms) {
         }
     }
 
-    /* The PIT is 100 Hz, so a tick is ten milliseconds. A negative timeout
-       means wait for ever, which here is as long as the counter allows. */
-    unsigned long ticks;
-    if (timeout_ms < 0) {
-        ticks = 0xFFFFFFFFUL;
-    } else {
-        ticks = ((unsigned long)timeout_ms + 9) / 10;
-    }
-
-    unsigned long deadline = __syscall0(SYS_TICKS) + ticks;
+    /* A negative timeout means wait for ever, which here is as long as
+       there is. */
+    unsigned long span = timeout_ns < 0 ? ~0UL : quark_span((unsigned long)timeout_ns);
+    unsigned long deadline = timeout_ns < 0 ? 0 : quark_now() + (unsigned long)timeout_ns;
     unsigned long n;
     for (;;) {
-        n = __syscall3(SYS_POLL, (unsigned long)q, (unsigned long)nfds, ticks);
+        n = __syscall3(SYS_POLL, (unsigned long)q, (unsigned long)nfds, span);
         if (n != QUARK_INTERRUPTED) {
             break;
         }
@@ -378,9 +372,9 @@ long __quark_poll(void *fds, long nfds, long timeout_ms) {
         if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
             return -LX_EINTR;
         }
-        if (timeout_ms >= 0) {
-            unsigned long now = __syscall0(SYS_TICKS);
-            ticks = now < deadline ? deadline - now : 0;
+        if (timeout_ns >= 0) {
+            unsigned long now = quark_now();
+            span = quark_span(now < deadline ? deadline - now : 0);
         }
     }
     if (n == QUARK_ERR) {
@@ -460,7 +454,7 @@ struct qw_ready {
     unsigned int pad;
 };
 
-long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms) {
+long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns) {
     struct lx_epoll_event *out = events;
     if (!out || maxevents <= 0) {
         return -LX_EINVAL;
@@ -470,27 +464,21 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms
     }
 
     struct qw_ready ready[MAX_POLL];
-    unsigned long ticks;
-    if (timeout_ms < 0) {
-        ticks = 0xFFFFFFFFUL;
-    } else {
-        ticks = ((unsigned long)timeout_ms + 9) / 10;
-    }
-
-    unsigned long deadline = __syscall0(SYS_TICKS) + ticks;
+    unsigned long span = timeout_ns < 0 ? ~0UL : quark_span((unsigned long)timeout_ns);
+    unsigned long deadline = timeout_ns < 0 ? 0 : quark_now() + (unsigned long)timeout_ns;
     unsigned long n;
     for (;;) {
         n = __syscall4(SYS_POLLSET_WAIT, (unsigned long)epfd, (unsigned long)ready,
-                       (unsigned long)maxevents, ticks);
+                       (unsigned long)maxevents, span);
         if (n != QUARK_INTERRUPTED) {
             break;
         }
         if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
             return -LX_EINTR;
         }
-        if (timeout_ms >= 0) {
-            unsigned long now = __syscall0(SYS_TICKS);
-            ticks = now < deadline ? deadline - now : 0;
+        if (timeout_ns >= 0) {
+            unsigned long now = quark_now();
+            span = quark_span(now < deadline ? deadline - now : 0);
         }
     }
     if (n == QUARK_ERR) {

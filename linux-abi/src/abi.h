@@ -180,9 +180,12 @@ long __quark_pipe(int *fds, long flags);
 long __quark_socketpair(long domain, long type, long protocol, int *sv);
 long __quark_sendmsg(long fd, const void *msg, long flags);
 long __quark_recvmsg(long fd, void *msg, long flags);
-long __quark_poll(void *fds, long nfds, long timeout_ms);
+/* How long these two wait is in nanoseconds, and negative is for ever:
+   `poll` and `epoll_wait` say milliseconds, `ppoll` and `pselect` a
+   timespec, and the kernel keeps what any of them says to the nanosecond. */
+long __quark_poll(void *fds, long nfds, long timeout_ns);
 long __quark_epoll_create(void);
 long __quark_epoll_ctl(long epfd, long op, long fd, void *event);
-long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ms);
+long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns);
 
 #endif
