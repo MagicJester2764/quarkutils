@@ -69,6 +69,7 @@
 #define QUARK_VFS_OPEN_READ    128UL  /* the descriptor may read */
 #define QUARK_VFS_OPEN_WRITE   256UL  /* the descriptor may write */
 #define QUARK_VFS_OPEN_NOWAIT  512UL  /* a named pipe: do not wait for the other end */
+#define QUARK_VFS_OPEN_ASK    2048UL  /* only to be asked about: needs no right to read it */
 
 /* Set in a word of permission bits to say they are meant: a word of 0 is a
    caller that says nothing, and gets 0644 for a file and 0755 for a

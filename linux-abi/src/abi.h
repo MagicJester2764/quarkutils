@@ -16,6 +16,7 @@
 #define LX_ESPIPE   29
 #define LX_EROFS    30
 #define LX_ENOSYS   38
+#define LX_EAFNOSUPPORT 97
 #define LX_EACCES   13
 #define LX_EIO       5
 #define LX_ENOTDIR  20

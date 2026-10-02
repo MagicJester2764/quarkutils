@@ -157,6 +157,13 @@
 #define QUARK_OBJECT_SHARED 2UL
 #define QUARK_OBJECT_EXEC   4UL
 #define SYS_CAP_DELETE      84
+/* What one slot of a task's capabilities holds: arg0 a task, arg1 the slot,
+   arg2 four words for its kind, its two parameters and whether it is live.
+   A task may read its own. */
+#define SYS_CAP_READ        92
+#define QUARK_CSPACE_SLOTS  64UL
+/* The kind that lets its holder say who a task is. */
+#define QUARK_CAP_TYPE_SET_UID 6UL
 
 /* 0xA0  kernel console */
 #define SYS_WRITE           160

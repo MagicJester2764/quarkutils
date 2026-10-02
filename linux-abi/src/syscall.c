@@ -114,6 +114,7 @@ typedef unsigned long size_t;
 #define LX_eventfd2        290
 #define LX_pipe2           293
 #define LX_socketpair       53
+#define LX_socket           41
 #define LX_fadvise64       221
 #define LX_getpid           39
 #define LX_getppid         110
@@ -677,6 +678,37 @@ static long set_identity(unsigned long how, int shift, long id) {
                : 0;
 }
 
+/* Give up the right to say who a task is: every capability of that kind
+ * this task holds.
+ *
+ * The kernel keeps one user for a task, and what lets a program change it is
+ * a capability, not being user 0. So a program that was root and has made
+ * itself somebody else still holds what would make it root again — and the
+ * one thing `setuid` promises is that it cannot. Unix keeps a saved id to
+ * decide that; here the capability is the saved id. It is kept across a
+ * change that Unix would let a program undo (`seteuid`, which leaves the
+ * real and saved ids alone) and given up at one it would not. */
+static void forget_set_uid(void) {
+    unsigned long me = __syscall0(SYS_GETPID);
+    for (unsigned long slot = 0; slot < QUARK_CSPACE_SLOTS; slot++) {
+        unsigned long cap[4];
+        if (__syscall3(SYS_CAP_READ, me, slot, (unsigned long)cap) != QUARK_ERR && cap[3] &&
+            cap[0] == QUARK_CAP_TYPE_SET_UID) {
+            __syscall1(SYS_CAP_DELETE, slot);
+        }
+    }
+}
+
+/* Become user `id`; and if `for_good`, and that is not user 0, be unable to
+   become anybody else afterwards. */
+static long set_user(long id, int for_good) {
+    long r = set_identity(SYS_SET_UID, 32, id);
+    if (r == 0 && for_good && (unsigned int)(__syscall0(SYS_GET_UID) >> 32) != 0) {
+        forget_set_uid();
+    }
+    return r;
+}
+
 /* Wait under another signal mask, as ppoll and pselect do: the mask goes in,
    whatever it lets through that was already waiting runs — and is an
    interruption, with no wait at all — and the mask comes back out. */
@@ -925,12 +957,30 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return job_answer(__syscall3(SYS_PGROUP, QUARK_PGROUP_SET, (unsigned long)a1,
                                      (unsigned long)a2));
-    /* In one group, its own. */
-    case LX_getgroups:
-        if (a1 > 0 && a2) {
-            *(unsigned int *)a2 = (unsigned int)(__syscall0(SYS_GET_UID) & 0xFFFFFFFFUL);
+    /* The groups a task is in besides its own. Asked with no room, it is
+       being asked how many there are; with too little, that is an error and
+       nothing is written. */
+    case LX_getgroups: {
+        unsigned int in[QUARK_MAX_GROUPS];
+        unsigned long count =
+            __syscall4(SYS_GROUPS, QUARK_GROUPS_GET, 0, (unsigned long)in, QUARK_MAX_GROUPS);
+        if (count == QUARK_ERR || count > QUARK_MAX_GROUPS) {
+            return -LX_EINVAL;
         }
-        return 1;
+        if (a1 == 0) {
+            return (long)count;
+        }
+        if (a1 < 0 || (unsigned long)a1 < count) {
+            return -LX_EINVAL;
+        }
+        if (!a2) {
+            return -LX_EFAULT;
+        }
+        for (unsigned long i = 0; i < count; i++) {
+            ((unsigned int *)a2)[i] = in[i];
+        }
+        return (long)count;
+    }
     case LX_getpriority:
         return 20; /* the raw call's "nice 0" */
     case LX_setpriority:
@@ -998,20 +1048,50 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
        which is all a program dropping privileges it has not got is doing.
        -1 in the forms that take several means "leave this one". */
     case LX_setuid:
+        /* All three of Unix's ids at once: there is no way back. */
+        return set_user(a1, 1);
     case LX_setfsuid:
-        return set_identity(SYS_SET_UID, 32, a1);
+        return set_user(a1, 0);
     case LX_setgid:
     case LX_setfsgid:
         return set_identity(SYS_SET_GID, 0, a1);
+    /* The forms that name the ids one by one. The effective one is who the
+       program is; it is for good when the real one goes with it — and, in
+       the form that names the saved one, when that does too. A program that
+       changes only the effective one is keeping the way back, and has it. */
     case LX_setreuid:
+        return set_user((int)a2 != -1 ? a2 : a1, (int)a1 != -1 && (int)a1 != 0);
     case LX_setresuid:
-        return set_identity(SYS_SET_UID, 32, (int)a2 != -1 ? a2 : a1);
+        return set_user((int)a2 != -1 ? a2 : a1,
+                        (int)a1 != -1 && (int)a1 != 0 && (int)a3 != -1 && (int)a3 != 0);
     case LX_setregid:
     case LX_setresgid:
         return set_identity(SYS_SET_GID, 0, (int)a2 != -1 ? a2 : a1);
-    case LX_setgroups:
-        /* One group, the task's own. */
-        return a1 <= 1 ? 0 : -LX_EPERM;
+    /* The groups besides its own, which are part of who a task is: the
+       kernel refuses without the capability, as it does a change of user.
+       Saying what is already so needs nothing. */
+    case LX_setgroups: {
+        if (a1 < 0 || a1 > QUARK_MAX_GROUPS) {
+            return -LX_EINVAL;
+        }
+        if (a1 > 0 && !a2) {
+            return -LX_EFAULT;
+        }
+        unsigned int in[QUARK_MAX_GROUPS];
+        unsigned long count =
+            __syscall4(SYS_GROUPS, QUARK_GROUPS_GET, 0, (unsigned long)in, QUARK_MAX_GROUPS);
+        int same = count == (unsigned long)a1;
+        for (long i = 0; same && i < a1; i++) {
+            same = in[i] == ((const unsigned int *)a2)[i];
+        }
+        if (same) {
+            return 0;
+        }
+        return __syscall4(SYS_GROUPS, QUARK_GROUPS_SET, 0, (unsigned long)a2, (unsigned long)a1) ==
+                       QUARK_ERR
+                   ? -LX_EPERM
+                   : 0;
+    }
 
     case LX_exit:
         /* One thread: `pthread_exit`, and what a thread's start routine
@@ -1539,6 +1619,15 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_pipe((int *)a1, a2);
     case LX_socketpair:
         return __quark_socketpair(a1, a2, a3, (int *)a4);
+    /* A socket by itself, to be bound or connected by a name: there are
+       none, of any family. Said as "that family is not supported", which is
+       the answer a program has something to do about — the C library asks a
+       name service daemon who a user is before it concludes there is no
+       such user, takes this for "there is no daemon", and reports nobody
+       found. Told "no such call" it reported that instead, and `id nobody`
+       said the function was not implemented. */
+    case LX_socket:
+        return -LX_EAFNOSUPPORT;
     case LX_sendmsg:
         return __quark_sendmsg(a1, (const void *)a2, a3);
     case LX_recvmsg:

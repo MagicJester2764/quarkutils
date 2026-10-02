@@ -33,3 +33,5 @@ detachtest
 blktest
 mounttest
 synctest
+idtest
+crypttest

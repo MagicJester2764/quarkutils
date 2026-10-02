@@ -370,10 +370,16 @@ long __quark_kill(long pid, long sig) {
                                      QUARK_RAISE_GROUP);
         return r == QUARK_ERR ? -LX_ESRCH : r == QUARK_NOT_ALLOWED ? -LX_EPERM : 0;
     }
-    return __syscall3(SYS_SIG_RAISE, (unsigned long)pid, (unsigned long)sig, QUARK_RAISE_BY_PID) ==
-                   QUARK_ERR
-               ? -LX_ESRCH
-               : 0;
+    if (__syscall3(SYS_SIG_RAISE, (unsigned long)pid, (unsigned long)sig, QUARK_RAISE_BY_PID) !=
+        QUARK_ERR) {
+        return 0;
+    }
+    /* The kernel says no one way, for a process that is not there and for
+       one that is somebody else's. Which it was is what the caller is told
+       apart by — `kill -0` asks exactly that — and a process that has a
+       group is a process that is there. */
+    return __syscall2(SYS_PGROUP, QUARK_PGROUP_GET, (unsigned long)pid) == QUARK_ERR ? -LX_ESRCH
+                                                                                     : -LX_EPERM;
 }
 
 /* Whether the program has `sig` blocked. The mask is kept here and nowhere

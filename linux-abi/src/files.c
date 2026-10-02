@@ -717,9 +717,12 @@ long __quark_stat(long dirfd, const char *path, void *statbuf, int follow) {
     if (bad) {
         return bad;
     }
-    /* A handle of this program's own, for as long as the question takes. */
+    /* A handle of this program's own, for as long as the question takes —
+       and one that is only asked about, which takes no right to read the
+       file: `ls -l` says whose a file is whether or not it may be opened. */
     struct quark_vfs_file info;
-    int err = quark_vfs_open_at(base, path, follow ? 0 : QUARK_VFS_OPEN_NOFOLLOW, &info);
+    int err = quark_vfs_open_at(base, path,
+                                QUARK_VFS_OPEN_ASK | (follow ? 0 : QUARK_VFS_OPEN_NOFOLLOW), &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -928,7 +931,7 @@ static long fill_statfs(unsigned long handle, unsigned char *out) {
    opened it: a mounted one answers for itself. */
 long __quark_statfs(const char *path, void *buf) {
     struct quark_vfs_file info;
-    int err = quark_vfs_open(path, 0, &info);
+    int err = quark_vfs_open(path, QUARK_VFS_OPEN_ASK, &info);
     if (err) {
         return vfs_errno(err);
     }
@@ -1120,8 +1123,10 @@ long __quark_access(long dirfd, const char *path, long mode) {
     if (bad) {
         return bad;
     }
+    /* Asked about, not opened to read: whether it may be read is the
+       answer wanted, and not a condition of being told. */
     struct quark_vfs_file info;
-    int err = quark_vfs_open_at(base, path, 0, &info);
+    int err = quark_vfs_open_at(base, path, QUARK_VFS_OPEN_ASK, &info);
     if (err) {
         return vfs_errno(err);
     }

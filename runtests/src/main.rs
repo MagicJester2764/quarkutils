@@ -26,7 +26,7 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 
 // The same authority the shell has, because this does what the shell does:
 // start programs and give them what their manifests ask for.
-quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
+quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64), CapReq::set_uid()]);
 
 /// Where a program's image is read to before it is loaded. Freed each time.
 const IMAGE_AT: usize = 0x9A_0000_0000;
