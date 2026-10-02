@@ -804,7 +804,11 @@ fn run_line(line: &[u8], vfs_tid: usize, input_tid: usize) {
         match parse_usize(tid_arg) {
             Some(tid) => {
                 if syscall::sys_signal(tid, sig).is_err() {
-                    println!("kill: failed to signal task {}", tid);
+                    // Refused is not the same as not there.
+                    match syscall::sys_task_info(tid) {
+                        Ok((_, _, owner)) => println!("kill: task {} is user {}'s, and not this account's to end", tid, owner),
+                        Err(()) => println!("kill: there is no task {}", tid),
+                    }
                 }
             }
             None => println!("usage: kill [-9] <tid>"),
