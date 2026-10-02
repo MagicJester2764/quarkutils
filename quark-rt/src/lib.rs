@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod args;
 pub mod auth;
 pub mod block;
+pub mod calendar;
 pub mod console;
 pub mod crypt;
 pub mod font;

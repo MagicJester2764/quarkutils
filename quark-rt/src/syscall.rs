@@ -182,6 +182,8 @@ pub const SYS_EVENT_CREATE: u64 = 131;
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
 pub const SYS_BOOT_TIME: u64 = 145;
+pub const SYS_CLOCK: u64 = 149;
+pub const SYS_CLOCK_SET: u64 = 150;
 
 // --- 0xB0  sockets ---
 pub const SYS_SOCK_FD: u64 = 176;
@@ -973,20 +975,45 @@ pub fn sys_futex_wake(addr: *const u32, max_wake: usize) -> u64 {
 /// Returned by [`sys_futex_wait_timeout`] when the deadline passed.
 pub const FUTEX_TIMED_OUT: u64 = 2;
 
-/// Wait, giving up after `timeout_ticks` (100 Hz, so 10 ms each).
+/// The bit that makes a span of time a count of nanoseconds.
 ///
-/// Returns 0 if woken, 1 if the word already differed, [`FUTEX_TIMED_OUT`] if
-/// the deadline passed. A timeout of 0 checks the word without blocking.
-pub fn sys_futex_wait_timeout(addr: *const u32, expected: u32, timeout_ticks: u64) -> u64 {
-    unsafe { syscall3(SYS_FUTEX_WAIT_TIMEOUT, addr as u64, expected as u64, timeout_ticks) }
+/// Every call that takes how long — a timeout, a timer, an alarm — takes a
+/// *span*: a count of ticks, hundredths of a second, as all of them always
+/// did, or with this bit set a count of nanoseconds. [`ns`] makes the
+/// second kind.
+pub const SPAN_NS: u64 = 1 << 63;
+
+/// One tick, in nanoseconds.
+pub const TICK_NS: u64 = 10_000_000;
+
+/// A span of `nanos` nanoseconds, for any call that takes one. A time too
+/// long to say this way — 292 years — is as long as can be said.
+pub const fn ns(nanos: u64) -> u64 {
+    if nanos >= SPAN_NS { u64::MAX } else { SPAN_NS | nanos }
 }
 
-/// Receive with timeout.
+/// A span as long as `time`.
+pub fn span_of(time: core::time::Duration) -> u64 {
+    let nanos = time.as_nanos();
+    ns(if nanos > u64::MAX as u128 { u64::MAX } else { nanos as u64 })
+}
+
+/// Wait, giving up after `timeout`, a span: ticks, or nanoseconds from
+/// [`ns`].
+///
+/// Returns 0 if woken, 1 if the word already differed, [`FUTEX_TIMED_OUT`] if
+/// the deadline passed. A timeout of no time checks the word without
+/// blocking.
+pub fn sys_futex_wait_timeout(addr: *const u32, expected: u32, timeout: u64) -> u64 {
+    unsafe { syscall3(SYS_FUTEX_WAIT_TIMEOUT, addr as u64, expected as u64, timeout) }
+}
+
+/// Receive with timeout, a span: ticks, or nanoseconds from [`ns`].
 /// Returns Ok(()) if a message was received (written to `msg`),
 /// Err(1) on timeout, Err(u64::MAX) on error.
-pub fn sys_recv_timeout(from: usize, msg: &mut crate::ipc::Message, timeout_ticks: u64) -> Result<(), u64> {
+pub fn sys_recv_timeout(from: usize, msg: &mut crate::ipc::Message, timeout: u64) -> Result<(), u64> {
     let ret = unsafe {
-        syscall3(SYS_RECV_TIMEOUT, from as u64, msg as *mut _ as u64, timeout_ticks)
+        syscall3(SYS_RECV_TIMEOUT, from as u64, msg as *mut _ as u64, timeout)
     };
     match ret {
         0 => Ok(()),
@@ -994,25 +1021,92 @@ pub fn sys_recv_timeout(from: usize, msg: &mut crate::ipc::Message, timeout_tick
     }
 }
 
-/// Read the kernel PIT tick counter (100 Hz, 10 ms per tick).
-/// Seconds since 1970 when tick 0 was counted, or 0 if the machine has no
-/// clock. Add `sys_ticks() / 100` for the time now.
+/// Seconds since 1970 when the machine was started, or 0 if it has no
+/// clock. Add `sys_ticks() / 100` for the time now, to the second;
+/// [`sys_clock_wall`] says it to the nanosecond.
 pub fn sys_boot_time() -> u64 {
     unsafe { syscall0(SYS_BOOT_TIME) }
 }
 
 /// Seconds since 1970, or since boot on a machine with no clock.
 pub fn unix_time() -> u64 {
-    sys_boot_time() + sys_ticks() / 100
+    unix_ns() / 1_000_000_000
 }
 
+/// Nanoseconds since 1970, or since boot on a machine with no clock.
+pub fn unix_ns() -> u64 {
+    match sys_clock_wall() {
+        0 => sys_clock(),
+        wall => wall,
+    }
+}
+
+/// The time since boot, in ticks: hundredths of a second.
 pub fn sys_ticks() -> u64 {
     unsafe { syscall0(SYS_TICKS) }
 }
 
-/// Sleep for `ticks` PIT ticks (each tick = 10 ms at 100 Hz).
-pub fn sleep_ticks(ticks: u64) {
-    if ticks == 0 {
+/// The time since boot, in nanoseconds. It only goes forward, and it is
+/// what every wait is measured by.
+///
+/// As fine as the machine's clock is: well under a microsecond where the
+/// processor has a counter the kernel can keep time by, and ten
+/// milliseconds where it has not.
+pub fn sys_clock() -> u64 {
+    unsafe { syscall1(SYS_CLOCK, 0) }
+}
+
+/// The date: nanoseconds since 1970, or 0 on a machine with no clock to say.
+/// It moves when somebody sets it ([`sys_clock_set`]).
+pub fn sys_clock_wall() -> u64 {
+    unsafe { syscall1(SYS_CLOCK, 1) }
+}
+
+/// Say what the date is: `nanos` nanoseconds since 1970, now. For a holder
+/// of the right to (`CAP_TYPE_CLOCK`). The kernel writes it to the clock
+/// that keeps time while the machine is off.
+pub fn sys_clock_set(nanos: u64) -> Result<(), ()> {
+    if unsafe { syscall1(SYS_CLOCK_SET, nanos) } == 0 { Ok(()) } else { Err(()) }
+}
+
+/// A timer that is a descriptor: readable once its time has come, and read
+/// as eight bytes — how many times it has fired since it was last read.
+pub fn sys_timer_create() -> Result<usize, ()> {
+    match unsafe { syscall0(SYS_TIMER_CREATE) } {
+        u64::MAX => Err(()),
+        fd => Ok(fd as usize),
+    }
+}
+
+/// Set timer `fd` to fire `first` from now and every `interval` after that:
+/// spans, ticks or nanoseconds from [`ns`]. No time at all for `first`
+/// turns it off; none for `interval` is a timer that fires once.
+pub fn sys_timer_set(fd: usize, first: u64, interval: u64) -> Result<(), ()> {
+    if unsafe { syscall3(SYS_TIMER_SET, fd as u64, first, interval) } == 0 { Ok(()) } else { Err(()) }
+}
+
+/// How timer `fd` stands, in nanoseconds: how long until it next fires, 0
+/// if it is not set, and what it repeats at.
+pub fn sys_timer_get(fd: usize) -> Option<(u64, u64)> {
+    let mut was = [0u64; 2];
+    match unsafe { syscall2(SYS_TIMER_GET, fd as u64, was.as_mut_ptr() as u64) } {
+        u64::MAX => None,
+        _ => Some((was[0], was[1])),
+    }
+}
+
+/// The same in ticks, as the call itself answers: each rounded up.
+pub fn sys_timer_get_ticks(fd: usize) -> Option<(u64, u64)> {
+    match unsafe { syscall2(SYS_TIMER_GET, fd as u64, 0) } {
+        u64::MAX => None,
+        packed => Some((packed & 0xFFFF_FFFF, packed >> 32)),
+    }
+}
+
+/// Sleep for `nanos` nanoseconds: no less, and where the machine can wake a
+/// task between two ticks, very little more.
+pub fn sleep_ns(nanos: u64) {
+    if nanos == 0 {
         return;
     }
     // Block by doing a recv_timeout from our own TID — nobody will send to us
@@ -1021,24 +1115,27 @@ pub fn sleep_ticks(ticks: u64) {
     // program asked to hear. A sleep that comes back early for any other
     // reason — a sibling thread was the one a signal was for — goes back.
     let from = sys_getpid() as usize;
-    let deadline = sys_ticks().saturating_add(ticks);
+    let deadline = sys_clock().saturating_add(nanos);
     loop {
-        let now = sys_ticks();
+        let now = sys_clock();
         if now >= deadline {
             return;
         }
         let mut msg = crate::ipc::Message::empty();
-        if sys_recv_timeout(from, &mut msg, deadline - now) == Err(SLEEP_INTERRUPTED) {
+        if sys_recv_timeout(from, &mut msg, ns(deadline - now)) == Err(SLEEP_INTERRUPTED) {
             return;
         }
     }
 }
 
-/// Sleep for approximately `ms` milliseconds.
+/// Sleep for `ticks` ticks, ten milliseconds each.
+pub fn sleep_ticks(ticks: u64) {
+    sleep_ns(ticks.saturating_mul(TICK_NS));
+}
+
+/// Sleep for `ms` milliseconds.
 pub fn sleep_ms(ms: u64) {
-    // PIT runs at 100 Hz → 1 tick = 10 ms. Round up.
-    let ticks = (ms + 9) / 10;
-    sleep_ticks(ticks);
+    sleep_ns(ms.saturating_mul(1_000_000));
 }
 
 /// One descriptor to watch, and what it did.
@@ -1065,9 +1162,11 @@ impl PollFd {
 /// saving is the two system calls that would otherwise bracket every wait.
 ///
 /// Returns how many entries have a non-zero `revents`.
-pub fn sys_poll(fds: &mut [PollFd], timeout_ticks: u64) -> Result<usize, ()> {
+///
+/// `timeout` is a span: ticks, or nanoseconds from [`ns`].
+pub fn sys_poll(fds: &mut [PollFd], timeout: u64) -> Result<usize, ()> {
     let ret = unsafe {
-        syscall3(SYS_POLL, fds.as_mut_ptr() as u64, fds.len() as u64, timeout_ticks)
+        syscall3(SYS_POLL, fds.as_mut_ptr() as u64, fds.len() as u64, timeout)
     };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
@@ -1118,17 +1217,18 @@ pub fn sys_pollset_remove(set: usize, fd: usize) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
-/// Wait until something in the set is ready, or `timeout_ticks` pass.
+/// Wait until something in the set is ready, or `timeout` passes: a span,
+/// ticks or nanoseconds from [`ns`].
 ///
 /// Returns how many entries of `out` were filled; 0 means it timed out.
-pub fn sys_pollset_wait(set: usize, out: &mut [Ready], timeout_ticks: u64) -> Result<usize, ()> {
+pub fn sys_pollset_wait(set: usize, out: &mut [Ready], timeout: u64) -> Result<usize, ()> {
     let ret = unsafe {
         syscall4(
             SYS_POLLSET_WAIT,
             set as u64,
             out.as_mut_ptr() as u64,
             out.len() as u64,
-            timeout_ticks,
+            timeout,
         )
     };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
@@ -1703,6 +1803,28 @@ pub fn sys_sig_alarm(ticks: u64, every: u64) -> (u64, u64) {
     alarm_answer(unsafe { syscall3(SYS_SIG_ALARM, ticks, every, 0) })
 }
 
+/// As [`sys_sig_alarm`], to the nanosecond: the alarm is raised `first`
+/// nanoseconds from now and every `every` after that, and the answer is how
+/// the one it replaces stood, in nanoseconds.
+pub fn sys_sig_alarm_ns(first: u64, every: u64) -> (u64, u64) {
+    let mut was = [0u64; 2];
+    let every = if every == 0 { 0 } else { ns(every) };
+    match unsafe { syscall4(SYS_SIG_ALARM, ns(first), every, 0, was.as_mut_ptr() as u64) } {
+        u64::MAX => (0, 0),
+        _ => (was[0], was[1]),
+    }
+}
+
+/// How this program's alarm stands, in nanoseconds — what is left of it and
+/// what it repeats at — changing nothing.
+pub fn sys_sig_alarm_left_ns() -> (u64, u64) {
+    let mut was = [0u64; 2];
+    match unsafe { syscall4(SYS_SIG_ALARM, 0, 0, 1, was.as_mut_ptr() as u64) } {
+        u64::MAX => (0, 0),
+        _ => (was[0], was[1]),
+    }
+}
+
 /// How this program's alarm stands — the ticks left and what it repeats at —
 /// changing nothing.
 pub fn sys_sig_alarm_left() -> (u64, u64) {
@@ -1948,6 +2070,8 @@ pub const CAP_TYPE_MEMOBJECT: u64 = 9;
 /// mint a `PhysRange` over any range that lies wholly in device memory —
 /// the addresses the firmware's memory map leaves out — and map with that.
 pub const CAP_TYPE_DEVICE_MEMORY: u64 = 10;
+/// The right to say what time it is (`sys_clock_set`).
+pub const CAP_TYPE_CLOCK: u64 = 11;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -2075,7 +2199,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 14;
+pub const ABI_VERSION_MINOR: u32 = 15;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

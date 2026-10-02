@@ -207,13 +207,20 @@ pid_t getpid(void) {
     return (pid_t)__syscall1(SYS_PID, 0);
 }
 
-/* The PIT runs at 100 Hz, so a tick is 10 ms — the only clock there is. */
-int usleep(unsigned int usec) {
-    unsigned long ticks = (usec + 9999) / 10000;
-    unsigned long until = __syscall0(SYS_TICKS) + ticks;
-    while (__syscall0(SYS_TICKS) < until) {
-        __syscall0(SYS_YIELD);
+/* Sleep for `ns` nanoseconds: a receive from this task itself, which nobody
+   sends to, so that only the time ends it. Gone back to if it ends early —
+   a signal some other thread took. */
+static void sleep_ns(unsigned long ns) {
+    unsigned long self = __syscall0(SYS_GETPID);
+    unsigned long until = quark_now() + ns;
+    for (unsigned long now = quark_now(); now < until; now = quark_now()) {
+        struct quark_msg m;
+        __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m, quark_span(until - now));
     }
+}
+
+int usleep(unsigned int usec) {
+    sleep_ns((unsigned long)usec * 1000UL);
     return 0;
 }
 
@@ -235,7 +242,8 @@ long readfile(const char *path, char *buf, long size) {
 }
 
 time_t time(time_t *t) {
-    time_t now = (time_t)(__syscall0(SYS_BOOT_TIME) + __syscall0(SYS_TICKS) / 100);
+    unsigned long wall = __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL);
+    time_t now = (time_t)((wall ? wall : quark_now()) / 1000000000UL);
     if (t) {
         *t = now;
     }
@@ -252,13 +260,6 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
         errno = EINVAL;
         return -1;
     }
-    /* Rounded up: a sleep that returns early is a bug, one that returns a
-       tick late is a 100 Hz timer. */
-    unsigned long ticks = (unsigned long)req->tv_sec * 100
-                        + (unsigned long)((req->tv_nsec + 9999999) / 10000000);
-    unsigned long until = __syscall0(SYS_TICKS) + ticks;
-    while (__syscall0(SYS_TICKS) < until) {
-        __syscall0(SYS_YIELD);
-    }
+    sleep_ns(quark_nanos((unsigned long)req->tv_sec, (unsigned long)req->tv_nsec));
     return 0;
 }

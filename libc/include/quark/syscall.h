@@ -149,9 +149,21 @@
 #define SYS_FUTEX_WAIT_TIMEOUT 130
 #define SYS_EVENT_CREATE    131
 
-/* 0x90  time */
+/* 0x90  time
+ *
+ * A span of time handed to the kernel — a timeout, a timer, an alarm — is a
+ * count of ticks, hundredths of a second, or with QUARK_SPAN_NS set a count
+ * of nanoseconds (quark_span). */
 #define SYS_TICKS           144
 #define SYS_BOOT_TIME       145
+/* What time it is, in nanoseconds: since boot, which only goes forward and
+   is what a wait is measured by; or with QUARK_CLOCK_WALL since 1970, which
+   is 0 on a machine with no clock to say. */
+#define SYS_CLOCK           149
+#define QUARK_CLOCK_WALL    1UL
+/* Say what time it is: nanoseconds since 1970. For a holder of the right. */
+#define SYS_CLOCK_SET       150
+#define QUARK_SPAN_NS       (1UL << 63)
 
 /* 0xC0  memory, continued */
 #define SYS_MAP_ANON        192
@@ -293,6 +305,23 @@ static inline unsigned long __syscall1(unsigned long n, unsigned long a) {
 }
 static inline unsigned long __syscall0(unsigned long n) {
     return __syscall5(n, 0, 0, 0, 0, 0);
+}
+
+/* A span of `ns` nanoseconds, for a call that takes one. Too long to say —
+   292 years — is as long as can be said. */
+static inline unsigned long quark_span(unsigned long ns) {
+    return ns >= QUARK_SPAN_NS ? ~0UL : (QUARK_SPAN_NS | ns);
+}
+
+/* Seconds and nanoseconds as nanoseconds; more than can be counted is as
+   many as can be. */
+static inline unsigned long quark_nanos(unsigned long sec, unsigned long nsec) {
+    return sec >= 9223372036UL ? QUARK_SPAN_NS - 1 : sec * 1000000000UL + nsec;
+}
+
+/* Nanoseconds since boot. */
+static inline unsigned long quark_now(void) {
+    return __syscall1(SYS_CLOCK, 0);
 }
 
 /* A fixed-size IPC message: the only shape the kernel carries. */

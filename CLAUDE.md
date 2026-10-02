@@ -324,9 +324,21 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   ordinary programs, idle — and a task in a better band that spins on
   `sys_yield` is immediately runnable again, so nothing below it ever runs.
   `nameserver::lookup_retry` yielded a hundred times between tries and starved
-  the VFS out of ever registering. Use `sleep_ticks`, or `sys_recv_timeout` if
-  there is also something to hear. A program asks for its band in its
-  `manifest!` block, and a spawner can never grant a better one than its own.
+  the VFS out of ever registering. Use `sleep_ns` (or `sleep_ms`, or
+  `sleep_ticks`), or `sys_recv_timeout` if there is also something to hear.
+  A program asks for its band in its `manifest!` block, and a spawner can
+  never grant a better one than its own.
+- **A time is nanoseconds, and a span of time says which it is in.** The
+  kernel keeps time to the nanosecond (`sys_clock`, `sys_clock_wall`) and
+  ends a wait when it is due. Every call that takes how long takes a
+  *span*: a count of ticks, hundredths of a second, as all of them always
+  did, or — from `syscall::ns` — nanoseconds. `sys_recv_timeout(from, msg,
+  5)` is fifty milliseconds and `sys_recv_timeout(from, msg, ns(5))` is
+  five nanoseconds; the type is `u64` either way and nothing will say which
+  was meant. New code says nanoseconds. And a sleep is now as long as was
+  asked: `sleep_ms(1)` used to mean "until the next tick", up to ten
+  milliseconds, and a loop that polled that way now polls ten times as
+  often.
 
 `init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls

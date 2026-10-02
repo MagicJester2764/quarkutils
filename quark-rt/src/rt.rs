@@ -134,7 +134,11 @@ pub mod futex {
         // This used to poll the word against the tick counter and yield, for
         // want of a timed wait in the kernel — which burned a core for the
         // length of the wait and could not see a wake before the next poll.
-        let r = syscall::sys_futex_wait_timeout(ptr, expected, ticks_for(timeout));
+        //
+        // At least a nanosecond: no time at all is "look at the word and do
+        // not wait", and a wait that was asked for waits.
+        let span = syscall::span_of(timeout.max(core::time::Duration::from_nanos(1)));
+        let r = syscall::sys_futex_wait_timeout(ptr, expected, span);
         if r != syscall::FUTEX_TIMED_OUT {
             return true;
         }
@@ -143,13 +147,6 @@ pub mod futex {
         // std reads `false` as "the deadline passed and nothing happened", and
         // a change that landed either side of the deadline did happen.
         futex.load(Ordering::Relaxed) != expected
-    }
-
-    /// Convert a duration to PIT ticks (100 Hz), rounding up so a sub-tick
-    /// timeout still waits at least one tick.
-    fn ticks_for(d: core::time::Duration) -> u64 {
-        let ms = d.as_millis().min(u64::MAX as u128) as u64;
-        ms.div_ceil(10).max(1)
     }
 
     /// Wake one waiter. Returns true if a task was actually woken.
@@ -166,18 +163,36 @@ pub mod futex {
 
 // ---- Time ----
 
-/// Returns the kernel PIT tick count (100 Hz, 10 ms per tick).
-/// Ticks (10 ms each) since 1970, from the clock the kernel read at boot, or
-/// since boot on a machine without one.
-pub fn unix_ticks() -> u64 {
-    syscall::sys_boot_time() * 100 + syscall::sys_ticks()
+/// Nanoseconds since boot: a clock that only goes forward, for measuring
+/// how long something took.
+pub fn now_ns() -> u64 {
+    syscall::sys_clock()
 }
 
+/// Nanoseconds since 1970, from the clock the kernel read at boot and
+/// whoever has set it since; or since boot on a machine without one.
+pub fn unix_ns() -> u64 {
+    syscall::unix_ns()
+}
+
+/// Sleep for `time`: no less.
+pub fn sleep(time: core::time::Duration) {
+    let nanos = time.as_nanos();
+    syscall::sleep_ns(if nanos > u64::MAX as u128 { u64::MAX } else { nanos as u64 });
+}
+
+/// Ticks (10 ms each) since 1970. What a standard library built before the
+/// clock was finer than a tick asks for.
+pub fn unix_ticks() -> u64 {
+    unix_ns() / syscall::TICK_NS
+}
+
+/// Ticks (10 ms each) since boot.
 pub fn ticks() -> u64 {
     syscall::sys_ticks()
 }
 
-/// Sleep for approximately `ms` milliseconds.
+/// Sleep for `ms` milliseconds.
 pub fn sleep_ms(ms: u64) {
     syscall::sleep_ms(ms);
 }

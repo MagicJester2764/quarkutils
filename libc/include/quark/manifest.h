@@ -25,6 +25,7 @@
 #define QUARK_CAP_TASK_MGMT  4UL
 #define QUARK_CAP_PHYS_ALLOC 5UL
 #define QUARK_CAP_SET_UID    6UL
+#define QUARK_CAP_CLOCK      11UL
 
 /* Each request is three words: what kind, and up to two parameters. */
 #define QUARK_CAP_IOPORT_RANGE(first, last) QUARK_CAP_IOPORT, (first), (last)
@@ -36,6 +37,9 @@
 #define QUARK_CAP_PHYS_ALLOC_N(pages)       QUARK_CAP_PHYS_ALLOC, (pages), 0UL
 /* Create and start tasks; 0 means any target. */
 #define QUARK_CAP_TASKS(target)             QUARK_CAP_TASK_MGMT, (target), 0UL
+/* Set the clock. A spawner grants it only if it holds it itself, which a
+   session does if its account has the right. */
+#define QUARK_CAP_SET_CLOCK                 QUARK_CAP_CLOCK, 0UL, 0UL
 
 /* Emit the section. The count is worked out from what was passed, so adding a
    request cannot leave the header disagreeing with the body. */

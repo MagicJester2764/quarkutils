@@ -100,6 +100,13 @@ impl CapReq {
     pub const fn set_uid() -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_SET_UID, param0: 0, param1: 0 }
     }
+
+    /// Say what time it is (`sys_clock_set`). A session holds it if its
+    /// account has the right to (`clock` in `/etc/rights`), and a program
+    /// that asks for it is given it by a spawner that does.
+    pub const fn clock() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_CLOCK, param0: 0, param1: 0 }
+    }
 }
 
 /// A manifest as it sits in the image: a header the scanner can recognise,
