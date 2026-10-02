@@ -212,99 +212,38 @@ pub const SYS_ABI_VERSION: u64 = 240;
 
 
 
+// A call with fewer arguments is the call with five, and zeroes.
+//
+// Not a convenience. The kernel reads the registers a call is documented to
+// take, and a call that is given another argument in a later version reads it
+// from every caller there is — including the ones written before, which
+// passed two and left in the third register whatever they had last computed.
+// These used to mark the registers they did not set as clobbered and nothing
+// more, which is exactly that. An argument not given is given as nothing.
+
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "syscall",
-        inlateout("rax") nr => ret,
-        out("rcx") _,
-        out("rdx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
+    syscall5(nr, 0, 0, 0, 0, 0)
 }
 
 #[inline(always)]
 pub unsafe fn syscall1(nr: u64, arg0: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "syscall",
-        inlateout("rax") nr => ret,
-        inlateout("rdi") arg0 => _,
-        out("rcx") _,
-        out("rdx") _,
-        out("rsi") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
+    syscall5(nr, arg0, 0, 0, 0, 0)
 }
 
 #[inline(always)]
 pub unsafe fn syscall2(nr: u64, arg0: u64, arg1: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "syscall",
-        inlateout("rax") nr => ret,
-        inlateout("rdi") arg0 => _,
-        inlateout("rsi") arg1 => _,
-        out("rcx") _,
-        out("rdx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
+    syscall5(nr, arg0, arg1, 0, 0, 0)
 }
 
 #[inline(always)]
 pub unsafe fn syscall3(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "syscall",
-        inlateout("rax") nr => ret,
-        inlateout("rdi") arg0 => _,
-        inlateout("rsi") arg1 => _,
-        inlateout("rdx") arg2 => _,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
+    syscall5(nr, arg0, arg1, arg2, 0, 0)
 }
 
 #[inline(always)]
 pub unsafe fn syscall4(nr: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
-    let ret: u64;
-    asm!(
-        "mov r10, {arg3}",
-        "syscall",
-        arg3 = in(reg) arg3,
-        inlateout("rax") nr => ret,
-        inlateout("rdi") arg0 => _,
-        inlateout("rsi") arg1 => _,
-        inlateout("rdx") arg2 => _,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack)
-    );
-    ret
+    syscall5(nr, arg0, arg1, arg2, arg3, 0)
 }
 
 #[inline(always)]

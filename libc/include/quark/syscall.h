@@ -24,6 +24,9 @@
 #define SYS_PID             14
 #define QUARK_WAIT_NOW      1UL
 #define QUARK_WAIT_BY_PID   2UL
+/* What SYS_SIG_RAISE's first argument names: a task of the program, or the
+   program's process id. Said, every time: it is the call's third argument. */
+#define QUARK_RAISE_BY_TASK 0UL
 #define QUARK_RAISE_BY_PID  1UL
 /* Jobs. A wait can ask to hear of a child that has stopped, or been started
    again, and can name a process group of children (0 for the caller's own);
@@ -243,53 +246,8 @@
  */
 #define __SYSCALL_CLOBBERS "rcx", "r11", "memory"
 
-static inline unsigned long __syscall0(unsigned long n) {
-    unsigned long r;
-    __asm__ volatile("syscall"
-                     : "=a"(r)
-                     : "a"(n)
-                     : "rdi", "rsi", "rdx", "r8", "r9", "r10", __SYSCALL_CLOBBERS);
-    return r;
-}
-static inline unsigned long __syscall1(unsigned long n, unsigned long a) {
-    unsigned long r;
-    __asm__ volatile("syscall"
-                     : "=a"(r), "+D"(a)
-                     : "a"(n)
-                     : "rsi", "rdx", "r8", "r9", "r10", __SYSCALL_CLOBBERS);
-    return r;
-}
-static inline unsigned long __syscall2(unsigned long n, unsigned long a, unsigned long b) {
-    unsigned long r;
-    __asm__ volatile("syscall"
-                     : "=a"(r), "+D"(a), "+S"(b)
-                     : "a"(n)
-                     : "rdx", "r8", "r9", "r10", __SYSCALL_CLOBBERS);
-    return r;
-}
-static inline unsigned long __syscall3(unsigned long n, unsigned long a, unsigned long b,
-                                       unsigned long c) {
-    unsigned long r;
-    __asm__ volatile("syscall"
-                     : "=a"(r), "+D"(a), "+S"(b), "+d"(c)
-                     : "a"(n)
-                     : "r8", "r9", "r10", __SYSCALL_CLOBBERS);
-    return r;
-}
 /* arg3 travels in r10, not rcx: the syscall instruction overwrites rcx with
-   the return address before the kernel ever sees it. */
-static inline unsigned long __syscall4(unsigned long n, unsigned long a, unsigned long b,
-                                       unsigned long c, unsigned long d) {
-    unsigned long r;
-    register unsigned long r10 __asm__("r10") = d;
-    __asm__ volatile("syscall"
-                     : "=a"(r), "+D"(a), "+S"(b), "+d"(c), "+r"(r10)
-                     : "a"(n)
-                     : "r8", "r9", __SYSCALL_CLOBBERS);
-    return r;
-}
-
-/* arg4 travels in r8. */
+   the return address before the kernel ever sees it. arg4 travels in r8. */
 static inline unsigned long __syscall5(unsigned long n, unsigned long a, unsigned long b,
                                        unsigned long c, unsigned long d, unsigned long e) {
     unsigned long r;
@@ -300,6 +258,37 @@ static inline unsigned long __syscall5(unsigned long n, unsigned long a, unsigne
                      : "a"(n)
                      : "r9", __SYSCALL_CLOBBERS);
     return r;
+}
+
+/* A call with fewer arguments is the call with five, and zeroes.
+ *
+ * Not a convenience. The kernel reads the registers a call is documented to
+ * take, and a call that is given another argument in a later version reads
+ * it from every caller there is — including the ones written before, which
+ * passed two and left in the third register whatever they had last
+ * computed. `SYS_SIG_RAISE` gained a third argument saying what its first
+ * one names, and the two-argument calls here went on being made: for a long
+ * time what was left in the register happened to say "a task", and then a
+ * change nearby moved a value, and `raise(SIGSTOP)` was a signal for a
+ * process group that did not exist. An argument not given is given as
+ * nothing.
+ */
+static inline unsigned long __syscall4(unsigned long n, unsigned long a, unsigned long b,
+                                       unsigned long c, unsigned long d) {
+    return __syscall5(n, a, b, c, d, 0);
+}
+static inline unsigned long __syscall3(unsigned long n, unsigned long a, unsigned long b,
+                                       unsigned long c) {
+    return __syscall5(n, a, b, c, 0, 0);
+}
+static inline unsigned long __syscall2(unsigned long n, unsigned long a, unsigned long b) {
+    return __syscall5(n, a, b, 0, 0, 0);
+}
+static inline unsigned long __syscall1(unsigned long n, unsigned long a) {
+    return __syscall5(n, a, 0, 0, 0, 0);
+}
+static inline unsigned long __syscall0(unsigned long n) {
+    return __syscall5(n, 0, 0, 0, 0, 0);
 }
 
 /* A fixed-size IPC message: the only shape the kernel carries. */

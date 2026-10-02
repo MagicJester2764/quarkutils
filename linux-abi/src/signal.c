@@ -111,7 +111,7 @@ static int run(long sig) {
         /* It had a handler when it was raised and has none now. What the
            signal does is the kernel's to do. */
         if (!harmless(sig)) {
-            __syscall2(SYS_SIG_RAISE, self(), (unsigned long)sig);
+            __syscall3(SYS_SIG_RAISE, self(), (unsigned long)sig, QUARK_RAISE_BY_TASK);
         }
         return 0;
     }
@@ -404,7 +404,8 @@ long __quark_tkill(long tid, long sig) {
         if (sig >= 32 && sig <= 34) {
             return -LX_ENOSYS;
         }
-        return __syscall2(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig) == QUARK_ERR
+        return __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig,
+                          QUARK_RAISE_BY_TASK) == QUARK_ERR
                    ? -LX_ESRCH
                    : 0;
     }
@@ -419,7 +420,8 @@ long __quark_tkill(long tid, long sig) {
         if (!harmless(sig)) {
             /* The end of this program, and the kernel's to carry out: a
                program cannot exit with a signal's status by asking to. */
-            __syscall2(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig);
+            __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig,
+                       QUARK_RAISE_BY_TASK);
         }
         return 0;
     }
