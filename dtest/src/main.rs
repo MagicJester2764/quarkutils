@@ -1212,6 +1212,18 @@ static SIG_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 /// The master of the terminal `typist` types at.
 static TYPIST_MASTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+static PRINTER_SLAVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// 1 once the newline has been printed, 2 if it could not be.
+static PRINTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Print a newline at a terminal, which waits if there is no room for it.
+extern "C" fn printer() -> ! {
+    let slave = PRINTER_SLAVE.load(core::sync::atomic::Ordering::SeqCst);
+    let wrote = syscall::sys_fd_write(slave, b"\n") == 1;
+    PRINTED.store(if wrote { 1 } else { 2 }, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
 /// Wait a while, then press Ctrl-C at the terminal. On a thread, so that the
 /// main task can be reading the terminal when it is pressed.
 extern "C" fn typist() -> ! {
@@ -1545,6 +1557,49 @@ fn test_signals() {
     let mut line = [0u8; 16];
     let got = syscall::sys_fd_read(slave, &mut line);
     check("erasing at a terminal takes back a whole character", got == 3 && &line[..3] == b"az\n");
+
+    // What a program prints waits for room, and for as much as it needs: a
+    // newline goes out as a return and a newline. With one byte left it
+    // waits, and is let through when the terminal is read. It asked only
+    // whether there was any room, found some, and tried again for ever —
+    // in the kernel, which on several processors nobody else could then
+    // get into to read the terminal.
+    let mut drain = [0u8; 256];
+    while (1..=256).contains(&syscall::sys_fd_read_nb(master, &mut drain)) {}
+    const NEARLY: usize = 4095;
+    let filled = syscall::sys_fd_write_nb(slave, &[b'x'; NEARLY]) == NEARLY as u64;
+    PRINTER_SLAVE.store(slave, SeqCst);
+    PRINTED.store(0, SeqCst);
+    match thread::spawn_with_stack(printer, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(10);
+            check(
+                "a newline printed to a terminal with one byte of room waits for two",
+                filled && PRINTED.load(SeqCst) == 0,
+            );
+            let mut seen = 0;
+            let mut last = [0u8; 2];
+            while seen < NEARLY + 2 {
+                let n = syscall::sys_fd_read(master, &mut drain);
+                if !(1..=256).contains(&n) {
+                    break;
+                }
+                let n = n as usize;
+                if n >= 2 {
+                    last = [drain[n - 2], drain[n - 1]];
+                } else {
+                    last = [last[1], drain[0]];
+                }
+                seen += n;
+            }
+            let _ = t.join();
+            check(
+                "and is printed when the terminal has been read",
+                PRINTED.load(SeqCst) == 1 && seen == NEARLY + 2 && &last == b"\r\n",
+            );
+        }
+        Err(_) => check("a thread to print a newline", false),
+    }
 
     let _ = syscall::sys_fd_close(slave);
     check(

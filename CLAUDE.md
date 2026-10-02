@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 747 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 749 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
