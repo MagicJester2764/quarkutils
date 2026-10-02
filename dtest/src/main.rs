@@ -5252,6 +5252,112 @@ fn test_smp() {
     check("two threads calling one server at once are each answered, every time", both == Some(true));
 }
 
+/// The word a thread asks to have cleared when it ends, as every thread a C
+/// library makes does: 1 while the thread is there.
+static JOIN_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static JOIN_READY: sync::Semaphore = sync::Semaphore::new(0);
+static JOIN_GO: sync::Semaphore = sync::Semaphore::new(0);
+
+/// Gives the kernel its word, says so, and ends when it is told to.
+extern "C" fn joined_by_word() -> ! {
+    let _ = syscall::sys_set_clear_tid(JOIN_WORD.as_ptr());
+    JOIN_READY.release();
+    JOIN_GO.acquire();
+    syscall::sys_exit_code(7);
+}
+
+/// Gives the kernel its word and ends.
+extern "C" fn joined_at_once() -> ! {
+    let _ = syscall::sys_set_clear_tid(JOIN_WORD.as_ptr());
+    syscall::sys_exit_code(0);
+}
+
+extern "C" fn leaves_with_five() -> ! {
+    syscall::sys_exit_code(5);
+}
+
+/// Gives the kernel its word a while after it has started — by which time
+/// its creator is waiting for it — and ends a while after that.
+extern "C" fn word_given_late() -> ! {
+    syscall::sleep_ticks(10);
+    let _ = syscall::sys_set_clear_tid(JOIN_WORD.as_ptr());
+    syscall::sleep_ticks(10);
+    syscall::sys_exit_code(0);
+}
+
+/// Join a thread the way a C library does: wait on its word until the
+/// kernel has cleared it. `false` if two seconds pass and it has not.
+fn word_cleared() -> bool {
+    use core::sync::atomic::Ordering;
+    let start = syscall::sys_ticks();
+    while JOIN_WORD.load(Ordering::SeqCst) != 0 {
+        if syscall::sys_ticks() - start > 200 {
+            return false;
+        }
+        let _ = syscall::sys_futex_wait_timeout(JOIN_WORD.as_ptr(), 1, 50);
+    }
+    true
+}
+
+/// A thread is joined one of two ways, and the thread says which: waited
+/// for, as any child is, or through a word the kernel clears when it ends.
+/// The second is a C library's, whose threads are not its children.
+fn test_threads() {
+    use core::sync::atomic::Ordering;
+    println!("a thread is joined one of two ways:");
+
+    let waited = thread::spawn_with_stack(leaves_with_five, 2).ok().map(|t| (t.tid(), syscall::sys_wait_for(t.tid())));
+    check(
+        "one that gives no word is a child, and a wait answers with what it ended with",
+        matches!(waited, Some((tid, Ok((got, 5)))) if got == tid),
+    );
+
+    JOIN_WORD.store(1, Ordering::SeqCst);
+    let Ok(t) = thread::spawn_with_stack(joined_by_word, 2) else {
+        check("started a thread", false);
+        return;
+    };
+    let tid = t.tid();
+    JOIN_READY.acquire();
+    check(
+        "one that gives a word to clear is nobody's child: there is no waiting for it",
+        syscall::sys_wait_nowait(tid) == Err(()),
+    );
+    JOIN_GO.release();
+    check("its word is cleared when it ends, and whoever waits on the word is woken", word_cleared());
+
+    // Nobody collects such a thread, so the kernel does, and what it had —
+    // its place among the system's tasks, most of all, of which there are
+    // sixty-four — comes back. It did not: an ended thread stayed until its
+    // program did, and a C program that made threads one after another
+    // came to a point where nothing in the system could make a task.
+    let mut made = 0;
+    for _ in 0..80 {
+        JOIN_WORD.store(1, Ordering::SeqCst);
+        if thread::spawn_with_stack(joined_at_once, 2).is_err() || !word_cleared() {
+            break;
+        }
+        made += 1;
+    }
+    println!("        {} threads made, one after another", made);
+    check("eighty of them, one after another, each give their place back", made == 80);
+
+    // A thread may give its own word, after it has started: its creator may
+    // by then be waiting for it as a child. The wait is told there is no
+    // such child, there and then — it used to have nothing to wake it, ever.
+    JOIN_WORD.store(1, Ordering::SeqCst);
+    let late = thread::spawn_with_stack(word_given_late, 2).ok().map(|t| {
+        let before = syscall::sys_ticks();
+        let answer = syscall::sys_wait_for(t.tid());
+        (answer, syscall::sys_ticks() - before)
+    });
+    check(
+        "a creator waiting for a thread when it gives its word is told it has no such child",
+        matches!(late, Some((Err(()), waited)) if (5..18).contains(&waited)),
+    );
+    check("and joins it through the word like any other", word_cleared());
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -5301,6 +5407,7 @@ pub extern "C" fn _start() -> ! {
         ("fpu", test_fpu),
         ("flags", test_flags),
         ("wire", test_wire),
+        ("threads", test_threads),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);

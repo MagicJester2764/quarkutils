@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 678 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 684 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
@@ -1068,6 +1068,13 @@ removed.
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
   once.
+- **A C program's signal mask is the program's, and a thread that ends
+  leaves everything blocked**: the C library blocks every signal in a thread
+  on its way out. A program with threads handles signals until its first
+  thread ends (`docs/c-library.md`). The cure is a mask the kernel keeps
+  for each thread.
+- **A child is the thread's that forked it**: `waitpid` from another thread
+  of the program is `ECHILD`.
 - A program has 64 descriptors, files included; the VFS has 512 handles for
   everybody, and 128 for any one program. A pipe, a terminal and a stream all
   say they are a character device to `fstat`: nothing tells the layer what

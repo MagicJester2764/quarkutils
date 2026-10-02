@@ -1195,6 +1195,12 @@ pub fn sys_fd_recv(
 /// `pthread_exit` takes the thread-list lock and never unlocks it, because the
 /// lock is this word and the kernel releasing it is what publishes the
 /// thread's removal from the list.
+///
+/// A thread with such a word is joined through it and is nobody's child: no
+/// `sys_wait` answers with it or counts it, and the kernel collects it. A
+/// creator says so for a thread before starting it — the call takes the
+/// task as a second argument — and this form, for the caller, is what a
+/// program's first task and a forked child use.
 pub fn sys_set_clear_tid(addr: *const u32) -> usize {
     unsafe { syscall1(SYS_SET_CLEAR_TID, addr as u64) as usize }
 }
@@ -2030,7 +2036,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 10;
+pub const ABI_VERSION_MINOR: u32 = 11;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

@@ -80,6 +80,13 @@ too. The difference is only visible to code that mixes the two kinds.
   the other threads; ending them here means unwinding what they hold in a
   server, so it is refused rather than half done.
 - `exit` ends every thread of the program. `pthread_exit` ends one.
+- **A thread is joined, never waited for.** It is no child: `waitpid(-1)`
+  in a program with threads and no child processes is `ECHILD`, and is
+  never answered with a thread. A thread that has ended and been joined —
+  or was detached — gives back its place among the system's tasks, of
+  which there are sixty-four. *A child is the thread's that made it*,
+  though, where on Linux it is the process's: `waitpid` for a child another
+  thread forked is `ECHILD`. Fork and wait in the same thread.
 - **Threads run at the same time**, on as many processors as the machine
   has: `sysconf(_SC_NPROCESSORS_ONLN)`, `nproc` and `sched_getaffinity` say
   how many, and `sched_getcpu` which one a thread is on at that moment.
@@ -166,7 +173,11 @@ Also different:
   no way to aim a signal at one thread: `pthread_kill` raises it for the
   program.
 - The mask is the program's, not each thread's, and is not kept across
-  `exec`.
+  `exec`. **So once any thread of a program has ended, its handlers stop
+  running**: the C library blocks every signal in a thread on its way out,
+  that is the program's mask, and nothing unblocks it. A program that makes
+  threads and handles signals handles them until the first thread ends. It
+  needs a mask the kernel keeps for each thread, which is not there yet.
 - The interval timers that count time spent running (`ITIMER_VIRTUAL`,
   `ITIMER_PROF`) are refused, since nothing measures it; `timer_create` is
   `ENOSYS`, and the programs that try it first fall back to `setitimer`.

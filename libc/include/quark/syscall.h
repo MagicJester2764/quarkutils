@@ -50,6 +50,7 @@
 #define SYS_GETPID          3
 #define SYS_RECV_TIMEOUT    21
 #define SYS_WAIT            4
+#define SYS_TASK_KILL       5
 #define SYS_TASK_INFO       7
 /* Who the caller is: its user id above its group id. */
 #define SYS_GET_UID         98

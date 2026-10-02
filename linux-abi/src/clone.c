@@ -37,17 +37,20 @@ void __quark_thread_entry(void);
 /* Called by the trampoline when the thread function returns. */
 void __quark_thread_exit(int code);
 
-void __quark_set_clear_tid(unsigned long addr);
-void __quark_set_clear_tid(unsigned long addr) {
-    __syscall1(SYS_SET_CLEAR_TID, addr);
-}
-
 void __quark_thread_exit(int code) {
     __syscall1(SYS_EXIT_CODE, (unsigned long)code);
     for (;;) { }
 }
 
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
+
+/* A task that was made and will not be started: ended, and collected, so
+   that its place among the system's tasks comes back. It has no memory and
+   has run nothing; a wait that does not wait finds it at once. */
+static void discard(unsigned long tid) {
+    __syscall1(SYS_TASK_KILL, tid);
+    __syscall2(SYS_WAIT_FOR, tid, QUARK_WAIT_NOW);
+}
 
 /* The end of a detached thread, on the stack kept for it (clone-entry.s):
    its own stack is given back, as any mapping is, and then it is gone.
@@ -121,10 +124,18 @@ long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
     unsigned long *slot = (unsigned long *)top;
     slot[-1] = (flags & CLONE_SETTLS) ? (unsigned long)tls : 0;
     slot[0] = (unsigned long)func;
-    // CLONE_CHILD_CLEARTID, which musl depends on to release the thread-list
-    // lock it holds through its own exit. Registered by the child rather than
-    // for it: the call names its caller, and only the child is the child.
-    slot[1] = (flags & CLONE_CHILD_CLEARTID) ? (unsigned long)ctid : 0;
+    /* CLONE_CHILD_CLEARTID, which musl depends on to release the thread-list
+       lock it holds through its own exit — and which is also how the kernel
+       knows this is a thread that will be joined and not a child that will
+       be waited for. Said here, for the thread, before it is started: left
+       to the thread to say when it first ran, there was a moment in which
+       its creator had a child, and a `waitpid` in that moment was told to
+       wait for something no wait would ever be given. */
+    if ((flags & CLONE_CHILD_CLEARTID) &&
+        __syscall2(SYS_SET_CLEAR_TID, (unsigned long)ctid, tid) == QUARK_ERR) {
+        discard(tid);
+        return -LX_EAGAIN;
+    }
 
     /* musl reads the new thread's id out of *ptid, and it must be there before
        the thread can run — afterwards is a race with the thread exiting. */
@@ -135,6 +146,7 @@ long __quark_clone(int (*func)(void *), void *stack, int flags, void *arg,
                                        (unsigned long)__quark_thread_entry,
                                        top, cr3, (unsigned long)arg);
     if (started == QUARK_ERR) {
+        discard(tid);
         return -LX_EAGAIN;
     }
     return (long)tid;
