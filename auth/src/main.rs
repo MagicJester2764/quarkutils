@@ -219,9 +219,8 @@ fn give(child: usize, cap_type: u64, p0: u64, p1: u64) {
     }
 }
 
-fn needs(vfs_tid: usize, sender: usize, msg: &Message) -> Message {
-    let mut text = [0u8; 512];
-    let Some([user]) = lent(sender, [msg.data[0]], &mut text) else {
+fn needs(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> Message {
+    let Some([user]) = lent(sender, [msg.data[0]], text) else {
         return answer(TAG_ERROR, ERR_BAD, 0);
     };
     let passwd = load(vfs_tid, b"passwd", core::ptr::addr_of_mut!(PASSWD_TEXT));
@@ -234,11 +233,10 @@ fn needs(vfs_tid: usize, sender: usize, msg: &Message) -> Message {
     answer(TAG_OK, asks as u64, 0)
 }
 
-fn bless(vfs_tid: usize, sender: usize, msg: &Message) -> Message {
+fn bless(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> Message {
     let child = msg.data[0] as usize;
     let flags = msg.data[3];
-    let mut text = [0u8; 512];
-    let Some([user, password]) = lent(sender, [msg.data[1], msg.data[2]], &mut text) else {
+    let Some([user, password]) = lent(sender, [msg.data[1], msg.data[2]], text) else {
         return answer(TAG_ERROR, ERR_BAD, 0);
     };
     if password.len() > crypt::MAX_PASSWORD {
@@ -332,9 +330,8 @@ fn bless(vfs_tid: usize, sender: usize, msg: &Message) -> Message {
     answer(TAG_OK, target.uid as u64, target.gid as u64)
 }
 
-fn passwd(vfs_tid: usize, sender: usize, msg: &Message) -> Message {
-    let mut text = [0u8; 512];
-    let Some([user, old, new]) = lent(sender, [msg.data[0], msg.data[1], msg.data[2]], &mut text) else {
+fn passwd(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> Message {
+    let Some([user, old, new]) = lent(sender, [msg.data[0], msg.data[1], msg.data[2]], text) else {
         return answer(TAG_ERROR, ERR_BAD, 0);
     };
     if new.is_empty() || new.len() > crypt::MAX_PASSWORD || old.len() > crypt::MAX_PASSWORD {
@@ -410,14 +407,23 @@ pub extern "C" fn _start() -> ! {
         if vfs_tid == 0 {
             vfs_tid = nameserver::lookup_retry(b"vfs", 20).unwrap_or(0);
         }
+        // What a request lends is read into this, and a password is among
+        // it. It is this loop's, so that whichever way a request ends, what
+        // was typed is not left lying in the one program everybody's
+        // password passes through.
+        let mut text = [0u8; 512];
         let reply = match msg.tag {
             quark_rt::ipc::TAG_PING => answer(quark_rt::ipc::TAG_PING, 0, 0),
             _ if vfs_tid == 0 => answer(TAG_ERROR, ERR_IO, 0),
-            TAG_NEEDS => needs(vfs_tid, sender, &msg),
-            TAG_BLESS => bless(vfs_tid, sender, &msg),
-            TAG_PASSWD => passwd(vfs_tid, sender, &msg),
+            TAG_NEEDS => needs(vfs_tid, sender, &msg, &mut text),
+            TAG_BLESS => bless(vfs_tid, sender, &msg, &mut text),
+            TAG_PASSWD => passwd(vfs_tid, sender, &msg, &mut text),
             _ => answer(TAG_ERROR, ERR_BAD, 0),
         };
+        text.fill(0);
+        // Written through a pointer the compiler cannot see the end of, so
+        // that clearing something nothing reads again is not optimised away.
+        core::hint::black_box(&mut text);
         let _ = syscall::sys_reply(sender, &reply);
     }
 }
