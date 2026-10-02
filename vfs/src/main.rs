@@ -1656,6 +1656,11 @@ pub extern "C" fn _start() -> ! {
     // Service loop
     loop {
         let mut msg = Message::empty();
+        // A mapped file nothing maps any more, which could not be let go
+        // when the kernel said so.
+        if pager::owed() {
+            transacted(pager::retry);
+        }
         // Writes are waiting for another to join them. Not for long: half a
         // second at most, whatever else is being asked meanwhile.
         if journal::in_transaction(journal_ref())

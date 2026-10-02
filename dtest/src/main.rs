@@ -2786,6 +2786,39 @@ fn test_memory() {
     check("a program past its limit ends with SIGBUS", hog == Some(Some(-7)));
     let (free3, _) = syscall::sys_mem_info();
     check("and its memory comes back", free3 + 64 >= free0);
+
+    // A pager gives a program a capability to map an object with, and the
+    // program maps it: two steps, and the object can go idle between them.
+    // It is kept for the program that was promised it. It was not, and a
+    // program that asked to map a file as another unmapped the last of it
+    // was told there was no memory.
+    const PAGED_SLOT: usize = 48;
+    let kept = syscall::sys_object_create(0x0B1EC7, 4096, PAGED_SLOT).ok().and_then(|id| {
+        let child = load_child(&[b"dchild", b"sleep"])?;
+        let tid = child.tid;
+        let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+        let granted = syscall::sys_cap_mint(
+            syscall::SLOT_SCRATCH,
+            syscall::CAP_TYPE_MEMOBJECT,
+            id,
+            syscall::OBJECT_ACCESS_READ,
+        )
+        .is_ok()
+            && syscall::sys_cap_grant_any(tid, syscall::SLOT_SCRATCH).is_ok();
+        let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+        child.start().ok()?;
+        let held = syscall::sys_object_ctl(id, syscall::OBJECT_RELEASE, 0, 0);
+        let _ = syscall::sys_task_kill(tid);
+        let _ = wait_for(tid);
+        let freed = syscall::sys_object_ctl(id, syscall::OBJECT_RELEASE, 0, 0);
+        Some((granted, held, freed))
+    });
+    let _ = syscall::sys_cap_delete(PAGED_SLOT);
+    check(
+        "an object nothing maps is kept while a program holds a capability to map it with",
+        matches!(kept, Some((true, syscall::OBJECT_RELEASE_LATER, _))),
+    );
+    check("and is released once that program has gone", matches!(kept, Some((true, _, 0))));
 }
 
 fn test_random() {

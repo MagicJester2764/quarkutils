@@ -29,7 +29,14 @@ struct Mapped {
     inode: u32,
     id: u64,
     slot: usize,
+    /// Nothing maps it, and it could not be released when the kernel said
+    /// so: a program had been given a capability to map it with and had not
+    /// used it yet. To be asked about again ([`retry`]).
+    owed: bool,
 }
+
+/// Whether any object is owed a release.
+static mut OWED: bool = false;
 
 const MAX_MAPPED: usize = LAST_SLOT - FIRST_SLOT + 1;
 static mut MAPPED: [Option<Mapped>; MAX_MAPPED] = [None; MAX_MAPPED];
@@ -58,12 +65,42 @@ fn find(inode: u32) -> Option<Mapped> {
 fn try_release(id: u64) -> Option<u32> {
     let entry = table().iter_mut().find(|e| e.is_some_and(|m| m.id == id))?;
     let m = entry.unwrap();
-    if syscall::sys_object_ctl(m.id, syscall::OBJECT_RELEASE, 0, 0) != 0 {
-        return None;
+    match syscall::sys_object_ctl(m.id, syscall::OBJECT_RELEASE, 0, 0) {
+        0 => {}
+        // A program this server answered a moment ago holds a capability
+        // for it and is about to map it. The kernel keeps the object for
+        // that, and says nothing when the capability has been used or
+        // thrown away: this asks again.
+        syscall::OBJECT_RELEASE_LATER => {
+            *entry = Some(Mapped { owed: true, ..m });
+            unsafe { OWED = true };
+            return None;
+        }
+        // Mapped again. The kernel will say when it is not.
+        _ => {
+            *entry = Some(Mapped { owed: false, ..m });
+            return None;
+        }
     }
     let _ = syscall::sys_cap_delete(m.slot);
     *entry = None;
     Some(m.inode)
+}
+
+/// Whether [`retry`] has anything to do.
+pub fn owed() -> bool {
+    unsafe { OWED }
+}
+
+/// Ask again about every object that could not be released when it went
+/// idle. Before each request: a program that was about to map one has, by
+/// then, or has gone.
+pub fn retry() {
+    unsafe { OWED = false };
+    let again: [Option<Mapped>; MAX_MAPPED] = core::array::from_fn(|i| table()[i].filter(|m| m.owed));
+    for m in again.into_iter().flatten() {
+        idle(m.inode, m.id);
+    }
 }
 
 /// The object for `inode`, `bytes` long, made on first use.
@@ -89,7 +126,7 @@ fn object_for(inode: u32, bytes: u64) -> Result<Mapped, u64> {
         }
         // A slot something else was granted into is refused; try the next.
         if let Ok(id) = syscall::sys_object_create(inode as u64, bytes, slot) {
-            let m = Mapped { inode, id, slot };
+            let m = Mapped { inode, id, slot, owed: false };
             table()[index] = Some(m);
             return Ok(m);
         }

@@ -53,7 +53,7 @@ useradd/ userdel/ groupadd/ gpasswd/ id/
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     684 checks of the kernel, made through the ABI.
+dtest/  dchild/     686 checks of the kernel, made through the ABI.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.

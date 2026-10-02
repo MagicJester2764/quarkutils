@@ -163,6 +163,11 @@ pub const OBJECT_READ_PAGE: u64 = 1;
 pub const OBJECT_WRITE_PAGE: u64 = 2;
 pub const OBJECT_TAKE_DIRTY: u64 = 3;
 pub const OBJECT_RELEASE: u64 = 4;
+/// [`OBJECT_RELEASE`]'s answer while a task other than the pager holds a
+/// capability for the object — it was given one to map with and has not
+/// mapped yet. Nothing was released, and nothing will say when the
+/// capability has gone: ask again.
+pub const OBJECT_RELEASE_LATER: u64 = 1;
 /// A `MemObject` capability's access bits.
 pub const OBJECT_ACCESS_READ: u64 = 1;
 pub const OBJECT_ACCESS_WRITE: u64 = 2;
@@ -2036,7 +2041,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 12;
+pub const ABI_VERSION_MINOR: u32 = 13;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
