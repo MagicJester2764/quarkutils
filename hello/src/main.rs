@@ -149,4 +149,14 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let elapsed = t0.elapsed();
     println!("Woke up ({}ms elapsed)", elapsed.as_millis());
+
+    // And a short one. The clock is in nanoseconds, and a sleep is as long
+    // as was asked: this used to come back in ten or twenty milliseconds,
+    // having been rounded up to the kernel's tick, by a clock that could
+    // only say "0ms" or "10ms" about it.
+    let t0 = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_micros(1500));
+    println!("A sleep of 1500us took {}us", t0.elapsed().as_micros());
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    println!("It is {}.{:09} seconds since 1970", since.as_secs(), since.subsec_nanos());
 }

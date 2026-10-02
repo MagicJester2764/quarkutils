@@ -93,8 +93,10 @@ pub fn yield_now() {
 }
 
 pub fn sleep(dur: Duration) {
-    let ms = dur.as_millis() as u64;
-    quark_rt::rt::sleep_ms(ms);
+    // For as long as was asked and no less: the kernel keeps the time to
+    // the nanosecond, and ends the sleep when it is due where the machine
+    // can and on the next tick where it cannot.
+    quark_rt::rt::sleep(dur);
 }
 
 pub fn sleep_until(deadline: crate::time::Instant) {

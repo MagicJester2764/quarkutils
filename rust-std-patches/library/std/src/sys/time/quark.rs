@@ -1,32 +1,38 @@
 use crate::time::Duration;
 
-const TICK_PERIOD_NS: u64 = 10_000_000; // 10 ms per tick (100 Hz PIT)
+// The kernel's clock counts nanoseconds: since boot for a time that only
+// goes forward, and since 1970 for the date, which moves when somebody sets
+// it. How fine it really is depends on the machine — well under a
+// microsecond where the processor has a counter the kernel can keep time by,
+// ten milliseconds where it has not.
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct Instant(u64); // ticks
+pub struct Instant(u64); // nanoseconds since boot
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct SystemTime(u64); // ticks since 1970, from the clock the kernel read at boot
+pub struct SystemTime(u64); // nanoseconds since 1970
 
 pub const UNIX_EPOCH: SystemTime = SystemTime(0);
 
+fn nanos(time: &Duration) -> Option<u64> {
+    u64::try_from(time.as_nanos()).ok()
+}
+
 impl Instant {
     pub fn now() -> Instant {
-        Instant(quark_rt::rt::ticks())
+        Instant(quark_rt::rt::now_ns())
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
-        self.0.checked_sub(other.0).map(|ticks| Duration::from_nanos(ticks * TICK_PERIOD_NS))
+        self.0.checked_sub(other.0).map(Duration::from_nanos)
     }
 
     pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
-        let ticks = other.as_nanos() as u64 / TICK_PERIOD_NS;
-        self.0.checked_add(ticks).map(Instant)
+        self.0.checked_add(nanos(other)?).map(Instant)
     }
 
     pub fn checked_sub_duration(&self, other: &Duration) -> Option<Instant> {
-        let ticks = other.as_nanos() as u64 / TICK_PERIOD_NS;
-        self.0.checked_sub(ticks).map(Instant)
+        self.0.checked_sub(nanos(other)?).map(Instant)
     }
 }
 
@@ -35,26 +41,22 @@ impl SystemTime {
     pub const MIN: SystemTime = SystemTime(0);
 
     pub fn now() -> SystemTime {
-        SystemTime(quark_rt::rt::unix_ticks())
+        SystemTime(quark_rt::rt::unix_ns())
     }
 
     pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {
         if self.0 >= other.0 {
-            let ticks = self.0 - other.0;
-            Ok(Duration::from_nanos(ticks * TICK_PERIOD_NS))
+            Ok(Duration::from_nanos(self.0 - other.0))
         } else {
-            let ticks = other.0 - self.0;
-            Err(Duration::from_nanos(ticks * TICK_PERIOD_NS))
+            Err(Duration::from_nanos(other.0 - self.0))
         }
     }
 
     pub fn checked_add_duration(&self, other: &Duration) -> Option<SystemTime> {
-        let ticks = other.as_nanos() as u64 / TICK_PERIOD_NS;
-        self.0.checked_add(ticks).map(SystemTime)
+        self.0.checked_add(nanos(other)?).map(SystemTime)
     }
 
     pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
-        let ticks = other.as_nanos() as u64 / TICK_PERIOD_NS;
-        self.0.checked_sub(ticks).map(SystemTime)
+        self.0.checked_sub(nanos(other)?).map(SystemTime)
     }
 }
