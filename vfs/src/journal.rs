@@ -21,6 +21,16 @@
 //!
 //! jbd2 is big-endian on disk, alone among everything else here.
 //!
+//! **File data is not journalled** when it is written a whole block at a
+//! time, which is how a file is copied: it goes straight to its block. What
+//! the journal keeps whole is the filesystem, and a block is not part of it
+//! until the inode that names it is committed — which is after the data is
+//! there, so a machine that stops in between has a block nobody owns and
+//! nothing that points at it. Writing data twice, and a transaction's whole
+//! ceremony round every page of it, was most of what writing a file cost. A
+//! block the open transaction already holds is still written through it
+//! ([`holds_block`]): the disk's copy of that one is not the latest.
+//!
 //! **No revoke records.** They exist so that a stale metadata block in an old
 //! transaction is not replayed over a location since reused for file data.
 //! This commits one transaction at a time and empties the journal after
@@ -156,30 +166,59 @@ impl Journal {
 // Block I/O
 // ---------------------------------------------------------------------------
 
-/// Read filesystem block `fs_block` into the buffer at `vaddr`.
+/// Read filesystem block `fs_block` into the buffer at `vaddr`, from the
+/// disk and not from any open transaction.
+///
+/// A block at a time, in one request to the driver. A transaction is a dozen
+/// blocks written twice and half of them read first; a sector at a time, with
+/// blocks of eight sectors, that was two hundred requests for every page
+/// written to a file.
 fn read_fs_block(ext2: &Ext2State, fs_block: u32, vaddr: usize) -> Result<(), u64> {
     let base = ext2.block_to_lba(fs_block);
-    for s in 0..ext2.sectors_per_block {
-        read_sector_bypass(ext2.disk_tid, base + s).map_err(|_| ERR_IO)?;
-        let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut((vaddr + (s * 512) as usize) as *mut u8, 512)
-        };
-        dst.copy_from_slice(disk);
+    let bytes = ext2.block_size as usize;
+    if ext2.sectors_per_block > crate::disk::MAX_SECTORS {
+        // More than fits a request, which nothing mounted here has: a sector
+        // at a time, as before.
+        for s in 0..ext2.sectors_per_block {
+            read_sector_bypass(ext2.disk_tid, base + s).map_err(|_| ERR_IO)?;
+            let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut((vaddr + (s * 512) as usize) as *mut u8, 512)
+            };
+            dst.copy_from_slice(disk);
+        }
+        return Ok(());
     }
+    crate::disk::read(ext2.disk_tid, base, ext2.sectors_per_block).map_err(|_| ERR_IO)?;
+    let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, bytes) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, bytes) };
+    dst.copy_from_slice(disk);
     Ok(())
 }
 
-/// Write the buffer at `vaddr` to filesystem block `fs_block`.
+/// Write the buffer at `vaddr` to filesystem block `fs_block`: straight to
+/// the disk, in one request.
 fn write_fs_block(ext2: &Ext2State, fs_block: u32, vaddr: usize) -> Result<(), u64> {
     let base = ext2.block_to_lba(fs_block);
+    let bytes = ext2.block_size as usize;
+    if ext2.sectors_per_block > crate::disk::MAX_SECTORS {
+        for s in 0..ext2.sectors_per_block {
+            let src = unsafe {
+                core::slice::from_raw_parts((vaddr + (s * 512) as usize) as *const u8, 512)
+            };
+            let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
+            disk.copy_from_slice(src);
+            ext2.write_sector_raw(base + s).map_err(|_| ERR_IO)?;
+        }
+        return Ok(());
+    }
+    let src = unsafe { core::slice::from_raw_parts(vaddr as *const u8, bytes) };
+    let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, bytes) };
+    disk.copy_from_slice(src);
+    crate::disk::write_many(ext2.disk_tid, base, ext2.sectors_per_block).map_err(|_| ERR_IO)?;
+    // What the cache has of these sectors is what was there before.
     for s in 0..ext2.sectors_per_block {
-        let src = unsafe {
-            core::slice::from_raw_parts((vaddr + (s * 512) as usize) as *const u8, 512)
-        };
-        let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
-        disk.copy_from_slice(src);
-        ext2.write_sector_raw(base + s).map_err(|_| ERR_IO)?;
+        unsafe { crate::SECTOR_CACHE.invalidate(base + s) };
     }
     Ok(())
 }
@@ -540,6 +579,18 @@ pub fn begin(j: &mut Journal) {
 /// Is a transaction collecting writes right now?
 pub fn in_transaction(j: &Journal) -> bool {
     j.loaded && j.txn.open
+}
+
+/// Whether the open transaction has staged filesystem block `fs_block`:
+/// what the disk has of it is then out of date, and whatever is written to
+/// it has to be written to the transaction's copy.
+pub fn holds_block(j: &Journal, fs_block: u32) -> bool {
+    j.txn.open && slot_of(j, fs_block).is_some()
+}
+
+/// How many blocks the open transaction has staged.
+pub fn staged(j: &Journal) -> usize {
+    if j.txn.open { j.txn.count } else { 0 }
 }
 
 /// Which slot holds `fs_block`, if the open transaction has it.

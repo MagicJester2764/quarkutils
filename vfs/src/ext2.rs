@@ -1063,7 +1063,12 @@ pub fn write_file_data(
             continue;
         }
         let new_block = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
-        zero_block(ext2, new_block)?;
+        // A block the write covers whole needs no zeroes under it: nothing
+        // names it until the write is done.
+        let covered = logical * bs >= offset && (logical + 1) * bs <= end_offset;
+        if !covered {
+            zero_block(ext2, new_block)?;
+        }
         if let Err(code) = set_block_ptr(ext2, inode, logical, new_block) {
             // Nothing refers to it; leaving it allocated would leak it.
             let _ = crate::ext2_alloc::free_block(ext2, new_block);
@@ -1086,6 +1091,28 @@ pub fn write_file_data(
 
         let remaining_in_block = bs - offset_in_block;
         let mut to_write_in_block = remaining_in_block.min(to_write - written);
+
+        // The whole of a block goes straight to the disk, in one request:
+        // see the journal's notes on why file data is not journalled. Not a
+        // block the open transaction holds, whose latest copy is there.
+        if offset_in_block == 0
+            && to_write_in_block == bs
+            && ext2.sectors_per_block <= crate::disk::MAX_SECTORS
+            && !crate::journal::holds_block(crate::journal_ref(), phys_block)
+        {
+            let base = ext2.block_to_lba(phys_block);
+            let src = unsafe {
+                core::slice::from_raw_parts((CLIENT_BUF + written as usize) as *const u8, bs as usize)
+            };
+            let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, bs as usize) };
+            disk.copy_from_slice(src);
+            crate::disk::write_many(ext2.disk_tid, base, ext2.sectors_per_block).map_err(|_| ERR_IO)?;
+            for s in 0..ext2.sectors_per_block {
+                unsafe { crate::SECTOR_CACHE.invalidate(base + s) };
+            }
+            written += bs;
+            continue;
+        }
 
         // Write sector by sector
         let mut block_pos = offset_in_block;
@@ -1272,11 +1299,24 @@ pub fn set_needs_recovery(ext2: &Ext2State, on: bool) -> Result<(), u64> {
     incompat = want;
     write_u32(sb, 96, incompat);
     csum::set_superblock(sb);
+    write_super_direct(ext2, sb)
+}
 
-    for s in 0..2usize {
-        let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
-        disk.copy_from_slice(&sb[s * 512..(s + 1) * 512]);
-        ext2.write_sector_raw(abs_lba + s as u32).map_err(|_| ERR_IO)?;
+/// Write the superblock's two sectors straight to the disk, as one request.
+///
+/// One, because the checksum over both is in the second. Written as two, a
+/// machine that stopped between them had a superblock with new fields and
+/// the old checksum, which nothing accepts: `e2fsck` falls back to the copy
+/// made when the disk was formatted and "repairs" everything that has
+/// changed since. A crash test that stops the machine at many moments found
+/// it at two stops in twenty-four.
+fn write_super_direct(ext2: &Ext2State, sb: &[u8; 1024]) -> Result<(), u64> {
+    let abs_lba = ext2.part_lba + 2;
+    let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 1024) };
+    disk.copy_from_slice(sb);
+    crate::disk::write_many(ext2.disk_tid, abs_lba, 2).map_err(|_| ERR_IO)?;
+    for s in 0..2 {
+        unsafe { SECTOR_CACHE.invalidate(abs_lba + s) };
     }
     Ok(())
 }
@@ -1307,6 +1347,12 @@ pub fn flush_superblock(ext2: &Ext2State) -> Result<(), u64> {
     }
     csum::set_superblock(sb);
 
+    // Into the open transaction, a sector at a time: it keeps the block
+    // whole and writes it whole. With no transaction to go into, to the
+    // disk in one request.
+    if !crate::journal::in_transaction(crate::journal_ref()) {
+        return write_super_direct(ext2, sb);
+    }
     for s in 0..2usize {
         let disk = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
         disk.copy_from_slice(&sb[s * 512..(s + 1) * 512]);

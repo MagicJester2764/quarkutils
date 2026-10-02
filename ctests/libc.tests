@@ -32,3 +32,4 @@ spawntest
 detachtest
 blktest
 mounttest
+synctest

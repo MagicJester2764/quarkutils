@@ -68,6 +68,26 @@ pub fn read(disk_tid: usize, lba: u32, count: u32) -> Result<(), ()> {
     }
 }
 
+/// Write the first `count` sectors of `DISK_IO_BUF` (at most
+/// [`MAX_SECTORS`]) to `lba` of the volume, in one request.
+pub fn write_many(disk_tid: usize, lba: u32, count: u32) -> Result<(), ()> {
+    if count <= 1 {
+        return write(disk_tid, lba);
+    }
+    let count = count.min(MAX_SECTORS);
+    let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, count as usize * 512) };
+    let msg = Message {
+        sender: 0,
+        tag: block::TAG_WRITE_SECTORS,
+        data: [lba as u64, volume(), count as u64, 0, 0, 0],
+    };
+    let mut reply = Message::empty();
+    match syscall::sys_call_lend(disk_tid, &msg, &mut reply, buf) {
+        Ok(()) if reply.tag == block::TAG_OK => Ok(()),
+        _ => Err(()),
+    }
+}
+
 /// Write the sector at the start of `DISK_IO_BUF` to `lba` of the volume.
 pub fn write(disk_tid: usize, lba: u32) -> Result<(), ()> {
     let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };

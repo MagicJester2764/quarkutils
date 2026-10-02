@@ -191,8 +191,9 @@ does on Linux. What is different is at the edges:
   fails with `EBUSY` if a filesystem on it is mounted, or if it is the disk
   the system is running from; opening one to read never does, so a mounted
   filesystem can be looked at. `BLKRRPART` wants a descriptor that writes
-  the whole disk (`EACCES`, and `EINVAL` for a partition). Nothing is cached: a write is on the disk
-  when it returns, and `fsync` and `BLKFLSBUF` have nothing to do.
+  the whole disk (`EACCES`, and `EINVAL` for a partition). Nothing written
+  to a disk this way is cached: it is on the disk when the write returns,
+  and `fsync` and `BLKFLSBUF` add nothing.
 - **A mounted filesystem is another device.** `st_dev` is 1 for the root
   and something else for each mount; `st_ino` and a directory entry's
   `d_ino` are the file's number in its own filesystem. `rename` and `link`
@@ -203,6 +204,12 @@ does on Linux. What is different is at the edges:
   (`/usr/bin/mount`), because a mount is a server it has to start.
   `mmap` of a file in a mounted filesystem fails, and a named pipe there
   cannot be opened.
+- **`fsync`, `fdatasync`, `syncfs` and `sync` wait.** A write returns a
+  moment before the filesystem has recorded it for good — half a second at
+  most, and usually a fiftieth of one; these return when it has. They do not tell
+  one file from another: everything written is recorded, which is more than
+  was asked and never less. On a pipe, a terminal or a socket they are
+  `EINVAL`, as on Linux.
 - `mmap` of a file works, shared and private. Anonymous memory is given its
   pages when they are first touched.
 - **A named pipe** is made with `mkfifo` or `mknod`, on ext2 and ext4, and

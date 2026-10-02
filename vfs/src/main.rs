@@ -1600,7 +1600,21 @@ pub extern "C" fn _start() -> ! {
     // Service loop
     loop {
         let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+        // Writes are waiting for another to join them. Not for long: half a
+        // second at most, whatever else is being asked meanwhile.
+        if journal::in_transaction(journal_ref())
+            && syscall::sys_ticks().wrapping_sub(unsafe { WAITING_SINCE }) >= MAX_WAIT_TICKS
+        {
+            commit_pending();
+        }
+        if journal::in_transaction(journal_ref()) {
+            // And with nothing asked at all, what they changed is committed
+            // at once.
+            if syscall::sys_recv_timeout(TID_ANY, &mut msg, FLUSH_TICKS).is_err() {
+                commit_pending();
+                continue;
+            }
+        } else if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
             continue;
         }
 
@@ -1697,7 +1711,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_READ => handle_read(disk, sender, msg),
         TAG_CLOSE => handle_close(sender, msg),
         TAG_STAT => handle_stat(sender, msg),
-        TAG_WRITE => transacted(|| handle_write(disk, sender, msg)),
+        TAG_WRITE => deferred(|| handle_write(disk, sender, msg)),
         TAG_MKDIR => transacted(|| handle_mkdir(disk, sender, msg)),
         TAG_MKNOD => transacted(|| handle_mknod(sender, msg)),
         TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
@@ -1722,6 +1736,13 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         }
         TAG_TRUNCATE => transacted(|| handle_truncate(disk, sender, msg)),
         TAG_STATFS => handle_statfs(sender),
+        // Everything said to have been written is on the disk when this is
+        // answered: here, and in every filesystem mounted here.
+        TAG_SYNC => {
+            commit_pending();
+            mounts::sync();
+            reply_opened(sender, [0; 6]);
+        }
         TAG_READDIR_BULK => handle_readdir_bulk(disk, sender, msg),
         quark_rt::ipc::TAG_PING => {
             // Liveness probe: reply immediately, touching no disk state.
@@ -3224,14 +3245,28 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
     }
 }
 
-/// Run one filesystem-modifying operation as a single transaction.
-///
-/// Everything it writes is held in the journal until it is complete, so a
-/// machine that stops half way through leaves the filesystem as it was rather
-/// than as neither one thing nor the other.
-fn transacted<F: FnOnce()>(body: F) {
-    journal::begin(journal_mut());
-    body();
+/// Writes that have left their transaction open for the next to join.
+static mut DEFERRED: u32 = 0;
+/// How many may share one, and how long one waits for the next: 256 KiB of a
+/// file, and a fiftieth of a second.
+const MAX_DEFERRED: u32 = 64;
+const FLUSH_TICKS: u64 = 2;
+/// When the first of them began waiting, and how long any may: half a
+/// second. The other limit is on quiet, and a server answering reads all
+/// day is never quiet.
+static mut WAITING_SINCE: u64 = 0;
+const MAX_WAIT_TICKS: u64 = 50;
+/// How many blocks a transaction may already hold when a request begins:
+/// half of what it has room for, so that whatever the request changes fits.
+const ROOM: usize = journal::MAX_TXN_BLOCKS / 2;
+
+/// Commit the open transaction, if there is one, and write it where it
+/// belongs.
+pub(crate) fn commit_pending() {
+    unsafe { DEFERRED = 0 };
+    if !journal::in_transaction(journal_ref()) {
+        return;
+    }
     match journal::commit(journal_mut(), ext2_state()) {
         Ok(_) => {
             if let Err(e) = journal::checkpoint(journal_mut(), ext2_state()) {
@@ -3242,6 +3277,51 @@ fn transacted<F: FnOnce()>(body: F) {
             println!("[vfs] commit failed ({}); the change was abandoned", e);
             journal::abort(journal_mut());
         }
+    }
+}
+
+/// Run one filesystem-modifying operation as a single transaction.
+///
+/// Everything it writes is held in the journal until it is complete, so a
+/// machine that stops half way through leaves the filesystem as it was rather
+/// than as neither one thing nor the other. Writes that were waiting for
+/// company are committed with it.
+fn transacted<F: FnOnce()>(body: F) {
+    if journal::staged(journal_ref()) > ROOM {
+        commit_pending();
+    }
+    journal::begin(journal_mut());
+    body();
+    commit_pending();
+}
+
+/// Run a write to a file, and leave its transaction open for the next.
+///
+/// A file is written a page at a time, and each page changes the same four
+/// blocks: the inode, a bitmap, a group's counts and the filesystem's. A
+/// transaction for each wrote those four twice over, with a descriptor, a
+/// commit and the journal's own superblock twice, for every page: fourteen
+/// blocks to store one. Left open, the transaction takes the next page's
+/// changes to the same four blocks, and is committed once — when it has
+/// been joined [`MAX_DEFERRED`] times, when anything else changes the
+/// filesystem, or when nothing has asked for [`FLUSH_TICKS`].
+///
+/// Nothing is lost by it that was not already at risk: a write was always
+/// answered before its transaction was committed. And nothing that frees a
+/// block waits — only writes do, which only allocate — so a block is never
+/// given to a second file while the disk still says it is the first's.
+fn deferred<F: FnOnce()>(body: F) {
+    if journal::staged(journal_ref()) > ROOM {
+        commit_pending();
+    }
+    if !journal::in_transaction(journal_ref()) {
+        unsafe { WAITING_SINCE = syscall::sys_ticks() };
+    }
+    journal::begin(journal_mut());
+    body();
+    unsafe { DEFERRED += 1 };
+    if unsafe { DEFERRED } >= MAX_DEFERRED || journal::staged(journal_ref()) > ROOM {
+        commit_pending();
     }
 }
 

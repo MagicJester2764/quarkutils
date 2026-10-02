@@ -111,6 +111,7 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode);
 void __quark_pty_opened(long fd, int noctty);
 long __quark_mknodat(long dirfd, const char *path, long mode);
 long __quark_blk_ioctl(long fd, unsigned long request, unsigned long arg);
+long __quark_fsync(long fd);
 long __quark_close(long fd);
 long __quark_read(long fd, void *buf, unsigned long n);
 long __quark_write(long fd, const void *buf, unsigned long n);

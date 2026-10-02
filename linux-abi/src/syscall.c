@@ -1418,13 +1418,17 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_utimens(a1, (const char *)a2, (const long *)a3,
                                (a4 & LX_AT_SYMLINK_NOFOLLOW) != 0);
 
-    /* Nothing here is written behind: a write is on the disk, or in the
-       journal on its way there, before the call that made it returns. */
+    /* A write is answered before the filesystem has recorded it for good:
+       its data is on the disk, and what says the file is that long waits a
+       moment for the next write to say so too. These wait for it. They do
+       not tell one file from another, or one filesystem: everything is
+       recorded, which is more than was asked and never less. */
     case LX_fsync:
     case LX_fdatasync:
-    case LX_sync:
     case LX_syncfs:
-        return 0;
+        return __quark_fsync(a1);
+    case LX_sync:
+        return __quark_fsync(-1);
 
     /* No extended attributes. "Not supported" is the answer that makes `ls`
        and `cp` carry on as for a filesystem that has none; "no such call"

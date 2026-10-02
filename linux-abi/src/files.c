@@ -888,6 +888,21 @@ long __quark_symlink(const char *target, long dirfd, const char *path) {
     return err ? vfs_errno(err) : 0;
 }
 
+/* fsync, fdatasync and syncfs: an open descriptor, and then everything.
+   sync is the same with no descriptor to ask about (-1), and cannot fail. */
+long __quark_fsync(long fd) {
+    if (fd == -1) {
+        quark_vfs_sync();
+        return 0;
+    }
+    if (!is_file(fd, 0)) {
+        /* A pipe, a terminal, a socket: open, and not something a
+           filesystem records. */
+        return is_open(fd) || (fd >= 0 && fd < 3) ? -LX_EINVAL : -LX_EBADF;
+    }
+    return quark_vfs_sync() ? -LX_EIO : 0;
+}
+
 /* Linux's struct statfs for x86-64: seven words, a two-int fsid, four more
    words and four spare. */
 static long fill_statfs(unsigned long handle, unsigned char *out) {

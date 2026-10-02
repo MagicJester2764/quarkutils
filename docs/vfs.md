@@ -135,6 +135,7 @@ Every request below that takes a handle takes either kind.
 | 32 | `IDENTITY` | `[uid, gid]` | — | — |
 | 33 | `RETIRE` | — | — | — |
 | 34 | `PATH_OF` | `[handle]` | 4096 bytes to fill | `[len]` |
+| 35 | `SYNC` | — | — | — |
 
 28 to 30 are *Mounts*, below; 31 to 34 are what one file server says to
 another, and a client that says them is refused.
@@ -180,6 +181,30 @@ A symbolic link opened with `NOFOLLOW` answers `STAT` (mode `0120777`, its
 size the target's length) and `CLOSE`, and `NOT_SUPPORTED` to everything else.
 `CREATE` through a link whose target does not exist says `EXISTS`; Linux would
 make the target.
+
+### When a write is on the disk
+
+A `WRITE` is answered before the filesystem has recorded it for good. On
+ext4 the record is a transaction in the journal, and a file is written a
+page at a time: a transaction to a page was fourteen blocks written to
+store one. So the transaction is left open for the next write to join, and
+is committed when sixty-four writes have joined it, when anything else
+changes the filesystem, when nothing has been asked for a fiftieth of a
+second, or half a second after the first of them, whichever is soonest.
+Only a write waits like this. Every other change is committed
+before it is answered, and takes the waiting writes with it.
+
+`SYNC` waits for it: when it is answered, everything written before it is
+recorded, here and in every filesystem mounted here. A machine that stops
+before a commit has the filesystem as it was — whole, and without the last
+few pages — which is what the journal is for.
+
+File data written a whole block at a time is not put through the journal at
+all: it goes straight to its block. A new block is one nothing names until
+the transaction that says so commits, so a crash leaves it nobody's. A
+block the file already had is simply overwritten, and a crash does not
+bring the old contents back — as on Linux, where only the filesystem's own
+structures are journalled unless asked otherwise.
 
 ### READ, WRITE and SEEK
 

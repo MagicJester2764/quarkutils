@@ -35,6 +35,7 @@ const TAG_DEVCTL: u64 = 27;
 const TAG_ATTACH: u64 = 28;
 const TAG_DETACH: u64 = 29;
 const TAG_MOUNTS: u64 = 30;
+const TAG_SYNC: u64 = 35;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// What kind of filesystem a mount is, as [`mounted`] says it.
@@ -829,6 +830,14 @@ pub fn write_mtab(vfs_tid: usize) -> Result<(), u64> {
     }
     let _ = close(vfs_tid, file.handle);
     result
+}
+
+/// Have everything written so far be on its disk: in the root filesystem and
+/// in every one mounted. A write is answered before the filesystem has
+/// recorded it for good — for a fiftieth of a second, or until something
+/// else is changed — and this is how to wait for that.
+pub fn sync(vfs_tid: usize) -> Result<(), u64> {
+    simple_call(vfs_tid, TAG_SYNC, [0; 6]).map(|_| ())
 }
 
 /// What the filesystem holding the open file `handle` is and how full:

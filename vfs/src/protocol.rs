@@ -78,6 +78,8 @@ pub const TAG_RETIRE: u64 = 33;
 /// The path of a directory handle, from this filesystem's root, into what
 /// is lent.
 pub const TAG_PATH_OF: u64 = 34;
+/// Have everything that was written be on the disk before answering.
+pub const TAG_SYNC: u64 = 35;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

@@ -703,6 +703,36 @@ change here: it has found what reading the code did not.
   open and the wait has still been.
 - **A mapping asks what the descriptor was opened for.** A descriptor opened
   to read is not one that writes because it was mapped shared.
+- **A write is answered before it is recorded, and only a write is.**
+  `deferred` (in `vfs/src/main.rs`) leaves a file write's transaction open
+  for the next write to join; everything else is `transacted` and commits
+  before it returns, taking any waiting writes with it. That asymmetry is
+  the safety of it: a write only allocates, so nothing that *frees* a block
+  ever waits, and a block cannot be given to a second file while the disk
+  still says it is the first's. The loop commits what is waiting after a
+  fiftieth of a second with nothing asked — and after half a second whatever
+  is being asked, since a server answering reads is never quiet — `TAG_SYNC`
+  commits it on demand,
+  a mounted filesystem's server commits before it ends, and `shutdown` asks
+  for a sync before it ends the servers. A new request that changes the
+  filesystem goes through `transacted`, never `deferred`.
+- **Whole blocks of file data go round the journal**, straight to their
+  blocks, before the transaction that names them commits. A block the open
+  transaction holds is the exception (`journal::holds_block`): the disk's
+  copy of that one is not the latest, and a write to it goes through the
+  transaction or is undone at the checkpoint.
+- **A structure with a checksum goes to the disk in one request**, and the
+  ATA driver hands the drive a request as one block (WRITE MULTIPLE). The
+  superblock is two sectors with its checksum in the second; written as two
+  requests — or as one, to an emulated drive that writes each sector as it
+  arrives — a machine stopped between them has a superblock nothing accepts,
+  and `e2fsck` falls back to the copy made at `mkfs` and "repairs" everything
+  since. The journal cannot help: its replay is decided by reading that
+  superblock. `tools/crash-test.sh` in ExplOSion found it by stopping the
+  machine at many moments instead of one, two stops in twenty-four. No ATA
+  command promises a write is all or nothing — a real disk gets it from
+  sectors that are physically four kilobytes — so this is the case removed
+  that there was no need to have, not a guarantee.
 - **A journaled write never lets a prefetch cache the old copy.** While a
   transaction holds a sector, a read ahead skips it; caching what is on disk
   under it lost a rename on ext4.

@@ -228,8 +228,20 @@ fn adopt(sender: usize) {
     reply_opened(sender, [unsafe { SELF_ROOT }, unsafe { SELF_KIND }, read_only as u64, 0, 0, 0]);
 }
 
+/// Have every filesystem mounted here put what it was told to write on its
+/// disk.
+pub fn sync() {
+    for m in 0..MAX_MOUNTS {
+        if mounts()[m].in_use && !mounts()[m].dead {
+            let msg = Message { sender: 0, tag: TAG_SYNC, data: [0; 6] };
+            let _ = request(m, &msg, Lend::Nothing);
+        }
+    }
+}
+
 /// The server above has gone, or has said to stop: nothing more will ask.
 fn end() -> ! {
+    crate::commit_pending();
     let (driver, volume) = crate::disk::root();
     let _ = quark_rt::block::release(driver, volume);
     syscall::sys_exit();
