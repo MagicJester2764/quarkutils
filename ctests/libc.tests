@@ -39,3 +39,4 @@ smptest
 watchtest
 clocktest
 avxtest
+handlertest

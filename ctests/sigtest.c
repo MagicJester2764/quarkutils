@@ -1,14 +1,10 @@
 // LINK: -lutil
-/* Signals, as far as a shell and what it runs need them.
- *
- * Quark's kernel runs no handler. It ends a program that has said nothing
- * about a signal, and tells one that has a handler — which the C layer then
- * calls, on the way out of whatever system call the program makes next, or of
- * the wait the signal cut short. This is everything a program can see of
- * that: a handler runs when it should and not before, the three waits a
- * program sits in at a prompt come back with EINTR, a child ends with the
- * signal's number, an exec keeps what was ignored, a pipe nobody reads is
- * SIGPIPE, and Ctrl-C at a terminal reaches what is running in it.
+/* Signals, as far as a shell and what it runs need them: a handler runs when
+ * it should and not before, the three waits a program sits in at a prompt
+ * come back with EINTR, a child ends with the signal's number, an exec keeps
+ * what was ignored, a pipe nobody reads is SIGPIPE, and Ctrl-C at a terminal
+ * reaches what is running in it. What only a handler the kernel runs can do
+ * is `handlertest`'s.
  *
  * Run with an argument it is the other half of one of its own checks: the
  * program something else exec'd.
