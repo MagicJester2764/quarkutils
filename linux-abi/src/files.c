@@ -336,9 +336,10 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
                was if the handler asked for that, and is over if it did not:
                the end goes back, so that nobody is left waiting for a
                program that has stopped opening it. */
-            if (r != QUARK_INTERRUPTED || (__quark_sig_interrupted() & QUARK_SIG_EINTR)) {
+            long cut = quark_cut_short(r, 1);
+            if (cut <= 0) {
                 __syscall1(SYS_FD_CLOSE, (unsigned long)fd);
-                return r == QUARK_INTERRUPTED ? -LX_EINTR : -LX_EIO;
+                return cut < 0 ? cut : -LX_EIO;
             }
         }
         __quark_fd_set_nonblock(fd, (flags & LX_O_NONBLOCK) != 0);
@@ -1171,22 +1172,24 @@ long __quark_read(long fd, void *buf, unsigned long n) {
        read that blocks there is a program that stops rather than one that
        fails. Setting the flag and ignoring it is the worst of both. */
     unsigned long r;
-    if (__quark_fd_is_nonblock(fd)) {
-        r = __syscall3(SYS_FD_READ_NB, (unsigned long)fd, (unsigned long)buf, n);
-        if (r == QUARK_WOULD_BLOCK) {
-            return -LX_EAGAIN;
-        }
-    } else {
-        for (;;) {
+    for (;;) {
+        if (__quark_fd_is_nonblock(fd)) {
+            r = __syscall3(SYS_FD_READ_NB, (unsigned long)fd, (unsigned long)buf, n);
+            if (r == QUARK_WOULD_BLOCK) {
+                return -LX_EAGAIN;
+            }
+        } else {
             r = __syscall3(SYS_FD_READ, (unsigned long)fd, (unsigned long)buf, n);
-            if (r != QUARK_INTERRUPTED) {
-                break;
-            }
-            /* A read of a terminal that a signal ended. If a handler ran and
-               did not ask for the read to go on, the read is over. */
-            if (__quark_sig_interrupted() & QUARK_SIG_EINTR) {
-                return -LX_EINTR;
-            }
+        }
+        /* A read a signal ended — or a read of a terminal from behind,
+           stopped and continued. Made again, unless a handler ran that did
+           not ask for that. */
+        long cut = quark_cut_short(r, 1);
+        if (cut < 0) {
+            return cut;
+        }
+        if (!cut) {
+            break;
         }
     }
     if (r == QUARK_ERR) {
@@ -1237,13 +1240,25 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
         return -LX_EBADF;
     }
     unsigned long r;
-    if (__quark_fd_is_nonblock(fd)) {
-        r = __syscall3(SYS_FD_WRITE_NB, (unsigned long)fd, (unsigned long)buf, n);
-        if (r == QUARK_WOULD_BLOCK) {
-            return -LX_EAGAIN;
+    for (;;) {
+        if (__quark_fd_is_nonblock(fd)) {
+            r = __syscall3(SYS_FD_WRITE_NB, (unsigned long)fd, (unsigned long)buf, n);
+            if (r == QUARK_WOULD_BLOCK) {
+                return -LX_EAGAIN;
+            }
+        } else {
+            r = __syscall3(SYS_FD_WRITE, (unsigned long)fd, (unsigned long)buf, n);
         }
-    } else {
-        r = __syscall3(SYS_FD_WRITE, (unsigned long)fd, (unsigned long)buf, n);
+        /* Cut short by a signal with nothing written — a full pipe, or a
+           terminal from behind — as a read is. Some of it written is a
+           short write, and says so. */
+        long cut = quark_cut_short(r, 1);
+        if (cut < 0) {
+            return cut;
+        }
+        if (!cut) {
+            break;
+        }
     }
     return r == QUARK_ERR ? write_failed(fd) : (long)r;
 }

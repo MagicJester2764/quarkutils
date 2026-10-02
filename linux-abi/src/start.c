@@ -39,7 +39,13 @@ static char env_bytes[ENV_BYTES];
 
 unsigned long *__quark_start_args(void);
 
+void __quark_sig_start(void);
+
 unsigned long *__quark_start_args(void) {
+    /* Before anything else can be signalled: where the kernel enters this
+       program to run a handler, and how a call a signal cuts short is to be
+       answered. */
+    __quark_sig_start();
     const unsigned char *page = (const unsigned char *)ARGS_PAGE;
     unsigned long count = *(const unsigned long *)page;
     unsigned long off = sizeof(unsigned long);

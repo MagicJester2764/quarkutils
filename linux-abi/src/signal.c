@@ -1,26 +1,31 @@
 /* Signals, for a libc that thinks it is talking to Linux.
  *
- * On Linux the kernel runs a handler: it stops the program wherever it is,
- * builds a frame on its stack and resumes it somewhere else. Quark's kernel
- * runs none. It knows what a program has said about each signal — nothing,
- * ignore it, or "I have a handler" — and for the first two it does what is
- * to be done, which is nothing or the end of the program. For the third it
- * tells the program, and the program runs its own handler: here.
+ * The kernel runs the handlers, as Linux's does. Told that a program has a
+ * handler for a signal, it turns a thread of the program aside when the
+ * signal is raised — on its way out of whatever call, interrupt or fault it
+ * is in, so within a tick whatever it is doing — and enters the program at
+ * one place, `__quark_sig_entry` below, with a record on the thread's stack
+ * of where it was. That place keeps the floating-point registers, makes
+ * the siginfo_t and ucontext_t a handler expects out of the record, calls
+ * the handler, puts back what the handler changed of the context, and gives
+ * the record back (SYS_SIG_RETURN). The thread then goes on from where the
+ * record says.
  *
- * It tells it twice. A word of this program's memory is set, and that is
- * looked at on the way out of every system call. And because a program
- * waiting for a key is making no system call, the waits a program sits in —
- * a read of a terminal, a poll, a sleep — end early and say why. Either way
- * the signals waiting are taken from the kernel and the handlers called from
- * here, as ordinary functions on the stack of whatever was being done.
+ * The mask is the kernel's too, a thread's own, and so is everything that
+ * depends on it: a signal held back by every thread waits, whatever it
+ * would do; sigsuspend, ppoll, pselect and epoll_pwait wait under another
+ * mask in one step; sigtimedwait takes a signal without running anything.
+ * A signal for one thread (tkill, raise) is that thread's.
  *
- * So a handler runs at a system-call boundary and nowhere else, which is a
- * subset of where Linux could run it: nothing a handler may do on Linux is
- * wrong here, a handler may still leave by `longjmp`, and a program that
- * computes for ever without a call is not interrupted. What is not here at
- * all: a mask for a signal with no handler (it does what it does at once),
- * and a thread a signal is aimed at — the first thread to look runs the
- * handler.
+ * A call a signal cuts short is answered as Unix would have it, because
+ * this program says so as it starts (`__quark_sig_start`): QUARK_INTERRUPTED
+ * if the handler that ran did not ask for SA_RESTART, QUARK_RESTART if it
+ * did, QUARK_AGAIN if nothing ran here — another thread took the signal, or
+ * it was a stop and a continue. Each call that waits does what Linux does
+ * with that (`quark_restartable`, `quark_cut_short`): a read, a write and a
+ * wait for a child are made again or fail with EINTR as the handler asked;
+ * a sleep, a poll and a sigsuspend are never made again; and none of them
+ * is told of an AGAIN.
  *
  * Two signals the kernel raises of its own accord, and both arrive here like
  * any other: SIGALRM, when the alarm `setitimer` set is due, and SIGCHLD,
@@ -34,7 +39,11 @@
 #define NSIG 64
 #define BIT(sig) (1UL << ((sig) - 1))
 
+#define LX_SIGILL  4
+#define LX_SIGBUS  7
+#define LX_SIGFPE  8
 #define LX_SIGKILL 9
+#define LX_SIGSEGV 11
 #define LX_SIGPIPE 13
 #define LX_SIGSTOP 19
 
@@ -42,184 +51,279 @@
 #define LX_SIG_IGN 1UL
 
 #define LX_SA_SIGINFO   4UL
+#define LX_SA_ONSTACK   0x08000000UL
 #define LX_SA_RESTART   0x10000000UL
 #define LX_SA_NODEFER   0x40000000UL
 #define LX_SA_RESETHAND 0x80000000UL
 
+#define LX_SS_ONSTACK 1
+#define LX_SS_DISABLE 2
+#define LX_MINSIGSTKSZ 2048
+
+/* si_code: raised by a program, by the kernel, and the four faults. */
+#define LX_SI_USER     0
+#define LX_SI_KERNEL   0x80
+#define LX_SEGV_MAPERR 1
+#define LX_BUS_ADRERR  2
+#define LX_FPE_INTDIV  1
+#define LX_ILL_ILLOPN  2
+
+/* What the kernel is told about running a handler (SYS_SIG_ACTION's flags):
+   its own signal is not held back while it runs; it is run once; on the
+   stack named for handlers; a call it cuts short is made again. And above
+   the kernel's byte, a bit of this program's own that the kernel hands back
+   in the frame: the handler takes three arguments. */
+#define Q_NODEFER   1UL
+#define Q_RESETHAND 2UL
+#define Q_ONSTACK   4UL
+#define Q_RESTARTS  8UL
+#define Q_SIGINFO   0x100UL
+
 /* The two a program may not refuse. */
 #define UNBLOCKABLE (BIT(LX_SIGKILL) | BIT(LX_SIGSTOP))
 
-/* What a program has said about each signal. Four words, read and written
-   whole under `actions_lock`: one thread says while another is being told of
-   the signal, and half of each is a handler called with the other's flags. */
+/* What the kernel leaves on the stack when it runs a handler. */
+struct quark_sigframe {
+    unsigned long signo;
+    /* 0: a program raised it, and `value` is its process id with the top
+       bit set; 1: the kernel did; 2: the thread faulted, at `value`. */
+    unsigned long code;
+    unsigned long value;
+    /* The thread's mask before, which is its mask again afterwards. */
+    unsigned long mask;
+    /* Bit 0: on the stack named for handlers. Above: the flags the handler
+       was given with, this program's own bits among them. */
+    unsigned long flags;
+    /* The handler, as it was given. */
+    unsigned long cookie;
+    unsigned long regs[18];
+};
+
+/* musl's siginfo_t and ucontext_t on x86-64, laid out as a handler compiled
+   against it reads them. */
+struct lx_siginfo {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    int pad;
+    union {
+        struct {
+            int pid;
+            unsigned int uid;
+        } kill;
+        void *addr;
+        char fill[112];
+    } u;
+};
+struct lx_ucontext {
+    unsigned long uc_flags;
+    struct lx_ucontext *uc_link;
+    void *ss_sp;
+    int ss_flags;
+    unsigned long ss_size;
+    unsigned long gregs[23];
+    void *fpregs;
+    unsigned long reserved[8];
+    unsigned long sigmask[16];
+    unsigned long fpregs_mem[64];
+};
+/* Where each register is in gregs. */
+enum {
+    G_R8, G_R9, G_R10, G_R11, G_R12, G_R13, G_R14, G_R15, G_RDI, G_RSI, G_RBP,
+    G_RBX, G_RDX, G_RAX, G_RCX, G_RSP, G_RIP, G_EFL, G_CSGSFS, G_ERR, G_TRAPNO,
+    G_OLDMASK, G_CR2
+};
+/* Each of the frame's registers — RAX RBX RCX RDX RSI RDI RBP R8 to R15 RIP
+   RFLAGS RSP — at its place in gregs. */
+static const unsigned char greg_of[18] = {
+    G_RAX, G_RBX, G_RCX, G_RDX, G_RSI, G_RDI, G_RBP, G_R8, G_R9, G_R10, G_R11,
+    G_R12, G_R13, G_R14, G_R15, G_RIP, G_EFL, G_RSP
+};
+
+/* What a program has said about each signal, for sigaction to say back. The
+   kernel runs the handlers from what it was told, so this is read only by
+   sigaction — which a handler may call. A writer holds `writing`, with every
+   signal held back in its own thread so that no handler of its own finds it
+   held; a reader goes round again while `seq` is odd or moves. */
 static struct lx_ksigaction actions[NSIG + 1];
-static int actions_lock;
+static int writing;
+static volatile unsigned long seq;
 /* Which of those it has said since it started. One it has not is as it was
    started: nothing said — or ignored, if whatever exec'd it was ignoring the
    signal, which the kernel kept and this program's memory did not. */
 static unsigned long known;
-/* Raised, with a handler, and not yet run. A bit is taken by whichever
-   thread clears it, and by no other: two threads on their way out of two
-   calls both see it set. */
-static unsigned long pending;
-/* The mask. One for the program rather than one a thread: the C library
-   blocks everything around the places it must not be interrupted and puts
-   back what it found, and that comes out the same either way — for one
-   thread. Two threads doing it at once put back what the *other* had
-   blocked, and it is each change that is one step here, not the pair. A
-   mask a thread can call its own needs the kernel to keep it. */
-static unsigned long blocked;
-/* Set to 1 by the kernel when a signal with a handler arrives. */
-static volatile unsigned int hint;
-static int kernel_knows_where;
+
+/* How the floating-point state is kept around a handler: by XSAVE, in this
+   many bytes, or by FXSAVE in 512. Set as the program starts. */
+unsigned long __quark_fp_size = 512;
+unsigned char __quark_fp_xsave;
+unsigned int __quark_mxcsr_default = 0x1F80;
 
 static unsigned long self(void) {
     return __syscall0(SYS_GETPID);
 }
 
-/* The signals that do nothing to a program that has said nothing: a child
-   has ended, urgent data, a window has changed size, and "carry on" to a
-   program that was not stopped. The four that stop one are not here: what
-   they do is the kernel's to do. */
-static int harmless(long sig) {
-    return sig == 17 || sig == 23 || sig == 28 || sig == 18;
-}
+/* Where the kernel enters the program to run a handler: RDI is the frame,
+   and the stack is as a function finds it. The floating-point registers are
+   kept below it — the header XRSTOR reads cleared first, since XSAVE does
+   not write all of it — and the handler is given a clean set of its own.
+   121 is SYS_SIG_RETURN. */
+__asm__(
+    ".text\n"
+    ".globl __quark_sig_entry\n"
+    ".type __quark_sig_entry,@function\n"
+    "__quark_sig_entry:\n"
+    "    push %rbp\n"
+    "    mov %rsp, %rbp\n"
+    "    push %rbx\n"
+    "    push %r12\n"
+    "    mov %rdi, %rbx\n"
+    "    sub __quark_fp_size(%rip), %rsp\n"
+    "    and $-64, %rsp\n"
+    "    mov %rsp, %r12\n"
+    "    cmpb $0, __quark_fp_xsave(%rip)\n"
+    "    je 1f\n"
+    "    xor %eax, %eax\n"
+    "    mov %rax, 512(%rsp)\n"
+    "    mov %rax, 520(%rsp)\n"
+    "    mov %rax, 528(%rsp)\n"
+    "    mov %rax, 536(%rsp)\n"
+    "    mov %rax, 544(%rsp)\n"
+    "    mov %rax, 552(%rsp)\n"
+    "    mov %rax, 560(%rsp)\n"
+    "    mov %rax, 568(%rsp)\n"
+    "    mov $-1, %eax\n"
+    "    mov $-1, %edx\n"
+    "    xsave (%rsp)\n"
+    "    jmp 2f\n"
+    "1:  fxsave (%rsp)\n"
+    "2:  fninit\n"
+    "    ldmxcsr __quark_mxcsr_default(%rip)\n"
+    "    mov %rbx, %rdi\n"
+    "    mov %r12, %rsi\n"
+    "    call __quark_sig_run\n"
+    "    cmpb $0, __quark_fp_xsave(%rip)\n"
+    "    je 3f\n"
+    "    mov $-1, %eax\n"
+    "    mov $-1, %edx\n"
+    "    xrstor (%r12)\n"
+    "    jmp 4f\n"
+    "3:  fxrstor (%r12)\n"
+    "4:  mov %rbx, %rdi\n"
+    "    mov $121, %eax\n"
+    "    syscall\n"
+    "    ud2\n"
+    ".size __quark_sig_entry, .-__quark_sig_entry\n");
 
-/* Take what the kernel has for this program, and tell it where the word is. */
-static void take(void) {
-    hint = 0;
-    unsigned long got = __syscall1(SYS_SIG_TAKE, (unsigned long)&hint);
-    kernel_knows_where = 1;
-    if (got != QUARK_ERR && got) {
-        __sync_fetch_and_or(&pending, got);
-    }
-}
+void __quark_sig_entry(void);
+void __quark_sig_run(struct quark_sigframe *f, void *fp);
 
-/* What is said about `sig` now: a copy, because it is another thread's to
-   change. */
-static struct lx_ksigaction action_of(long sig) {
-    if (!(__atomic_load_n(&known, __ATOMIC_ACQUIRE) & BIT(sig))) {
-        unsigned long was = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_ASK);
-        __quark_lock(&actions_lock);
-        if (!(known & BIT(sig))) {
-            actions[sig].handler = was == QUARK_SIG_IGNORE ? LX_SIG_IGN : LX_SIG_DFL;
-            actions[sig].flags = 0;
-            actions[sig].restorer = 0;
-            actions[sig].mask = 0;
-            __atomic_fetch_or(&known, BIT(sig), __ATOMIC_RELEASE);
+/* Why, as siginfo says it. */
+static int code_of(const struct quark_sigframe *f) {
+    if (f->code == 2) {
+        switch (f->signo) {
+        case LX_SIGSEGV: return LX_SEGV_MAPERR;
+        case LX_SIGBUS: return LX_BUS_ADRERR;
+        case LX_SIGFPE: return LX_FPE_INTDIV;
+        case LX_SIGILL: return LX_ILL_ILLOPN;
+        default: return LX_SI_KERNEL;
         }
-        __quark_unlock(&actions_lock);
     }
-    __quark_lock(&actions_lock);
-    struct lx_ksigaction a = actions[sig];
-    __quark_unlock(&actions_lock);
+    return f->code == 0 ? LX_SI_USER : LX_SI_KERNEL;
+}
+
+/* Call the handler the frame names, and put back what it changed of where
+   the thread was and what it holds back. */
+void __quark_sig_run(struct quark_sigframe *f, void *fp) {
+    int sig = (int)f->signo;
+    if (!(f->flags & Q_SIGINFO)) {
+        ((void (*)(int))f->cookie)(sig);
+        return;
+    }
+    struct lx_siginfo info;
+    struct lx_ucontext uc;
+    __builtin_memset(&info, 0, sizeof info);
+    __builtin_memset(&uc, 0, sizeof uc);
+    info.si_signo = sig;
+    info.si_code = code_of(f);
+    if (f->code == 2) {
+        info.u.addr = (void *)f->value;
+    } else if (f->code == 0) {
+        info.u.kill.pid = (int)(f->value & 0x7FFFFFFFUL);
+    }
+    for (int i = 0; i < 18; i++) {
+        uc.gregs[greg_of[i]] = f->regs[i];
+    }
+    uc.gregs[G_CSGSFS] = 0x33;
+    uc.fpregs = fp;
+    uc.sigmask[0] = f->mask;
+    uc.ss_flags = (f->flags & 1) ? LX_SS_ONSTACK : 0;
+    ((void (*)(int, void *, void *))f->cookie)(sig, &info, &uc);
+    for (int i = 0; i < 18; i++) {
+        f->regs[i] = uc.gregs[greg_of[i]];
+    }
+    f->mask = uc.sigmask[0];
+}
+
+/* As the program starts: where its handlers are entered, that a call a
+   signal cuts short is to answer as Unix would have it, and how to keep the
+   floating-point registers — XSAVE, if the kernel has turned it on, in as
+   many bytes as the processor says what is turned on takes. */
+void __quark_sig_start(void) {
+    unsigned int a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (c & (1u << 27)) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xD), "c"(0));
+        if (b >= 576) {
+            __quark_fp_size = (b + 63) & ~63UL;
+            __quark_fp_xsave = 1;
+        }
+    }
+    __syscall5(SYS_SIG_ACTION, 0, QUARK_SIG_RUN, 0, QUARK_SIG_UNIX, (unsigned long)__quark_sig_entry);
+}
+
+/* What this thread holds back. */
+static unsigned long mask_now(void) {
+    return __syscall2(SYS_SIG_MASK, QUARK_SIG_ASK, 0);
+}
+
+/* What is said about `sig` now: a copy, made without waiting for anybody. */
+static struct lx_ksigaction action_of(long sig) {
+    struct lx_ksigaction a;
+    unsigned long k;
+    for (;;) {
+        unsigned long s = seq;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        a = actions[sig];
+        k = known & BIT(sig);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (!(s & 1) && s == seq) {
+            break;
+        }
+    }
+    /* What was said here holds while the kernel agrees with it. Where it
+       does not, the kernel says what is true: nothing was said here, or a
+       handler run once (SA_RESETHAND) is gone, or exec kept an ignore. */
+    unsigned long said = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_ASK);
+    int handled = a.handler != LX_SIG_DFL && a.handler != LX_SIG_IGN;
+    int agrees = k && (handled ? said == QUARK_SIG_RUN
+                               : (said == QUARK_SIG_IGNORE) == (a.handler == LX_SIG_IGN));
+    if (!agrees) {
+        a.handler = said == QUARK_SIG_IGNORE ? LX_SIG_IGN : LX_SIG_DFL;
+        a.flags = 0;
+        a.restorer = 0;
+        a.mask = 0;
+    }
     return a;
 }
 
-/* Take `sig` from what is waiting: true for one caller. */
-static int claim(long sig) {
-    return (__atomic_fetch_and(&pending, ~BIT(sig), __ATOMIC_SEQ_CST) & BIT(sig)) != 0;
-}
-
-/* Call the handler for `sig`. Says whether one ran (QUARK_SIG_RAN), and
-   whether a call it cut short that *can* be made again should say EINTR
-   instead (QUARK_SIG_EINTR): the handler was not installed with SA_RESTART. */
-static int run(long sig) {
-    struct lx_ksigaction a = action_of(sig);
-    if (a.handler == LX_SIG_IGN) {
-        return 0;
-    }
-    if (a.handler == LX_SIG_DFL) {
-        /* It had a handler when it was raised and has none now. What the
-           signal does is the kernel's to do. */
-        if (!harmless(sig)) {
-            __syscall3(SYS_SIG_RAISE, self(), (unsigned long)sig, QUARK_RAISE_BY_TASK);
-        }
-        return 0;
-    }
-    unsigned long during = a.mask;
-    if (!(a.flags & LX_SA_NODEFER)) {
-        during |= BIT(sig);
-    }
-    unsigned long saved = __atomic_fetch_or(&blocked, during & ~UNBLOCKABLE, __ATOMIC_SEQ_CST);
-    if (a.flags & LX_SA_RESETHAND) {
-        __quark_lock(&actions_lock);
-        actions[sig].handler = LX_SIG_DFL;
-        __quark_unlock(&actions_lock);
-        __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_DEFAULT);
-    }
-    if (a.flags & LX_SA_SIGINFO) {
-        /* A siginfo_t and a ucontext_t, both empty but for the number: there
-           is no sender to name and no interrupted frame to describe. */
-        unsigned long info[16];
-        unsigned long context[128];
-        for (int i = 0; i < 16; i++) {
-            info[i] = 0;
-        }
-        for (int i = 0; i < 128; i++) {
-            context[i] = 0;
-        }
-        info[0] = (unsigned long)sig; /* si_signo, and si_errno of 0 above it */
-        ((void (*)(int, void *, void *))a.handler)((int)sig, info, context);
-    } else {
-        ((void (*)(int))a.handler)((int)sig);
-    }
-    /* A handler that left by longjmp never gets here, and the mask it left
-       with is its program's to put right — which is what sigsetjmp saves it
-       for. */
-    __atomic_store_n(&blocked, saved, __ATOMIC_SEQ_CST);
-    return QUARK_SIG_RAN | ((a.flags & LX_SA_RESTART) ? 0 : QUARK_SIG_EINTR);
-}
-
-/* Is there anything to do on the way out of a call? */
-int __quark_sig_due(void) {
-    return hint || (pending & ~blocked);
-}
-
-/* Run every handler that may run now. The answer is what the call that was
-   cut short does about it, and there are two kinds of call.
-
-   A read can be made again, so it is — unless a handler that ran was
-   installed without SA_RESTART (QUARK_SIG_EINTR).
-
-   A wait for a time or for readiness cannot: a sleep, a poll, a select, an
-   epoll_wait. Linux ends those with EINTR whenever a handler has run
-   (QUARK_SIG_RAN), whatever the handler asked for, and programs lean on it:
-   `signal()` — which asks for restarting — then `alarm()` and `sleep()` is
-   how a program has been given a deadline since before `sigaction` existed.
-   Restarted, the sleep ran to its end and the alarm was for nothing. */
-int __quark_sig_deliver(void) {
-    int interrupts = 0;
-    if (hint) {
-        take();
-    }
-    for (;;) {
-        unsigned long ready = pending & ~blocked;
-        if (!ready) {
-            break;
-        }
-        long sig = __builtin_ctzl(ready) + 1;
-        if (claim(sig)) {
-            interrupts |= run(sig);
-        }
-    }
-    return interrupts;
-}
-
-/* The kernel ended a wait for a signal. Take it and run what may run; the
-   answer is `__quark_sig_deliver`'s, and 0 — nothing ran, the signal is
-   blocked or was somebody else's — is a wait to go back to. */
-int __quark_sig_interrupted(void) {
-    take();
-    return __quark_sig_deliver();
-}
-
-/* In the child of a fork: what was waiting was the parent's, and so was
-   whichever thread held the lock. */
+/* In the child of a fork: whichever thread of the parent was writing is not
+   here to finish. */
 void __quark_sig_forked(void) {
-    pending = 0;
-    hint = 0;
-    actions_lock = 0;
+    writing = 0;
+    if (seq & 1) {
+        seq++;
+    }
 }
 
 long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksigaction *old,
@@ -227,27 +331,49 @@ long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksig
     if (sig < 1 || sig > NSIG || size != 8) {
         return -LX_EINVAL;
     }
+    if (act && (sig == LX_SIGKILL || sig == LX_SIGSTOP)) {
+        return -LX_EINVAL;
+    }
     struct lx_ksigaction was = action_of(sig);
     if (act) {
-        if (sig == LX_SIGKILL || sig == LX_SIGSTOP) {
+        unsigned long r;
+        if (act->handler == LX_SIG_DFL) {
+            r = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_DEFAULT);
+        } else if (act->handler == LX_SIG_IGN) {
+            r = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_IGNORE);
+        } else {
+            unsigned long how = 0;
+            if (act->flags & LX_SA_NODEFER) {
+                how |= Q_NODEFER;
+            }
+            if (act->flags & LX_SA_RESETHAND) {
+                how |= Q_RESETHAND;
+            }
+            if (act->flags & LX_SA_ONSTACK) {
+                how |= Q_ONSTACK;
+            }
+            if (act->flags & LX_SA_RESTART) {
+                how |= Q_RESTARTS;
+            }
+            if (act->flags & LX_SA_SIGINFO) {
+                how |= Q_SIGINFO;
+            }
+            r = __syscall5(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_RUN,
+                           act->mask & ~UNBLOCKABLE, how, act->handler);
+        }
+        if (r == QUARK_ERR) {
             return -LX_EINVAL;
         }
-        unsigned long how = act->handler == LX_SIG_DFL   ? QUARK_SIG_DEFAULT
-                            : act->handler == LX_SIG_IGN ? QUARK_SIG_IGNORE
-                                                         : QUARK_SIG_HANDLE;
-        /* Before the kernel is told there is a handler, it has to know where
-           to say so. */
-        if (how == QUARK_SIG_HANDLE && !kernel_knows_where) {
-            take();
-        }
-        __quark_lock(&actions_lock);
+        unsigned long held = __syscall2(SYS_SIG_MASK, 2 /* SIG_SETMASK */, ~0UL);
+        __quark_lock(&writing);
+        seq++;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         actions[sig] = *act;
-        __quark_unlock(&actions_lock);
-        __syscall2(SYS_SIG_ACTION, (unsigned long)sig, how);
-        /* A signal waiting for a handler that is no longer there. */
-        if (how == QUARK_SIG_IGNORE || (how == QUARK_SIG_DEFAULT && harmless(sig))) {
-            __sync_fetch_and_and(&pending, ~BIT(sig));
-        }
+        known |= BIT(sig);
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        seq++;
+        __quark_unlock(&writing);
+        __syscall2(SYS_SIG_MASK, 2, held);
     }
     if (old) {
         *old = was;
@@ -262,119 +388,118 @@ long __quark_sigprocmask(long how, const unsigned long *set, unsigned long *old,
     }
     unsigned long was;
     if (set) {
-        unsigned long m = *set & ~UNBLOCKABLE;
-        switch (how) {
-        case 0: was = __atomic_fetch_or(&blocked, m, __ATOMIC_SEQ_CST); break;   /* SIG_BLOCK */
-        case 1: was = __atomic_fetch_and(&blocked, ~m, __ATOMIC_SEQ_CST); break; /* SIG_UNBLOCK */
-        case 2: was = __atomic_exchange_n(&blocked, m, __ATOMIC_SEQ_CST); break; /* SIG_SETMASK */
-        default: return -LX_EINVAL;
+        /* SIG_BLOCK, SIG_UNBLOCK and SIG_SETMASK are the kernel's 0, 1 and
+           2. What that lets through is run on the way out of this call. */
+        if (how < 0 || how > 2) {
+            return -LX_EINVAL;
         }
+        was = __syscall2(SYS_SIG_MASK, (unsigned long)how, *set & ~UNBLOCKABLE);
     } else {
-        was = __atomic_load_n(&blocked, __ATOMIC_SEQ_CST);
+        was = mask_now();
     }
     if (old) {
         *old = was;
     }
-    /* What that let through runs on the way out of this call. */
     return 0;
-}
-
-/* The mask, for a call that waits under a different one (ppoll, pselect):
-   put `mask` in place and return what was there. */
-unsigned long __quark_sig_swap_mask(unsigned long mask) {
-    return __atomic_exchange_n(&blocked, mask & ~UNBLOCKABLE, __ATOMIC_SEQ_CST);
 }
 
 long __quark_sigpending(unsigned long *set, unsigned long size) {
     if (size != 8 || !set) {
         return -LX_EINVAL;
     }
-    if (hint) {
-        take();
-    }
-    *set = pending & blocked;
+    *set = __syscall2(SYS_SIG_MASK, QUARK_SIG_MASK_PENDING, 0);
     return 0;
 }
 
-/* Sleep until a signal arrives or `span` passes: ticks, or nanoseconds from
-   quark_span. The kernel ends this sleep for a signal with a handler,
-   including one raised a moment before it began. */
-static void doze(unsigned long span) {
-    struct quark_msg m;
-    __syscall3(SYS_RECV_TIMEOUT, self(), (unsigned long)&m, span);
-}
-
-/* sigsuspend, and pause with no mask: wait, under `mask`, until a handler has
-   run. */
+/* sigsuspend, and pause with no mask: wait under `mask` until a handler has
+   run in this thread. */
 long __quark_sigsuspend(const unsigned long *mask, unsigned long size) {
     if (mask && size != 8) {
         return -LX_EINVAL;
     }
-    unsigned long saved = mask ? __atomic_exchange_n(&blocked, *mask & ~UNBLOCKABLE, __ATOMIC_SEQ_CST)
-                               : __atomic_load_n(&blocked, __ATOMIC_SEQ_CST);
-    for (;;) {
-        if (hint) {
-            take();
-        }
-        /* Until a handler has run *here*: one that another thread took and
-           ran on its way out of a call is not what this was waiting for. */
-        if ((pending & ~blocked) && (__quark_sig_deliver() & QUARK_SIG_RAN)) {
-            break;
-        }
-        doze(~0UL);
+    unsigned long under = (mask ? *mask : mask_now()) & ~UNBLOCKABLE;
+    while (__syscall2(SYS_SIG_MASK, QUARK_SIG_MASK_WAIT, under) == QUARK_AGAIN) {
     }
-    __atomic_store_n(&blocked, saved, __ATOMIC_SEQ_CST);
     return -LX_EINTR;
 }
 
-/* sigtimedwait: take one of `set` without running its handler. Only a signal
-   with a handler waits to be taken; one with none has already done what it
-   does. */
+/* sigtimedwait: take one of `set` without running its handler. */
 long __quark_sigtimedwait(const unsigned long *set, void *info, const long *timeout,
                           unsigned long size) {
     if (size != 8 || !set) {
         return -LX_EINVAL;
     }
-    unsigned long want = *set;
     unsigned long deadline = 0;
     if (timeout) {
         deadline = quark_now() + quark_nanos((unsigned long)timeout[0], (unsigned long)timeout[1]);
     }
     for (;;) {
-        if (hint) {
-            take();
-        }
-        unsigned long have = pending & want;
-        if (have) {
-            long sig = __builtin_ctzl(have) + 1;
-            if (!claim(sig)) {
-                continue;
-            }
-            if (info) {
-                unsigned long *words = info;
-                for (int i = 1; i < 16; i++) {
-                    words[i] = 0;
-                }
-                words[0] = (unsigned long)sig;
-            }
-            return sig;
-        }
-        /* Something else arrived, with a handler that may run: that is an
-           interruption. */
-        if (pending & ~blocked) {
-            __quark_sig_deliver();
-            return -LX_EINTR;
-        }
-        unsigned long left = ~0UL;
+        unsigned long span = ~0UL;
         if (timeout) {
             unsigned long now = quark_now();
-            if (now >= deadline) {
-                return -LX_EAGAIN;
-            }
-            left = quark_span(deadline - now);
+            span = now < deadline ? quark_span(deadline - now) : 0;
         }
-        doze(left);
+        unsigned long who = 0;
+        unsigned long r = __syscall3(SYS_SIG_WAIT, *set, span, (unsigned long)&who);
+        if (r >= 1 && r <= NSIG) {
+            if (info) {
+                struct lx_siginfo *si = info;
+                __builtin_memset(si, 0, sizeof *si);
+                si->si_signo = (int)r;
+                si->si_code = (who >> 63) ? LX_SI_USER : LX_SI_KERNEL;
+                si->u.kill.pid = (int)(who & 0x7FFFFFFFUL);
+            }
+            return (long)r;
+        }
+        if (r == 0) {
+            return -LX_EAGAIN;
+        }
+        if (r != QUARK_AGAIN) {
+            return -LX_EINTR;
+        }
     }
+}
+
+/* sigaltstack: the stack for handlers that ask for one, this thread's. */
+struct lx_stack {
+    void *ss_sp;
+    int ss_flags;
+    unsigned long ss_size;
+};
+
+long __quark_sigaltstack(const void *new_stack, void *old_stack) {
+    const struct lx_stack *ss = new_stack;
+    struct lx_stack *old = old_stack;
+    unsigned long was[2] = {0, 0};
+    unsigned long base = 0, size = 0;
+    if (ss) {
+        if (ss->ss_flags & ~LX_SS_DISABLE) {
+            return -LX_EINVAL;
+        }
+        if (!(ss->ss_flags & LX_SS_DISABLE)) {
+            if (ss->ss_size < LX_MINSIGSTKSZ) {
+                return -LX_ENOMEM;
+            }
+            base = (unsigned long)ss->ss_sp;
+            size = ss->ss_size;
+        }
+    }
+    __syscall3(SYS_SIG_STACK, ~0UL, 0, (unsigned long)was);
+    /* Not while a handler is running on it. */
+    unsigned long here = (unsigned long)__builtin_frame_address(0);
+    int on_it = was[1] && here > was[0] && here <= was[0] + was[1];
+    if (ss && on_it) {
+        return -LX_EPERM;
+    }
+    if (ss && __syscall3(SYS_SIG_STACK, base, size, 0) == QUARK_ERR) {
+        return -LX_EINVAL;
+    }
+    if (old) {
+        old->ss_sp = (void *)was[0];
+        old->ss_size = was[1];
+        old->ss_flags = !was[1] ? LX_SS_DISABLE : on_it ? LX_SS_ONSTACK : 0;
+    }
+    return 0;
 }
 
 /* kill. A signal is said to a program, which is named by its process id. One
@@ -409,52 +534,17 @@ long __quark_kill(long pid, long sig) {
                                                                                      : -LX_EPERM;
 }
 
-/* Whether the program has `sig` blocked. The mask is kept here and nowhere
-   else, so anything the kernel would do differently for a blocked signal has
-   to be told. */
-int __quark_sig_is_blocked(long sig) {
-    return sig >= 1 && sig <= NSIG && (blocked & BIT(sig)) != 0;
-}
-
-/* tkill and tgkill: a signal for one thread. For the caller's own it is
-   exact — the handler runs here, in this thread, before the call returns,
-   which is what `raise` and `abort` depend on. */
+/* tkill and tgkill: a signal for one thread, run in that thread — for the
+   caller's own, before the call returns, which is what `raise` and `abort`
+   depend on. */
 long __quark_tkill(long tid, long sig) {
     if (sig < 0 || sig > NSIG || tid <= 0) {
         return -LX_EINVAL;
     }
-    if ((unsigned long)tid != self()) {
-        /* Another thread of this program, or another program. The first is
-           wrong for the two signals the C library sends a thread to cancel
-           it or to run something in it: whichever thread looked first would
-           be the one cancelled. */
-        if (sig >= 32 && sig <= 34) {
-            return -LX_ENOSYS;
-        }
-        return __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig,
-                          QUARK_RAISE_BY_TASK) == QUARK_ERR
-                   ? -LX_ESRCH
-                   : 0;
-    }
-    if (sig == 0) {
-        return 0;
-    }
-    unsigned long handler = action_of(sig).handler;
-    if (handler == LX_SIG_IGN) {
-        return 0;
-    }
-    if (handler == LX_SIG_DFL) {
-        if (!harmless(sig)) {
-            /* The end of this program, and the kernel's to carry out: a
-               program cannot exit with a signal's status by asking to. */
-            __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig,
-                       QUARK_RAISE_BY_TASK);
-        }
-        return 0;
-    }
-    /* Run on the way out of this call. */
-    __sync_fetch_and_or(&pending, BIT(sig));
-    return 0;
+    return __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig, QUARK_RAISE_THREAD) ==
+                   QUARK_ERR
+               ? -LX_ESRCH
+               : 0;
 }
 
 /* A write found nobody at the other end. */

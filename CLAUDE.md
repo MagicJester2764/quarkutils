@@ -456,20 +456,24 @@ the thread stayed for good. `ctests/detachtest` and `spawntest` are for
 those two. `posix_spawn` is musl's `clone` with `CLONE_VM | CLONE_VFORK`,
 and its child is a copy like any other.
 
-**Signals are the program's to run.** The kernel ends a program that has said
-nothing about a signal and tells one that has a handler; it calls no handler
-itself. `linux-abi/src/signal.c` does: on the way out of every system call
-the layer makes for musl, and when a read of a terminal, a poll or a sleep
-comes back saying a signal ended it (`QUARK_INTERRUPTED`), it takes what is
-waiting and calls the handlers as functions — which is when that wait fails
-with `EINTR`, unless the handler asked for it to go on. Three rules follow.
-A wait added to the layer that the kernel can end has to handle that answer,
-or it returns a count of four thousand million. A default action is the
-kernel's to carry out — the layer asks it to (`SYS_SIG_RAISE` at itself),
-because a program cannot exit with a signal's status by asking to. And a
-program that holds a session's terminal without being what the session runs
-says what it does about signal 2: `getty` and `login` ignore it, and `qsh`
-handles it so that Ctrl-C at its prompt is a fresh prompt.
+**Signals are the kernel's to run, for C; a program written for this system
+is told.** A C program says as it starts where the kernel is to enter it to
+run a handler, and that it wants Unix's answers (`__quark_sig_start`, from
+musl's start); `linux-abi/src/signal.c` is what is entered — it keeps the
+floating-point registers, makes the `siginfo_t` and `ucontext_t` out of the
+kernel's record, calls the handler, puts back what it changed and gives the
+record back. Masks, `sigwait`, `sigaltstack` and a signal for one thread are
+the kernel's (`docs/c-library.md`). A program built on `quark-rt` is told
+instead, and runs its handlers at a call (`SYS_SIG_TAKE`); it can have the
+kernel run one too (`quark_rt::signal::handle`). Three rules follow. Every
+call the layer makes that the kernel can end for a signal has to look at
+the answer with `quark_cut_short` — `QUARK_AGAIN` is a call to make again,
+and a wait added without that returns a count of four thousand million. A
+default action is the kernel's to carry out, because a program cannot exit
+with a signal's status by asking to. And a program that holds a session's
+terminal without being what the session runs says what it does about
+signal 2: `getty` and `login` ignore it, and `qsh` handles it so that Ctrl-C
+at its prompt is a fresh prompt.
 
 **A process id is not a task id.** The kernel gives a dead task's id to the
 next task made, and a Unix program assumes a pid it was told a moment ago is
@@ -1109,15 +1113,13 @@ removed.
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and
   no focus stealing prevention.
-- **A handler runs at a system-call boundary and nowhere else.** A C program
-  has `sigaction`, a mask, `kill`, `EINTR` and SIGPIPE (`linux-abi/src/
-  signal.c`), and one that handles a signal and then computes without a call
-  is not interrupted by it. Nothing is raised when a terminal changes size.
-  `alarm` and `setitimer` are the kernel's one alarm for a program, in real
-  time, to the nanosecond: the timers that count time spent running are refused,
-  and so is `timer_create`, which every program asked falls back from. A
-  signal that is blocked and has no handler is not held back. The mask is the program's
-  rather than a thread's, and is not kept across an exec.
+- **A call to a server is not cut short by a signal**: a C program's read
+  of a file, or its wait for a lock, runs its handler when the server has
+  answered. Nothing is queued, real-time signals included, and a handler is
+  told who sent a signal by process id alone. `alarm` and `setitimer` are
+  the kernel's one alarm for a program, in real time, to the nanosecond: the
+  timers that count time spent running are refused, and so is
+  `timer_create`, which every program asked falls back from.
 - **A program's first thread is not numbered as its process.** `getpid` is
   a process id, 64 or more, and `gettid` a task id, below 64. On Linux the
   two are equal in the first thread, and code that finds its main thread by
@@ -1182,11 +1184,6 @@ removed.
   once. An `fcntl` lock is the program's and goes when the program becomes
   another, where POSIX keeps it across `exec`; `flock`'s is the open file's
   and stays with the descriptor.
-- **A C program's signal mask is the program's, and a thread that ends
-  leaves everything blocked**: the C library blocks every signal in a thread
-  on its way out. A program with threads handles signals until its first
-  thread ends (`docs/c-library.md`). The cure is a mask the kernel keeps
-  for each thread.
 - **A child is the thread's that forked it**: `waitpid` from another thread
   of the program is `ECHILD`.
 - A program has 64 descriptors, files included; the VFS has 512 handles for

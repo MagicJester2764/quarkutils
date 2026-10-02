@@ -92,20 +92,28 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
                           unsigned long size);
 long __quark_kill(long pid, long sig);
 long __quark_tkill(long tid, long sig);
-/* Is there a handler to run on the way out of a call, and run them. */
-int __quark_sig_due(void);
-/* What `__quark_sig_deliver` and `__quark_sig_interrupted` answer: a handler
-   ran, and one that ran wants a restartable call to fail instead. */
-#define QUARK_SIG_RAN   1
-#define QUARK_SIG_EINTR 2
-int __quark_sig_deliver(void);
-/* A wait the kernel ended for a signal: what ran, as above; 0 to wait again. */
-int __quark_sig_interrupted(void);
-int __quark_sig_is_blocked(long sig);
-unsigned long __quark_sig_swap_mask(unsigned long mask);
+long __quark_sigaltstack(const void *ss, void *old);
+/* As the program starts: where the kernel enters it to run a handler. */
+void __quark_sig_start(void);
 void __quark_sig_forked(void);
 /* A write nobody will read: SIGPIPE, which by default is the end. */
 void __quark_sig_pipe(void);
+
+/* What to do with what a call answered, if a signal cut it short: 0, it was
+   not; 1, make the call again; or -EINTR. A call Linux makes again when the
+   handler asked for SA_RESTART — a read, a write, a wait for a child — is
+   `restartable`; one it never makes again — a sleep, a poll — is not, and
+   says EINTR whenever a handler ran. Nothing having run, every call is
+   made again. */
+static inline long quark_cut_short(unsigned long r, int restartable) {
+    if (r == QUARK_AGAIN) {
+        return 1;
+    }
+    if (r == QUARK_RESTART) {
+        return restartable ? 1 : -LX_EINTR;
+    }
+    return r == QUARK_INTERRUPTED ? -LX_EINTR : 0;
+}
 
 /* "From the working directory", where an *at call takes a descriptor. */
 #define LX_AT_FDCWD (-100)
@@ -183,9 +191,10 @@ long __quark_recvmsg(long fd, void *msg, long flags);
 /* How long these two wait is in nanoseconds, and negative is for ever:
    `poll` and `epoll_wait` say milliseconds, `ppoll` and `pselect` a
    timespec, and the kernel keeps what any of them says to the nanosecond. */
-long __quark_poll(void *fds, long nfds, long timeout_ns);
+long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *under);
 long __quark_epoll_create(void);
 long __quark_epoll_ctl(long epfd, long op, long fd, void *event);
-long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns);
+long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns,
+                        const unsigned long *under);
 
 #endif

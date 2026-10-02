@@ -483,17 +483,15 @@ static long do_sleep(long clock, long flags, const struct lx_timespec *req,
     if (deadline < now) {
         deadline = ~0UL;
     }
-    unsigned long self = __syscall0(SYS_GETPID);
     while ((now = quark_now()) < deadline) {
-        struct quark_msg m;
-        unsigned long r = __syscall3(SYS_RECV_TIMEOUT, self, (unsigned long)&m,
-                                     quark_span(deadline - now));
+        /* A wait for no signal at all, which a signal with a handler ends. */
+        unsigned long r = __syscall3(SYS_SIG_WAIT, 0, quark_span(deadline - now), 0);
         /* A signal ended the sleep. If a handler ran, that is the sleep over,
            with what was left of it said — a sleep is never taken up again,
            whatever the handler asked for. If none did, the signal is blocked
            or was not this thread's to take, and there is the rest of the
            sleep still to do. */
-        if (r == QUARK_SLEEP_INTERRUPTED && (__quark_sig_interrupted() & QUARK_SIG_RAN)) {
+        if (quark_cut_short(r, 0) < 0) {
             if (rem && !(flags & LX_TIMER_ABSTIME)) {
                 now = quark_now();
                 unsigned long left = now < deadline ? deadline - now : 0;
@@ -623,7 +621,7 @@ static long wait_ms(int ms) {
 /* select, over the same wait poll uses. An fd_set is an array of words, one
    bit a descriptor. */
 static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned long *ex,
-                      long timeout_ns) {
+                      long timeout_ns, const unsigned long *under) {
     struct { int fd; short events; short revents; } p[32];
     long n = 0;
     if (nfds < 0 || nfds > 1024) {
@@ -653,7 +651,7 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
         p[n].revents = 0;
         n++;
     }
-    long got = __quark_poll(p, n, timeout_ns);
+    long got = __quark_poll(p, n, timeout_ns, under);
     if (got < 0) {
         return got;
     }
@@ -779,34 +777,15 @@ static long set_user(long id, int for_good) {
     return r;
 }
 
-/* Wait under another signal mask, as ppoll and pselect do: the mask goes in,
-   whatever it lets through that was already waiting runs — and is an
-   interruption, with no wait at all — and the mask comes back out. */
-#define WAIT_UNDER(maskp, wait)                                          \
-    do {                                                                 \
-        const unsigned long *under_ = (maskp);                           \
-        if (!under_) {                                                   \
-            return (wait);                                               \
-        }                                                                \
-        unsigned long saved_ = __quark_sig_swap_mask(*under_);           \
-        long r_ = (__quark_sig_deliver() & QUARK_SIG_RAN) ? -LX_EINTR : (wait); \
-        __quark_sig_swap_mask(saved_);                                   \
-        return r_;                                                       \
-    } while (0)
-
 static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
-/* Every call musl makes arrives here. A handler runs on the way out of one:
-   the kernel has said a signal is waiting, or the call just made let one
-   through — `sigprocmask`, `kill` at itself. */
+/* Every call musl makes arrives here. A handler runs wherever the kernel
+   finds the program, on the way out of a call or an interrupt: nothing is
+   left for this to do about one. */
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
-    long r = dispatch(n, a1, a2, a3, a4, a5, a6);
-    if (__quark_sig_due()) {
-        __quark_sig_deliver();
-    }
-    return r;
+    return dispatch(n, a1, a2, a3, a4, a5, a6);
 }
 
 static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -990,7 +969,20 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (a3 & 8 /* WCONTINUED */) {
             how |= QUARK_WAIT_CONTINUED;
         }
-        unsigned long got = __syscall2(SYS_WAIT_FOR, who, how);
+        unsigned long got;
+        for (;;) {
+            got = __syscall2(SYS_WAIT_FOR, who, how);
+            /* A signal ended the wait: made again, or EINTR, as the handler
+               asked. Looked at before the answer is read as a child's: its
+               shape is a report's. */
+            long cut = quark_cut_short(got, 1);
+            if (cut < 0) {
+                return cut;
+            }
+            if (!cut) {
+                break;
+            }
+        }
         if (got == QUARK_ERR) {
             return -LX_ECHILD;
         }
@@ -1078,7 +1070,7 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         __syscall0(SYS_YIELD);
         return 0;
     case LX_sigaltstack:
-        return 0;
+        return __quark_sigaltstack((const void *)a1, (void *)a2);
 
     /* A process of one's own.
      *
@@ -1225,6 +1217,12 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             }
             if (r == 2) {
                 return -LX_ETIMEDOUT;
+            }
+            /* A signal ended the wait. A handler that did not ask for its
+               calls to be made again is EINTR; anything else is a wake like
+               any other, and the caller looks at the word again. */
+            if (r == QUARK_INTERRUPTED) {
+                return -LX_EINTR;
             }
             return 0;
         }
@@ -1489,15 +1487,15 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_select: {
         const long *tv = (const long *)a5;
         return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4,
-                         tv ? wait_ns(tv[0], tv[1] * 1000) : -1);
+                         tv ? wait_ns(tv[0], tv[1] * 1000) : -1, NULL);
     }
     case LX_pselect6: {
         const long *ts = (const long *)a5;
         long ns = ts ? wait_ns(ts[0], ts[1]) : -1;
         /* The sixth argument is a pointer to a mask and its size. */
         const unsigned long *const *sixth = (const unsigned long *const *)a6;
-        WAIT_UNDER(sixth ? sixth[0] : NULL,
-                   do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4, ns));
+        return do_select(a1, (unsigned long *)a2, (unsigned long *)a3, (unsigned long *)a4, ns,
+                         sixth ? sixth[0] : NULL);
     }
 
     /* The kernel's generator never blocks, so GRND_NONBLOCK, GRND_RANDOM
@@ -1820,21 +1818,21 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_recvmsg:
         return __quark_recvmsg(a1, (void *)a2, a3);
     case LX_poll:
-        return __quark_poll((void *)a1, a2, wait_ms((int)a3));
+        return __quark_poll((void *)a1, a2, wait_ms((int)a3), NULL);
     case LX_ppoll: {
         /* A timespec rather than milliseconds, and a mask to wait under. */
         const long *ts = (const long *)a3;
         long ns = ts ? wait_ns(ts[0], ts[1]) : -1;
-        WAIT_UNDER((const unsigned long *)a4, __quark_poll((void *)a1, a2, ns));
+        return __quark_poll((void *)a1, a2, ns, (const unsigned long *)a4);
     }
     case LX_epoll_pwait:
-        WAIT_UNDER((const unsigned long *)a5, __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4)));
+        return __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4), (const unsigned long *)a5);
     case LX_epoll_create1:
         return __quark_epoll_create();
     case LX_epoll_ctl:
         return __quark_epoll_ctl(a1, a2, a3, (void *)a4);
     case LX_epoll_wait:
-        return __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4));
+        return __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4), NULL);
 
     /* statx carries more than the VFS knows, and musl falls back to the plain
        stat calls when it is refused. */

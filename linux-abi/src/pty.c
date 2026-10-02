@@ -26,8 +26,6 @@
 #define PTY_GET_FRONT   6
 #define PTY_SET_SESSION 7
 #define PTY_GET_SESSION 8
-/* With PTY_SET_FRONT: the caller is not to be stopped for asking. */
-#define PTY_FRONT_QUIETLY (1UL << 63)
 
 /* The requests a terminal emulator and a shell actually send. */
 #define TCGETS     0x5401
@@ -39,7 +37,6 @@
 #define TIOCSPGRP  0x5410
 #define TIOCNOTTY  0x5422
 #define TIOCGSID   0x5429
-#define LX_SIGTTOU 22
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
@@ -151,6 +148,22 @@ long __quark_pty_held(const char *path) {
  * Anything this does not answer is `ENOTTY`, which is the right answer to a
  * program asking a pipe about its window size — and is how `isatty` tells the
  * two apart. */
+/* A change to a terminal: its settings, its size. A job behind that makes
+   one is stopped for it (SIGTTOU), and asks again when it is continued —
+   unless it holds the signal back or ignores it, when the kernel lets it. */
+static long change(long fd, unsigned long op, unsigned long arg) {
+    for (;;) {
+        unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd, op, arg);
+        long cut = quark_cut_short(r, 1);
+        if (cut < 0) {
+            return cut;
+        }
+        if (!cut) {
+            return r == QUARK_ERR ? -LX_ENOTTY : 0;
+        }
+    }
+}
+
 long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
     switch (request) {
     case TCGETS:
@@ -165,17 +178,13 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
            away. With a buffer this small and no hardware behind it, draining
            is already done and there is nothing to discard that a program has
            not already been given. */
-        return __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_TERMIOS, arg) == QUARK_ERR
-                   ? -LX_ENOTTY
-                   : 0;
+        return change(fd, PTY_SET_TERMIOS, arg);
     case TIOCGWINSZ:
         return __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_GET_WINSIZE, arg) == QUARK_ERR
                    ? -LX_ENOTTY
                    : 0;
     case TIOCSWINSZ:
-        return __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_WINSIZE, arg) == QUARK_ERR
-                   ? -LX_ENOTTY
-                   : 0;
+        return change(fd, PTY_SET_WINSIZE, arg);
     case TIOCGPTN: {
         unsigned long n = __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_NUMBER, 0);
         if (n == QUARK_ERR) {
@@ -231,19 +240,18 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
         }
         unsigned long group = (unsigned long)*(int *)arg;
         for (;;) {
-            unsigned long quietly = __quark_sig_is_blocked(LX_SIGTTOU) ? PTY_FRONT_QUIETLY : 0;
-            unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_FRONT,
-                                         group | quietly);
+            unsigned long r = __syscall3(SYS_PTY_CTL, (unsigned long)fd, PTY_SET_FRONT, group);
             if (r == 0) {
                 return 0;
             }
-            if (r != QUARK_INTERRUPTED) {
-                return r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_ENOTTY;
-            }
             /* Stopped, and started again; or a handler has run. Ask again,
                unless the handler wanted to be told. */
-            if (__quark_sig_interrupted() & QUARK_SIG_EINTR) {
-                return -LX_EINTR;
+            long cut = quark_cut_short(r, 1);
+            if (cut < 0) {
+                return cut;
+            }
+            if (!cut) {
+                return r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_ENOTTY;
             }
         }
     }

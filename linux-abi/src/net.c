@@ -220,6 +220,16 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
         unsigned long attach = (total == 0 && pass >= 0) ? (unsigned long)pass : QUARK_ERR;
         unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd,
                                      (unsigned long)v->iov_base, v->iov_len, attach, fl);
+        /* Cut short by a signal with nothing sent, the descriptor included:
+           sent again, or EINTR, as the handler asked. */
+        long cut = quark_cut_short(w, 1);
+        if (cut > 0) {
+            i--;
+            continue;
+        }
+        if (cut < 0) {
+            return total ? total : cut;
+        }
         if (w == QUARK_ERR) {
             if (total) {
                 return total;
@@ -288,6 +298,18 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
                                : QUARK_ERR;
         unsigned long r = __syscall5(SYS_FD_RECV, (unsigned long)fd,
                                      (unsigned long)v->iov_base, v->iov_len, at, fl);
+        /* Cut short by a signal with nothing taken, a descriptor included. */
+        long cut = quark_cut_short(r, 1);
+        if (cut > 0) {
+            i--;
+            continue;
+        }
+        if (cut < 0) {
+            if (total) {
+                break;
+            }
+            return cut;
+        }
         if (r == QUARK_ERR) {
             return total ? total : -LX_EIO;
         }
@@ -330,7 +352,7 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
     return total;
 }
 
-long __quark_poll(void *fds, long nfds, long timeout_ns) {
+long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *under) {
     struct lx_pollfd *p = fds;
     if (nfds < 0 || (!p && nfds > 0)) {
         return -LX_EFAULT;
@@ -362,15 +384,19 @@ long __quark_poll(void *fds, long nfds, long timeout_ns) {
     unsigned long deadline = timeout_ns < 0 ? 0 : quark_now() + (unsigned long)timeout_ns;
     unsigned long n;
     for (;;) {
-        n = __syscall3(SYS_POLL, (unsigned long)q, (unsigned long)nfds, span);
-        if (n != QUARK_INTERRUPTED) {
-            break;
-        }
+        /* Under another mask, it is put on in the same step as the wait
+           begins and comes off as it ends: ppoll and pselect. */
+        n = __syscall5(SYS_POLL, (unsigned long)q, (unsigned long)nfds, span,
+                       under ? *under : 0, under ? QUARK_POLL_UNDER : 0);
         /* A signal ended the wait. A handler that ran makes that the answer,
-           whatever it asked for: a poll is never made again. A signal that
-           is blocked leaves what is left of the wait to do. */
-        if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
-            return -LX_EINTR;
+           whatever it asked for: a poll is never made again. One that ran
+           nothing leaves what is left of the wait to do. */
+        long cut = quark_cut_short(n, 0);
+        if (cut < 0) {
+            return cut;
+        }
+        if (!cut) {
+            break;
         }
         if (timeout_ns >= 0) {
             unsigned long now = quark_now();
@@ -454,7 +480,8 @@ struct qw_ready {
     unsigned int pad;
 };
 
-long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns) {
+long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns,
+                        const unsigned long *under) {
     struct lx_epoll_event *out = events;
     if (!out || maxevents <= 0) {
         return -LX_EINVAL;
@@ -468,13 +495,14 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns
     unsigned long deadline = timeout_ns < 0 ? 0 : quark_now() + (unsigned long)timeout_ns;
     unsigned long n;
     for (;;) {
-        n = __syscall4(SYS_POLLSET_WAIT, (unsigned long)epfd, (unsigned long)ready,
-                       (unsigned long)maxevents, span);
-        if (n != QUARK_INTERRUPTED) {
-            break;
+        n = __syscall5(SYS_POLLSET_WAIT, (unsigned long)epfd, (unsigned long)ready,
+                       (unsigned long)maxevents, span, under ? *under | QUARK_POLLSET_UNDER : 0);
+        long cut = quark_cut_short(n, 0);
+        if (cut < 0) {
+            return cut;
         }
-        if (__quark_sig_interrupted() & QUARK_SIG_RAN) {
-            return -LX_EINTR;
+        if (!cut) {
+            break;
         }
         if (timeout_ns >= 0) {
             unsigned long now = quark_now();

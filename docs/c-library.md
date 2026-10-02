@@ -133,56 +133,53 @@ too. The difference is only visible to code that mixes the two kinds.
 
 ## Signals
 
-A program has `sigaction`, a signal mask, `kill`, `raise`, `sigsuspend`,
-`sigtimedwait`, `alarm` and `setitimer(ITIMER_REAL)`, and is told when a
-child ends (`SIGCHLD`). What differs is *when a handler runs*.
+A program has what Linux gives it: `sigaction` with `SA_SIGINFO`,
+`SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `SA_ONSTACK`; a mask for
+each thread (`sigprocmask`, `pthread_sigmask`); `kill`, `raise`,
+`pthread_kill`; `sigsuspend`, `pause`, `sigpending`, `sigwait`,
+`sigwaitinfo` and `sigtimedwait`; `sigaltstack`; `alarm` and
+`setitimer(ITIMER_REAL)`; and `SIGCHLD` when a child ends.
 
-**A handler runs when the program next makes a system call, and at no other
-time.** The kernel does not interrupt a program to run one: it records the
-signal, and the layer runs the handler on the way out of whatever call the
-program makes next. For nearly every program that is indistinguishable from
-Linux, because a program waiting for something is in a system call, and the
-waits a program sits in are ended early by a signal as they are on Linux:
+**The kernel runs the handler**, as Linux's does: a thread that does not
+block the signal is turned aside wherever it is — in a call, or computing —
+and goes on where it was when the handler returns. A handler that changes
+the `ucontext_t` it is handed changes where the thread goes on from, and
+the mask it goes back to. The floating-point registers are kept around it,
+and it runs with the rounding mode and exceptions of a new thread.
 
-- a read of a terminal, which fails with `EINTR`, or is made again if the
-  handler was installed with `SA_RESTART`;
-- `poll`, `ppoll`, `select`, `pselect` and `epoll_wait`, and `nanosleep`,
-  `clock_nanosleep`, `sleep`, `usleep`, `pause` and `sigsuspend`, which fail
-  with `EINTR` whatever the handler asked for — as on Linux, where none of
-  them is ever restarted.
+A signal for the program is run by a thread that does not block it; one for
+a thread (`pthread_kill`, `raise`, `tgkill`) by that thread. A signal every
+thread blocks waits, whatever it would do — one that would end the program
+ends it when a thread unblocks it — and can be taken with `sigwaitinfo`
+without a handler. A fault — touching what is not there (`SIGSEGV`), a page
+of a file that cannot be had (`SIGBUS`), dividing by nought (`SIGFPE`), an
+instruction that is not one (`SIGILL`) — goes to a handler for it, with
+`si_addr`; a program that overflows its stack is saved by a handler on an
+alternate one, as on Linux.
 
-So is an `open` of a named pipe that is waiting for its other end.
+Every wait a thread sits in is ended by a signal it is to handle, and says
+so as Linux does: a read or a write of a pipe, a socket or a terminal, a
+`wait` for a child, a futex (and so `sem_wait`), an `open` of a named pipe
+— each fails with `EINTR`, or is made again if the handler was installed
+with `SA_RESTART`; and `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`,
+`epoll_pwait`, `nanosleep`, `clock_nanosleep`, `sleep`, `usleep`, `pause`,
+`sigsuspend` and `sigtimedwait` fail with `EINTR` whatever the handler asked
+for, as on Linux, where none of them is made again. `ppoll`, `pselect` and
+`epoll_pwait` put their mask on in the same step as the wait begins.
 
-Other waits are **not** ended by a signal: a read of a pipe, a socket or a
-file, a `wait` for a child, a lock. (A `wait` is ended by what it is
-waiting for, which with `WUNTRACED` includes a child stopping.) The handler runs when the call returns.
-A program that wants a signal to interrupt one of those waits with `poll`
-first, as it would for a timeout.
+What is different:
 
-The program it is not indistinguishable for is one that installs a handler
-and then **computes without making a call** — a loop that waits for a flag
-the handler sets. Its handler does not run until it calls something.
-
-Also different:
-
-- A signal with no handler does what it does at once, **even if it is
-  blocked**. The mask is kept by the layer, which can hold back only a signal
-  it would have run a handler for. That includes the signals that stop a
-  program: see *Job control*.
-- A handler runs on the stack of whatever the program was doing, in whichever
-  thread made the next system call. There is no alternate signal stack and
-  no way to aim a signal at one thread: `pthread_kill` raises it for the
-  program.
-- The mask is the program's, not each thread's, and is not kept across
-  `exec`. **So once any thread of a program has ended, its handlers stop
-  running**: the C library blocks every signal in a thread on its way out,
-  that is the program's mask, and nothing unblocks it. A program that makes
-  threads and handles signals handles them until the first thread ends. It
-  needs a mask the kernel keeps for each thread, which is not there yet.
+- **A read or a write of a file is not ended by a signal**, nor a wait for a
+  lock: they are calls to the file server, and the handler runs when it has
+  answered. On Linux a file on a disk is not interruptible either; a lock's
+  wait is.
+- **Nothing is queued.** A signal raised twice before it is handled is
+  handled once — the real-time signals included, which Linux queues.
+- **`siginfo_t` says who sent a signal by process id and nothing more**:
+  `si_uid` is 0, and for `SIGCHLD` there is no `si_status`.
 - The interval timers that count time spent running (`ITIMER_VIRTUAL`,
   `ITIMER_PROF`) are refused, since nothing measures it; `timer_create` is
   `ENOSYS`, and the programs that try it first fall back to `setitimer`.
-- Nothing is sent when a terminal changes size (`SIGWINCH`).
 
 ## Job control
 
@@ -193,18 +190,12 @@ front of it, and programs that stop: `setpgid`, `getpgid`, `getpgrp`,
 `WCONTINUED`, 0 and a negative pid. A shell with job control runs as it
 does on Linux. What is different is at the edges:
 
-- **Only a read, and a change of who is in front, are checked.** A job that
-  reads the terminal from the background is stopped (`SIGTTIN`), and so is
-  one that calls `tcsetpgrp` from there (`SIGTTOU`). A job that *writes*
-  from the background is never stopped — `stty tostop` is stored and not
-  acted on — and nor is one that calls `tcsetattr`.
-- **A blocked stop signal still stops.** The mask is the layer's, and it can
-  hold back only a signal it would have run a handler for; `SIGTSTP`,
-  `SIGTTIN` and `SIGTTOU` with no handler do what they do at once, blocked
-  or not. A program that blocks one of them to do something undisturbed
-  should ignore it instead, or catch it. The one case every shell relies on
-  works as on Linux: `tcsetpgrp` with `SIGTTOU` blocked succeeds from the
-  background.
+- **The terminal is checked as on Linux.** A job that reads the terminal
+  from the background is stopped (`SIGTTIN`), and so is one that changes it
+  from there — `tcsetattr`, `TIOCSWINSZ`, `tcsetpgrp` (`SIGTTOU`) — or
+  writes to it when `stty tostop` is set. One that blocks or ignores the
+  signal goes ahead, and a read with `SIGTTIN` blocked fails with `EIO`.
+  Whoever is in front is sent `SIGWINCH` when the terminal's size changes.
 - **A terminal's slave is its session's.** A process outside the session
   that has the terminal — one left running after its own session ended, or
   another user's — gets `EIO` from a read or a write of a descriptor for the
