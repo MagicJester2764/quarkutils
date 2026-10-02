@@ -1031,6 +1031,33 @@ fn read_dir_entry(
 // Create a new directory entry
 // ---------------------------------------------------------------------------
 
+/// Now, as a FAT directory entry says it: a date (years from 1980, month,
+/// day) and a time (hours, minutes, seconds in twos). An entry with neither
+/// has the zeroth day of the zeroth month, which no calendar has.
+fn fat_now() -> (u16, u16) {
+    let seconds = syscall::unix_time();
+    let days = (seconds / 86400) as i64;
+    let rest = seconds % 86400;
+    // Days since 1970 to a date, the way every C library does it.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + (month <= 2) as i64;
+    // FAT counts from 1980 and stops at 2107. A machine with no clock is in
+    // 1970, before any of it: it gets the first day FAT has.
+    if !(1980..=2107).contains(&year) {
+        return (1 << 5 | 1, 0);
+    }
+    let date = ((year - 1980) << 9 | month << 5 | day) as u16;
+    let time = (rest / 3600 << 11 | rest % 3600 / 60 << 5 | rest % 60 / 2) as u16;
+    (date, time)
+}
+
 /// Create a new file entry in a directory. Returns the first cluster of the new file.
 fn create_dir_entry(
     disk: &DiskState,
@@ -1073,6 +1100,14 @@ fn create_dir_entry(
         // ".." entry — points to parent
         sec[32..43].copy_from_slice(b"..         ");
         sec[43] = 0x10;
+        let (date, time) = fat_now();
+        for at in [0usize, 32] {
+            sec[at + 14..at + 16].copy_from_slice(&time.to_le_bytes());
+            sec[at + 16..at + 18].copy_from_slice(&date.to_le_bytes());
+            sec[at + 18..at + 20].copy_from_slice(&date.to_le_bytes());
+            sec[at + 22..at + 24].copy_from_slice(&time.to_le_bytes());
+            sec[at + 24..at + 26].copy_from_slice(&date.to_le_bytes());
+        }
         let parent_cl = if dir_cluster == disk.bpb.root_cluster { 0 } else { dir_cluster };
         let p_hi = ((parent_cl >> 16) & 0xFFFF) as u16;
         let p_lo = (parent_cl & 0xFFFF) as u16;
@@ -1103,12 +1138,16 @@ fn create_dir_entry(
                     // Write the new entry
                     sec_buf[off..off + 11].copy_from_slice(name);
                     sec_buf[off + 11] = if is_dir { 0x10 } else { 0x20 }; // dir or archive
-                    // Zero out remaining fields (timestamps etc.)
+                    // Zero out remaining fields, and say when it was made.
                     for i in 12..32 {
-                        if i != 11 {
-                            sec_buf[off + i] = 0;
-                        }
+                        sec_buf[off + i] = 0;
                     }
+                    let (date, time) = fat_now();
+                    sec_buf[off + 14..off + 16].copy_from_slice(&time.to_le_bytes());
+                    sec_buf[off + 16..off + 18].copy_from_slice(&date.to_le_bytes());
+                    sec_buf[off + 18..off + 20].copy_from_slice(&date.to_le_bytes());
+                    sec_buf[off + 22..off + 24].copy_from_slice(&time.to_le_bytes());
+                    sec_buf[off + 24..off + 26].copy_from_slice(&date.to_le_bytes());
                     // Set first cluster
                     let cl_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
                     let cl_lo = (new_cluster & 0xFFFF) as u16;
@@ -1205,6 +1244,12 @@ fn update_dir_entry(
                             sec_buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
                         }
                         Change::Remove => sec_buf[off] = 0xE5,
+                    }
+                    // Written to: when.
+                    if !matches!(change, Change::Remove) {
+                        let (date, time) = fat_now();
+                        sec_buf[off + 22..off + 24].copy_from_slice(&time.to_le_bytes());
+                        sec_buf[off + 24..off + 26].copy_from_slice(&date.to_le_bytes());
                     }
                     let data = disk.sector_data_mut();
                     data.copy_from_slice(&sec_buf);
