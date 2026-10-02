@@ -266,6 +266,15 @@ fn test_program_table() {
     }
     check("and what it had open is closed", ended);
     let _ = syscall::sys_fd_close(mine);
+
+    // A negative status is how the kernel says a program was killed, and a
+    // program cannot say it of itself: what it ends with is kept as eight
+    // bits, whichever call it ends with. Ending the *program* kept all of
+    // it, and a C program that returned -1 from `main` had been "hung up".
+    check(
+        "a program cannot claim to have been killed",
+        run(b"dchild", &[b"claim"]) == Some(245),
+    );
 }
 
 /// A file as a descriptor: in the kernel's table, with its position kept by

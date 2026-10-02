@@ -30,6 +30,8 @@
 //! `fault` writes through a null pointer; `sleep` sleeps ten seconds.
 //! `leave` starts a thread that never ends and then ends the program with
 //! status 5: descriptor 3, which the thread never closes, has to close.
+//! `claim` ends the program with status -11, as if a fault had: a parent
+//! has to be told 245, since a negative status is the kernel's to give.
 //! `fdclient TID` is a client of a server at TID that serves descriptors: it
 //! asks for one, reads and writes through it, copies and closes it, and exits
 //! with a bit for each thing that worked.
@@ -219,6 +221,9 @@ pub extern "C" fn _start() -> ! {
         // program ending and not a race it happened to lose.
         syscall::sleep_ticks(5);
         syscall::sys_exit_program(5);
+    }
+    if quark_rt::args::argv(1) == Some(&b"claim"[..]) {
+        syscall::sys_exit_program(-11);
     }
     if quark_rt::args::argv(1) == Some(&b"fault"[..]) {
         unsafe { core::ptr::write_volatile(core::hint::black_box(0usize) as *mut u8, 1) };
