@@ -549,8 +549,6 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
     let s_inodes_count = read_u32(&sb_buf, 0);
     let s_blocks_count = read_u32(&sb_buf, 4);
     let s_r_blocks_count = read_u32(&sb_buf, 8);
-    let s_free_blocks_count = read_u32(&sb_buf, 12);
-    let s_free_inodes_count = read_u32(&sb_buf, 16);
     let s_first_data_block = read_u32(&sb_buf, 20);
     let s_log_block_size = read_u32(&sb_buf, 24);
     let s_blocks_per_group = read_u32(&sb_buf, 32);
@@ -628,9 +626,6 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
     ext2.num_block_groups = num_block_groups;
     ext2.total_blocks = s_blocks_count;
     ext2.total_inodes = s_inodes_count;
-    ext2.free_blocks_count = s_free_blocks_count;
-    ext2.free_inodes_count = s_free_inodes_count;
-    ext2.last_orphan = if s_rev_level >= 1 { read_u32(&sb_buf, 232) } else { 0 };
     ext2.reserved_blocks = s_r_blocks_count;
     ext2.desc_size = desc_size;
     ext2.feature_compat = feature_compat;
@@ -649,24 +644,7 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
         0
     };
 
-    // Read block group descriptor table (starts at block after superblock).
-    // For 1K blocks: superblock is block 1, BGD table starts at block 2.
-    // For 4K blocks: superblock is in block 0 (bytes 1024-2047), BGD table at block 1.
-    let bgd_block = if block_size == 1024 { 2 } else { 1 };
-
-    // Descriptors are read one at a time through read_block_bytes rather than
-    // a sector at a time: a 64-byte descriptor divides 512, but the loop that
-    // assumed it also assumed the 32-byte stride, and the two assumptions are
-    // easy to get out of step. This has one.
-    let groups = (num_block_groups as usize).min(MAX_BLOCK_GROUPS);
-    let mut desc = [0u8; 64];
-    for g in 0..groups {
-        let off = g * desc_size;
-        let block = bgd_block + (off / block_size as usize) as u32;
-        let in_block = off % block_size as usize;
-        read_block_bytes(ext2, block, in_block, &mut desc[..desc_size]).map_err(|_| ())?;
-        ext2.bgd_table[g] = BlockGroupDesc::from_bytes(&desc, 0, desc_size);
-    }
+    read_state(ext2)?;
 
     if num_block_groups as usize > MAX_BLOCK_GROUPS {
         println!(
@@ -675,6 +653,54 @@ pub fn init_ext2(ext2: &mut Ext2State, disk_tid: usize, part_lba: u32) -> Result
         );
     }
 
+    Ok(())
+}
+
+/// What the filesystem says of itself that changes as it is used — the free
+/// counts, the first orphan, every group's descriptor — read from the disk
+/// into `ext2`, which is where everything that changes them changes them
+/// first.
+///
+/// When it is mounted, and again once the journal has been replayed. A
+/// transaction a crash left in the journal is made of exactly these, and a
+/// copy read before it was replayed is the filesystem from before the
+/// transaction: kept, it was written back over the replayed one with the
+/// next change — freeing the orphan the crash also left was the first — and
+/// the counts went back by whatever the transaction had moved them. A
+/// directory removed in it was still counted, and its inode and block were
+/// free in the bitmaps and not in the totals. The crash test found it, once,
+/// at a stop that came where a directory was being taken away.
+pub fn read_state(ext2: &mut Ext2State) -> Result<(), ()> {
+    let mut sb = [0u8; 1024];
+    for s in 0..2usize {
+        raw_read_sector(ext2.disk_tid, ext2.part_lba + 2 + s as u32)?;
+        let disk = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
+        sb[s * 512..(s + 1) * 512].copy_from_slice(disk);
+    }
+    ext2.free_blocks_count = read_u32(&sb, 12);
+    ext2.free_inodes_count = read_u32(&sb, 16);
+    ext2.last_orphan = if read_u32(&sb, 76) >= 1 { read_u32(&sb, 232) } else { 0 };
+
+    // Read block group descriptor table (starts at block after superblock).
+    // For 1K blocks: superblock is block 1, BGD table starts at block 2.
+    // For 4K blocks: superblock is in block 0 (bytes 1024-2047), BGD table at block 1.
+    let block_size = ext2.block_size as usize;
+    let bgd_block = if block_size == 1024 { 2 } else { 1 };
+
+    // Descriptors are read one at a time through read_block_bytes rather than
+    // a sector at a time: a 64-byte descriptor divides 512, but the loop that
+    // assumed it also assumed the 32-byte stride, and the two assumptions are
+    // easy to get out of step. This has one.
+    let groups = (ext2.num_block_groups as usize).min(MAX_BLOCK_GROUPS);
+    let desc_size = ext2.desc_size;
+    let mut desc = [0u8; 64];
+    for g in 0..groups {
+        let off = g * desc_size;
+        let block = bgd_block + (off / block_size) as u32;
+        let in_block = off % block_size;
+        read_block_bytes(ext2, block, in_block, &mut desc[..desc_size]).map_err(|_| ())?;
+        ext2.bgd_table[g] = BlockGroupDesc::from_bytes(&desc, 0, desc_size);
+    }
     Ok(())
 }
 

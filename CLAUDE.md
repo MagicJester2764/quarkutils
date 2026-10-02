@@ -911,6 +911,17 @@ change here: it has found what reading the code did not.
 - **A journaled write never lets a prefetch cache the old copy.** While a
   transaction holds a sector, a read ahead skips it; caching what is on disk
   under it lost a rename on ext4.
+- **What the server keeps of the filesystem is read again once the journal
+  is replayed.** The free counts, the first orphan and every group's
+  descriptor live in memory (`Ext2State`), and whatever changes them changes
+  that copy and writes it back. Read before the replay, the copy is the
+  filesystem from before the transaction a crash left behind: written back
+  with the next change — freeing the orphan the crash also left was the
+  first — it undid the transaction in the counts, and a directory made in it
+  had its inode and its block marked free, for the next file to be given.
+  `ext2::read_state` is called at mount and after a replay, and anything new
+  the server keeps of the disk belongs in it. `tools/crash-test.sh` in
+  ExplOSion makes such a disk with `debugfs` and boots it.
 - **A write allocates every block in its range, holes included.** A
   truncate that lengthens a file leaves holes, and ext4 keeps the extent root
   in logical order so that a block written into one is where a read looks.

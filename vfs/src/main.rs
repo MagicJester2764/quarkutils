@@ -1540,6 +1540,11 @@ pub extern "C" fn _start() -> ! {
                                 {
                                     println!("[vfs] could not clear the journal ({}); read-only", e);
                                     ext2_state_mut().read_only = true;
+                                } else if ext2::read_state(ext2_state_mut()).is_err() {
+                                    // What the replay changed, read again
+                                    // over what was read before it.
+                                    println!("[vfs] could not read the filesystem back after its journal; read-only");
+                                    ext2_state_mut().read_only = true;
                                 } else {
                                     say!("[vfs] journal ready");
                                 }
