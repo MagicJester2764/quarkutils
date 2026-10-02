@@ -365,6 +365,24 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   asked: `sleep_ms(1)` used to mean "until the next tick", up to ten
   milliseconds, and a loop that polled that way now polls ten times as
   often.
+- **What memory is written out with is never written out.** The kernel
+  takes pages a program has not used lately and writes them out when memory
+  is short — through `swapd`, which writes through the file server, which
+  writes through the disk driver — and it takes them from programs in the
+  ordinary band only. A driver and a server keep all of theirs. So the band
+  a program asks for in its manifest is also a statement about its memory:
+  `swapd` asks for the server band, and a pager for memory that did not
+  would be asked to read its own code back from the file it could not run
+  without. The same goes for anything put under it. The file it keeps
+  pages in is on the root filesystem, whose server `init` starts as one; a
+  filesystem `mount` starts a server for is served by an ordinary program,
+  and is not a place for it.
+- **Nobody but `swapd` holds `Swap`**, and no account has a right that
+  gives it. Whoever holds it is handed pages of every program's memory and
+  hands them back: it could read them, and answer with anything. `init`
+  has it from the kernel and gives it to a program that asks in its
+  manifest (`CapReq::swap()`), which a distribution starts with a `start`
+  line; a session does not hold it and cannot hand it on.
 
 `init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
 program misbehaves for lack of a capability, check that its pass actually calls
@@ -1068,6 +1086,17 @@ removed.
   a client's TID past one call — a lease, a registration, a foreground task —
   must watch it with `sys_task_watch` and forget it on death. Otherwise it
   treats whatever takes the TID next as the same client.
+- **Memory is written out slowly, to a file that grows.** `swapd` writes a
+  page a call through the file server, which journals it, to a disk driven a
+  word at a time: about a hundred pages a second in a virtual machine. Its
+  file is made empty and takes room as pages are written, the lowest numbers
+  first, so it is as long as the most that was ever out at once; on a full
+  disk a page that cannot be written stays in memory, which is right and is
+  also a machine that is still short. Nothing stops it or takes its file
+  away while the machine is on: ended, the pages it held are gone, and a
+  program that touches one ends with a bus error. A partition of its own,
+  pages written several at a time, and a disk driver that does not copy
+  through a port are each of them faster and none is here.
 - Focus is a single stack with little policy: Tab cycles, a new window takes it,
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and

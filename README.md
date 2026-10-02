@@ -31,6 +31,9 @@ net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
 edu/                QEMU's teaching device: the smallest driver there is for
                     a device whose registers are memory and whose interrupt
                     is a message. Started by a `start` line in init.conf.
+swapd/              Where memory goes when there is not enough of it: the
+                    pager the kernel writes programs' unused pages out to,
+                    and a file to keep them in. Started the same way.
 
 fb/                 The framebuffer device: owns the display, decides who draws.
 qtty/               The text console. What the machine boots into, and to
@@ -53,7 +56,7 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
                     holds anything: they ask `auth`.
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
-ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/
+ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.

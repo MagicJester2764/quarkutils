@@ -51,7 +51,8 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  setfont:SETFONT ramdisk:RAMDISK disks:DISKS parts:PARTS \
                  vfs:VFS mount:MOUNT umount:UMOUNT su:SU passwd:PASSWD \
                  useradd:USERADD userdel:USERDEL groupadd:GROUPADD \
-                 gpasswd:GPASSWD id:ID edu:EDU date:DATE
+                 gpasswd:GPASSWD id:ID edu:EDU date:DATE swapd:SWAPD \
+                 free:FREE
 
 # Programs written in C, built against libc/.
 C_PROGRAMS    := cwc:CWC envtest:ENVTEST
