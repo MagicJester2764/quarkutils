@@ -58,6 +58,17 @@ pub extern "C" fn _start() -> ! {
     // terminal for it.
     let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_IGNORE);
     let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
+    // On a terminal, this is a session: begun here, with the terminal taken
+    // as its own, and ended when this ends — which is after one login.
+    // Whoever logs in next is in another, and the kernel gives a terminal's
+    // slave to nobody outside the session that has it. A session that
+    // outlived its user is how the last user's program came to read the
+    // next one's password.
+    let on_terminal = syscall::sys_pty_number(0).is_ok();
+    if on_terminal {
+        let _ = syscall::sys_setsid();
+        let _ = syscall::sys_pty_set_session(0);
+    }
     let mut line_buf = [0u8; 64];
     let mut password = [0u8; quark_rt::crypt::MAX_PASSWORD + 2];
 
@@ -228,6 +239,12 @@ pub extern "C" fn _start() -> ! {
         // so does standard input not being a terminal.
         if let Some(group) = syscall::sys_getpgid(0) {
             let _ = syscall::sys_pty_set_front(0, group, true);
+        }
+        // One login to a session. Whatever started this on a terminal
+        // starts another, which begins another session.
+        if on_terminal {
+            println!("");
+            syscall::sys_exit_code(0);
         }
 
         println!(""); // blank line before next login prompt

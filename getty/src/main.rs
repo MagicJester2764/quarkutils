@@ -18,11 +18,14 @@
 //! last holder go: a hangup is for a terminal whose user has left, and this
 //! one has only finished a session.
 //!
-//! And this is what makes it a *session*, in the sense a shell with job
-//! control needs: it begins one, and takes the terminal as the session's
-//! own. From then on the terminal has a process group in front of it, which
-//! is who Ctrl-C and Ctrl-Z are for, and a shell that puts each job in a
-//! group of its own can say which.
+//! The *session*, in the sense a shell with job control needs, is not this
+//! program's: `login` begins one each time it is started, and takes the
+//! terminal as that session's own. So each login is a session, a session
+//! ends when its `login` does, and the kernel gives a terminal's slave to
+//! nobody outside the session that has it — which is what keeps a program
+//! somebody left running, and then logged out, from reading what the next
+//! person types. This led one session for as long as the machine was up,
+//! and everybody who ever logged in was in it.
 
 use quark_rt::ipc::Message;
 use quark_rt::spawn::{self, Scratch};
@@ -73,17 +76,10 @@ pub extern "C" fn _start() -> ! {
         println!("getty: no file server");
         syscall::sys_exit_code(1);
     };
-    // A session of its own, before there is a terminal for it to be the
-    // session of. Everything started from here is in it.
-    let _ = syscall::sys_setsid();
     let Some(tty) = open_terminal() else {
         println!("getty: the console has no terminal to give");
         syscall::sys_exit_code(1);
     };
-    // The session's terminal, with this group in front: `login` is started
-    // in it, and so is a shell that does nothing about groups. One that does
-    // moves itself and says so.
-    let _ = syscall::sys_pty_set_session(tty);
     // As the terminal is before anybody has changed it. A session that ends
     // with the echo off — a shell killed at its prompt — must not leave the
     // next one typing blind.
@@ -116,13 +112,12 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit_code(1);
         }
         let _ = syscall::sys_wait_for(info.tid);
-        // Whatever was in front when it went, this group is now.
-        if let Some(group) = syscall::sys_getpgid(0) {
-            let _ = syscall::sys_pty_set_front(tty, group, true);
-        }
-        // Not at once: a login program that dies as it starts would otherwise
-        // be started as fast as the machine can load it.
-        syscall::sleep_ticks(50);
+        // Its session went with it, and the terminal is nobody's until the
+        // next one takes it. Not at once: a login program that dies as it
+        // starts would otherwise be started as fast as the machine can load
+        // it — and one that ended a session in the ordinary way is not kept
+        // waiting for long.
+        syscall::sleep_ticks(10);
     }
 }
 

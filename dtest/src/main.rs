@@ -1577,6 +1577,16 @@ fn test_jobs() {
     let group = syscall::sys_getpgid(0);
     let session = syscall::sys_getsid(0);
     check("a program is in a process group and a session", group.is_some() && session.is_some());
+    // On a terminal, a session is one login's: begun when somebody logged
+    // in, over when they log out, and what they left running is then in a
+    // session the terminal is no longer the terminal of. For a long time the
+    // terminal's keeper led one session for as long as the machine was up,
+    // and everybody who ever logged in was in it. The keeper is what `init`
+    // starts; a login is what the keeper starts.
+    let on_terminal = syscall::sys_pty_number(0).is_ok() && syscall::sys_pty_session(0) == session;
+    let leader = (2..64).find(|&t| session.is_some() && syscall::sys_pid(t) == session);
+    let a_logins = leader.is_some_and(|t| matches!(syscall::sys_task_info(t), Ok((_, parent, _)) if parent != INIT_TID));
+    check("a session on a terminal is one login's, and not the terminal's keeper's", !on_terminal || a_logins);
 
     // A child that can be seen to be running: it writes a byte every
     // twentieth of a second.
@@ -1722,6 +1732,31 @@ fn test_jobs() {
         "or to take",
         syscall::sys_pty_set_session(slave) == Err(Refused::NotAllowed),
     );
+    // Nor to use, for a user. A program outside the session is refused the
+    // terminal by its number and through a descriptor it was left holding:
+    // what somebody's program is, once they have logged out and somebody
+    // else is typing.
+    if syscall::sys_get_uid().0 == 0 && holds_set_uid() {
+        let mut text = [0u8; 20];
+        let number = decimal(syscall::sys_pty_number(slave).unwrap_or(usize::MAX), &mut text);
+        let spied = load_child(&[b"dchild", b"ptyspy", number]).and_then(|child| {
+            let tid = child.tid;
+            let ready = syscall::sys_fd_dup(tid, 3, slave).is_ok()
+                && syscall::sys_set_gid(tid, USER_GROUP).is_ok()
+                && syscall::sys_set_uid(tid, USER).is_ok();
+            if !ready {
+                child.discard();
+                return None;
+            }
+            child.start().ok()?;
+            wait_for(tid)
+        });
+        let bits = spied.filter(|s| (0..128).contains(s)).unwrap_or(0);
+        check("a user outside the session is not given its terminal by number", bits & 1 != 0);
+        check("nor reads it through a descriptor left over from another", bits & 2 != 0);
+        check("nor writes to it, nor changes how it behaves", bits & 12 == 12);
+        check("a terminal a user makes is that user's to open", bits & 16 != 0);
+    }
     // What is typed is for the group in front, and for nobody else who
     // happens to hold the terminal — as this does.
     let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_HANDLE);

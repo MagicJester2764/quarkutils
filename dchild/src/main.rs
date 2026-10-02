@@ -46,6 +46,14 @@
 //! server that says who somebody is to change passwords, its own and
 //! OTHER's; `become NAME ID PASSWORD` asks it to make this program NAME
 //! with this account's own password, and exits 0 if it is then user ID.
+//! `linger PATH TICKS` leaves a child behind and ends: the child waits, then
+//! tries the terminal it was started on — a read, a write, its number —
+//! and writes in PATH how many of the three it was refused. What somebody's
+//! program is when they have logged out and somebody else has logged in.
+//! `ptyspy N` is such a user with a terminal that is not its to use: pty N
+//! is another session's, and descriptor 3 is its slave, left over. A bit
+//! for each way in that is shut — and one for a terminal of its own, which
+//! is its to open.
 //! `fdclient TID` is a client of a server at TID that serves descriptors: it
 //! asks for one, reads and writes through it, copies and closes it, and exits
 //! with a bit for each thing that worked.
@@ -262,6 +270,35 @@ fn user_fat(dir: &[u8], name: &[u8]) -> i32 {
         && vfs::mkdir(v, under(dir, b"NEWDIR", &mut two)) == no
     {
         ok |= 2;
+    }
+    ok
+}
+
+/// A terminal another session has, as a user outside that session: pty
+/// `number`, whose slave is also descriptor 3 here. A bit for each thing
+/// that is refused, and one for what is not.
+fn pty_spy(number: usize) -> i32 {
+    let mut ok = 0;
+    if syscall::sys_pty_open(number).is_err() {
+        ok |= 1;
+    }
+    // Refused, which is not the same as nothing to read yet.
+    let mut buf = [0u8; 4];
+    if syscall::sys_fd_read_nb(3, &mut buf) == u64::MAX {
+        ok |= 2;
+    }
+    if syscall::sys_fd_write_nb(3, b"x") == u64::MAX && syscall::sys_fd_write(3, b"x") == u64::MAX {
+        ok |= 4;
+    }
+    // How it behaves may be asked, and is not this program's to change.
+    if syscall::sys_pty_get_termios(3).is_ok_and(|t| syscall::sys_pty_set_termios(3, &t).is_err()) {
+        ok |= 8;
+    }
+    // A terminal this user makes is this user's, until a session takes it.
+    if let Ok(master) = syscall::sys_pty_create() {
+        if syscall::sys_pty_number(master).is_ok_and(|n| syscall::sys_pty_open(n).is_ok()) {
+            ok |= 16;
+        }
     }
     ok
 }
@@ -495,6 +532,42 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"userfat"[..]) {
         let arg = |i| quark_rt::args::argv(i).unwrap_or(b"");
         syscall::sys_exit_program(user_fat(arg(2), arg(3)));
+    }
+    if quark_rt::args::argv(1) == Some(&b"linger"[..]) {
+        let path = quark_rt::args::argv(2).unwrap_or(b"/tmp/lingered");
+        let ticks = quark_rt::args::argv(3).map_or(1000, number) as u64;
+        match syscall::sys_fork() {
+            Ok(0) => {}
+            Ok(_) => syscall::sys_exit_program(0),
+            Err(()) => syscall::sys_exit_program(1),
+        }
+        syscall::sleep_ticks(ticks);
+        let mut refused = 0u8;
+        let mut buf = [0u8; 8];
+        // Refused is an error. Nothing to read yet, or a line somebody
+        // typed, is this program reading somebody else's terminal.
+        if syscall::sys_fd_read_nb(0, &mut buf) == u64::MAX {
+            refused += 1;
+        }
+        if syscall::sys_fd_write_nb(1, b"left behind, and still writing here\n") == u64::MAX {
+            refused += 1;
+        }
+        if syscall::sys_pty_number(0).is_ok_and(|n| syscall::sys_pty_open(n).is_err()) {
+            refused += 1;
+        }
+        let mut line = *b"left behind, and refused the terminal N ways of 3\n";
+        let at = line.iter().position(|&b| b == b'N').unwrap_or(0);
+        line[at] = b'0' + refused;
+        if let Some(v) = nameserver::lookup_retry(b"vfs", 20) {
+            if let Ok(o) = vfs::open_with(v, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) {
+                let _ = vfs::write(v, o.handle, &line, 0);
+                let _ = vfs::close(v, o.handle);
+            }
+        }
+        syscall::sys_exit_program(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"ptyspy"[..]) {
+        syscall::sys_exit_program(pty_spy(quark_rt::args::argv(2).map_or(usize::MAX, number)));
     }
     if quark_rt::args::argv(1) == Some(&b"usersys"[..]) {
         syscall::sys_exit_program(user_sys(quark_rt::args::argv(2).map_or(0, number)));
