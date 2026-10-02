@@ -42,12 +42,18 @@ libc/               A small C library against the raw ABI.
 linux-abi/          The Linux system-call surface, answered by Quark. musl is
                     built on this, and every ported program on musl.
 
+auth/               Who somebody is: the one program that may say, which
+                    checks passwords and makes a new session's shell its user.
 getty/              Put a session on the console's terminal.
 login/  qsh/        Log in; the shell.
+su/  passwd/        Be somebody else for a while; change a password. Neither
+                    holds anything: they ask `auth`.
+useradd/ userdel/ groupadd/ gpasswd/ id/
+                    Who the users are, in Unix's files, by Unix's names.
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     588 checks of the kernel, made through the ABI.
+dtest/  dchild/     662 checks of the kernel, made through the ABI.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
@@ -61,7 +67,7 @@ rust-std-patches/   The std fork's port to Quark, mirrored: the commit it left
                     upstream at, a patch for the files upstream has, and the
                     files it adds. Generated; see its README.
 docs/               C on Quark, and where it is not Linux; the VFS
-                    protocol; the compositor.
+                    protocol; the compositor; users.
 tools/check-abi.sh  The numbers here agree with each other and with the kernel.
 tools/std-patches.sh  The mirror above agrees with the fork.
 ```

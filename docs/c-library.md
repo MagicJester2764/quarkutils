@@ -87,6 +87,35 @@ too. The difference is only visible to code that mixes the two kinds.
   which ends it with the signal Linux would have sent — reports that signal
   to `WTERMSIG`.
 
+## Who a program is
+
+- **One id, not three.** A task has one user and one group. `getuid` and
+  `geteuid` answer the same number, always, and so do the three that
+  `getresuid` fills in. There is no file whose mode makes a program run as
+  its owner, so nothing here ever has a real id that differs from its
+  effective one.
+- **`getgroups` and `setgroups` are the kernel's**: the groups a process is
+  in besides its own, sixteen at most. `getgroups` with too little room is
+  `EINVAL`, and with none says how many there are.
+- **Changing who a program is takes a capability, not being root.** `setuid`,
+  `setgid` and `setgroups` are `EPERM` without `SetUid`, which a program is
+  given only if it asks for it (`QUARK_CAP_SET_UID` in its manifest) and
+  whoever starts it holds it — or if it was forked from something that did.
+  Asking to be who one already is, or to be in the groups one is in, is
+  always allowed.
+- **`setuid` to somebody else is for good.** The capability is given up as
+  the id changes, so there is no way back, as Unix promises. The forms that
+  change only the effective id — `seteuid`, `setreuid(-1, u)`,
+  `setresuid(-1, u, -1)` — keep it, and a program can come back, as Unix
+  allows; while it is away its real id is the other user's too, there being
+  one. Change groups first, and the user last: after `setuid` there is
+  nothing left to change them with.
+- **`crypt` is musl's**, and the system's own `passwd` writes hashes it
+  verifies (`$6$`, SHA-512). `getpwnam`, `getgrnam` and `getspnam` read the
+  files, which are Unix's; `/etc/shadow` is root's to read.
+- **`kill` of somebody else's process is `EPERM`**, and of one that is not
+  there `ESRCH`.
+
 ## Signals
 
 A program has `sigaction`, a signal mask, `kill`, `raise`, `sigsuspend`,
@@ -157,6 +186,13 @@ does on Linux. What is different is at the edges:
   should ignore it instead, or catch it. The one case every shell relies on
   works as on Linux: `tcsetpgrp` with `SIGTTOU` blocked succeeds from the
   background.
+- **A terminal's slave is its session's.** A process outside the session
+  that has the terminal — one left running after its own session ended, or
+  another user's — gets `EIO` from a read or a write of a descriptor for the
+  slave, and `ENOENT` from opening `/dev/pts/N`, where Linux leaves a
+  descriptor usable until the terminal is hung up. Before any session has
+  claimed a terminal it is its maker's user's, which is what `openpty` and
+  `forkpty` need.
 - **A terminal becomes a session's when its leader opens it** without
   `O_NOCTTY`, or asks with `TIOCSCTTY`; it cannot be taken from a session
   that has it, and is given up only by the leader ending (`TIOCNOTTY` is
@@ -252,6 +288,13 @@ and much later. The ones a ported program is most likely to meet:
 `timer_create`, `set_robust_list`, `rseq`, `statx` (musl falls back to
 `fstatat`), and `epoll_wait` on anything but the descriptors the layer can
 poll.
+
+`socket` is the exception: it answers `EAFNOSUPPORT`, for every family.
+There are no sockets to be bound or connected by name — a local stream is
+made as a pair (`socketpair`) — and "that family is not supported" is the
+answer a program has something to do about. musl asks a name service daemon
+who a user is before it concludes nobody has the name, and takes this for
+"there is no daemon".
 
 Everything is linked statically. There is no dynamic loader, so `dlopen`
 fails, and a library that would be loaded as a plugin has to be built in.

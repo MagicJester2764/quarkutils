@@ -42,9 +42,19 @@ code in `data[0]`:
 | 20 | `BUSY` | A disk somebody else is using, or the one this system runs from; a mounted filesystem something still uses |
 | 21 | `CROSS_DEVICE` | Two names in two filesystems, asked for as one file |
 
-Permission is checked against the caller's user and group, which the server
-asks the kernel for (`SYS_GET_TUID`). User 0 is not checked. FAT32 has no
-owners or modes and checks nothing.
+Permission is checked against who the caller is: its user and group
+(`SYS_GET_TUID`) and the groups it is in besides (`SYS_GROUPS`), which the
+server asks the kernel for — the last only when a file's group is not the
+caller's own. The rules are Unix's: the owner's three bits for the owner,
+the group's for anybody in the file's group, the rest for everybody else,
+and each directory on the way to a file has to let the caller through
+(execute). User 0 is not checked. A caller that has gone by the time it is
+asked about is nobody (65534), not user 0.
+
+FAT32 has no owners and no modes to check anything against. It is anybody's
+to read and user 0's alone to change — `PERMISSION` to anybody else for
+every request that writes, makes, removes or renames — which is the least
+that keeps a user off the partition a machine starts from.
 
 ## Paths
 
@@ -132,7 +142,7 @@ Every request below that takes a handle takes either kind.
 | 29 | `DETACH` | `[path_len]` | path | — |
 | 30 | `MOUNTS` | `[index]` | room for a record | `[record_len, kind, pid]` |
 | 31 | `ADOPT` | — | — | `[root id, kind, read_only]` |
-| 32 | `IDENTITY` | `[uid, gid]` | — | — |
+| 32 | `IDENTITY` | `[uid, gid, groups]` | the groups, four bytes each | — |
 | 33 | `RETIRE` | — | — | — |
 | 34 | `PATH_OF` | `[handle]` | 4096 bytes to fill | `[len]` |
 | 35 | `SYNC` | — | — | — |
@@ -161,6 +171,7 @@ message and cut it to 40 bytes.
 | 256 | `WRITE` | The descriptor may write |
 | 512 | `NOWAIT` | The caller will not wait for what it opens: see *Named pipes* |
 | 1024 | `PROXIED` | From the server this filesystem is mounted in: `READ` and `WRITE` are checked as for a descriptor, and a handle is given |
+| 2048 | `ASK` | Only to be asked about: see below |
 
 With `DESCRIPTOR` the reply's first word is `handle << 32 | descriptor`: the
 number the caller now has, the lowest free from 3, and the handle to name in
@@ -176,6 +187,16 @@ mode 0644 if the word is 0.
 The reply's `mode` includes the file-type bits (`0o170000`), `access` is what
 this caller may do (4 read, 2 write, 1 execute), and `id` is the inode number
 (FAT32: the first cluster), stable for as long as the file exists.
+
+A handle that is not a descriptor's is one its program reads through, so
+opening one needs the right to read the file — unless it is opened with
+`ASK`, alone or with `NOFOLLOW` or `DIRECTORY`. That needs nothing of the
+file itself, only the way to it, and the handle answers `STAT`, `STATFS` and
+`CLOSE` and is `NOT_SUPPORTED` for anything else. It is what `stat` is: whose
+a file is and how big is something its directory says, and a file nobody but
+its owner may read is still listed by `ls -l`. The reply's `access` says what
+the caller could do with the file, which is all `access` asks. A disk under
+`/dev` is asked about by anybody this way and opened by user 0.
 
 A symbolic link opened with `NOFOLLOW` answers `STAT` (mode `0120777`, its
 size the target's length) and `CLOSE`, and `NOT_SUPPORTED` to everything else.
@@ -267,12 +288,16 @@ name, or, if a handle still names it, when that handle closes. Until then it
 is on the filesystem's orphan list, so a machine stopped first frees it at the
 next mount. `RMDIR` removes
 an empty directory (`NOT_EMPTY` otherwise). Both need write permission on the
-parent.
+parent — and, where the parent is *sticky* (mode bit `01000`, as `/tmp` is),
+the caller has to own the file or the directory, or be user 0. Anybody may
+make a file in such a directory and nobody take another's out of it.
 
 `RENAME` lends the source path followed directly by the destination, with the
 two lengths in `data[0]` and `data[1]`. It replaces a destination of the same
 kind — a file for a file, an empty directory for a directory — and refuses to
-move a directory inside itself (`INVALID_PATH`).
+move a directory inside itself (`INVALID_PATH`). Moving a name is taking it
+out of where it was, and replacing one is taking that one out: a sticky
+directory holds both to its rule.
 
 `LINK` lends its two paths the same way and gives the file at the first a
 second name at the second. A link at the first path gets the name itself,
@@ -443,8 +468,8 @@ which is `fchmod`, `fchown` and `futimens`.
 
 The rules are Unix's. A mode is its file's owner's to change, or user 0's;
 a link has none to change (`NOT_SUPPORTED`). Giving a file to another user is
-user 0's alone; an owner may move a file to their own group, or say what is
-already so. A time set to a value is the owner's to set; a time set to now is
+user 0's alone; an owner may move a file to their own group or to any group
+they are in besides, or say what is already so. A time set to a value is the owner's to set; a time set to now is
 also anybody's who may write the file. Every change sets the change time.
 Owners and groups are sixteen bits (`INVALID_PATH` beyond). `/dev` and what
 is in it are the server's and stay as they are (`PERMISSION`); FAT32 has
@@ -618,8 +643,10 @@ else.
 - **`ADOPT`** makes the caller the server above. Only a server started to be
   mounted accepts it (`PERMISSION` from the root's), and only once (`BUSY`).
   When the server above goes, so does this one.
-- **`IDENTITY`** says whose requests follow. A server checks permissions as
-  that user, and believes it of the server above alone.
+- **`IDENTITY`** says whose requests follow: a user, a group, and the groups
+  the user is in besides, lent as that many 32-bit numbers. A server checks
+  permissions as that user, and believes it of the server above alone. It
+  is sent again only when who is asking changes.
 - **`RETIRE`** has it let its volume go and end; `BUSY` while anything is
   open or mounted in it.
 - **`PATH_OF`** is the path of an open directory from this filesystem's

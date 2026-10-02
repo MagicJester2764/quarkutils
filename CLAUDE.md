@@ -159,7 +159,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 588 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 662 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
@@ -233,9 +233,12 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   program that needs a capability needs it in every spawner above it:
   `shutdown -r` writes the reset control register (port 0xCF9), and asked
   for it, and the machine turned off instead — the port stopped at `login`,
-  which hands the shell its ports one at a time, by hand. It is in
-  `getty`'s manifest, `login`'s grants, `qsh`'s manifest and `shutdown`'s
-  now. A program that "does nothing" is the first thing to suspect of this.
+  which handed the shell its ports one at a time, by hand. A session's
+  capabilities come from `auth` now, so the chain is `auth`'s manifest, the
+  shell's (`qsh`) and `shutdown`'s. A program that "does nothing" is the
+  first thing to suspect of this — and a program that needs a capability
+  looks for it and says so (`shutdown`: "this account may not turn the
+  machine off") rather than trying and doing nothing.
 - **IPC needs an Endpoint capability, and nobody mints one for a stranger.**
   The kernel will not deliver a call the caller holds no `Endpoint` for. Every
   program gets the nameserver's from its spawner, and a lookup grants the one
@@ -383,28 +386,101 @@ the console for its pty (`TAG_TTY_OPEN`), opens the slave, and runs `login`
 with it as descriptors 0, 1 and 2, so that everything below has a tty —
 `isatty` is true, `tcsetattr` works, and a shell that edits its own command
 line can turn the echo off. `getty` keeps the slave open between sessions, so
-the terminal never sees its last holder go. `login` reads `/etc/passwd` in
+the terminal never sees its last holder go, and starts `login` again each
+time it ends — which, on a terminal, is after one login. `login` reads `/etc/passwd` in
 Unix's seven fields or the five this began with, and starts any shell but
 `qsh` the way a Unix login does: in the home directory, with `HOME`, `USER`,
 `LOGNAME`, `SHELL`, `PATH` and `TERM`, under a name with a dash in front.
+Who the shell is, and what it holds, is not `login`'s to say: see *Users*.
 
-**`getty` is what makes that a session**, in the sense job control needs.
-It begins one (`sys_setsid`) and takes the terminal as the session's own
-(`sys_pty_set_session`), which gives the terminal a process group in front
-of it: `getty`'s, in which `login` and whatever it starts all begin. A shell
-that does nothing about groups — `qsh` — leaves it at that, and Ctrl-C is
-for the lot of them, as it always was. A shell with job control puts itself
-in a group of its own and in front, and each job after it. Two things follow
-for whoever is *not* the shell:
+**`login` is what makes that a session**, in the sense job control needs —
+and each login is one. It begins a session (`sys_setsid`) and takes the
+terminal as the session's own (`sys_pty_set_session`), which gives the
+terminal a process group in front of it: `login`'s, in which whatever it
+starts begins. A shell that does nothing about groups — `qsh` — leaves it at
+that, and Ctrl-C is for the lot of them, as it always was. A shell with job
+control puts itself in a group of its own and in front, and each job after
+it. Three things follow:
 
-- **`login` takes the terminal back when the shell ends**, and `getty` when
-  `login` does (`sys_pty_set_front`, quietly). The group in front is the one
-  that has just gone; until somebody is in front again, nothing typed is for
-  anybody and a read from behind is not a read — `login` would print its
-  prompt and be refused the answer for ever.
+- **A session ends with its login, and the terminal goes with it.** The
+  kernel gives a terminal's slave to the session that has claimed it and to
+  nobody else who merely holds a descriptor (`../quark/CLAUDE.md`). So a
+  program somebody left running, and then logged out, is in a session that
+  no longer has the terminal: it cannot read what the next person types, by
+  the descriptor it kept or by the terminal's number. `getty` led one
+  session for as long as the machine was up, and everybody who ever logged
+  in was in it. `dtest jobs` checks that a session's leader is not something
+  `init` started, and `dchild linger` is the program left behind.
+- **`login` takes the terminal back when the shell ends** (`sys_pty_set_front`,
+  quietly), and then ends. The group in front is the one that has just gone;
+  until somebody is in front again, nothing typed is for anybody and a read
+  from behind is not a read.
 - **Ctrl-Z does nothing at `qsh`**, by the kernel's rule and not by anybody
   ignoring it: a group with nobody to continue it is not stopped from a
   terminal. Nothing here needs to say what it does about signal 20.
+
+## Users
+
+`docs/users.md` is the whole of it: read that before touching `auth`,
+`login`, `su`, `passwd`, the account tools or `quark_rt::{auth, accounts,
+session, crypt}`. What must not regress:
+
+- **One program may say who a task is, and it is a server.** `auth` holds
+  `SetUid`; `login`, `su` and `passwd` hold nothing, and neither does
+  `getty`. There is no setuid bit and there cannot be: a program is loaded
+  by whoever starts it, so nothing can vouch that what runs is the file
+  whose mode said so, and a spawner hands on only what it holds. A program
+  that "needs to be root for a moment" asks `auth`.
+- **It blesses a child that has not started, and narrows nothing.** The
+  asker builds the child holding nothing; `auth` checks the password, says
+  who the child is (`sys_identify`, which the kernel checks against whose
+  child it is *at that moment*) and hands it what the account's sessions
+  hold. Everything that waits — files, hashing — comes before that step, and
+  the grants come straight after it: a task id is recycled, and a grant made
+  after a wait is a grant to whatever has the number by then.
+- **A child that is built and not wanted goes back whole**
+  (`Spawned::discard`). A wrong password leaves a task and an address space
+  with an image in it; sixty-four of them were the last password anybody
+  typed. `spawn::load` does the same when loading fails half way.
+- **What a session may do is what it was handed**, by the account's line in
+  `/etc/rights` — and with no such file, everything for user 0 and nothing
+  for anybody else. Never test a user id to decide what a *program* may do;
+  test it to decide whose a *resource a server owns* is (the file server, a
+  disk driver), or to say early what a server would say late (`mount`).
+- **A name nobody has is treated as a name somebody has**, all the way: it
+  is asked for a password, hashed against, counted as wrong and answered
+  with the same words. A shortcut for "no such user" anywhere on that path
+  tells whoever is at the login prompt which names there are.
+- **Wrong passwords are refused early, never slept on**, counted by who
+  asked and by the name typed, in places that are never given up to make
+  room. Each of those is there because the alternative was tried or thought
+  through: a server that sleeps is asleep for everybody; counted by account
+  alone, any user locks root out; and a table of "the last few" had root's
+  count pushed out by guesses at other names.
+- **A password is read with `stdio::read_secret`** and its buffer is zeroed
+  after its one use. The old console's `input` server takes a flag on a read
+  that stops it echoing; a pty has its `ECHO` cleared and put back.
+- **The account files are Unix's**, in the forms a C library reads, and
+  `/etc/shadow` is 0600 from the moment it exists, under any name: the new
+  file is *made* with its mode (`vfs::open_new`) beside the old one, and
+  renamed over it. Made 0644 and changed afterwards, it was every hash to
+  anybody waiting for the name to appear. `auth` clears what a request lent
+  it — a password — whichever way the request ends. `ctests/crypttest.c`
+  holds the C library to reading what this writes.
+- **A terminal is its session's**, and a session is one login's: see
+  *Starting programs*. It holds only on a terminal. The plain console
+  (`input`) answers whoever asks it for a line, and has no notion of whose
+  it is: a system with more than one user runs its sessions on a terminal
+  (`session /usr/bin/getty`), as an installed one does.
+- **`stat` needs no right to read the file.** `OPEN_ASK` is how it is asked
+  (`vfs::lstat`, the C layer's `stat`, `access` and `statfs`). Without it a
+  user's `ls -l /home` was an error for every home but their own. It was
+  invisible while everybody was root.
+- **The root file server's rules are the mounted ones' too.** A request
+  through a mount carries who is asking — user, group and groups
+  (`TAG_IDENTITY`) — and `dtest`'s `mounts` section runs the same checks as
+  `users` through one. FAT has no owners: it is anybody's to read and user
+  0's to change.
 
 ## The screen
 
@@ -610,7 +686,11 @@ is. `disk`, the ATA driver, registers as `disk0`.
   filesystem being written under its server.
 - **Only root claims.** A capability to call a driver is handed to anybody
   who looks its name up, so being able to call cannot be the authority. The
-  driver asks the kernel who the caller is.
+  driver asks the kernel who the caller is. And a tool says which it was:
+  `parts` showed a disk a user may not read as one with no partition table,
+  and `mount` started a file server to be refused the disk. "Refused" and
+  "nothing there" are different answers, and each tool now gives the right
+  one (`only root reads a disk`, `only root mounts a filesystem`).
 - **The partition table is read again when whoever holds the whole device
   asks**, and not while any partition is claimed: its holder was told where
   it is.
@@ -860,11 +940,17 @@ coming, and an absolute symbolic link inside a mount is followed from the
 mount's root. A file there cannot be mapped, and a named pipe there cannot
 be opened.
 
-**Nothing has run as another user through a mount.** Every test is root,
-because nothing here can start a program as anybody else without `login`.
-The path that carries a caller's identity down is read, and short; it has
-not been run with an identity that would be refused. That is owed when
-there are users to test with.
+A mount's server is told who is asking, and holds them to it: `dtest` runs
+a program as a user who is not root against a directory laid out in a
+mounted ext4 — a file of root's, one of a group the user is in besides its
+own, a sticky directory, a directory of root's — and against a FAT
+filesystem, which is anybody's to read and root's to change.
+
+**FAT12 and FAT16 are not FAT32**, and are refused at mount: they keep the
+root directory in a place of its own, and other things where FAT32 keeps the
+two fields this reads. For a long time one was mounted and then failed every
+read — and `mformat` makes anything under half a gigabyte FAT16 unless told
+otherwise, so an image's own EFI partition was one.
 
 FAT32, which had only ever been a root nobody wrote much to, is what an EFI
 system partition is, so it had to be right enough to mount one and have
@@ -912,6 +998,16 @@ removed.
   kernel copies capabilities at a fork and keeps them across an exec, and
   nothing narrows them to what the new program's manifest asks for, as a
   spawner does. A shell that execs is as trusted as everything it runs.
+  Which is why a user's session has to *begin* holding nothing: there is no
+  later point at which it is taken away.
+- **A seat is nobody's.** `input` and `fb` give the keyboard and the display
+  to whoever claims them, which is how `wm` runs; nothing ties a claim to
+  the session at the console, so a user's program can take the keyboard out
+  from under the next user's login. The terminal above them is the
+  session's (*Starting programs*); the devices under it are not.
+- **Users**: one id where Unix has three, no list of commands a user may run
+  as another, no password ageing, no `groupdel` or `usermod`, sixteen-bit
+  ids on disk. `docs/users.md` has the list and the reasons.
 - The compositor keeps no history of serials, so `xdg_toplevel.move` and
   `.resize` cannot check that the serial they are given was a recent press.
   What they check instead is that a button is down. Drag and drop, touch and
