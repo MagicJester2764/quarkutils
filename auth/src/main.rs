@@ -155,11 +155,17 @@ fn answer(tag: u64, code: u64, more: u64) -> Message {
 ///
 /// No line in `/etc/shadow`, or an empty hash, is an account nobody has
 /// given a password: it asks for none. `!` or `*` is one nobody can log in
-/// to with a password at all.
+/// to with a password at all — and nobody is told that is why. It is
+/// checked against a hash no password makes, so that it takes as long as a
+/// wrong password, and it is answered as one: "that account is locked",
+/// said at a login prompt, is "that account is there".
 fn opens(hash: Option<&[u8]>, password: &[u8]) -> Result<(), u64> {
     match hash {
         None | Some(b"") => Ok(()),
-        Some(h) if accounts::locked(h) => Err(ERR_LOCKED),
+        Some(h) if accounts::locked(h) => {
+            let _ = crypt::verify(password, NOBODYS);
+            Err(ERR_WRONG)
+        }
         Some(h) if crypt::verify(password, h) => Ok(()),
         Some(_) => Err(ERR_WRONG),
     }

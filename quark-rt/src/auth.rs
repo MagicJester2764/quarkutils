@@ -39,7 +39,9 @@ pub const HOME: u64 = 4;
 pub const ERR_NO_USER: u64 = 1;
 /// The password is not the one, or the account is not one.
 pub const ERR_WRONG: u64 = 2;
-/// The account cannot be logged in to with a password.
+/// Not said. An account nobody logs in to with a password is answered
+/// [`ERR_WRONG`], like any other password that is not the one: whoever is
+/// told an account is locked has been told it is there.
 pub const ERR_LOCKED: u64 = 3;
 /// The task is not the caller's own child, still being made.
 pub const ERR_NOT_YOURS: u64 = 4;

@@ -3633,8 +3633,8 @@ fn test_auth() {
     let tid = child.tid;
     let who = || syscall::sys_get_tuid(tid);
     check(
-        "a new account is locked: no password makes anybody it",
-        auth::bless(tid, NAME, b"", auth::CHECK) == Err(auth::ERR_LOCKED) && who() == Ok((0, 0)),
+        "a new account is locked: no password makes anybody it, and none is told why",
+        auth::bless(tid, NAME, b"", auth::CHECK) == Err(auth::ERR_WRONG) && who() == Ok((0, 0)),
     );
     check(
         "root is asked for none, and its child is made that user",
