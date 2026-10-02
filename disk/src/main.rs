@@ -46,6 +46,8 @@ const ATA_SR_ERR: u8 = 0x01;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_PIO: u8 = 0x20;
 const ATA_CMD_WRITE_PIO: u8 = 0x30;
+const ATA_CMD_WRITE_MULTIPLE: u8 = 0xC5;
+const ATA_CMD_SET_MULTIPLE: u8 = 0xC6;
 
 /// The driver's own page, which every sector passes through on its way to or
 /// from a client's lent buffer.
@@ -56,11 +58,15 @@ const MAX_SECTORS: u32 = 8;
 struct DriveInfo {
     present: bool,
     lba28_sectors: u32,
+    /// How many sectors the drive takes as one block of a WRITE MULTIPLE; 0
+    /// if it has not agreed to any.
+    multiple: u32,
 }
 
 static mut DRIVE: DriveInfo = DriveInfo {
     present: false,
     lba28_sectors: 0,
+    multiple: 0,
 };
 
 fn ata_read_status() -> u8 {
@@ -95,6 +101,19 @@ fn ata_400ns_delay() {
     for _ in 0..4 {
         syscall::sys_ioport_read(ATA_ALT_STATUS);
     }
+}
+
+/// Ask the drive to take `sectors` at a time as one block of a WRITE
+/// MULTIPLE. Whether it agreed.
+fn ata_set_multiple(sectors: u32) -> bool {
+    ata_wait_not_busy();
+    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0);
+    ata_400ns_delay();
+    syscall::sys_ioport_write(ATA_SECTOR_COUNT, sectors as u8);
+    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_SET_MULTIPLE);
+    ata_400ns_delay();
+    ata_wait_not_busy();
+    ata_read_status() & ATA_SR_ERR == 0
 }
 
 fn ata_identify() -> bool {
@@ -158,6 +177,14 @@ fn ata_identify() -> bool {
         DRIVE.lba28_sectors = lba28_sectors;
     }
 
+    // The most sectors it will take as one block (word 47's low byte): a
+    // whole request's worth, if it will take that many. See
+    // `ata_write_sectors` for what that buys.
+    let most = (identify[47] & 0xFF) as u32;
+    if most >= MAX_SECTORS && ata_set_multiple(MAX_SECTORS) {
+        unsafe { DRIVE.multiple = MAX_SECTORS };
+    }
+
     // Print drive info
     if let Ok(model_str) = core::str::from_utf8(&model[..model_len]) {
         println!("[disk] ATA drive: {}", model_str);
@@ -199,9 +226,26 @@ fn ata_read_sectors(lba: u32, count: u32, buf: *mut u8) -> bool {
     true
 }
 
-fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
+/// Write `count` sectors from `buf` at `lba`, as one command.
+///
+/// One command for the run, not one a sector: setting a command up is a
+/// dozen writes to the drive's registers and two waits, and a client that
+/// writes a filesystem block writes eight sectors at a time. Done a sector
+/// at a time, that setup was most of what writing a file cost.
+///
+/// And as one *block* where the drive will take one (WRITE MULTIPLE): it is
+/// handed the whole request before it writes any of it. With WRITE SECTORS
+/// an emulated drive writes each sector as it arrives, so a machine stopped
+/// half way through a request had half of it on the disk — and an ext4
+/// superblock is two sectors with its checksum in the second. Stopped
+/// between those two, the filesystem was one `e2fsck` would not open
+/// without falling back to a copy of the superblock made when the disk was
+/// formatted. No ATA command promises that a write is all or nothing; this
+/// removes the case there was no need to have.
+fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
     let max_sectors = unsafe { DRIVE.lba28_sectors };
-    if lba >= max_sectors {
+    // The LBA comes from a client, so the end is computed without wrapping.
+    if count == 0 || count > MAX_SECTORS || lba.checked_add(count).is_none_or(|end| end > max_sectors) {
         return false;
     }
 
@@ -211,26 +255,40 @@ fn ata_write_sector(lba: u32, buf: *const u8) -> bool {
     syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F) as u8);
     ata_400ns_delay();
 
-    // Set sector count = 1
-    syscall::sys_ioport_write(ATA_SECTOR_COUNT, 1);
+    syscall::sys_ioport_write(ATA_SECTOR_COUNT, count as u8);
 
     // Set LBA
     syscall::sys_ioport_write(ATA_LBA_LO, lba as u8);
     syscall::sys_ioport_write(ATA_LBA_MID, (lba >> 8) as u8);
     syscall::sys_ioport_write(ATA_LBA_HI, (lba >> 16) as u8);
 
-    // Send WRITE SECTORS command
-    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_WRITE_PIO);
+    // The drive asks for each block when it has taken the last: the whole
+    // request at once, or a sector at a time.
+    let (command, block) = if unsafe { DRIVE.multiple } >= count {
+        (ATA_CMD_WRITE_MULTIPLE, count)
+    } else {
+        (ATA_CMD_WRITE_PIO, 1)
+    };
+    syscall::sys_ioport_write(ATA_COMMAND, command);
     ata_400ns_delay();
 
-    // Wait for DRQ (device ready to accept data)
-    if !ata_wait_drq() {
-        return false;
+    for i in 0..count {
+        if i % block == 0 && !ata_wait_drq() {
+            return false;
+        }
+        // 512 bytes, four at a time and each its own instruction. That is
+        // what an emulated drive makes fast: under a hypervisor every byte
+        // written to the data port is a trap, and `rep outsw` is 256 of them
+        // taken the slowest way there is, through an instruction emulator.
+        // This is 128 taken the quickest, and nearly three times as fast.
+        // (Reads are not like this: a hypervisor reads ahead for `rep insw`.)
+        // Every PCI IDE controller takes its data 32 bits at a time; the ISA
+        // ones that did not are older than the firmware this boots from.
+        for w in 0..128usize {
+            let at = unsafe { buf.add(i as usize * 512 + w * 4) as *const u32 };
+            syscall::sys_ioport_write32(ATA_DATA, unsafe { core::ptr::read_unaligned(at) });
+        }
     }
-
-    // Write 256 words (512 bytes)
-    let words = unsafe { core::slice::from_raw_parts(buf as *const u16, 256) };
-    let _ = syscall::sys_ioport_rep_outsw(ATA_DATA, words);
 
     // Flush cache — wait for BSY to clear after write
     ata_wait_not_busy();
@@ -260,7 +318,7 @@ impl Device for Ata {
         if lba.checked_add(count as u64).is_none_or(|end| end > u32::MAX as u64) {
             return false;
         }
-        (0..count).all(|i| ata_write_sector(lba as u32 + i, unsafe { from.as_ptr().add(i as usize * 512) }))
+        ata_write_sectors(lba as u32, count, from.as_ptr())
     }
 }
 

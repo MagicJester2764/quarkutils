@@ -635,6 +635,18 @@ is. `disk`, the ATA driver, registers as `disk0`.
   is a disk nobody can format. And a handle remembers its driver as a
   program, not as a task or a name: a RAM disk is killed and another takes
   both.
+- **Writing a disk is slow here, and it is the emulator.** The ATA driver
+  writes with programmed I/O, and under a hypervisor every write to the
+  data port is a trap: about 0.8 MB a second, however the data is sent.
+  `rep outsw` is the slowest way — it goes through an instruction emulator
+  — so the driver writes 32 bits at a time, one instruction each, which is
+  nearly three times as fast; and it writes a run of sectors as one command.
+  Reads are forty times faster, because a hypervisor reads ahead for
+  `rep insw`. The answer is DMA, and it has not been taken on purpose: a
+  bus-master device writes wherever its driver points it, so DMA with no
+  IOMMU gives the disk driver all of physical memory, which is exactly what
+  it was built not to have. Until the kernel can confine it, what is slow is
+  made up for above the driver: fewer sectors, not faster ones.
 - **`qfuzz` does not send a disk driver a claim.** It runs as root, a volume
   nobody has is one it would be given, and its next random write would be a
   write.
