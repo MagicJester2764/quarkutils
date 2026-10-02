@@ -1844,6 +1844,57 @@ fn test_jobs() {
     for fd in [says, slave, master] {
         let _ = syscall::sys_fd_close(fd);
     }
+
+    // A job behind may not change the terminal, nor — where it asks for
+    // that — write to it: it is stopped, as one that reads is.
+    let pair = syscall::sys_pty_create().ok().and_then(|master| {
+        let number = syscall::sys_pty_number(master).ok()?;
+        Some((master, syscall::sys_pty_open(number).ok()?))
+    });
+    let Some((master, slave)) = pair else {
+        check("a terminal", false);
+        return;
+    };
+    let started = match (syscall::sys_socketpair(), load_child(&[b"dchild", b"behind"])) {
+        (Ok((mine, theirs)), Some(child)) => {
+            let tid = child.tid;
+            let _ = syscall::sys_fd_dup(tid, 0, slave);
+            let _ = syscall::sys_fd_dup(tid, 3, theirs);
+            let _ = syscall::sys_fd_close(theirs);
+            child.start().ok().map(|()| (tid, mine))
+        }
+        _ => None,
+    };
+    let mut said = [0u8; 2];
+    let went = match started {
+        Some((tid, mine)) => {
+            let mut fds = [syscall::PollFd::new(mine, syscall::POLL_READABLE)];
+            let heard = syscall::sys_poll(&mut fds, 500) == Ok(1) && syscall::sys_fd_read(mine, &mut said) == 2;
+            if !heard {
+                let _ = syscall::sys_sig_raise(tid, syscall::SIGKILL);
+            }
+            let _ = wait_for(tid);
+            let _ = syscall::sys_fd_close(mine);
+            if heard { said[0] as u32 | (said[1] as u32) << 8 } else { 0 }
+        }
+        None => 0,
+    };
+    check("a session on a terminal of its own", went & 1 != 0);
+    check("a job behind that changes the terminal's settings is stopped by signal 22", went & 2 != 0);
+    check("and one that changes its size", went & 4 != 0);
+    check("one that writes to it goes ahead", went & 8 != 0);
+    check("unless the terminal says a job behind is stopped for that", went & 16 != 0);
+    check("one that holds signal 22 back goes ahead", went & 32 != 0);
+    check("and one that ignores it", went & 64 != 0);
+    check("a read from behind with signal 21 held back fails rather than stopping", went & 128 != 0);
+    check("whoever is in front is told the terminal's size has changed", went & 256 != 0);
+    check(
+        "a stopped read, continued in front, says to make it again, to a program that asked",
+        went & 512 != 0,
+    );
+    for fd in [slave, master] {
+        let _ = syscall::sys_fd_close(fd);
+    }
 }
 
 /// Sleep a little, then write. Run on a thread so that something can become
@@ -6231,6 +6282,591 @@ fn test_fork() {
     }
 }
 
+/// What the handlers below leave for the checks to read.
+static HANDLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HANDLED_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HANDLED_BY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HANDLED_WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static HANDLED_WHO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HANDLED_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HANDLED_ON_STACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HANDLER_DEPTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HANDLER_DEEPEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HANDLER_AGAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SPINNER_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SPINNER_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+const HANDLED_USR1: u64 = 10;
+const HANDLED_SEGV: u64 = 11;
+const HANDLED_USR2: u64 = 12;
+const HANDLED_ALRM: u64 = 14;
+const HANDLED_TERM: u64 = 15;
+const HANDLED_WINCH: u64 = 28;
+/// Where nothing is mapped, to touch; and four pages for handlers to run on.
+const NOTHING_AT: usize = 0xC1_0000_0000;
+const HANDLER_STACK_AT: usize = 0xC2_0000_0000;
+const HANDLER_STACK: usize = 4 * 4096;
+
+fn sig(signo: u64) -> u64 {
+    1 << (signo - 1)
+}
+
+/// Which signal the handler below was last run for.
+static HANDLED_SIGNO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A word for a futex wait that nothing ends but a signal.
+static NEVER_WOKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Descriptors for the checks of waits a handler ends: a pipe for the child
+/// to wait on, and one for it to say it is about to.
+const ENDED_DATA: (usize, usize) = (40, 41);
+const ENDED_READY: (usize, usize) = (42, 43);
+
+/// Says that it ran, in which task, why, and where its own stack is.
+fn on_signal(frame: &mut quark_rt::signal::Frame) {
+    use core::sync::atomic::Ordering::SeqCst;
+    HANDLED_SIGNO.store(frame.signo, SeqCst);
+    let here = 0u8;
+    HANDLED_AT.store(&here as *const u8 as usize, SeqCst);
+    HANDLED_ON_STACK.store(frame.flags as u32 & 1, SeqCst);
+    HANDLED_BY.store(syscall::sys_getpid() as usize, SeqCst);
+    HANDLED_WHY.store(frame.code, SeqCst);
+    HANDLED_WHO.store(frame.value, SeqCst);
+    HANDLED.fetch_add(1, SeqCst);
+    HANDLED_FLAG.store(1, SeqCst);
+}
+
+/// Raises its own signal again from inside itself, once, and says how deep
+/// it has ever found itself.
+fn on_signal_again(frame: &mut quark_rt::signal::Frame) {
+    use core::sync::atomic::Ordering::SeqCst;
+    let depth = HANDLER_DEPTH.fetch_add(1, SeqCst) + 1;
+    HANDLER_DEEPEST.fetch_max(depth, SeqCst);
+    HANDLED.fetch_add(1, SeqCst);
+    if HANDLER_AGAIN.swap(0, SeqCst) == 1 {
+        let _ = syscall::sys_sig_raise(syscall::sys_getpid() as usize, frame.signo);
+        // Long enough for it to have been run, were it going to be.
+        let _ = syscall::sys_getpid();
+    }
+    HANDLER_DEPTH.fetch_sub(1, SeqCst);
+}
+
+/// A fault: says where, and has the task go on after the instruction that
+/// did it — which is three bytes long, in [`touch`].
+fn on_fault(frame: &mut quark_rt::signal::Frame) {
+    use core::sync::atomic::Ordering::SeqCst;
+    HANDLED_WHY.store(frame.code, SeqCst);
+    HANDLED_WHO.store(frame.value, SeqCst);
+    HANDLED.fetch_add(1, SeqCst);
+    frame.regs[quark_rt::signal::REG_RIP] += 3;
+}
+
+/// Write a byte at `at`: one instruction, three bytes, and a return.
+#[unsafe(naked)]
+extern "C" fn touch(at: usize) {
+    core::arch::naked_asm!("mov byte ptr [rdi], 1", "ret");
+}
+
+/// Compute, making no call, until the word at `flag` is not nought or a
+/// great many turns have gone by — with something of its own in every
+/// register it may use, looked at every time round. 1 if the word was set
+/// and every register was as it was left; 0 if one was not; 2 if nothing
+/// ever set the word.
+#[unsafe(naked)]
+extern "C" fn compute_until(flag: *const u32) -> u64 {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rax, 0x1111111111111111",
+        "mov rbx, 0x2222222222222222",
+        "mov rcx, 0x3333333333333333",
+        "mov rdx, 0x4444444444444444",
+        "mov rsi, 0x5555555555555555",
+        "mov rbp, 0x6666666666666666",
+        "mov r8,  0x7777777777777777",
+        "mov r9,  0x8888888888888888",
+        "mov r10, 0x9999999999999999",
+        "mov r11, 0xAAAAAAAAAAAAAAAA",
+        "mov r12, 0xBBBBBBBBBBBBBBBB",
+        "mov r13, 0xCCCCCCCCCCCCCCCC",
+        "mov r14, 0xDDDDDDDDDDDDDDDD",
+        "mov r15, 12000000000",
+        "2:",
+        "cmp dword ptr [rdi], 0",
+        "jne 3f",
+        "dec r15",
+        "jnz 2b",
+        "mov eax, 2",
+        "jmp 5f",
+        "3:",
+        "mov r15, 0x1111111111111111",
+        "cmp rax, r15",
+        "jne 4f",
+        "mov r15, 0x2222222222222222",
+        "cmp rbx, r15",
+        "jne 4f",
+        "mov r15, 0x3333333333333333",
+        "cmp rcx, r15",
+        "jne 4f",
+        "mov r15, 0x4444444444444444",
+        "cmp rdx, r15",
+        "jne 4f",
+        "mov r15, 0x5555555555555555",
+        "cmp rsi, r15",
+        "jne 4f",
+        "mov r15, 0x6666666666666666",
+        "cmp rbp, r15",
+        "jne 4f",
+        "mov r15, 0x7777777777777777",
+        "cmp r8, r15",
+        "jne 4f",
+        "mov r15, 0x8888888888888888",
+        "cmp r9, r15",
+        "jne 4f",
+        "mov r15, 0x9999999999999999",
+        "cmp r10, r15",
+        "jne 4f",
+        "mov r15, 0xAAAAAAAAAAAAAAAA",
+        "cmp r11, r15",
+        "jne 4f",
+        "mov r15, 0xBBBBBBBBBBBBBBBB",
+        "cmp r12, r15",
+        "jne 4f",
+        "mov r15, 0xCCCCCCCCCCCCCCCC",
+        "cmp r13, r15",
+        "jne 4f",
+        "mov r15, 0xDDDDDDDDDDDDDDDD",
+        "cmp r14, r15",
+        "jne 4f",
+        "mov eax, 1",
+        "jmp 5f",
+        "4:",
+        "xor eax, eax",
+        "5:",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "ret",
+    );
+}
+
+/// Computes until it is told to stop, holding nothing back.
+extern "C" fn spinner() -> ! {
+    SPINNER_TID.store(syscall::sys_getpid() as usize, core::sync::atomic::Ordering::SeqCst);
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+    while SPINNER_STOP.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        core::hint::spin_loop();
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// A handler the kernel runs: the program is turned aside wherever it is —
+/// computing, with no call to be told at — and goes on afterwards as if it
+/// had not been. And a mask, which is each task's own, and which holds
+/// back whatever a signal would have done.
+fn test_handlers() {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::signal;
+    println!("handlers the kernel runs:");
+    let me = syscall::sys_getpid() as usize;
+    let fresh = || {
+        HANDLED.store(0, SeqCst);
+        HANDLED_FLAG.store(0, SeqCst);
+        HANDLED_WHY.store(u64::MAX, SeqCst);
+    };
+
+    // In the middle of computing.
+    fresh();
+    let said = signal::handle(HANDLED_ALRM, on_signal, 0, 0).is_ok();
+    let _ = syscall::sys_sig_alarm_ns(20_000_000, 0);
+    let kept = compute_until(HANDLED_FLAG.as_ptr());
+    check("a handler interrupts a program that is computing and makes no call", said && kept != 2);
+    check("which goes on with every register as it was", kept == 1);
+    check("and the kernel says it raised the signal itself", HANDLED_WHY.load(SeqCst) == signal::BY_KERNEL);
+
+    // Held back, and let through.
+    fresh();
+    let _ = signal::handle(HANDLED_USR1, on_signal, 0, 0);
+    let before = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_USR1));
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR1);
+    syscall::sleep_ticks(2);
+    check("a signal a task holds back waits", before == 0 && HANDLED.load(SeqCst) == 0);
+    let _ = syscall::sys_sig_mask(syscall::SIG_UNBLOCK, sig(HANDLED_USR1));
+    check("and its handler has run by the time the call that let it through returns", HANDLED.load(SeqCst) == 1);
+    check(
+        "it is told who raised it",
+        HANDLED_WHY.load(SeqCst) == signal::BY_PROGRAM && HANDLED_WHO.load(SeqCst) == syscall::sys_pid_self(),
+    );
+    check("the mask is as it was afterwards", syscall::sys_sig_mask_get() == 0);
+
+    // Its own signal is held back while a handler runs, unless it says not.
+    fresh();
+    HANDLER_DEEPEST.store(0, SeqCst);
+    HANDLER_AGAIN.store(1, SeqCst);
+    let _ = signal::handle(HANDLED_USR2, on_signal_again, 0, 0);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    check(
+        "a handler's own signal waits until it has returned, and is then run",
+        HANDLED.load(SeqCst) == 2 && HANDLER_DEEPEST.load(SeqCst) == 1,
+    );
+    fresh();
+    HANDLER_DEEPEST.store(0, SeqCst);
+    HANDLER_AGAIN.store(1, SeqCst);
+    let _ = signal::handle(HANDLED_USR2, on_signal_again, 0, syscall::SIG_NODEFER);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    check(
+        "or is run inside it, if the program asked for that",
+        HANDLED.load(SeqCst) == 2 && HANDLER_DEEPEST.load(SeqCst) == 2,
+    );
+
+    // Once.
+    fresh();
+    let _ = signal::handle(HANDLED_USR2, on_signal, 0, syscall::SIG_RESETHAND);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    check(
+        "a handler asked for once is run once, and nothing is said about the signal afterwards",
+        HANDLED.load(SeqCst) == 1 && syscall::sys_sig_action_get(HANDLED_USR2) == Ok(syscall::SIG_DEFAULT),
+    );
+
+    // Another thread, computing, while this one holds the signal back.
+    fresh();
+    SPINNER_STOP.store(0, SeqCst);
+    SPINNER_TID.store(0, SeqCst);
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_USR1));
+    match thread::spawn_with_stack(spinner, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(3);
+            let began = syscall::sys_clock();
+            let _ = syscall::sys_sig_raise(me, HANDLED_USR1);
+            let mut waited = 0;
+            while HANDLED.load(SeqCst) == 0 && waited < 50 {
+                syscall::sleep_ns(1_000_000);
+                waited += 1;
+            }
+            let took = syscall::sys_clock() - began;
+            println!("        run in the other thread {} us after it was raised", took / 1000);
+            check(
+                "a signal is run by a task that does not hold it back, whatever it is doing",
+                HANDLED.load(SeqCst) == 1 && HANDLED_BY.load(SeqCst) == SPINNER_TID.load(SeqCst) && HANDLED_BY.load(SeqCst) != me,
+            );
+            check("within a tick or two", took < 25_000_000);
+            SPINNER_STOP.store(1, SeqCst);
+            let _ = t.join();
+        }
+        Err(()) => check("start a thread to compute", false),
+    }
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+
+    // Held back by every task, with nothing said about it: it does what it
+    // does when it is let through, and not before.
+    if own_pipe(3, 4).is_ok() && own_pipe(5, 6).is_ok() {
+        match syscall::sys_fork() {
+            Ok(0) => {
+                let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_TERM));
+                let mut go = [0u8; 1];
+                let _ = syscall::sys_fd_write(6, b"r");
+                let _ = syscall::sys_fd_read(3, &mut go);
+                let _ = syscall::sys_sig_mask(syscall::SIG_UNBLOCK, sig(HANDLED_TERM));
+                syscall::sys_exit_program(8);
+            }
+            Ok(child) => {
+                let mut ready = [0u8; 1];
+                let _ = syscall::sys_fd_read(5, &mut ready);
+                let _ = syscall::sys_sig_raise(child, HANDLED_TERM);
+                syscall::sleep_ticks(3);
+                check(
+                    "a signal that would end a program waits while every task of it holds it back",
+                    syscall::sys_wait_nowait(child) == Ok(None),
+                );
+                let _ = syscall::sys_fd_write(4, b"g");
+                check("and ends it when one lets it through", wait_for(child) == Some(-15));
+            }
+            Err(()) => check("fork", false),
+        }
+        for fd in 3..7 {
+            let _ = syscall::sys_fd_close(fd);
+        }
+    } else {
+        check("two pipes", false);
+    }
+
+    // A wait with another mask: put on for the wait, and put back.
+    fresh();
+    let _ = signal::handle(HANDLED_ALRM, on_signal, 0, 0);
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_ALRM));
+    let _ = syscall::sys_sig_alarm_ns(20_000_000, 0);
+    syscall::sys_sig_wait(0);
+    check(
+        "a wait for a signal lets it through for as long as the wait, and no longer",
+        HANDLED.load(SeqCst) == 1 && syscall::sys_sig_mask_get() == sig(HANDLED_ALRM),
+    );
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+
+    // A sleep is ended by one, when the handler has run.
+    fresh();
+    let _ = syscall::sys_sig_alarm_ns(20_000_000, 0);
+    let before = syscall::sys_ticks();
+    syscall::sleep_ticks(100);
+    check(
+        "a sleep is ended by a handler that was run",
+        HANDLED.load(SeqCst) == 1 && syscall::sys_ticks() - before < 50,
+    );
+
+    // On a stack of its own.
+    fresh();
+    let mapped = syscall::sys_mmap(HANDLER_STACK_AT, HANDLER_STACK / 4096).is_ok();
+    let named = mapped && syscall::sys_sig_stack(HANDLER_STACK_AT, HANDLER_STACK).is_ok();
+    let _ = signal::handle(HANDLED_USR1, on_signal, 0, syscall::SIG_ONSTACK);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR1);
+    let at = HANDLED_AT.load(SeqCst);
+    check(
+        "a handler that asks is run on the stack the task named for it",
+        named && HANDLED.load(SeqCst) == 1
+            && (HANDLER_STACK_AT..HANDLER_STACK_AT + HANDLER_STACK).contains(&at)
+            && HANDLED_ON_STACK.load(SeqCst) == 1,
+    );
+    let _ = syscall::sys_sig_stack(0, 0);
+    fresh();
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR1);
+    let at = HANDLED_AT.load(SeqCst);
+    check(
+        "and on the task's own when it has named none",
+        HANDLED.load(SeqCst) == 1 && !(HANDLER_STACK_AT..HANDLER_STACK_AT + HANDLER_STACK).contains(&at),
+    );
+    let _ = syscall::sys_munmap(HANDLER_STACK_AT, HANDLER_STACK / 4096);
+
+    // A fault is one too, to a program that has said what to do about it.
+    fresh();
+    let _ = signal::handle(HANDLED_SEGV, on_fault, 0, 0);
+    touch(NOTHING_AT + 24);
+    check(
+        "a fault is handed to a program's own handler, with where it was",
+        HANDLED.load(SeqCst) == 1
+            && HANDLED_WHY.load(SeqCst) == signal::BY_FAULT
+            && HANDLED_WHO.load(SeqCst) == (NOTHING_AT + 24) as u64,
+    );
+    let _ = syscall::sys_sig_action(HANDLED_SEGV, syscall::SIG_DEFAULT);
+
+    // A forked child has its parent's handlers, and what it held back.
+    fresh();
+    let _ = signal::handle(HANDLED_USR1, on_signal, 0, 0);
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_USR2));
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let held = syscall::sys_sig_mask_get() == sig(HANDLED_USR2);
+            let _ = syscall::sys_sig_raise(syscall::sys_getpid() as usize, HANDLED_USR1);
+            syscall::sys_exit_program(if held && HANDLED.load(SeqCst) == 1 { 7 } else { 8 });
+        }
+        Ok(child) => check(
+            "a forked child has its parent's handlers and holds back what it did",
+            wait_for(child) == Some(7) && HANDLED.load(SeqCst) == 0,
+        ),
+        Err(()) => check("fork", false),
+    }
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+    for signo in [HANDLED_USR1, HANDLED_USR2, HANDLED_ALRM] {
+        let _ = syscall::sys_sig_action(signo, syscall::SIG_DEFAULT);
+    }
+
+    // Every wait a program sits in is ended by a handler the kernel runs,
+    // and says so — not only a sleep, a poll and a terminal's read.
+    let kinds: [(&str, u8); 6] = [
+        ("a read of an empty pipe", 0),
+        ("a write to a full one", 1),
+        ("a wait on a futex", 2),
+        ("a wait for a child", 3),
+        ("a read of a counter that is nought", 4),
+        ("a read of a timer that is not set", 5),
+    ];
+    for (what, kind) in kinds {
+        let got = wait_ended(kind, false, false);
+        if got != Some(1) {
+            println!("        {}: {:?}", what, got);
+        }
+        check(what, got == Some(1));
+    }
+    // To a program that has said it wants Unix's answers, they say whether
+    // the handler asked for what it cut short to be made again.
+    check(
+        "a program that asks is told a handler that restarts ran",
+        wait_ended(0, true, true) == Some(1),
+    );
+    check(
+        "and one that does not",
+        wait_ended(0, true, false) == Some(1),
+    );
+
+    // A signal for one task is run in that one, whoever else would.
+    fresh();
+    SPINNER_STOP.store(0, SeqCst);
+    SPINNER_TID.store(0, SeqCst);
+    let _ = signal::handle(HANDLED_USR1, on_signal, 0, 0);
+    match thread::spawn_with_stack(spinner, 8) {
+        Ok(t) => {
+            while SPINNER_TID.load(SeqCst) == 0 {
+                syscall::sleep_ticks(1);
+            }
+            let raised = syscall::sys_sig_raise_thread(SPINNER_TID.load(SeqCst), HANDLED_USR1).is_ok();
+            let mut waited = 0;
+            while HANDLED.load(SeqCst) == 0 && waited < 50 {
+                syscall::sleep_ns(1_000_000);
+                waited += 1;
+            }
+            check(
+                "a signal raised for one thread is run in that thread, though the one raising it would take it",
+                raised && HANDLED.load(SeqCst) == 1 && HANDLED_BY.load(SeqCst) == SPINNER_TID.load(SeqCst),
+            );
+            SPINNER_STOP.store(1, SeqCst);
+            let _ = t.join();
+        }
+        Err(()) => check("start a thread to compute", false),
+    }
+    let _ = syscall::sys_sig_action(HANDLED_USR1, syscall::SIG_DEFAULT);
+
+    // Taken rather than run: held back, a signal waits — whatever it would
+    // do — and can be asked about and taken.
+    fresh();
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(HANDLED_USR2) | sig(HANDLED_ALRM));
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    check("a signal held back is said to be waiting", syscall::sys_sig_pending() & sig(HANDLED_USR2) != 0);
+    check(
+        "and is taken, with who raised it, and nothing else done",
+        syscall::sys_sig_wait_for(sig(HANDLED_USR2), 0)
+            == Ok(Some((HANDLED_USR2, syscall::sys_pid_self() | (1 << 63)))),
+    );
+    check("after which it is not", syscall::sys_sig_pending() & sig(HANDLED_USR2) == 0);
+    let before = syscall::sys_ticks();
+    check(
+        "a wait for one that does not come ends when its time does",
+        syscall::sys_sig_wait_for(sig(HANDLED_USR2), 20) == Ok(None) && syscall::sys_ticks() - before >= 20,
+    );
+    let _ = syscall::sys_sig_alarm_ns(20_000_000, 0);
+    let before = syscall::sys_ticks();
+    check(
+        "and one that comes while it waits ends the wait",
+        syscall::sys_sig_wait_for(sig(HANDLED_ALRM), 100) == Ok(Some((HANDLED_ALRM, 0)))
+            && syscall::sys_ticks() - before < 50,
+    );
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+
+    // A terminal says when its size changes.
+    fresh();
+    HANDLED_SIGNO.store(0, SeqCst);
+    let pair = syscall::sys_pty_create().ok().and_then(|master| {
+        let number = syscall::sys_pty_number(master).ok()?;
+        Some((master, syscall::sys_pty_open(number).ok()?))
+    });
+    match pair {
+        Some((master, slave)) => {
+            let _ = signal::handle(HANDLED_WINCH, on_signal, 0, 0);
+            let changed = syscall::sys_pty_set_size(master, 30, 90).is_ok();
+            check(
+                "a terminal whose size changes raises signal 28 for whoever holds it",
+                changed && HANDLED.load(SeqCst) == 1 && HANDLED_SIGNO.load(SeqCst) == HANDLED_WINCH,
+            );
+            let _ = syscall::sys_pty_set_size(master, 30, 90);
+            check("and not when it is said to be the size it is", HANDLED.load(SeqCst) == 1);
+            let _ = syscall::sys_sig_action(HANDLED_WINCH, syscall::SIG_DEFAULT);
+            let _ = syscall::sys_fd_close(slave);
+            let _ = syscall::sys_fd_close(master);
+        }
+        None => check("a terminal", false),
+    }
+}
+
+/// A child that waits in one of six ways ([`test_handlers`]), with a handler
+/// for signal 10 that this then raises for it: its status, which is 1 if
+/// the wait ended with the answer it should and the handler had run.
+/// `unix`: the child has said it wants Unix's answers, and `restarts`: its
+/// handler asks for what it cuts short to be made again. `None` if the wait
+/// did not end within two seconds, when the child is ended.
+fn wait_ended(kind: u8, unix: bool, restarts: bool) -> Option<i32> {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::signal;
+    if own_pipe(ENDED_DATA.0, ENDED_DATA.1).is_err() || own_pipe(ENDED_READY.0, ENDED_READY.1).is_err() {
+        return None;
+    }
+    let close = || {
+        for fd in [ENDED_DATA.0, ENDED_DATA.1, ENDED_READY.0, ENDED_READY.1] {
+            let _ = syscall::sys_fd_close(fd);
+        }
+    };
+    let child = match syscall::sys_fork() {
+        Ok(0) => {
+            HANDLED.store(0, SeqCst);
+            if unix {
+                let _ = signal::speak_unix();
+            }
+            let flags = if restarts { syscall::SIG_RESTARTS } else { 0 };
+            let _ = signal::handle(HANDLED_USR1, on_signal, 0, flags);
+            let mut buf = [0u8; 64];
+            let mut grandchild = 0;
+            let mut fd = usize::MAX;
+            match kind {
+                1 => while syscall::sys_fd_write_nb(ENDED_DATA.1, &buf) != syscall::WOULD_BLOCK {},
+                3 => match syscall::sys_fork() {
+                    Ok(0) => {
+                        syscall::sleep_ticks(1000);
+                        syscall::sys_exit_code(0);
+                    }
+                    Ok(t) => grandchild = t,
+                    Err(()) => syscall::sys_exit_program(9),
+                },
+                4 => fd = unsafe { syscall::syscall2(syscall::SYS_EVENT_CREATE, 0, 0) } as usize,
+                5 => fd = syscall::sys_timer_create().unwrap_or(usize::MAX),
+                _ => {}
+            }
+            let _ = syscall::sys_fd_write(ENDED_READY.1, b"r");
+            let got = match kind {
+                0 => syscall::sys_fd_read(ENDED_DATA.0, &mut buf),
+                1 => syscall::sys_fd_write(ENDED_DATA.1, &buf),
+                2 => syscall::sys_futex_wait(NEVER_WOKEN.as_ptr(), 0),
+                3 => unsafe { syscall::syscall2(syscall::SYS_WAIT_FOR, 0, 0) },
+                _ => syscall::sys_fd_read(fd, &mut buf[..8]),
+            };
+            if grandchild != 0 {
+                let _ = syscall::sys_sig_raise(grandchild, syscall::SIGKILL);
+                let _ = wait_for(grandchild);
+            }
+            let want = if unix && restarts { syscall::RESTART } else { syscall::INTERRUPTED };
+            let ran = HANDLED.load(SeqCst) == 1;
+            if got != want || !ran {
+                println!("        the wait answered {:#x}, and the handler {}", got, if ran { "ran" } else { "did not" });
+            }
+            syscall::sys_exit_program(if got == want && ran { 1 } else if ran { 2 } else { 3 });
+        }
+        Ok(child) => child,
+        Err(()) => {
+            close();
+            return None;
+        }
+    };
+    let mut ready = [0u8; 1];
+    let _ = syscall::sys_fd_read(ENDED_READY.0, &mut ready);
+    // Long enough for it to be parked.
+    syscall::sleep_ticks(3);
+    let _ = syscall::sys_sig_raise(child, HANDLED_USR1);
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some((_, code))) = syscall::sys_wait_nowait(child) {
+            status = Some(code);
+            break;
+        }
+        syscall::sleep_ticks(1);
+    }
+    if status.is_none() {
+        let _ = syscall::sys_sig_raise(child, syscall::SIGKILL);
+        let _ = wait_for(child);
+    }
+    close();
+    status
+}
+
 /// Where the checks of memory given back keep theirs.
 const OUT_AT: usize = 0xB1_0000_0000;
 const OUT_PAGES: usize = 64;
@@ -6950,6 +7586,7 @@ pub extern "C" fn _start() -> ! {
         ("frames", test_frames),
         ("fork", test_fork),
         ("pressure", test_pressure),
+        ("handlers", test_handlers),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);

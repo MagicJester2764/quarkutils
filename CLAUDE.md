@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 750 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 796 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
@@ -194,7 +194,13 @@ kernel otherwise does only when it must — a program may give up pages of
 its own (`sys_page_out`) — because which pages a machine short of memory
 takes is not something a check can count on; the last of it is the thing
 itself, a program that wants more than there is, and takes about ten
-seconds on a disk driven a word at a time. `dtest
+seconds on a disk driven a word at a time. `dtest handlers` is about the
+kernel running a handler: in a program that is computing, in the thread it
+was meant for, on a stack of its own, for a fault, and ending every kind of
+wait — each with a handler of its own (`quark_rt::signal::handle`), where
+the rest of `dtest` is told of signals as a program written for this
+system is. `dtest jobs` runs jobs behind a terminal a child of its own
+leads (`dchild behind`). `dtest
 msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
 machines it tests on) and its driver running (`start /usr/bin/edu` in

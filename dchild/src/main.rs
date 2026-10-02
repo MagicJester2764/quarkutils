@@ -1013,6 +1013,9 @@ pub extern "C" fn _start() -> ! {
         let n = syscall::sys_fd_read(0, &mut line);
         syscall::sys_exit_code(n as i32);
     }
+    if quark_rt::args::argv(1) == Some(&b"behind"[..]) {
+        syscall::sys_exit_code(behind() as i32);
+    }
     if quark_rt::args::argv(1) == Some(&b"sigstate"[..]) {
         let said = |signo| syscall::sys_sig_action_get(signo).unwrap_or(3) as i32;
         syscall::sys_exit_code(said(2) | said(10) << 2 | said(12) << 4);
@@ -1297,4 +1300,128 @@ fn serve_once() -> ! {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("[dchild] PANIC: {}", info);
     syscall::sys_exit_code(255);
+}
+
+/// A session of its own, on the terminal at descriptor 0 with itself in
+/// front of it, and jobs behind it that try to change the terminal, write to
+/// it and read it: what became of each, as bits, said down [`CONN`] as two
+/// bytes and answered as the status too.
+fn behind() -> u32 {
+    use syscall::ChildNews;
+    let bit = |signo: u64| 1u64 << (signo - 1);
+    let me = syscall::sys_pid_self();
+    let mut went = 0u32;
+    if syscall::sys_setsid() == Ok(me) && syscall::sys_pty_set_session(0).is_ok() {
+        went |= 1;
+    }
+    // `what`, run in a job of its own, behind: what became of it. One that
+    // stopped is ended and collected.
+    let job = |what: u8| -> Option<ChildNews> {
+        match syscall::sys_fork() {
+            Ok(0) => {
+                let _ = syscall::sys_setpgid(0, 0);
+                let settings = || {
+                    let t = syscall::sys_pty_get_termios(0);
+                    t.is_ok_and(|t| syscall::sys_pty_set_termios(0, &t).is_ok())
+                };
+                let ok = match what {
+                    0 => settings(),
+                    1 => syscall::sys_pty_set_size(0, 25, 80).is_ok(),
+                    2 => syscall::sys_fd_write(0, b"x") == 1,
+                    3 => {
+                        let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, bit(syscall::SIGTTOU));
+                        settings()
+                    }
+                    4 => {
+                        let _ = syscall::sys_sig_action(syscall::SIGTTOU, syscall::SIG_IGNORE);
+                        settings()
+                    }
+                    _ => {
+                        let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, bit(syscall::SIGTTIN));
+                        let mut b = [0u8; 8];
+                        syscall::sys_fd_read(0, &mut b) == u64::MAX
+                    }
+                };
+                syscall::sys_exit_code(if ok { 0 } else { 1 });
+            }
+            Ok(t) => {
+                let pid = syscall::sys_pid(t).unwrap_or(0);
+                let _ = syscall::sys_setpgid(pid, pid);
+                let news = syscall::sys_wait_job(pid, syscall::WAIT_STOPPED).ok().flatten();
+                if let Some(ChildNews::Stopped(..)) = news {
+                    let _ = syscall::sys_sig_raise_pid(pid, syscall::SIGKILL);
+                    let _ = syscall::sys_wait_job(pid, 0);
+                }
+                news
+            }
+            Err(()) => None,
+        }
+    };
+    let stopped = |news: Option<ChildNews>, signo: u8| matches!(news, Some(ChildNews::Stopped(_, s)) if s == signo);
+    let went_ahead = |news: Option<ChildNews>| matches!(news, Some(ChildNews::Ended(_, 0)));
+    if stopped(job(0), 22) {
+        went |= 2;
+    }
+    if stopped(job(1), 22) {
+        went |= 4;
+    }
+    if went_ahead(job(2)) {
+        went |= 8;
+    }
+    // A terminal that asks for it stops a job behind that writes.
+    if let Ok(mut t) = syscall::sys_pty_get_termios(0) {
+        t.c_lflag |= 0o400;
+        let _ = syscall::sys_pty_set_termios(0, &t);
+        if stopped(job(2), 22) {
+            went |= 16;
+        }
+        t.c_lflag &= !0o400;
+        let _ = syscall::sys_pty_set_termios(0, &t);
+    }
+    if went_ahead(job(3)) {
+        went |= 32;
+    }
+    if went_ahead(job(4)) {
+        went |= 64;
+    }
+    if went_ahead(job(5)) {
+        went |= 128;
+    }
+    // Whoever is in front is told the terminal's size has changed.
+    let _ = syscall::sys_sig_action(syscall::SIGWINCH, syscall::SIG_HANDLE);
+    let _ = syscall::sys_sig_take(None);
+    let _ = syscall::sys_pty_set_size(0, 33, 99);
+    if syscall::sys_sig_take(None) & bit(syscall::SIGWINCH) != 0 {
+        went |= 256;
+    }
+    // A read from behind, by a program that wants Unix's answers, is
+    // stopped; continued in front, it is answered "again", having run no
+    // handler — not "interrupted", which a C library would report.
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let _ = syscall::sys_setpgid(0, 0);
+            let _ = quark_rt::signal::speak_unix();
+            let mut b = [0u8; 8];
+            let got = syscall::sys_fd_read(0, &mut b);
+            syscall::sys_exit_code(if got == syscall::AGAIN { 0 } else { 1 });
+        }
+        Ok(t) => {
+            let pid = syscall::sys_pid(t).unwrap_or(0);
+            let _ = syscall::sys_setpgid(pid, pid);
+            if stopped(syscall::sys_wait_job(pid, syscall::WAIT_STOPPED).ok().flatten(), 21) {
+                let _ = syscall::sys_pty_set_front(0, pid, false);
+                let _ = syscall::sys_sig_raise_pid(pid, syscall::SIGCONT);
+                if went_ahead(syscall::sys_wait_job(pid, 0).ok().flatten()) {
+                    went |= 512;
+                }
+                let _ = syscall::sys_pty_set_front(0, me, true);
+            } else {
+                let _ = syscall::sys_sig_raise_pid(pid, syscall::SIGKILL);
+                let _ = syscall::sys_wait_job(pid, 0);
+            }
+        }
+        Err(()) => {}
+    }
+    let _ = syscall::sys_fd_write(CONN, &[went as u8, (went >> 8) as u8]);
+    went
 }
