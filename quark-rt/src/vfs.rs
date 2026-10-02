@@ -252,7 +252,19 @@ pub struct FsStat {
 
 /// Open a file or directory by path, with `OPEN_*` flags.
 pub fn open_with(vfs_tid: usize, path: &[u8], flags: u64) -> Result<Opened, u64> {
-    let r = call_with_path(vfs_tid, TAG_OPEN, path, [0, flags, 0, 0, 0, 0])?;
+    opened_with(vfs_tid, path, flags, 0)
+}
+
+/// [`open_with`], for a file this may make: `mode` is the permission bits
+/// the file has from the moment it exists. Made 0644 and changed afterwards,
+/// a file is everybody's to read until the change — which is a long time
+/// for a file of password hashes.
+pub fn open_new(vfs_tid: usize, path: &[u8], flags: u64, mode: u32) -> Result<Opened, u64> {
+    opened_with(vfs_tid, path, flags, MODE_GIVEN | (mode as u64 & 0o7777))
+}
+
+fn opened_with(vfs_tid: usize, path: &[u8], flags: u64, mode_word: u64) -> Result<Opened, u64> {
+    let r = call_with_path(vfs_tid, TAG_OPEN, path, [0, flags, mode_word, 0, 0, 0])?;
     Ok(Opened {
         handle: r.data[0] as usize,
         size: r.data[1],

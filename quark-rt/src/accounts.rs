@@ -442,8 +442,19 @@ pub fn write(vfs_tid: usize, root: &[u8], name: &[u8], bytes: &[u8], mode: u32) 
     let path = path_of(root, name, capitals, b"", &mut path).ok_or(vfs::ERR_NAME_TOO_LONG)?;
     let beside = path_of(root, name, capitals, b".new", &mut beside).ok_or(vfs::ERR_NAME_TOO_LONG)?;
 
-    let put = |to: &[u8]| -> Result<(), u64> {
-        let handle = vfs::open_with(vfs_tid, to, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE)?.handle;
+    let put = |to: &[u8], fresh: bool| -> Result<(), u64> {
+        // Made with its mode, and at no moment with another: a file of
+        // password hashes that was 0644 until it had been written could be
+        // opened in between by anybody waiting for it to appear. Whatever an
+        // attempt that stopped half way left goes first — it has the mode
+        // that attempt got as far as — and the new one must be new.
+        let flags = if fresh {
+            let _ = vfs::unlink(vfs_tid, to);
+            vfs::OPEN_CREATE | vfs::OPEN_EXCLUSIVE
+        } else {
+            vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE
+        };
+        let handle = vfs::open_new(vfs_tid, to, flags, mode)?.handle;
         let mut at = 0;
         let done = loop {
             if at == bytes.len() {
@@ -457,18 +468,18 @@ pub fn write(vfs_tid: usize, root: &[u8], name: &[u8], bytes: &[u8], mode: u32) 
         };
         let _ = vfs::close(vfs_tid, handle);
         done?;
-        // The mode before the name: a shadow file is never readable under
-        // the name anybody looks for it by.
+        // And said again, for a file that was there already and written in
+        // place: it keeps the mode it had unless it is given this one.
         match vfs::set_attr(vfs_tid, to, vfs::ATTR_MODE, mode, 0, 0, 0, 0) {
             Ok(()) | Err(vfs::ERR_NOT_SUPPORTED) => Ok(()),
             Err(code) => Err(code),
         }
     };
-    match put(beside).and_then(|()| vfs::rename(vfs_tid, beside, path)) {
+    match put(beside, true).and_then(|()| vfs::rename(vfs_tid, beside, path)) {
         Ok(()) => {}
         Err(vfs::ERR_NOT_SUPPORTED) => {
             let _ = vfs::unlink(vfs_tid, beside);
-            put(path)?;
+            put(path, false)?;
         }
         Err(code) => {
             let _ = vfs::unlink(vfs_tid, beside);
