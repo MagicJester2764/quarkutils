@@ -66,8 +66,9 @@ too. The difference is only visible to code that mixes the two kinds.
 
 ### Starting and ending
 
-- `fork` copies the whole address space at once; there is no copy-on-write.
-  `vfork` is `fork`. `clone` makes a thread (with `CLONE_VM | CLONE_THREAD`)
+- `fork` shares the address space and copies a page when either side writes
+  it, as on Linux, so a child that execs at once costs page tables and
+  little else. `vfork` is `fork`. `clone` makes a thread (with `CLONE_VM | CLONE_THREAD`)
   or is `fork` (with neither).
 - **`posix_spawn` works, and its child does not share memory.** musl makes
   it of `clone` with `CLONE_VM | CLONE_VFORK`: a child that borrows its

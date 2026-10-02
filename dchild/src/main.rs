@@ -27,6 +27,8 @@
 //! recorded. `hog` reserves four gigabytes and
 //! touches them until something stops it. `mapwrite PATH` maps a file shared,
 //! writes into it, and exits without asking for it to be written back.
+//! `gift` was given a page before it was started: it exits 0 if what its
+//! giver put there is there, and the page is its own to write.
 //! `fault` writes through a null pointer; `sleep` sleeps ten seconds; `late`
 //! sleeps a fifth of one and ends with status 3, having answered nobody.
 //! `leave` starts a thread that never ends and then ends the program with
@@ -743,6 +745,17 @@ pub extern "C" fn _start() -> ! {
     // start, not talking to this one.
     if quark_rt::args::argv(1) == Some(&b"quit"[..]) {
         syscall::sys_exit_code(0);
+    }
+    // Given a page before it was started, where a spawner puts a spare one:
+    // what was put in it is there, and the page is this program's to write.
+    if quark_rt::args::argv(1) == Some(&b"gift"[..]) {
+        const SPARE: usize = 0x90_0000_0000;
+        const GIFTED: u64 = 0x6177_6179_2D74_6921;
+        let page = SPARE as *mut u64;
+        let found = unsafe { page.read_volatile() } == GIFTED;
+        unsafe { page.write_volatile(!GIFTED) };
+        let wrote = unsafe { page.read_volatile() } == !GIFTED;
+        syscall::sys_exit_code(if found && wrote { 0 } else { 1 });
     }
     // Try to turn the machine off, and to start it again, holding nothing
     // that says this may — and to make itself something that does. A bit

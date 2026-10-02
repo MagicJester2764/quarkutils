@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 720 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 747 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
@@ -180,7 +180,13 @@ clock` is about time: what the clock says, and whether a wait ends when it
 was asked to. A check that a wait is *on time* asks that most of several
 are — one of them is on time by luck on a machine that wakes only on its
 tick, and on any machine one is sometimes late — and is not made at all
-where the clock is the tick, which `dtest` says. `dtest
+where the clock is the tick, which `dtest` says. `dtest fork` is about a
+fork that shares what the program has and copies a page when one side
+writes it: who sees a write, what it costs, and every way to a page that is
+not a write through it — the kernel writing for the program, a server
+writing what it was lent, a word a thread is waiting on. What it costs is
+measured after one fork that is not counted: the first task the kernel
+makes room for costs it room it then keeps. `dtest
 msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
 machines it tests on) and its driver running (`start /usr/bin/edu` in

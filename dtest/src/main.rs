@@ -5665,6 +5665,517 @@ fn test_frames() {
     check("all of it goes back", free_after + 4 >= free_before);
 }
 
+/// Where the fork checks keep their pages: memory nothing else in this
+/// program writes, so that a page stays shared for as long as a check needs
+/// it to. Four megabytes, and then a page for each check that wants one.
+const SHARED_AT: usize = 0xAE_0000_0000;
+const SHARED_PAGES: usize = 1024;
+const SHARED_HALF: usize = SHARED_PAGES / 2;
+const fn own_page(n: usize) -> usize {
+    SHARED_AT + (SHARED_PAGES + n) * 4096
+}
+const KERNEL_PAGE: usize = own_page(0);
+const SERVER_PAGE: usize = own_page(1);
+const LENT_PAGE: usize = own_page(2);
+const READ_PAGE: usize = own_page(3);
+const FUTEX_PAGE: usize = own_page(4);
+const TID_PAGE: usize = own_page(5);
+const SIGNAL_PAGE: usize = own_page(6);
+const THREE_PAGE: usize = own_page(7);
+const COUNT_PAGE: usize = own_page(8);
+const OWN_PAGES: usize = 9;
+/// A file mapped privately, for the last of them.
+const PRIVATE_AT: usize = 0xAF_0000_0000;
+
+/// What the four megabytes hold before the fork, what the parent writes to
+/// its half afterwards, and what the child writes to its.
+const WAS: u64 = 0x0A11_0000_0000_0000;
+const PARENTS: u64 = 0x0B22_0000_0000_0000;
+const CHILDS: u64 = 0x0C33_0000_0000_0000;
+/// What is in the page that is given away, and what `dchild gift` knows to
+/// look for.
+const GIFTED: u64 = 0x6177_6179_2D74_6921;
+
+/// Fork a child that waits to be told to go — a byte down descriptor 3 — and
+/// then ends with 7 if `then` says so and 8 if it does not. Until it is told,
+/// it shares every page this program had when it was made.
+fn held_child(then: fn() -> bool) -> Option<usize> {
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let mut go = [0u8; 1];
+            let told = syscall::sys_fd_read(3, &mut go) == 1;
+            syscall::sys_exit_program(if told && then() { 7 } else { 8 });
+        }
+        Ok(child) => Some(child),
+        Err(()) => None,
+    }
+}
+
+/// Tell a held child to go, and say whether it ended with 7.
+fn let_go(child: Option<usize>) -> bool {
+    child.is_some_and(|c| syscall::sys_fd_write(4, b"g") == 1 && wait_for(c) == Some(7))
+}
+
+/// Whether the page at `at` is all `byte`.
+fn page_is(at: usize, byte: u8) -> bool {
+    (0..4096).all(|i| unsafe { core::ptr::read_volatile((at + i) as *const u8) } == byte)
+}
+
+fn fill_page(at: usize, byte: u8) {
+    for i in 0..4096 {
+        unsafe { core::ptr::write_volatile((at + i) as *mut u8, byte) };
+    }
+}
+
+fn shared_word(i: usize) -> *mut u64 {
+    (SHARED_AT + i * 4096) as *mut u64
+}
+
+/// The child of the first check: nothing its parent has written since the
+/// fork is here, and what it writes itself is.
+fn half_child() -> bool {
+    let as_it_was = (0..SHARED_PAGES).all(|i| unsafe { shared_word(i).read_volatile() } == WAS ^ i as u64);
+    for i in 0..SHARED_HALF {
+        unsafe { shared_word(i).write_volatile(CHILDS ^ i as u64) };
+    }
+    as_it_was && (0..SHARED_HALF).all(|i| unsafe { shared_word(i).read_volatile() } == CHILDS ^ i as u64)
+}
+
+fn kernel_pages_child() -> bool {
+    page_is(KERNEL_PAGE, b'a') && page_is(SERVER_PAGE, b'a')
+}
+
+fn lent_page_child() -> bool {
+    page_is(LENT_PAGE, b'a')
+}
+
+fn read_page_child() -> bool {
+    page_is(READ_PAGE, b'a')
+}
+
+fn nothing_to_do() -> bool {
+    true
+}
+
+fn tid_page_child() -> bool {
+    unsafe { core::ptr::read_volatile(TID_PAGE as *const u32) == 0x55 }
+}
+
+fn signal_page_child() -> bool {
+    unsafe { core::ptr::read_volatile(SIGNAL_PAGE as *const u32) == 0 }
+}
+
+fn gift_child() -> bool {
+    unsafe { core::ptr::read_volatile(GIFT as *const u64) == GIFTED }
+}
+
+static FORK_SERVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FORK_LEND_GO: sync::Semaphore = sync::Semaphore::new(0);
+/// 1 once the lending call has been answered.
+static FORK_LENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 1 if the read that was waiting was given what was written, 2 if not.
+static FORK_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 1 and what the wait answered, once it has.
+static FORK_WOKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FORK_TID_READY: sync::Semaphore = sync::Semaphore::new(0);
+static FORK_TID_GO: sync::Semaphore = sync::Semaphore::new(0);
+static FORK_WRITER_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Lends main a page, for writing, in a call main answers after it has
+/// forked.
+extern "C" fn fork_lender() -> ! {
+    use quark_rt::ipc::Message;
+    FORK_LEND_GO.acquire();
+    let server = FORK_SERVER.load(core::sync::atomic::Ordering::SeqCst);
+    let buf = unsafe { core::slice::from_raw_parts_mut(LENT_PAGE as *mut u8, 8) };
+    let ask = Message { sender: 0, tag: 1, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend_rw(server, &ask, &mut reply, buf).is_ok() {
+        FORK_LENT.store(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// Reads descriptor 5 into a page, and is waiting there when main forks.
+extern "C" fn fork_reader() -> ! {
+    let buf = unsafe { core::slice::from_raw_parts_mut(READ_PAGE as *mut u8, 4) };
+    let n = syscall::sys_fd_read(5, buf);
+    let got = n == 4 && buf == b"late";
+    FORK_READ.store(if got { 1 } else { 2 }, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// Waits on a word for three seconds at most, and says how the wait ended.
+extern "C" fn fork_waiter() -> ! {
+    let r = syscall::sys_futex_wait_timeout(FUTEX_PAGE as *const u32, 0, syscall::ns(3_000_000_000));
+    FORK_WOKEN.store(1 + r as u32, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// Names a word for the kernel to clear when this thread ends, and ends
+/// when it is told to.
+extern "C" fn fork_leaver() -> ! {
+    let _ = syscall::sys_set_clear_tid(TID_PAGE as *const u32);
+    FORK_TID_READY.release();
+    FORK_TID_GO.acquire();
+    syscall::sys_exit_code(0);
+}
+
+/// Counts in a page for as long as it is let.
+extern "C" fn fork_writer() -> ! {
+    let count = COUNT_PAGE as *mut u64;
+    while FORK_WRITER_STOP.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+        unsafe { count.write_volatile(count.read_volatile() + 1) };
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// A fork shares what the program has and copies a page when one of the two
+/// writes it. Nothing a program can see says that is what happened — which
+/// is the point — so these are the places where it would show if it were
+/// done wrong: who sees a write, what it costs, and every way into a page
+/// that does not go through the page: the kernel writing one for a program,
+/// a server writing one it was lent, a word a thread is waiting on, a word
+/// the kernel clears or sets by itself, a page given away.
+fn test_fork() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use quark_rt::ipc::Message;
+    println!("a fork shares, and a write copies:");
+    let me = syscall::sys_getpid() as usize;
+    if own_pipe(3, 4).is_err() || own_pipe(5, 6).is_err() {
+        check("two pipes, to hold a child with and to read from", false);
+        return;
+    }
+    if syscall::sys_map_anon(SHARED_AT, SHARED_PAGES + OWN_PAGES, false).is_err() {
+        check("four megabytes to share", false);
+        return;
+    }
+    for i in 0..SHARED_PAGES {
+        unsafe { shared_word(i).write_volatile(WAS ^ i as u64) };
+    }
+    for n in 0..OWN_PAGES {
+        fill_page(own_page(n), 0);
+    }
+
+    // What it costs, and who sees what. After one fork that is not counted:
+    // the first task the kernel makes room for costs it room it then keeps.
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(0),
+        Ok(child) => {
+            let _ = wait_for(child);
+        }
+        Err(()) => {}
+    }
+    let (free0, charged0) = syscall::sys_mem_info();
+    let child = held_child(half_child);
+    let (free1, _) = syscall::sys_mem_info();
+    let forked = free0.saturating_sub(free1);
+    check(
+        "a fork takes page tables, and not a page for a page",
+        child.is_some() && forked < SHARED_PAGES / 4,
+    );
+    for i in SHARED_HALF..SHARED_PAGES {
+        unsafe { shared_word(i).write_volatile(PARENTS ^ i as u64) };
+    }
+    let (free2, _) = syscall::sys_mem_info();
+    let copied = free1.saturating_sub(free2);
+    println!("        {} frames for the fork, {} for the {} pages then written", forked, copied, SHARED_HALF);
+    check("a page is copied when it is written, and only then", (SHARED_HALF..SHARED_HALF + 16).contains(&copied));
+    check("what a parent writes after a fork its child does not see", let_go(child));
+    check(
+        "nor the parent what the child writes",
+        (0..SHARED_HALF).all(|i| unsafe { shared_word(i).read_volatile() } == WAS ^ i as u64)
+            && (SHARED_HALF..SHARED_PAGES).all(|i| unsafe { shared_word(i).read_volatile() } == PARENTS ^ i as u64),
+    );
+    let (free3, charged3) = syscall::sys_mem_info();
+    check("when the child has gone every frame is back", free3 + 16 >= free0);
+    check("and the parent was charged for nothing it did not have before", charged3 == charged0);
+
+    // The kernel writing a page for the program: what a read reads into.
+    fill_page(KERNEL_PAGE, b'a');
+    fill_page(SERVER_PAGE, b'a');
+    let child = held_child(kernel_pages_child);
+    let into = unsafe { core::slice::from_raw_parts_mut(KERNEL_PAGE as *mut u8, 4) };
+    check(
+        "the kernel writes a page shared since a fork as the program would",
+        syscall::sys_fd_write(6, b"kern") == 4 && syscall::sys_fd_read(5, into) == 4 && into == b"kern",
+    );
+    // And a server writing one it is lent: the same, of a file.
+    let into = unsafe { core::slice::from_raw_parts_mut(SERVER_PAGE as *mut u8, 4) };
+    let served = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs_tid| {
+        let o = vfs::open_with(vfs_tid, b"/dev/zero", 0).ok()?;
+        let n = vfs::read(vfs_tid, o.handle, into, 0);
+        let _ = vfs::close(vfs_tid, o.handle);
+        n.ok()
+    });
+    check("and so does a server that is lent one", served == Some(4) && into == [0u8; 4]);
+    check("into the program's own copy: its child has both pages as they were", let_go(child));
+
+    // A page lent before the fork and written after it.
+    fill_page(LENT_PAGE, b'a');
+    FORK_SERVER.store(me, Ordering::SeqCst);
+    match thread::spawn_with_stack(fork_lender, 8) {
+        Ok(t) => {
+            let t = t.tid();
+            let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok()
+                && syscall::sys_cap_grant_any(t, syscall::SLOT_SCRATCH).is_ok();
+            let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+            FORK_LEND_GO.release();
+            let mut msg = Message::empty();
+            let arrived = granted && syscall::sys_recv(t, &mut msg).is_ok() && msg.tag == 1;
+            let child = held_child(lent_page_child);
+            check(
+                "what was lent before a fork can be written after it",
+                arrived && syscall::sys_lent_write(t, 0, b"serv") == Ok(4),
+            );
+            let _ = syscall::sys_reply(t, &Message::empty());
+            let _ = wait_for(t);
+            check(
+                "and it is the lender's page that is written",
+                FORK_LENT.load(Ordering::SeqCst) == 1
+                    && unsafe { core::slice::from_raw_parts(LENT_PAGE as *const u8, 4) } == b"serv",
+            );
+            check("not its child's", let_go(child));
+        }
+        Err(()) => check("start a thread to lend a page", false),
+    }
+
+    // A read that was waiting when the program forked: the kernel checked
+    // the page before it waited, and writes it after.
+    fill_page(READ_PAGE, b'a');
+    match thread::spawn_with_stack(fork_reader, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(5);
+            let child = held_child(read_page_child);
+            let wrote = syscall::sys_fd_write(6, b"late") == 4;
+            let _ = wait_for(t.tid());
+            check(
+                "a read that was waiting when its program forked is answered into the program's own page",
+                wrote
+                    && FORK_READ.load(Ordering::SeqCst) == 1
+                    && unsafe { core::slice::from_raw_parts(READ_PAGE as *const u8, 4) } == b"late",
+            );
+            check("and the child's is as it was", let_go(child));
+        }
+        Err(()) => check("start a thread to read", false),
+    }
+
+    // A word a thread is waiting on. It is the program's word, wherever the
+    // page is: a child's wake is for the child's, and the program's own
+    // wake finds the thread after the page has been copied to another frame.
+    let word = FUTEX_PAGE as *mut u32;
+    match thread::spawn_with_stack(fork_waiter, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(5);
+            let stray = match syscall::sys_fork() {
+                Ok(0) => {
+                    let woke = syscall::sys_futex_wake(word, 1);
+                    syscall::sys_exit_program(if woke == 0 { 7 } else { 8 });
+                }
+                Ok(child) => wait_for(child) == Some(7),
+                Err(()) => false,
+            };
+            syscall::sleep_ticks(2);
+            check(
+                "a child's wake does not reach a thread of its parent's",
+                stray && FORK_WOKEN.load(Ordering::SeqCst) == 0,
+            );
+            let child = held_child(nothing_to_do);
+            unsafe { word.write_volatile(1) };
+            let woke = syscall::sys_futex_wake(word, 1);
+            let _ = wait_for(t.tid());
+            check(
+                "a wake finds a thread that waited before the page was copied",
+                woke == 1 && FORK_WOKEN.load(Ordering::SeqCst) == 1,
+            );
+            let _ = let_go(child);
+        }
+        Err(()) => check("start a thread to wait", false),
+    }
+
+    // A word the kernel clears by itself, when a thread ends.
+    let word = TID_PAGE as *mut u32;
+    unsafe { word.write_volatile(0x55) };
+    match thread::spawn_with_stack(fork_leaver, 8) {
+        Ok(_) => {
+            FORK_TID_READY.acquire();
+            let child = held_child(tid_page_child);
+            FORK_TID_GO.release();
+            let mut cleared = false;
+            for _ in 0..30 {
+                if unsafe { word.read_volatile() } == 0 {
+                    cleared = true;
+                    break;
+                }
+                let _ = syscall::sys_futex_wait_timeout(word, 0x55, syscall::ns(100_000_000));
+            }
+            check("a thread that ends after its program forked has its word cleared", cleared);
+            check("in its program, and not in the child", let_go(child));
+        }
+        Err(()) => check("start a thread to end", false),
+    }
+
+    // And one it sets by itself, when a signal is raised.
+    const USR1: u64 = 10;
+    let told: &'static AtomicU32 = unsafe { &*(SIGNAL_PAGE as *const AtomicU32) };
+    let _ = syscall::sys_sig_action(USR1, syscall::SIG_HANDLE);
+    let _ = syscall::sys_sig_take(Some(told));
+    let child = held_child(signal_page_child);
+    let raised = syscall::sys_sig_raise(me, USR1).is_ok();
+    check(
+        "a program is told of a signal through a page shared since a fork",
+        raised && told.load(Ordering::SeqCst) == 1,
+    );
+    check(
+        "and its child is told nothing",
+        syscall::sys_sig_take(None) == 1 << (USR1 - 1) && let_go(child),
+    );
+    let _ = syscall::sys_sig_action(USR1, syscall::SIG_DEFAULT);
+
+    // A page given away is the giver's alone before it goes.
+    let made = syscall::sys_mmap(GIFT, 1).is_ok();
+    if made {
+        unsafe { core::ptr::write_volatile(GIFT as *mut u64, GIFTED) };
+    }
+    let taker = load_child(&[b"dchild", b"gift"]);
+    let child = held_child(gift_child);
+    let given = made
+        && taker
+            .as_ref()
+            .is_some_and(|t| syscall::sys_addrspace_give(t.cr3, CHILD_SPARE, GIFT, 1, 1).is_ok());
+    check("a page shared since a fork can be given away", given && nothing_at(GIFT));
+    let ran = taker.is_some_and(|t| {
+        let tid = t.tid;
+        t.start().is_ok() && wait_for(tid) == Some(0)
+    });
+    check("whoever is given it finds what was in it, and writes it", ran);
+    check("and the child that shared it has its own, as it was", let_go(child));
+
+    // Three programs with one page.
+    let three = THREE_PAGE as *mut u64;
+    unsafe { three.write_volatile(1) };
+    let each = match syscall::sys_fork() {
+        Ok(0) => {
+            let below = match syscall::sys_fork() {
+                Ok(0) => {
+                    unsafe { three.write_volatile(3) };
+                    syscall::sys_exit_program(if unsafe { three.read_volatile() } == 3 { 7 } else { 8 });
+                }
+                Ok(grandchild) => wait_for(grandchild) == Some(7),
+                Err(()) => false,
+            };
+            let mine = unsafe { three.read_volatile() } == 1;
+            unsafe { three.write_volatile(2) };
+            let wrote = unsafe { three.read_volatile() } == 2;
+            syscall::sys_exit_program(if below && mine && wrote { 7 } else { 8 });
+        }
+        Ok(child) => wait_for(child) == Some(7) && unsafe { three.read_volatile() } == 1,
+        Err(()) => false,
+    };
+    unsafe { three.write_volatile(9) };
+    check(
+        "a page three programs share is each one's own when it writes it",
+        each && unsafe { three.read_volatile() } == 9,
+    );
+
+    // A thread that goes on writing a page while the program forks. Only the
+    // task that forked is in the child, so nothing there writes the page:
+    // if it changes, it is the parent's thread writing it, through what its
+    // processor still remembered.
+    let count = COUNT_PAGE as *mut u64;
+    match thread::spawn_with_stack(fork_writer, 8) {
+        Ok(t) => {
+            const ROUNDS: usize = 40;
+            let mut still = 0;
+            for _ in 0..ROUNDS {
+                match syscall::sys_fork() {
+                    Ok(0) => {
+                        let first = unsafe { count.read_volatile() };
+                        for _ in 0..200_000 {
+                            core::hint::spin_loop();
+                        }
+                        let then = unsafe { count.read_volatile() };
+                        syscall::sys_exit_program(if first == then { 7 } else { 8 });
+                    }
+                    Ok(child) => {
+                        if wait_for(child) == Some(7) {
+                            still += 1;
+                        }
+                    }
+                    Err(()) => {}
+                }
+            }
+            let before = unsafe { count.read_volatile() };
+            syscall::sleep_ticks(3);
+            let after = unsafe { count.read_volatile() };
+            FORK_WRITER_STOP.store(1, Ordering::SeqCst);
+            let _ = wait_for(t.tid());
+            check(
+                "a thread still writing while its program forks writes nothing of the child's",
+                still == ROUNDS,
+            );
+            check("and goes on writing its own", after > before);
+        }
+        Err(()) => check("start a thread to write", false),
+    }
+
+    // A file mapped privately: a page of it that has been touched is the
+    // program's own copy, which still names the file. Children that had
+    // such pages, and have gone, took nothing of the file's with them.
+    const PRIVATE: &[u8] = b"/tmp/dtest-private";
+    let kept = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs_tid| {
+        let o = vfs::open_with(vfs_tid, PRIVATE, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+        for i in 0..4u8 {
+            vfs::write(vfs_tid, o.handle, &[b'0' + i; 4096], i as u32 * 4096).ok()?;
+        }
+        let (slot, _) = vfs::map(vfs_tid, o.handle, false).ok()?;
+        let made = syscall::sys_object_map(slot, PRIVATE_AT, 4, 0, syscall::OBJECT_MAP_WRITE);
+        let _ = syscall::sys_cap_delete(slot);
+        let _ = vfs::close(vfs_tid, o.handle);
+        made.ok()?;
+        let touched = page_is(PRIVATE_AT, b'0') && page_is(PRIVATE_AT + 4096, b'1');
+        let mut gone = 0;
+        for _ in 0..4 {
+            match syscall::sys_fork() {
+                Ok(0) => syscall::sys_exit_program(7),
+                Ok(child) => {
+                    if wait_for(child) == Some(7) {
+                        gone += 1;
+                    }
+                }
+                Err(()) => {}
+            }
+        }
+        // Long enough for the file's server to be told nothing maps the
+        // file, if the kernel thinks so, and to let it go.
+        syscall::sleep_ticks(5);
+        // In a child of its own, so that a file that is no longer there
+        // ends the child and not this.
+        let rest = match syscall::sys_fork() {
+            Ok(0) => {
+                let there = page_is(PRIVATE_AT + 2 * 4096, b'2') && page_is(PRIVATE_AT + 3 * 4096, b'3');
+                syscall::sys_exit_program(if there { 7 } else { 8 });
+            }
+            Ok(child) => wait_for(child) == Some(7),
+            Err(()) => false,
+        };
+        let _ = syscall::sys_munmap(PRIVATE_AT, 4);
+        let _ = vfs::unlink(vfs_tid, PRIVATE);
+        Some(touched && gone == 4 && rest)
+    });
+    check(
+        "a file mapped privately is still there when children that had copies of its pages have gone",
+        kept == Some(true),
+    );
+
+    for chunk in (0..SHARED_PAGES + OWN_PAGES).step_by(256) {
+        let _ = syscall::sys_munmap(SHARED_AT + chunk * 4096, 256.min(SHARED_PAGES + OWN_PAGES - chunk));
+    }
+    for fd in 3..7 {
+        let _ = syscall::sys_fd_close(fd);
+    }
+}
+
 /// Turning the machine off is for whoever holds the right to, and this
 /// program does not: it asks for none in its manifest, and neither does the
 /// one it starts to try. That the checks are reached at all is most of what
@@ -6084,6 +6595,7 @@ pub extern "C" fn _start() -> ! {
         ("clock", test_clock),
         ("power", test_power),
         ("frames", test_frames),
+        ("fork", test_fork),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);
