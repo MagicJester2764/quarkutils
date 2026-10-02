@@ -28,6 +28,9 @@ pub const S_IFDIR: u16 = 0x4000;
 pub const S_IFREG: u16 = 0x8000;
 pub const S_IFLNK: u16 = 0xA000;
 pub const S_IFIFO: u16 = 0x1000;
+/// The sticky bit: in a directory that has it, a name is its file's owner's
+/// to remove, and the directory's — not anybody's who may write there.
+pub const S_ISVTX: u16 = 0o1000;
 
 // Directory entry file types
 pub const FT_REG_FILE: u8 = 1;
@@ -1255,9 +1258,11 @@ pub fn check_permission(inode: &Ext2Inode, uid: u32, gid: u32, required: u16) ->
     }
 
     let mode = inode.i_mode & 0o777;
+    // The file's group is the caller's own, or one the caller is in besides:
+    // asked of the kernel only when it comes to that.
     let bits = if uid == inode.i_uid as u32 {
         (mode >> 6) & 7
-    } else if gid == inode.i_gid as u32 {
+    } else if gid == inode.i_gid as u32 || crate::who::in_group(inode.i_gid as u32) {
         (mode >> 3) & 7
     } else {
         mode & 7

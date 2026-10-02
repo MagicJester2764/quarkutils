@@ -190,7 +190,8 @@ pub fn setattr(e2: &mut Ext2State, ino: u32, a: &Attrs, uid: u32, gid: u32) -> R
             return Err(ERR_INVALID_PATH);
         }
         let stays = to_uid == inode.i_uid as u64;
-        let own_group = to_gid == inode.i_gid as u64 || to_gid == gid as u64;
+        let own_group =
+            to_gid == inode.i_gid as u64 || to_gid == gid as u64 || crate::who::in_group(to_gid as u32);
         if uid != 0 && !(uid == inode.i_uid as u32 && stays && own_group) {
             return Err(ERR_PERMISSION);
         }
@@ -243,6 +244,14 @@ fn writable_dir(
     Ok((ino, dir))
 }
 
+/// Whether `uid` may take the name of `inode` out of `dir`, where it may
+/// already write `dir`: anybody may, unless the directory is sticky, and
+/// then only the file's owner, the directory's, and root. `/tmp` is why:
+/// everybody may make a file there, and nobody another's file go away.
+fn may_remove(dir: &Ext2Inode, inode: &Ext2Inode, uid: u32) -> bool {
+    dir.i_mode & ext2::S_ISVTX == 0 || uid == 0 || uid == inode.i_uid as u32 || uid == dir.i_uid as u32
+}
+
 /// Remove `path`'s name. The file goes with its last name, unless a handle
 /// still names it.
 pub fn unlink(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) -> Result<(), u64> {
@@ -252,6 +261,9 @@ pub fn unlink(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) ->
     let mut inode = ext2::read_inode(e2, ino)?;
     if inode.is_dir() {
         return Err(ERR_IS_DIR);
+    }
+    if !may_remove(&parent, &inode, uid) {
+        return Err(ERR_PERMISSION);
     }
     ext2_dir::remove_entry(e2, parent_ino, &mut parent, name)?;
     let t = ext2::now();
@@ -272,6 +284,9 @@ pub fn rmdir(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) -> 
     }
     if !ext2_dir::is_empty(e2, &dir)? {
         return Err(ERR_NOT_EMPTY);
+    }
+    if !may_remove(&parent, &dir, uid) {
+        return Err(ERR_PERMISSION);
     }
     ext2_dir::remove_entry(e2, parent_ino, &mut parent, name)?;
     let t = ext2::now();
@@ -300,6 +315,10 @@ pub fn rename(
     let (ino, kind) = ext2_dir::find_entry(e2, &fparent, from_name)?.ok_or(ERR_NOT_FOUND)?;
     let mut inode = ext2::read_inode(e2, ino)?;
     let is_dir = inode.is_dir();
+    // Moving a name is taking it out of where it was.
+    if !may_remove(&fparent, &inode, uid) {
+        return Err(ERR_PERMISSION);
+    }
     // A directory cannot be moved inside itself.
     if is_dir && within(e2, tpi, ino)? {
         return Err(ERR_INVALID_PATH);
@@ -311,6 +330,10 @@ pub fn rename(
             return Ok(()); // two names for one file: POSIX says do nothing
         }
         let mut victim = ext2::read_inode(e2, existing)?;
+        // And replacing one is taking that one out of where it is.
+        if !may_remove(&tparent, &victim, uid) {
+            return Err(ERR_PERMISSION);
+        }
         if is_dir {
             if !victim.is_dir() {
                 return Err(ERR_NOT_DIR);

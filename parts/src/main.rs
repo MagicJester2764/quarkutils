@@ -139,7 +139,14 @@ fn load(driver: usize) -> Option<Disk> {
     if info.sectors < 2 * (2 + TABLE_SECTORS) + ALIGN {
         return Some(disk);
     }
-    if !read(driver, 1, &mut header) || &header[..8] != b"EFI PART" {
+    // Refused is not the same as nothing there: a disk a user may not read
+    // used to be shown as one with no table, to somebody about to believe it.
+    match block::read(driver, 0, 1, &mut header) {
+        Ok(()) => {}
+        Err(block::ERR_NOT_ALLOWED | block::ERR_NOT_CLAIMANT) => fail("only root reads a disk"),
+        Err(_) => return Some(disk),
+    }
+    if &header[..8] != b"EFI PART" {
         return Some(disk);
     }
     let (count, size, at) = (le32(&header, 80) as usize, le32(&header, 84) as usize, le64(&header, 72));

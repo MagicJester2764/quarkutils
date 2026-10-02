@@ -63,6 +63,10 @@ pub const OPEN_DIRECTORY: u64 = 8;
 /// A symbolic link at the end of the path is opened itself: the handle
 /// answers `stat_full` and nothing else.
 pub const OPEN_NOFOLLOW: u64 = 16;
+/// The file is opened to be asked about and for nothing else, which takes
+/// no permission over the file itself: only over the directories that lead
+/// to it. The handle answers `stat_full` and `statfs_of`.
+pub const OPEN_ASK: u64 = 0x800;
 /// The file is opened as a *descriptor*: a number in this program's
 /// descriptor table, which a forked child has a copy of and the program this
 /// one execs keeps. See [`open_fd`].
@@ -686,7 +690,7 @@ fn simple_call(vfs_tid: usize, tag: u64, data: [u64; 6]) -> Result<Message, u64>
 
 /// What `path` is, without following a symbolic link at its end.
 pub fn lstat(vfs_tid: usize, path: &[u8]) -> Result<Stat, u64> {
-    let o = open_with(vfs_tid, path, OPEN_NOFOLLOW)?;
+    let o = open_with(vfs_tid, path, OPEN_NOFOLLOW | OPEN_ASK)?;
     let st = stat_full(vfs_tid, o.handle);
     let _ = close(vfs_tid, o.handle);
     st

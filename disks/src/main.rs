@@ -68,6 +68,7 @@ pub extern "C" fn _start() -> ! {
     }
     println!("{:<9} {:>9}  {:<12}  {:<5}  HELD BY", "NAME", "SIZE", "WHAT", "HOLDS");
     let mut found = 0;
+    let mut unread = false;
     for name in DRIVERS {
         let Some(driver) = nameserver::lookup(name.as_bytes()) else { continue };
         let Ok(whole) = block::info(driver, 0) else { continue };
@@ -94,12 +95,14 @@ pub extern "C" fn _start() -> ! {
                 }
                 label[len] = b'0' + (volume % 10) as u8;
             }
+            let holds = contents(driver, volume);
+            unread |= holds == "?";
             print!(
                 "{} {:>5} MiB  {:<12}  {:<5}",
                 core::str::from_utf8(&label).unwrap_or("?"),
                 v.sectors / 2048,
                 what,
-                contents(driver, volume)
+                holds
             );
             match v.claimant {
                 0 => println!(),
@@ -109,6 +112,10 @@ pub extern "C" fn _start() -> ! {
     }
     if found == 0 {
         println!("(no disks)");
+    }
+    // A question mark with nothing said about it reads as a disk gone wrong.
+    if unread && syscall::sys_get_uid().0 != 0 {
+        println!("(? is a disk this account may not read: what is on one is root's to look at)");
     }
     syscall::sys_exit_code(0);
 }

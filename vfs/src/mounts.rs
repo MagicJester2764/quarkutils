@@ -95,7 +95,7 @@ struct Mount {
     root_id: u64,
     kind: u64,
     /// Whose requests its server was last told it is answering.
-    told: Option<(u32, u32)>,
+    told: Option<Who>,
     record: [u8; RECORD_MAX],
     record_len: usize,
 }
@@ -160,6 +160,43 @@ static mut PARENT_TID: usize = 0;
 static mut PARENT_SPACE: u64 = 0;
 /// Whose requests the server above is passing on. Nobody's, until it says.
 static mut ACTING: (u32, u32) = (65534, 65534);
+/// And the groups that caller is in besides its own.
+static mut ACTING_GROUPS: ([u32; crate::who::MAX], usize) = ([0; crate::who::MAX], 0);
+
+/// A caller as a server below is told of it: its user and group, and the
+/// groups it is in besides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Who {
+    ids: (u32, u32),
+    groups: [u32; crate::who::MAX],
+    count: usize,
+}
+
+impl Who {
+    fn of(sender: usize) -> Who {
+        let mut groups = [0u32; crate::who::MAX];
+        let count = crate::who::groups_of(sender, &mut groups);
+        // Past the count is nothing, so that two tellings of one caller
+        // compare the same.
+        groups[count..].fill(0);
+        Who { ids: get_sender_uid_gid(sender), groups, count }
+    }
+}
+
+/// Tell mount `m`'s server whose requests come next.
+fn tell(m: usize, who: &Who) -> Result<(), u64> {
+    let msg = Message {
+        sender: 0,
+        tag: TAG_IDENTITY,
+        data: [who.ids.0 as u64, who.ids.1 as u64, who.count as u64, 0, 0, 0],
+    };
+    let mut bytes = [0u8; crate::who::MAX * 4];
+    for (i, group) in who.groups[..who.count].iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&group.to_le_bytes());
+    }
+    let lend = if who.count == 0 { Lend::Nothing } else { Lend::Out(&bytes[..who.count * 4]) };
+    request(m, &msg, lend).map(|_| ())
+}
 
 /// What this server serves, for whoever asks what is mounted: `/dev/` and
 /// the volume's name, a NUL, `/`, a NUL.
@@ -204,6 +241,12 @@ pub fn is_parent(space: u64) -> bool {
 pub fn acting(sender: usize) -> Option<(u32, u32)> {
     let parent = unsafe { PARENT_TID };
     (parent != 0 && sender == parent).then(|| unsafe { ACTING })
+}
+
+/// And the groups that somebody is in besides their own.
+pub fn acting_groups(sender: usize) -> Option<([u32; crate::who::MAX], usize)> {
+    let parent = unsafe { PARENT_TID };
+    (parent != 0 && sender == parent).then(|| unsafe { ACTING_GROUPS })
 }
 
 /// ADOPT: the caller is the server this filesystem is mounted in.
@@ -357,10 +400,9 @@ fn request(m: usize, msg: &Message, lend: Lend) -> Result<Message, u64> {
 /// [`request`], for `sender`: the server is told whose request it is first,
 /// if that is not who it was last told.
 fn request_for(sender: usize, m: usize, msg: &Message, lend: Lend) -> Result<Message, u64> {
-    let who = get_sender_uid_gid(sender);
+    let who = Who::of(sender);
     if mounts()[m].told != Some(who) {
-        let tell = Message { sender: 0, tag: TAG_IDENTITY, data: [who.0 as u64, who.1 as u64, 0, 0, 0, 0] };
-        request(m, &tell, Lend::Nothing)?;
+        tell(m, &who)?;
         mounts()[m].told = Some(who);
     }
     request(m, msg, lend)
@@ -539,7 +581,25 @@ pub(crate) fn intercept(disk: &DiskState, sender: usize, msg: &Message) -> bool 
     match msg.tag {
         TAG_ADOPT => adopt(sender),
         TAG_IDENTITY if sender == unsafe { PARENT_TID } => {
-            unsafe { ACTING = (msg.data[0] as u32, msg.data[1] as u32) };
+            // The groups are lent, four bytes each: more than a message has
+            // words for.
+            let mut groups = [0u32; crate::who::MAX];
+            let count = (msg.data[2] as usize).min(crate::who::MAX);
+            let mut bytes = [0u8; crate::who::MAX * 4];
+            let got = count == 0 || syscall::sys_lent_read(sender, 0, &mut bytes[..count * 4]) == Ok(count * 4);
+            if !got {
+                return {
+                    error_reply(sender, ERR_IO);
+                    true
+                };
+            }
+            for (i, group) in groups[..count].iter_mut().enumerate() {
+                *group = u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+            }
+            unsafe {
+                ACTING = (msg.data[0] as u32, msg.data[1] as u32);
+                ACTING_GROUPS = (groups, count);
+            }
             reply_opened(sender, [0; 6]);
         }
         TAG_IDENTITY => error_reply(sender, ERR_PERMISSION),
@@ -712,6 +772,9 @@ fn open_there(sender: usize, msg: &Message, away: &Away) {
     // that.
     let theirs = if flags & OPEN_DESCRIPTOR != 0 {
         (flags & !OPEN_DESCRIPTOR) | OPEN_PROXIED
+    } else if asks(flags) {
+        // Only to be asked about: nothing of it will be read.
+        flags | OPEN_PROXIED
     } else {
         flags | OPEN_READ | OPEN_PROXIED
     };
@@ -741,8 +804,8 @@ fn open_there(sender: usize, msg: &Message, away: &Away) {
         in_use: true,
         owner: space_of(sender),
         is_dir: is_dir != 0,
-        writable: access & 2 != 0,
-        link: mode & 0o170000 == 0o120000,
+        writable: access & 2 != 0 && !asks(flags),
+        link: mode & 0o170000 == 0o120000 || asks(flags),
         fs: FsFileData::Remote(remote),
         ..OpenFile::empty()
     };
@@ -1059,9 +1122,8 @@ fn attach_there(sender: usize, msg: &Message, away: &Away) {
             return Err(ERR_BUSY);
         }
         // The server below answers for the caller, who is the one mounting.
-        let who = get_sender_uid_gid(sender);
-        let tell = Message { sender: 0, tag: TAG_IDENTITY, data: [who.0 as u64, who.1 as u64, 0, 0, 0, 0] };
-        request(m, &tell, Lend::Nothing)?;
+        let who = Who::of(sender);
+        tell(m, &who)?;
         mounts()[m].told = Some(who);
         let ask = Message {
             sender: 0,

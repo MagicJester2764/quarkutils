@@ -116,6 +116,22 @@ pub const OPEN_NOWAIT: u64 = 0x200;
 /// The descriptor is the server above's to make.
 pub const OPEN_PROXIED: u64 = 0x400;
 
+/// The file is opened to be asked about, and for nothing else: the handle
+/// answers STAT and what its filesystem is, as a symbolic link opened as
+/// itself does. Nothing of the file's own mode is asked for — knowing how
+/// big a file is and whose takes the right to look in its directory, not
+/// the right to read it, and without this `ls -l` of a directory showed
+/// nothing of anybody else's private files but an error. It means this only
+/// by itself: with anything that reads, writes, makes or keeps, it means
+/// nothing.
+pub const OPEN_ASK: u64 = 0x800;
+
+/// Whether an OPEN's flags are [`OPEN_ASK`] and nothing that asks for more.
+pub fn asks(flags: u64) -> bool {
+    let more = OPEN_CREATE | OPEN_TRUNCATE | OPEN_DESCRIPTOR | OPEN_READ | OPEN_WRITE | OPEN_APPEND;
+    flags & OPEN_ASK != 0 && flags & more == 0
+}
+
 /// In a READ's or a WRITE's offset, or a READDIR_BULK's start: wherever the
 /// descriptor is. The position moves past what is transferred.
 pub const AT_POSITION: u64 = u64::MAX;

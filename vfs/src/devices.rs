@@ -315,13 +315,14 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
                 return error_reply(sender, ERR_EXISTS);
             }
             // Root's, and nobody else's: whoever can read a disk can read
-            // every file on it, whatever the files' modes say.
-            if crate::get_sender_uid_gid(sender).0 != 0 {
+            // every file on it, whatever the files' modes say. Anybody may
+            // ask what it is.
+            if !asks(flags) && crate::get_sender_uid_gid(sender).0 != 0 {
                 return error_reply(sender, ERR_PERMISSION);
             }
             // A handle says whether it is for writing, or it is not: a
             // program that only looks claims nothing.
-            let disk = match open_disk(dev, flags & OPEN_WRITE != 0) {
+            let disk = match open_disk(dev, flags & OPEN_WRITE != 0 && !asks(flags)) {
                 Ok(disk) => disk,
                 Err(code) => return error_reply(sender, code),
             };
@@ -346,7 +347,8 @@ pub fn open(sender: usize, path: &[u8], found: Lookup, flags: u64) {
         in_use: true,
         owner: space_of(sender),
         is_dir,
-        writable: !is_dir && writable,
+        writable: !is_dir && writable && !asks(flags),
+        link: asks(flags),
         fs,
         ..OpenFile::empty()
     };

@@ -18,6 +18,7 @@ pub mod locks;
 pub mod mounts;
 pub mod pager;
 pub mod protocol;
+pub mod who;
 
 pub use protocol::*;
 use handles::{FsFileData, OpenFile};
@@ -1578,12 +1579,18 @@ pub extern "C" fn _start() -> ! {
         let bpb = parse_bpb(data);
         // Anything that is not ext2 was taken for FAT32, and a volume with
         // nothing on it is neither: its first sector describes a filesystem
-        // of no sectors in clusters of none.
+        // of no sectors in clusters of none. Nor is FAT12 or FAT16, which
+        // keep the root directory in a place of its own and say how big it
+        // is and how long one table is in two fields FAT32 leaves at nothing
+        // — and keep other things where FAT32 keeps the two this reads, so a
+        // FAT16 volume used to be mounted and then fail every read.
         let plausible = data[510] == 0x55
             && data[511] == 0xAA
             && bpb.bytes_per_sector == 512
             && bpb.sectors_per_cluster.is_power_of_two()
             && bpb.num_fats >= 1
+            && read_u16(data, 17) == 0
+            && read_u16(data, 22) == 0
             && bpb.fat_size_32 != 0
             && bpb.root_cluster >= 2;
         if !plausible {
@@ -1672,6 +1679,7 @@ pub extern "C" fn _start() -> ! {
         // From the kernel, which is not waiting for an answer: a program has
         // gone, or a task that may have been waiting for a lock. The same
         // tags from anybody else are unknown requests.
+        who::began(sender);
         if let Some(space) = quark_rt::ipc::space_death_notice(&msg) {
             // The server this is mounted in, if that is who it was: this
             // ends with it.
@@ -1736,7 +1744,30 @@ pub extern "C" fn _start() -> ! {
 
 /// Every request that is not about where a descriptor is.
 fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
+    // A FAT filesystem has no owners and no modes to check anything against.
+    // It is root's to change and anybody's to read, which is the least that
+    // keeps a user off the partition a machine starts from — and what a
+    // Unix makes of one, mounted as it comes.
+    if unsafe { FS_TYPE } != FsType::Ext2 && get_sender_uid_gid(sender).0 != 0 {
+        let changes = match msg.tag {
+            TAG_WRITE | TAG_MKDIR | TAG_MKNOD | TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK
+            | TAG_SYMLINK | TAG_TRUNCATE | TAG_SETATTR => true,
+            TAG_OPEN => msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE | OPEN_WRITE | OPEN_APPEND) != 0,
+            _ => false,
+        };
+        if changes {
+            return error_reply(sender, ERR_PERMISSION);
+        }
+    }
     match msg.tag {
+        // A link opened as itself, or anything opened only to be asked
+        // about, answers STAT and nothing else — whatever it is, which is
+        // why this comes before anybody else is asked whose handle it is.
+        TAG_READ | TAG_WRITE | TAG_READDIR_BULK | TAG_TRUNCATE
+            if get_handle(msg.data[0] as usize, sender).is_some_and(|f| f.link) =>
+        {
+            error_reply(sender, ERR_NOT_SUPPORTED)
+        }
         TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
             if mounts::is_ours(sender, msg) =>
         {
@@ -1746,12 +1777,6 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
             if devices::is_ours(sender, msg) =>
         {
             devices::serve(sender, msg)
-        }
-        // A link opened as itself answers STAT and nothing else.
-        TAG_READ | TAG_WRITE | TAG_READDIR_BULK | TAG_TRUNCATE
-            if get_handle(msg.data[0] as usize, sender).is_some_and(|f| f.link) =>
-        {
-            error_reply(sender, ERR_NOT_SUPPORTED)
         }
         TAG_OPEN if msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE) != 0 => {
             transacted(|| handle_open(disk, sender, msg))
@@ -2203,8 +2228,10 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
     if wants_dir && !inode.is_dir() {
         return error_reply(sender, ERR_NOT_DIR);
     }
-    // Only OPEN_NOFOLLOW gets this far with a link.
-    let link = inode.is_symlink();
+    // Only OPEN_NOFOLLOW gets this far with a link. And a file opened only
+    // to be asked about is, from here on, treated as a link is: nothing of
+    // its mode is asked for, and the handle reads and writes nothing.
+    let link = inode.is_symlink() || protocol::asks(flags);
     if flags & (OPEN_DESCRIPTOR | OPEN_PROXIED) != 0 {
         // A descriptor says what it is for, and is refused here if the file
         // does not allow it — not at the first write, a long way from the
@@ -3258,7 +3285,9 @@ pub fn get_sender_uid_gid(sender: usize) -> (u32, u32) {
     if let Some(who) = mounts::acting(sender) {
         return who;
     }
-    syscall::sys_get_tuid(sender).unwrap_or((0, 0))
+    // A caller that has gone is nobody. It was root, which is the one
+    // thing a caller nobody can vouch for should not be.
+    syscall::sys_get_tuid(sender).unwrap_or((who::NOBODY, who::NOBODY))
 }
 
 /// A program has been given the directory it is in as a descriptor: the

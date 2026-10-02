@@ -79,8 +79,8 @@ pub struct OpenFile {
     pub file_size: u32,
     pub is_dir: bool,
     pub writable: bool,
-    /// A symbolic link opened as itself: it can be asked about, and nothing
-    /// else.
+    /// A symbolic link opened as itself, or anything opened with `OPEN_ASK`:
+    /// it can be asked about, and nothing else.
     pub link: bool,
     pub read_offset: u32,
     pub fs: FsFileData,

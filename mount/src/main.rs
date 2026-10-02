@@ -155,6 +155,11 @@ pub extern "C" fn _start() -> ! {
     }
     let (source, dir) = (words[0], words[1]);
 
+    // Said first, before a file server is started to be refused its disk.
+    if syscall::sys_get_uid().0 != 0 {
+        fail(format_args!("only root mounts a filesystem"));
+    }
+
     let Some((driver, volume)) = device(source) else {
         fail(format_args!("{} is not a disk or a partition of one", text(source)));
     };
@@ -209,7 +214,10 @@ pub extern "C" fn _start() -> ! {
     let ping = Message { sender: 0, tag: quark_rt::ipc::TAG_PING, data: [0; 6] };
     let mut reply = Message::empty();
     let up = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, server.tid as u64, 0).is_ok()
-        && syscall::sys_call(server.tid, &ping, &mut reply).is_ok();
+        && syscall::sys_call(server.tid, &ping, &mut reply).is_ok()
+        // A server that went while this waited is answered for by the
+        // kernel, with a refusal: an answer, and not the one asked for.
+        && reply.tag == quark_rt::ipc::TAG_PING;
     let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
     if !up {
         let _ = syscall::sys_task_kill(server.tid);
