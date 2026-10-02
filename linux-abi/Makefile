@@ -27,6 +27,19 @@ MANIFEST := src/manifest.o
 
 all: liblinux-abi.a $(MANIFEST)
 
+# Every object is built again when any header is changed. The system calls
+# are inline functions in `quark/syscall.h`, so a change there is a change
+# to the code in every one of these — and for a long time nothing said so:
+# an object was built again when its own `.c` was touched and not otherwise.
+# The header was changed so that a call passes zero for an argument it does
+# not give; the two files edited that day were built with it and the other
+# eight were not, and went on leaving whatever was in the register. It
+# showed weeks of work later, as soon as the kernel read a second argument
+# to a call that used to take one — `raise` stopped working in every C
+# program, because the library's own thread id was never recorded.
+HEADERS := $(wildcard ../libc/include/quark/*.h) $(wildcard ../libc/include/*.h) $(wildcard src/*.h)
+$(OBJS) $(MANIFEST): $(HEADERS)
+
 liblinux-abi.a: $(OBJS)
 	rm -f $@
 	$(AR) rcs $@ $(OBJS)

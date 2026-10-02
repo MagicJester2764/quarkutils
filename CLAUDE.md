@@ -153,6 +153,16 @@ toolchain's specs name the archive by path, so a stale one is linked into every
 musl program silently, and the symptom is a bug you already fixed still
 happening. After changing it, relink whatever C programs you are testing.
 
+Its objects, and `libc`'s, are built again when *any* header changes
+(`$(OBJS): $(HEADERS)` in both Makefiles). The system calls are inline
+functions in `libc/include/quark/syscall.h`, so that header is code in
+every one of them. For a long time only a `.c` that was itself touched was
+compiled again: the header was changed so that a call passes zero for an
+argument it does not give, two files were built with that and eight were
+not, and nothing showed until the kernel read a second argument to a call
+that used to take one — then `raise` failed in every C program. A new
+Makefile for C gets the same line.
+
 Only serial reaches the host's stdout; a program's `println!` goes to the
 framebuffer. To see user-space output headlessly, screendump over QMP
 (`../explosion/tools/boot-test.sh`) rather than assuming the system hung.

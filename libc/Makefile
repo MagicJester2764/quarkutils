@@ -20,6 +20,13 @@ CRT0    := src/start.o
 
 all: libquark.a $(CRT0)
 
+# Every object is built again when any header is changed: the system calls
+# are inline functions in `quark/syscall.h`, and a change there is a change
+# to the code in each of these. `../linux-abi/Makefile` says what it cost
+# when nothing said so.
+HEADERS := $(wildcard include/*.h) $(wildcard include/quark/*.h) $(wildcard src/*.h)
+$(OBJS) $(CRT0): $(HEADERS)
+
 # Built from nothing each time: `ar r` replaces members and adds new ones, but
 # never drops one that is no longer listed, so an object that moves out of the
 # library stays in it until somebody notices the duplicate symbol.
