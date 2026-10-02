@@ -2036,7 +2036,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 11;
+pub const ABI_VERSION_MINOR: u32 = 12;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

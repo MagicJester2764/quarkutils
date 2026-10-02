@@ -2643,14 +2643,7 @@ fn handle_lock(sender: usize, msg: &Message) {
             None => return error_reply(sender, ERR_INVALID_PATH),
         }
     };
-    let owner = if flags & LOCK_OFD != 0 {
-        locks::Owner::Handle(handle)
-    } else {
-        // Its locks go when the program does, and a program that holds only
-        // descriptors is not otherwise being watched.
-        let _ = syscall::sys_space_watch(space);
-        locks::Owner::Program(space)
-    };
+    let owner = if flags & LOCK_OFD != 0 { locks::Owner::Handle(handle) } else { locks::Owner::Program(space) };
     let want = locks::Range { inode, owner, start, end, exclusive: kind == 2 };
 
     if flags & LOCK_QUERY != 0 {
@@ -2681,6 +2674,13 @@ fn handle_lock(sender: usize, msg: &Message) {
         }
         return grant_waiters();
     }
+    // A program's locks go when the program does, and a program that holds
+    // only descriptors is not otherwise being watched. If the kernel will
+    // not say when it goes, it has gone already — ended while this request
+    // waited its turn — and a lock kept for it would be kept for good.
+    if matches!(owner, locks::Owner::Program(_)) && syscall::sys_space_watch(space).is_err() {
+        return error_reply(sender, ERR_TOO_MANY_OPEN);
+    }
     match locks::conflict(&want) {
         None => match locks::apply(&want, false) {
             // An exclusive lock made shared may let a waiter in.
@@ -2693,9 +2693,12 @@ fn handle_lock(sender: usize, msg: &Message) {
         Some(_) if flags & LOCK_WAIT != 0 => {
             match locks::wait(locks::Waiter { sender, space, want }) {
                 // No answer until it is granted. If the task waiting goes
-                // first, the server is told, and forgets the request.
+                // first, the server is told, and forgets the request — and
+                // if it has gone already, forgets it now.
                 Ok(()) => {
-                    let _ = syscall::sys_task_watch(sender);
+                    if syscall::sys_task_watch(sender).is_err() {
+                        locks::drop_task(sender);
+                    }
                 }
                 Err(code) => error_reply(sender, code),
             }

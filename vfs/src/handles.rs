@@ -134,15 +134,22 @@ pub fn alloc(file: OpenFile) -> Option<usize> {
     };
     let t = table();
     let (by_fd, owner) = (file.by_fd, file.owner);
+    // A program's handle goes when the program does, which the kernel says:
+    // watching a program twice is the same as watching it once. If it will
+    // not say, the program has gone already, and a handle made for it now
+    // would never be closed. That used to be thought impossible, because a
+    // program that is calling is there — but it can be ended while its
+    // request waits its turn, and with a second processor while it is
+    // being answered. A removed directory such a program had been looking
+    // at stayed on the disk until the next start.
+    if !by_fd && syscall::sys_space_watch(owner).is_err() {
+        gone(&file);
+        return None;
+    }
     t[i] = file;
     t[i].in_use = true;
     if by_fd {
         t[i].owner = 0;
-    } else {
-        // Told when the program is gone, so its handles go with it. Watching
-        // a program twice is the same as watching it once, and a program
-        // already gone cannot be calling.
-        let _ = syscall::sys_space_watch(owner);
     }
     Some(i)
 }

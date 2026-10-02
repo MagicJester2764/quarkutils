@@ -108,7 +108,9 @@
 #define SYS_SET_FS_BASE     102
 #define SYS_TASK_START_ARG  103
 #define SYS_SET_CLEAR_TID   106
+#define SYS_TASK_WATCH      104
 #define SYS_TASK_SPACE      107
+#define SYS_SPACE_WATCH     108
 #define SYS_FORK            110
 #define SYS_EXEC_SPACE      111
 

@@ -70,8 +70,11 @@ pub fn set(space: u64, to: Where, path: &[u8]) -> Result<Where, u64> {
         None => {
             let i = t.iter().position(|e| e.space == 0).ok_or(crate::ERR_TOO_MANY_OPEN)?;
             // Told when the program goes, so its directory is let go. A
-            // program already gone cannot be calling.
-            let _ = syscall::sys_space_watch(space);
+            // program that has gone already is in no directory, and is
+            // never said to go again.
+            if syscall::sys_space_watch(space).is_err() {
+                return Err(crate::ERR_INVALID_HANDLE);
+            }
             i
         }
     };

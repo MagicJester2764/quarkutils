@@ -36,3 +36,4 @@ synctest
 idtest
 crypttest
 smptest
+watchtest

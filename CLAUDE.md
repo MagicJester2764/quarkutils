@@ -262,6 +262,18 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   `SYS_SPACE_WATCH` says when its last task has gone. Anything a server keeps
   for a program — an open file, a working directory, a lock — is kept by that,
   so every thread of a program shares it and a recycled TID inherits nothing.
+- **A server keeps nothing for a program it could not watch.** A watch that
+  fails says the program has gone already, and it can have: a program is
+  ended from outside while its request waits its turn, or — with a second
+  processor — while it is being answered. "A program that is calling is
+  there" was written in three places in the VFS, each beside a watch whose
+  answer was thrown away, and each kept a handle, a lock or a directory for
+  a program nobody would ever say had gone: a removed directory that a
+  killed program had been reading stayed on the disk until the next start,
+  and `e2fsck` found it. The same for a task (`sys_task_watch`): a lock
+  somebody waits for is not kept waiting for a task already gone. And
+  `exec` is a program going: the kernel says so, what was kept for the old
+  one is let go, and nothing of it is the new one's.
 - **A pager answers only the kernel.** A call from the kernel to a pager
   carries `PAGER_BIT` in its sender and nothing else can set it. The VFS
   answers `TAG_PAGE_IN` and `TAG_OBJECT_SYNC` only for a sender that has it,
@@ -1067,7 +1079,9 @@ removed.
   which. C programs have the whole of the C library's interface.
 - `flock` and `fcntl` locks are one kind here, so the two can keep each other
   out where Linux keeps them apart. Locks live in the server's memory, 256 at
-  once.
+  once. An `fcntl` lock is the program's and goes when the program becomes
+  another, where POSIX keeps it across `exec`; `flock`'s is the open file's
+  and stays with the descriptor.
 - **A C program's signal mask is the program's, and a thread that ends
   leaves everything blocked**: the C library blocks every signal in a thread
   on its way out. A program with threads handles signals until its first

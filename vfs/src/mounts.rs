@@ -261,12 +261,15 @@ fn adopt(sender: usize) {
     if space == 0 {
         return error_reply(sender, ERR_PERMISSION);
     }
+    // Told when it goes: a filesystem mounted in nothing is nobody's. One
+    // that has gone already is not mounting anything.
+    if syscall::sys_space_watch(space).is_err() {
+        return error_reply(sender, ERR_PERMISSION);
+    }
     unsafe {
         PARENT_TID = sender;
         PARENT_SPACE = space;
     }
-    // Told when it goes: a filesystem mounted in nothing is nobody's.
-    let _ = syscall::sys_space_watch(space);
     let read_only = crate::is_ext2() && crate::ext2_state().read_only;
     reply_opened(sender, [unsafe { SELF_ROOT }, unsafe { SELF_KIND }, read_only as u64, 0, 0, 0]);
 }
