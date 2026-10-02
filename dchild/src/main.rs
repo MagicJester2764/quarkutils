@@ -744,6 +744,16 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"quit"[..]) {
         syscall::sys_exit_code(0);
     }
+    // Try to set the clock, an hour on, holding nothing that says this may:
+    // 0 if it was refused, and 1 — having put it back — if it was not.
+    if quark_rt::args::argv(1) == Some(&b"clockset"[..]) {
+        let now = syscall::sys_clock_wall();
+        if syscall::sys_clock_set(now + 3_600_000_000_000).is_err() {
+            syscall::sys_exit_code(0);
+        }
+        let _ = syscall::sys_clock_set(now);
+        syscall::sys_exit_code(1);
+    }
     // Leave a thread behind, dead but never collected, and say which one: the
     // parent checks that collecting this program takes the thread with it.
     if quark_rt::args::argv(1) == Some(&b"orphan"[..]) {

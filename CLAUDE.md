@@ -169,11 +169,16 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 686 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 708 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
 the part about what a second processor changes, and passes on one. `dtest
+clock` is about time: what the clock says, and whether a wait ends when it
+was asked to. A check that a wait is *on time* asks that most of several
+are — one of them is on time by luck on a machine that wakes only on its
+tick, and on any machine one is sometimes late — and is not made at all
+where the clock is the tick, which `dtest` says. `dtest
 msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
 machines it tests on) and its driver running (`start /usr/bin/edu` in

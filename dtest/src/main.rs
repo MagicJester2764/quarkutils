@@ -14,7 +14,7 @@ use quark_rt::{nameserver, print, println, spawn, sync, syscall, thread, vfs};
 
 // The right to say who a task is, is what `identity` checks the use of. A
 // shell that does not hold it cannot give it, and the section says so.
-quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64), CapReq::set_uid()]);
+quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64), CapReq::set_uid(), CapReq::clock()]);
 
 static mut PASSED: u32 = 0;
 static mut FAILED: u32 = 0;
@@ -573,8 +573,7 @@ fn test_discard() {
         }
     }
     check("eighty are built and taken back, in a table of sixty-four", all);
-    let after = (2..64).filter(|&t| syscall::sys_task_info(t).is_ok()).count();
-    check("and no task is left of them", after == before);
+    check("and no task is left of them", mine() == before);
     check("the next one still runs", run(b"dchild", &[b"quit"]) == Some(0));
 }
 
@@ -5340,6 +5339,254 @@ fn test_msi() {
     check("and every time it sends one", again == 3);
 }
 
+/// The latest time any thread of this program has been told, how many times
+/// one was told an earlier time than that, and how many threads have
+/// finished asking.
+static CLOCK_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CLOCK_WENT_BACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CLOCK_ASKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Ask the time for a tenth of a second, as fast as it can be asked, and
+/// hold each answer to the latest anybody had before the question was put.
+fn ask_the_time() {
+    use core::sync::atomic::Ordering;
+    let until = syscall::sys_clock() + 100_000_000;
+    loop {
+        let seen = CLOCK_SEEN.load(Ordering::SeqCst);
+        let now = syscall::sys_clock();
+        if now < seen {
+            CLOCK_WENT_BACK.fetch_add(1, Ordering::SeqCst);
+        }
+        CLOCK_SEEN.fetch_max(now, Ordering::SeqCst);
+        if now >= until {
+            break;
+        }
+    }
+    CLOCK_ASKED.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn clock_asker() -> ! {
+    ask_the_time();
+    syscall::sys_exit_code(0);
+}
+
+/// How long `wait` takes, in nanoseconds, each of `tries` times: the
+/// shortest, and how many of them were over in less than `soon`.
+///
+/// The shortest holds a wait to what it must never do, end early. How many
+/// were soon holds it to ending on time: most of them, not all, because a
+/// machine with other work to do is sometimes late; and not one, because a
+/// wait that ends on the next tick ends soon once in a while by where in a
+/// tick it happened to begin.
+fn timed(tries: usize, soon: u64, wait: impl Fn()) -> (u64, usize) {
+    let mut shortest = u64::MAX;
+    let mut quick = 0;
+    for _ in 0..tries {
+        let from = syscall::sys_clock();
+        wait();
+        let took = syscall::sys_clock() - from;
+        shortest = shortest.min(took);
+        if took < soon {
+            quick += 1;
+        }
+    }
+    (shortest, quick)
+}
+
+/// Time: what the clock says, how finely, and whether a wait ends when it
+/// was asked to. The clock is the processor's counter where the kernel can
+/// keep time by it, and the count of ticks where it cannot; what is asked of
+/// the first is not asked of the second.
+fn test_clock() {
+    use core::sync::atomic::Ordering;
+    use syscall::{ns, TICK_NS};
+    const MS: u64 = 1_000_000;
+    println!("the clock:");
+    let first = syscall::sys_clock();
+    check("the clock goes forward", first > 0 && syscall::sys_clock() >= first);
+    let (ticks, clock) = (syscall::sys_ticks(), syscall::sys_clock() / TICK_NS);
+    check("and a tick is ten milliseconds of it", clock == ticks || clock == ticks + 1);
+
+    // How finely it moves: the smallest step between two readings, over
+    // thirty milliseconds of reading it.
+    let mut step = u64::MAX;
+    let mut last = syscall::sys_clock();
+    let until = last + 30 * MS;
+    while last < until {
+        let now = syscall::sys_clock();
+        if now != last {
+            step = step.min(now - last);
+        }
+        last = now;
+    }
+    let fine = step < TICK_NS;
+    if fine {
+        println!("        it moves in steps of {} ns or less", step);
+    } else {
+        println!("        this machine's clock is the tick: what a finer one does is not checked");
+    }
+
+    let wall = syscall::sys_clock_wall();
+    let started = syscall::sys_boot_time();
+    check(
+        "the date is when the machine was started and the time since",
+        (wall == 0 && started == 0) || wall.abs_diff(started * 1_000_000_000 + syscall::sys_clock()) < 2_000 * MS,
+    );
+
+    // A wait is never short, whatever it is a wait for; and where the clock
+    // is fine it is not rounded up to a tick either.
+    let (least, soon) = timed(20, 5 * MS, || syscall::sleep_ns(MS));
+    check("a sleep of a millisecond is a millisecond at least", least >= MS);
+    if fine {
+        check("and not a tick: it ends when the millisecond does", soon >= 15);
+    }
+    let (least, soon) = timed(3, 3 * TICK_NS, || syscall::sleep_ticks(2));
+    check("a sleep of two ticks is twenty milliseconds", least >= 2 * TICK_NS && soon >= 1);
+
+    static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let word = &WORD as *const _ as *const u32;
+    let gave_up = core::cell::Cell::new(true);
+    let (least, soon) = timed(10, 8 * MS, || {
+        if syscall::sys_futex_wait_timeout(word, 0, ns(3 * MS)) != syscall::FUTEX_TIMED_OUT {
+            gave_up.set(false);
+        }
+    });
+    check("a wait on a word gives up when its time is up, and no sooner", gave_up.get() && least >= 3 * MS);
+    if fine {
+        check("to the millisecond", soon >= 7);
+    }
+    let nothing = core::cell::Cell::new(true);
+    let (least, soon) = timed(10, 7 * MS, || {
+        if syscall::sys_poll(&mut [], ns(2 * MS)) != Ok(0) {
+            nothing.set(false);
+        }
+    });
+    check("a poll of nothing is a sleep of that long", nothing.get() && least >= 2 * MS && (!fine || soon >= 7));
+
+    // A timer, which is a descriptor: read as how many times it has fired.
+    let fired = |fd: usize| {
+        let mut count = [0u8; 8];
+        (syscall::sys_fd_read(fd, &mut count) == 8).then(|| u64::from_le_bytes(count))
+    };
+    match syscall::sys_timer_create() {
+        Ok(fd) => {
+            let from = syscall::sys_clock();
+            let once = syscall::sys_timer_set(fd, ns(3 * MS), 0).is_ok() && fired(fd) == Some(1);
+            let took = syscall::sys_clock() - from;
+            check("a timer set in nanoseconds fires then", once && took >= 3 * MS && (!fine || took < 50 * MS));
+
+            // Every millisecond, left alone for forty of them. What a read
+            // says is how many milliseconds had gone by when it was made:
+            // no fewer than had since the timer was known to be set, by
+            // the time just before the read, and no more than had since
+            // just before it was set, by the time just after.
+            let before_set = syscall::sys_clock();
+            let set = syscall::sys_timer_set(fd, ns(MS), ns(MS)).is_ok();
+            let after_set = syscall::sys_clock();
+            syscall::sleep_ns(40 * MS);
+            let before_read = syscall::sys_clock();
+            let count = fired(fd).unwrap_or(0);
+            let after_read = syscall::sys_clock();
+            check(
+                "one that repeats counts every time it would have fired",
+                set && count >= (before_read - after_set) / MS && count <= (after_read - before_set) / MS,
+            );
+
+            // And every nanosecond, which no machine can do and any program
+            // may ask for. The kernel looks at it as often as it will look
+            // at anything — not a thousand million times a second — and the
+            // count is still the nanoseconds that went by; that this line
+            // is reached at all is the machine having gone on running.
+            let before_set = syscall::sys_clock();
+            let set = syscall::sys_timer_set(fd, ns(1), ns(1)).is_ok();
+            let after_set = syscall::sys_clock();
+            syscall::sleep_ns(50 * MS);
+            let before_read = syscall::sys_clock();
+            let count = fired(fd).unwrap_or(0);
+            let after_read = syscall::sys_clock();
+            check(
+                "one that repeats every nanosecond counts them, and stops nothing",
+                set && count >= before_read - after_set && count <= after_read - before_set,
+            );
+
+            let set = syscall::sys_timer_set(fd, ns(500 * MS), 0).is_ok();
+            let left = syscall::sys_timer_get(fd);
+            let in_ticks = syscall::sys_timer_get_ticks(fd);
+            check(
+                "what is left of a timer is said in nanoseconds, and in ticks rounded up",
+                set && matches!(left, Some((left, 0)) if left > 400 * MS && left <= 500 * MS)
+                    && matches!(in_ticks, Some((left, 0)) if left > 40 && left <= 50),
+            );
+            check("and a timer turned off has nothing left", {
+                syscall::sys_timer_set(fd, 0, 0).is_ok() && syscall::sys_timer_get(fd) == Some((0, 0))
+            });
+            let _ = syscall::sys_fd_close(fd);
+        }
+        Err(()) => check("make a timer", false),
+    }
+
+    // The alarm, set and taken back before it is due: this program has said
+    // nothing about that signal.
+    let none = syscall::sys_sig_alarm_ns(2_000 * MS, 0);
+    let was = syscall::sys_sig_alarm_ns(0, 0);
+    check(
+        "an alarm says how long it has, to the nanosecond",
+        none == (0, 0) && was.0 > 1_900 * MS && was.0 <= 2_000 * MS && was.1 == 0,
+    );
+    let _ = syscall::sys_sig_alarm(200, 0);
+    let was = syscall::sys_sig_alarm(0, 0);
+    check("and in ticks, rounded up", was == (200, 0) && syscall::sys_sig_alarm_left() == (0, 0));
+
+    // The date is the machine's, and who may set it holds the right to.
+    check("a program that does not hold the right may not set the clock", run(b"dchild", &[b"clockset"]) == Some(0));
+    let me = syscall::sys_getpid() as usize;
+    let may = (0..64).any(|slot| {
+        matches!(syscall::sys_cap_read(me, slot), Ok(c) if c.valid && c.cap_type == syscall::CAP_TYPE_CLOCK)
+    });
+    if may && wall != 0 {
+        const AHEAD: u64 = 100_000 * MS;
+        let (date, since_boot) = (syscall::sys_clock_wall(), syscall::sys_clock());
+        let set = syscall::sys_clock_set(date + AHEAD).is_ok();
+        let after = syscall::sys_clock_wall();
+        check("one that does sets the date, and time goes on from there", set && after >= date + AHEAD && after < date + AHEAD + 1_000 * MS);
+        let (least, soon) = timed(3, 1_000 * MS, || syscall::sleep_ns(5 * MS));
+        check(
+            "and no wait is moved by it: they are by the time since the machine started",
+            syscall::sys_clock() - since_boot < 4_000 * MS && least >= 5 * MS && soon == 3,
+        );
+        check(
+            "a date the clock cannot keep is refused",
+            syscall::sys_clock_set(0).is_err() && syscall::sys_clock_set(7_300_000_000 * 1_000_000_000).is_err(),
+        );
+        // Back to what it was, and the time this took.
+        let back = syscall::sys_clock_set(date + (syscall::sys_clock() - since_boot)).is_ok();
+        check("and it is set back", back && syscall::sys_clock_wall().abs_diff(date) < 3_000 * MS);
+    } else {
+        println!("        this session may not set the clock, or the machine has none: setting it is not checked");
+    }
+
+    // Asked on every processor at once: no answer is earlier than one
+    // already given.
+    CLOCK_SEEN.store(0, Ordering::SeqCst);
+    CLOCK_WENT_BACK.store(0, Ordering::SeqCst);
+    CLOCK_ASKED.store(0, Ordering::SeqCst);
+    let (processors, _) = syscall::sys_cpus();
+    let mut askers = 0;
+    for _ in 1..processors.min(4) {
+        if thread::spawn_with_stack(clock_asker, 8).is_ok() {
+            askers += 1;
+        }
+    }
+    ask_the_time();
+    for _ in 0..askers {
+        let _ = syscall::sys_wait();
+    }
+    check(
+        "the clock does not go back, whichever processor is asked",
+        CLOCK_ASKED.load(Ordering::SeqCst) == askers + 1 && CLOCK_WENT_BACK.load(Ordering::SeqCst) == 0,
+    );
+}
+
 /// The word a thread asks to have cleared when it ends, as every thread a C
 /// library makes does: 1 while the thread is there.
 static JOIN_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -5497,6 +5744,7 @@ pub extern "C" fn _start() -> ! {
         ("wire", test_wire),
         ("threads", test_threads),
         ("msi", test_msi),
+        ("clock", test_clock),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);
