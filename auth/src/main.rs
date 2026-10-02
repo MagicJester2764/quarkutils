@@ -39,6 +39,7 @@ quark_rt::manifest!([
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
     CapReq::ioport(0xCF9, 0xCF9),
+    CapReq::clock(),
 ]);
 
 /// The slot a capability is made in before it is handed over.
@@ -319,6 +320,9 @@ fn bless(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> 
         for port in [0x604u64, 0xB004, 0xCF9] {
             give(child, syscall::CAP_TYPE_IOPORT, port, port);
         }
+    }
+    if may.has(Rights::CLOCK) {
+        give(child, syscall::CAP_TYPE_CLOCK, 0, 0);
     }
     if may.has(Rights::ALL) {
         give(child, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);

@@ -24,6 +24,8 @@ quark_rt::manifest!([
     // The right to say who a task is, where the session holds it — root's
     // does — for the programs root runs that say it.
     CapReq::set_uid(),
+    // And the right to set the clock, for `date -s`.
+    CapReq::clock(),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

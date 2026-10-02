@@ -148,6 +148,7 @@ that the passwords are at no moment anybody's to read under either name.
 | `power` | the ports that turn the machine off and restart it, and authority over every task (ending them is part of turning a machine off) |
 | `tasks` | authority over every task: ending anybody's program |
 | `become` | nothing at login. It lets `BLESS` with `OWN` succeed: the account becomes another on its own password |
+| `clock` | the right to set the date (`date -s`), which is the machine's and everybody's |
 | `all` | everything, `SetUid` among it |
 
 An account no line names has what Unix gives it: everything for user 0 and

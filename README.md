@@ -53,7 +53,8 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
                     holds anything: they ask `auth`.
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
-ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
+ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/
+                    Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
 dtest/  dchild/     686 checks of the kernel, made through the ABI, and
