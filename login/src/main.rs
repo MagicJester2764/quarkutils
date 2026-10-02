@@ -73,7 +73,14 @@ pub extern "C" fn _start() -> ! {
     let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
     let mut line_buf = [0u8; 64];
 
+    // What the system says of itself to whoever is about to log in, if it
+    // says anything: /etc/issue. Once, and again after each session.
+    let mut greet = true;
     loop {
+        if greet {
+            show(vfs_tid, b"/etc/issue");
+            greet = false;
+        }
         print!("login: ");
         let n = read_line(&mut line_buf);
 
@@ -244,11 +251,15 @@ pub extern "C" fn _start() -> ! {
             let _ = spawn::set_args_env(&info, &[&argv0[..1 + n]], &env, &SPAWN_SCRATCH);
         }
 
+        // And what it says to whoever has: /etc/motd.
+        show(vfs_tid, b"/etc/motd");
+
         // Start shell and wait for it to exit
         if info.start().is_err() {
             println!("login: failed to start shell");
             continue;
         }
+        greet = true;
 
         let _ = syscall::sys_wait();
 
@@ -268,6 +279,26 @@ pub extern "C" fn _start() -> ! {
 
         println!(""); // blank line before next login prompt
     }
+}
+
+/// Print a file, if it is there to print.
+fn show(vfs_tid: usize, path: &[u8]) {
+    let Ok((handle, _, is_dir)) = vfs::open(vfs_tid, path) else {
+        return;
+    };
+    let mut page = [0u8; 512];
+    let mut at = 0u32;
+    // A greeting, not a document: a few lines.
+    while !is_dir && at < 4096 {
+        match vfs::read(vfs_tid, handle, &mut page, at) {
+            Ok(n) if n > 0 => {
+                quark_rt::stdio::print_bytes(&page[..n as usize]);
+                at += n;
+            }
+            _ => break,
+        }
+    }
+    let _ = vfs::close(vfs_tid, handle);
 }
 
 fn load_passwd_file(vfs_tid: usize) -> Option<&'static [u8]> {
