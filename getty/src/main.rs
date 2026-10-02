@@ -25,21 +25,13 @@
 //! group of its own can say which.
 
 use quark_rt::ipc::Message;
-use quark_rt::manifest::CapReq;
 use quark_rt::spawn::{self, Scratch};
 use quark_rt::{nameserver, println, syscall, vfs};
 
-// What `login` asks for, so that there is something to grant it from: a
-// spawner hands on no more than it holds.
-quark_rt::manifest!([
-    CapReq::task_mgmt(0),
-    CapReq::phys_alloc(64),
-    CapReq::set_uid(),
-    CapReq::ioport(0x604, 0x604),
-    CapReq::ioport(0xB004, 0xB004),
-    // The reset control register: `shutdown -r`.
-    CapReq::ioport(0xCF9, 0xCF9),
-]);
+// This asks for nothing, and `login` after it holds nothing: what a session
+// holds comes from `auth`, by whose account it is. Both used to hold the
+// right to say who a task is and the ports that turn the machine off, to
+// have them to hand on.
 
 /// Ask the console for its terminal: the reply's first word is the pty.
 const TAG_TTY_OPEN: u64 = 0x110;

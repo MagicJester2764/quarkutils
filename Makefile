@@ -40,7 +40,8 @@ REQUIRE_ABI ?=
 # Programs, as source directory and the name they are installed under. The
 # directory is also the crate and the binary.
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
-                 input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK
+                 input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
+                 auth:AUTH
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
@@ -162,7 +163,11 @@ $(foreach p,$(call names,$(C_PROGRAMS)),$(eval $(call C_BUILD_RULE,$(p))))
 
 rootfs:
 	@mkdir -p rootfs/etc
-	@echo 'root:0:0:/home/root:/usr/bin/QSH.ELF' > rootfs/etc/passwd
+	@# Unix's seven fields: what a C library reads to turn a file's owner
+	@# into a name. Root has no password until somebody gives it one.
+	@echo 'root:x:0:0:root:/home/root:/usr/bin/QSH.ELF' > rootfs/etc/passwd
+	@echo 'root:x:0:' > rootfs/etc/group
+	@echo 'root::0::::::' > rootfs/etc/shadow
 
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
@@ -201,6 +206,9 @@ else
 	 done
 endif
 	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
+	@cp rootfs/etc/group $(DESTDIR)/etc/GROUP
+	@# Hashes of passwords: root's alone to read.
+	@install -m 600 rootfs/etc/shadow $(DESTDIR)/etc/SHADOW
 	@# What the console is, to a program that asks: the entry is the console's
 	@# and is kept beside it.
 	@cp qtty/termcap $(DESTDIR)/etc/termcap

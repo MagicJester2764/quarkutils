@@ -740,6 +740,13 @@ pub fn sys_task_create() -> Result<usize, ()> {
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
+/// Free an address space the caller made and nothing runs in, with every
+/// page that was given to it.
+pub fn sys_addrspace_destroy(cr3: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall1(SYS_ADDRSPACE_DESTROY, cr3 as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
 pub fn sys_addrspace_create() -> Result<usize, ()> {
     let ret = unsafe { syscall0(SYS_ADDRSPACE_CREATE) };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }

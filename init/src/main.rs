@@ -436,7 +436,7 @@ fn is_essential_elf(name: &[u8; 11]) -> bool {
     let base = &name[0..8];
     base == b"NAMESRVR" || base == b"QTTY    " || base == b"KEYBOARD"
         || base == b"DISK    " || base == b"INPUT   " || base == b"VFS     "
-        || base == b"NET     "
+        || base == b"NET     " || base == b"AUTH    "
 }
 
 /// Where init keeps its capability to the nameserver. Every program it starts

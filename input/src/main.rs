@@ -191,8 +191,9 @@ struct Server {
     line: [u8; LINE_BUF_SIZE],
     line_len: usize,
     cooked: Cooked,
-    /// Readers waiting for a line, oldest first, with how much each wants.
-    readers: [(usize, usize); MAX_READERS],
+    /// Readers waiting for a line, oldest first, with how much each wants
+    /// and whether it asked for the line not to be shown as it is typed.
+    readers: [(usize, usize, bool); MAX_READERS],
     nreaders: usize,
     claims: Claims,
     /// Who Ctrl-C interrupts, and who said so.
@@ -217,7 +218,13 @@ impl Server {
         let first = self.readers[0];
         self.readers.copy_within(1..self.nreaders, 0);
         self.nreaders -= 1;
-        Some(first)
+        Some((first.0, first.1))
+    }
+
+    /// Whether what is typed is shown: not while the reader the line is for
+    /// asked that it should not be. A password is the reason.
+    fn shown(&self) -> bool {
+        !(self.nreaders > 0 && self.readers[0].2)
     }
 
     /// Answer waiting readers from the finished lines, oldest first. A reader
@@ -262,7 +269,9 @@ impl Server {
             8 | 127 => {
                 if self.line_len > 0 {
                     self.line_len -= 1;
-                    print!("\x08 \x08");
+                    if self.shown() {
+                        print!("\x08 \x08");
+                    }
                 }
             }
             c if c >= 0x20 => {
@@ -270,7 +279,7 @@ impl Server {
                 if self.line_len < LINE_BUF_SIZE - 1 {
                     self.line[self.line_len] = c;
                     self.line_len += 1;
-                    if let Ok(s) = core::str::from_utf8(&[c]) {
+                    if let (true, Ok(s)) = (self.shown(), core::str::from_utf8(&[c])) {
                         print!("{}", s);
                     }
                 }
@@ -388,7 +397,7 @@ pub extern "C" fn _start() -> ! {
         line: [0; LINE_BUF_SIZE],
         line_len: 0,
         cooked: Cooked { buf: [0; COOKED_SIZE], len: 0 },
-        readers: [(0, 0); MAX_READERS],
+        readers: [(0, 0, false); MAX_READERS],
         nreaders: 0,
         claims: Claims { tids: [0; MAX_CLAIMANTS], depth: 0 },
         foreground: 0,
@@ -432,7 +441,8 @@ pub extern "C" fn _start() -> ! {
                     pack_read_reply(&[])
                 } else {
                     // Held until there is a line, or answered from one now.
-                    s.readers[s.nreaders] = (sender, max);
+                    // The second word asks for it not to be shown.
+                    s.readers[s.nreaders] = (sender, max, msg.data[1] == 1);
                     s.nreaders += 1;
                     s.keys_waiting();
                     continue;

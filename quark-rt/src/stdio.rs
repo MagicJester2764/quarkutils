@@ -78,6 +78,57 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     read_line_result(buf).unwrap_or(0)
 }
 
+/// The bit of a terminal's local flags that has it show what is typed.
+const ECHO: u32 = 0o10;
+/// The console's line reader is asked for a line with this, a length, and
+/// then a word that says whether to show the line as it is typed.
+const TAG_INPUT_READ: u64 = 1;
+
+/// Read a line that is not shown as it is typed: a password.
+///
+/// A terminal has its echo turned off for the line and put back. The
+/// console's own line reader — what standard input is where nothing has put
+/// a terminal there — is asked for the line with a word that says not to
+/// show it. Anything else, a pipe or a file, is read as it is: nothing was
+/// going to show it.
+pub fn read_secret(buf: &mut [u8]) -> usize {
+    if let Ok(was) = syscall::sys_pty_get_termios(0) {
+        let mut quiet = was;
+        quiet.c_lflag &= !ECHO;
+        let _ = syscall::sys_pty_set_termios(0, &quiet);
+        let n = read_line(buf);
+        let _ = syscall::sys_pty_set_termios(0, &was);
+        // The newline that ended it was not shown either.
+        print_bytes(b"\n");
+        return n;
+    }
+    let console = matches!(syscall::sys_fd_kind(0), Some((syscall::FD_KIND_ENDPOINT, _)));
+    let Some(input) = crate::nameserver::lookup(b"input").filter(|_| console) else {
+        return read_line(buf);
+    };
+    let mut got = 0;
+    while got < buf.len() {
+        let want = (buf.len() - got).min(40);
+        let msg = crate::ipc::Message { sender: 0, tag: TAG_INPUT_READ, data: [want as u64, 1, 0, 0, 0, 0] };
+        let mut reply = crate::ipc::Message::empty();
+        if syscall::sys_call(input, &msg, &mut reply).is_err() {
+            break;
+        }
+        let n = (reply.data[0] as usize).min(want);
+        if n == 0 {
+            break;
+        }
+        for i in 0..n {
+            buf[got + i] = (reply.data[1 + i / 8] >> (8 * (i % 8))) as u8;
+        }
+        got += n;
+        if buf[got - 1] == b'\n' {
+            break;
+        }
+    }
+    got
+}
+
 /// What reading a line came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Line {

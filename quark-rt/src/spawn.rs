@@ -107,6 +107,18 @@ impl Spawned {
     pub fn start(&self) -> Result<(), ()> {
         syscall::sys_task_start(self.tid, self.entry, self.stack_top, self.cr3)
     }
+
+    /// Take back a child that will not be started after all: the task, and
+    /// the address space with everything that was moved into it.
+    ///
+    /// A spawner that builds a program and then is told no — `login`, when
+    /// the password was wrong — has one of these each time, and a task slot
+    /// and an image's worth of memory with it.
+    pub fn discard(self) {
+        let _ = syscall::sys_task_kill(self.tid);
+        let _ = syscall::sys_wait_for(self.tid);
+        let _ = syscall::sys_addrspace_destroy(self.cr3);
+    }
 }
 
 #[repr(C)]
@@ -218,7 +230,10 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     let base = segs[0].first;
 
     let cr3 = syscall::sys_addrspace_create()?;
-    let tid = syscall::sys_task_create_in(cr3 as u64)?;
+    let Ok(tid) = syscall::sys_task_create_in(cr3 as u64) else {
+        let _ = syscall::sys_addrspace_destroy(cr3);
+        return Err(());
+    };
 
     let loaded = build(elf, segs, base, scratch.elf)
         .and_then(|()| give_image(cr3, segs, base, scratch.elf))
@@ -230,6 +245,12 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
             release(scratch.elf + (s.first - base), (s.end - s.first) / PAGE_SIZE);
         }
         release(scratch.stack, STACK_PAGES);
+        // And the child that was being built, which nobody else can name:
+        // left, it was a task and an address space for every program that
+        // would not load.
+        let _ = syscall::sys_task_kill(tid);
+        let _ = syscall::sys_wait_for(tid);
+        let _ = syscall::sys_addrspace_destroy(cr3);
         return Err(());
     }
 

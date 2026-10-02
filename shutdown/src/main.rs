@@ -42,6 +42,23 @@ pub extern "C" fn _start() -> ! {
     }
     let my_tid = syscall::sys_getpid() as usize;
 
+    // Turning a machine off is a capability — the port that does it — and a
+    // session holds it or does not. Said before anything is ended: this used
+    // to end what it could, fail to turn the machine off, and leave whoever
+    // ran it with no session.
+    let port = if again { RESET_CONTROL } else { ACPI_PM1A_CNT } as u64;
+    let may = (0..64).any(|slot| {
+        matches!(syscall::sys_cap_read(my_tid, slot), Ok(c) if c.valid
+            && c.cap_type == syscall::CAP_TYPE_IOPORT && c.param0 <= port && port <= c.param1)
+    });
+    if !may {
+        println!(
+            "shutdown: this account may not {}",
+            if again { "restart the machine" } else { "turn the machine off" }
+        );
+        syscall::sys_exit_code(1);
+    }
+
     // The file servers are among what is about to be ended, and a write is
     // answered a moment before it is recorded for good. Have it recorded.
     if let Some(vfs_tid) = quark_rt::nameserver::lookup(b"vfs") {
