@@ -3,9 +3,11 @@
 #[cfg(not(feature = "rustc-dep-of-std"))]
 extern crate alloc;
 
+pub mod accounts;
 pub mod args;
 pub mod block;
 pub mod console;
+pub mod crypt;
 pub mod font;
 pub mod ipc;
 pub mod manifest;
