@@ -19,6 +19,8 @@ quark_rt::manifest!([
     CapReq::phys_alloc(64),
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
+    // The reset control register: `shutdown -r`.
+    CapReq::ioport(0xCF9, 0xCF9),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

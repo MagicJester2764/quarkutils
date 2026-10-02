@@ -37,6 +37,8 @@ quark_rt::manifest!([
     CapReq::set_uid(),
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
+    // The reset control register: `shutdown -r`.
+    CapReq::ioport(0xCF9, 0xCF9),
 ]);
 
 /// Ask the console for its terminal: the reply's first word is the pty.

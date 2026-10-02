@@ -15,6 +15,8 @@ quark_rt::manifest!([
     CapReq::set_uid(),
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
+    // The reset control register: `shutdown -r`.
+    CapReq::ioport(0xCF9, 0xCF9),
 ]);
 
 const PAGE_SIZE: usize = 4096;
@@ -179,6 +181,10 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_cap_delete(SCRATCH);
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xB004, 0xB004);
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 3);
+        let _ = syscall::sys_cap_delete(SCRATCH);
+        // And the reset control register, for `shutdown -r`.
+        let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xCF9, 0xCF9);
+        let _ = syscall::sys_cap_grant(tid, SCRATCH, 4);
         let _ = syscall::sys_cap_delete(SCRATCH);
 
         // Wire file descriptors

@@ -229,6 +229,13 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   than it has — the shell holds no `PhysRange` and therefore cannot give one
   away. The framebuffer is the one exception: its address comes from the
   bootloader at runtime, so `init` grants it directly.
+- **A request a spawner cannot mint is skipped, and nothing says so.** A
+  program that needs a capability needs it in every spawner above it:
+  `shutdown -r` writes the reset control register (port 0xCF9), and asked
+  for it, and the machine turned off instead — the port stopped at `login`,
+  which hands the shell its ports one at a time, by hand. It is in
+  `getty`'s manifest, `login`'s grants, `qsh`'s manifest and `shutdown`'s
+  now. A program that "does nothing" is the first thing to suspect of this.
 - **IPC needs an Endpoint capability, and nobody mints one for a stranger.**
   The kernel will not deliver a call the caller holds no `Endpoint` for. Every
   program gets the nameserver's from its spawner, and a lookup grants the one

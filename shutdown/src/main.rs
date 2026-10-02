@@ -5,12 +5,18 @@ use quark_rt::{args, println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// Signals every task to exit, then writes the ACPI poweroff ports.
+// Signals every task to exit, then writes the ACPI poweroff ports — or, to
+// start the machine again, the reset control register.
 quark_rt::manifest!([
     CapReq::task_mgmt(0),
     CapReq::ioport(0x604, 0x604),
     CapReq::ioport(0xB004, 0xB004),
+    CapReq::ioport(RESET_CONTROL, RESET_CONTROL),
 ]);
+
+/// The reset control register, which every PC chipset since PIIX has at this
+/// port: bit 1 says a hard reset, and bit 2, going from 0 to 1, does it.
+const RESET_CONTROL: u16 = 0xCF9;
 
 const MAX_TASKS: usize = 64;
 
@@ -25,7 +31,22 @@ const ACPI_S5_VALUE: u16 = 1 << 13;
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     let force = has_flag(b"-f") || has_flag(b"--force");
+    let again = has_flag(b"-r") || has_flag(b"--reboot");
+    if (1..args::argc()).any(|i| {
+        !matches!(args::argv(i), Some(b"-f" | b"--force" | b"-r" | b"--reboot"))
+    }) {
+        println!("usage: shutdown [-r] [-f]");
+        println!("  -r  start the machine again instead of turning it off");
+        println!("  -f  do not wait for programs to end by themselves");
+        syscall::sys_exit_code(2);
+    }
     let my_tid = syscall::sys_getpid() as usize;
+
+    // The file servers are among what is about to be ended, and a write is
+    // answered a moment before it is recorded for good. Have it recorded.
+    if let Some(vfs_tid) = quark_rt::nameserver::lookup(b"vfs") {
+        let _ = quark_rt::vfs::sync(vfs_tid);
+    }
 
     // Phase 1: Signal all user tasks to terminate
     let mut signaled = 0usize;
@@ -56,7 +77,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    println!("shutdown: powering off...");
+    println!("shutdown: {}...", if again { "starting again" } else { "powering off" });
 
     // Phase 2: Force-kill any survivors
     if !force {
@@ -70,6 +91,14 @@ pub extern "C" fn _start() -> ! {
                 }
             }
         }
+    }
+
+    if again {
+        // A hard reset: say which kind, then ask for it.
+        syscall::sys_ioport_write(RESET_CONTROL, 0x02);
+        syscall::sys_ioport_write(RESET_CONTROL, 0x06);
+        syscall::sleep_ms(500);
+        println!("shutdown: the machine would not reset; turning it off instead");
     }
 
     // Phase 3: ACPI S5 power-off
