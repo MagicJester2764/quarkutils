@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 749 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 750 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
@@ -186,7 +186,15 @@ writes it: who sees a write, what it costs, and every way to a page that is
 not a write through it — the kernel writing for the program, a server
 writing what it was lent, a word a thread is waiting on. What it costs is
 measured after one fork that is not counted: the first task the kernel
-makes room for costs it room it then keeps. `dtest
+makes room for costs it room it then keeps. `dtest pressure` is about
+memory given back when there is not enough: it needs `swapd` running
+(`start /usr/bin/swapd /var/swap 16` in `/etc/init.conf`) and makes one
+check without it and twenty-four with. Most of it asks for what the
+kernel otherwise does only when it must — a program may give up pages of
+its own (`sys_page_out`) — because which pages a machine short of memory
+takes is not something a check can count on; the last of it is the thing
+itself, a program that wants more than there is, and takes about ten
+seconds on a disk driven a word at a time. `dtest
 msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
 machines it tests on) and its driver running (`start /usr/bin/edu` in

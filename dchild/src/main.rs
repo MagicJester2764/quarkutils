@@ -29,6 +29,10 @@
 //! writes into it, and exits without asking for it to be written back.
 //! `gift` was given a page before it was started: it exits 0 if what its
 //! giver put there is there, and the page is its own to write.
+//! `fill PAGES` writes to every page of that many and reads each back: 0
+//! if every one holds what was written to it, 3 if one does not. `outgo`
+//! writes to sixteen pages, gives them up to be written out, and ends with
+//! however many were: a program that goes with pages of its own out.
 //! `fault` writes through a null pointer; `sleep` sleeps ten seconds; `late`
 //! sleeps a fifth of one and ends with status 3, having answered nobody.
 //! `leave` starts a thread that never ends and then ends the program with
@@ -821,6 +825,37 @@ pub extern "C" fn _start() -> ! {
         }
         // Four gigabytes, and nobody stopped it.
         syscall::sys_exit_code(2);
+    }
+    // Write something of its own to every page of so many, and then read
+    // every page back: 0 if each holds what was written to it, 3 if one
+    // does not. On a machine with less memory than that, the pages written
+    // first have been to the disk and back by the time they are read.
+    if quark_rt::args::argv(1) == Some(&b"fill"[..]) {
+        const FILL: usize = 0xB8_0000_0000;
+        let pages = quark_rt::args::argv(2).map_or(0, |n| {
+            n.iter().fold(0usize, |acc, &d| acc * 10 + (d.wrapping_sub(b'0') as usize % 10))
+        });
+        if pages == 0 || syscall::sys_map_anon(FILL, pages, false).is_err() {
+            syscall::sys_exit_code(1);
+        }
+        let word = |page: usize| (FILL + page * 4096 + (page % 500) * 8) as *mut u64;
+        let what = |page: usize| 0x5EED_F111_0000_0000u64 ^ (page as u64).wrapping_mul(0x9E37_79B9);
+        for page in 0..pages {
+            unsafe { core::ptr::write_volatile(word(page), what(page)) };
+        }
+        let kept = (0..pages).all(|page| unsafe { core::ptr::read_volatile(word(page)) } == what(page));
+        syscall::sys_exit_code(if kept { 0 } else { 3 });
+    }
+    if quark_rt::args::argv(1) == Some(&b"outgo"[..]) {
+        const OUTGO: usize = 0xB9_0000_0000;
+        if syscall::sys_map_anon(OUTGO, 16, false).is_err() {
+            syscall::sys_exit_code(1);
+        }
+        for page in 0..16 {
+            unsafe { core::ptr::write_volatile((OUTGO + page * 4096) as *mut u8, 1) };
+        }
+        let out = syscall::sys_page_out(OUTGO, 16).unwrap_or(0);
+        syscall::sys_exit_code(out as i32);
     }
     if quark_rt::args::argv(1) == Some(&b"fdclient"[..]) {
         let server = quark_rt::args::argv(2).map_or(0, |n| {

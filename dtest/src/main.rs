@@ -6231,6 +6231,304 @@ fn test_fork() {
     }
 }
 
+/// Where the checks of memory given back keep theirs.
+const OUT_AT: usize = 0xB1_0000_0000;
+const OUT_PAGES: usize = 64;
+/// A few pages mapped and unmapped while written out, and four of a file.
+const GONE_OUT_AT: usize = 0xB2_0000_0000;
+const FILE_OUT_AT: usize = 0xB3_0000_0000;
+/// Single pages after the sixty-four: one a read is waiting to fill, one
+/// with a word a thread waits on, one the program is told of signals in.
+const OUT_READ_PAGE: usize = OUT_AT + (OUT_PAGES + 2) * 4096;
+const OUT_FUTEX_PAGE: usize = OUT_AT + (OUT_PAGES + 4) * 4096;
+const OUT_SIGNAL_PAGE: usize = OUT_AT + (OUT_PAGES + 6) * 4096;
+const OUT_SPAN: usize = OUT_PAGES + 8;
+
+fn out_word(page: usize) -> *mut u64 {
+    (OUT_AT + page * 4096 + (page % 400) * 8) as *mut u64
+}
+
+fn out_what(page: usize) -> u64 {
+    0x0D15_C000_0000_0000 ^ (page as u64).wrapping_mul(0x9E37_79B9_7F4A)
+}
+
+/// Whether each of the sixty-four pages in `pages` holds what was put there.
+fn out_kept(pages: core::ops::Range<usize>) -> bool {
+    pages.into_iter().all(|page| unsafe { out_word(page).read_volatile() } == out_what(page))
+}
+
+fn out_first_half() -> bool {
+    out_kept(0..OUT_PAGES / 2)
+}
+
+static OUT_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static OUT_WOKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Reads descriptor 5 into a page, and waits there.
+extern "C" fn out_reader() -> ! {
+    let buf = unsafe { core::slice::from_raw_parts_mut(OUT_READ_PAGE as *mut u8, 4) };
+    let n = syscall::sys_fd_read(5, buf);
+    let got = n == 4 && buf == b"here";
+    OUT_READ.store(if got { 1 } else { 2 }, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// Waits on a word, for three seconds at most.
+extern "C" fn out_waiter() -> ! {
+    let r = syscall::sys_futex_wait_timeout(OUT_FUTEX_PAGE as *const u32, 0, syscall::ns(3_000_000_000));
+    OUT_WOKEN.store(1 + r as u32, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// Memory is given back when there is not enough of it: pages a program
+/// has not used lately are written out, by a pager the system started for
+/// that, and read back when they are touched. Nothing a program can see
+/// says that it happened to it, so most of this asks for it — a program may
+/// give up pages of its own — and looks at what follows: who has the page
+/// afterwards, what the kernel does when it needs one that has gone, and
+/// what is never taken. The last check is the thing itself: a program that
+/// wants more memory than the machine has.
+///
+/// On a machine with nowhere to write memory out to — no pager started for
+/// it — there is one thing to say and this says it.
+fn test_pressure() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    println!("memory that is given back:");
+    if syscall::sys_map_anon(OUT_AT, OUT_SPAN, false).is_err() {
+        check("a few pages to give up", false);
+        return;
+    }
+    for page in 0..OUT_PAGES {
+        unsafe { out_word(page).write_volatile(out_what(page)) };
+    }
+    let (room, used) = syscall::sys_swap_room();
+    if room == 0 {
+        println!("        this machine has nowhere to write memory out to");
+        check(
+            "where there is nowhere to write them, a program's own pages stay where they are",
+            syscall::sys_page_out(OUT_AT, OUT_PAGES) == Ok(0) && out_kept(0..OUT_PAGES),
+        );
+        let _ = syscall::sys_munmap(OUT_AT, OUT_SPAN);
+        return;
+    }
+    if own_pipe(3, 4).is_err() || own_pipe(5, 6).is_err() {
+        check("two pipes, to hold a child with and to read from", false);
+        return;
+    }
+
+    // Given up, and back.
+    let (free0, charged0) = syscall::sys_mem_info();
+    let (_, back0) = syscall::sys_swap_traffic();
+    check(
+        "a program gives up pages of its own, and they are written out",
+        syscall::sys_page_out(OUT_AT, OUT_PAGES) == Ok(OUT_PAGES),
+    );
+    let (free1, charged1) = syscall::sys_mem_info();
+    let (_, used1) = syscall::sys_swap_room();
+    check(
+        "their frames are free, and that many more pages are out",
+        free1 + 8 >= free0 + OUT_PAGES && used1 == used + OUT_PAGES,
+    );
+    check("they are the program's memory still, wherever they are", charged1 == charged0);
+    check("each comes back as it was when it is touched", out_kept(0..OUT_PAGES));
+    let (_, back1) = syscall::sys_swap_traffic();
+    let (_, used2) = syscall::sys_swap_room();
+    check(
+        "read back from where it was written, and no longer kept there",
+        back1 - back0 == OUT_PAGES && used2 == used,
+    );
+
+    // The kernel wanting a page that has gone: a write from one and a read
+    // into another.
+    let gone = syscall::sys_page_out(OUT_AT, OUT_PAGES) == Ok(OUT_PAGES);
+    let from = unsafe { core::slice::from_raw_parts(out_word(1) as *const u8, 8) };
+    let into = unsafe { core::slice::from_raw_parts_mut((OUT_AT + 2 * 4096 + 2048) as *mut u8, 8) };
+    check(
+        "the kernel reads and writes a page that is written out, as the program would",
+        gone && syscall::sys_fd_write(6, from) == 8
+            && syscall::sys_fd_read(5, into) == 8
+            && into == out_what(1).to_le_bytes()
+            && out_kept(0..OUT_PAGES),
+    );
+
+    // A fork with pages written out: they are in both, and each has its
+    // own when it touches one. The child reads half and leaves the rest.
+    let gone = syscall::sys_page_out(OUT_AT, OUT_PAGES) == Ok(OUT_PAGES);
+    let child = held_child(out_first_half);
+    let childs = let_go(child);
+    // Other pages written out before the parent looks at its own: where
+    // the child's went is free to be used again, and where the parent's
+    // are is not.
+    let others = syscall::sys_map_anon(GONE_OUT_AT, OUT_PAGES, false).is_ok();
+    for page in 0..OUT_PAGES {
+        unsafe { core::ptr::write_volatile((GONE_OUT_AT + page * 4096) as *mut u64, !out_what(page)) };
+    }
+    let reused = others && syscall::sys_page_out(GONE_OUT_AT, OUT_PAGES) == Ok(OUT_PAGES);
+    check(
+        "a fork with pages written out leaves them in both",
+        gone && childs && reused && out_kept(0..OUT_PAGES),
+    );
+    let _ = syscall::sys_munmap(GONE_OUT_AT, OUT_PAGES);
+    check("and they are kept for nobody once both have done with them", syscall::sys_swap_room().1 == used);
+
+    // And a page a fork has left in two programs is not written out from
+    // under one of them.
+    let child = held_child(nothing_to_do);
+    check(
+        "a page a fork left in two programs is not given up while it is in both",
+        child.is_some() && syscall::sys_page_out(OUT_AT, OUT_PAGES) == Ok(0),
+    );
+    let _ = let_go(child);
+
+    // Unmapped while written out, and a program that ends with pages out.
+    let mapped = syscall::sys_map_anon(GONE_OUT_AT, 16, false).is_ok();
+    for page in 0..16 {
+        unsafe { core::ptr::write_volatile((GONE_OUT_AT + page * 4096) as *mut u8, 1) };
+    }
+    let gone = mapped && syscall::sys_page_out(GONE_OUT_AT, 16) == Ok(16);
+    let unmapped = syscall::sys_munmap(GONE_OUT_AT, 16).is_ok();
+    check(
+        "what is written out goes when its page is unmapped, and the charge for it",
+        gone && unmapped && syscall::sys_swap_room().1 == used && syscall::sys_mem_info().1 == charged0,
+    );
+    let ended = run(b"dchild", &[b"outgo"]);
+    check(
+        "and when its program ends",
+        ended == Some(16) && syscall::sys_swap_room().1 == used,
+    );
+
+    // What is never taken: a page a system call is waiting to fill, a page
+    // with a word a thread is waiting on, the page a program is told of
+    // signals through. The first is copied into with a lock held when the
+    // read is answered, where a page that had gone could not be waited
+    // for; the others are found by their frames.
+    fill_page(OUT_READ_PAGE, b'a');
+    match thread::spawn_with_stack(out_reader, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(5);
+            check(
+                "a page a read is waiting to fill is not given up",
+                syscall::sys_page_out(OUT_READ_PAGE, 1) == Ok(0),
+            );
+            let wrote = syscall::sys_fd_write(6, b"here") == 4;
+            let _ = wait_for(t.tid());
+            check("and the read is answered into it", wrote && OUT_READ.load(Ordering::SeqCst) == 1);
+            check(
+                "it is given up like any other once the call has returned",
+                syscall::sys_page_out(OUT_READ_PAGE, 1) == Ok(1)
+                    && unsafe { core::slice::from_raw_parts(OUT_READ_PAGE as *const u8, 4) } == b"here",
+            );
+        }
+        Err(()) => check("start a thread to read", false),
+    }
+    let word = OUT_FUTEX_PAGE as *mut u32;
+    unsafe { word.write_volatile(0) };
+    match thread::spawn_with_stack(out_waiter, 8) {
+        Ok(t) => {
+            syscall::sleep_ticks(5);
+            check(
+                "nor a page with a word a thread is waiting on",
+                syscall::sys_page_out(OUT_FUTEX_PAGE, 1) == Ok(0),
+            );
+            unsafe { word.write_volatile(1) };
+            let woke = syscall::sys_futex_wake(word, 1);
+            let _ = wait_for(t.tid());
+            check("which is woken", woke == 1 && OUT_WOKEN.load(Ordering::SeqCst) == 1);
+        }
+        Err(()) => check("start a thread to wait", false),
+    }
+    const USR1: u64 = 10;
+    let told: &'static AtomicU32 = unsafe { &*(OUT_SIGNAL_PAGE as *const AtomicU32) };
+    told.store(0, Ordering::SeqCst);
+    let _ = syscall::sys_sig_action(USR1, syscall::SIG_HANDLE);
+    let _ = syscall::sys_sig_take(Some(told));
+    let stays = syscall::sys_page_out(OUT_SIGNAL_PAGE, 1) == Ok(0);
+    let raised = syscall::sys_sig_raise(syscall::sys_getpid() as usize, USR1).is_ok();
+    check(
+        "nor the page a program is told of signals through, which it then is",
+        stays && raised && told.load(Ordering::SeqCst) == 1 && syscall::sys_sig_take(None) == 1 << (USR1 - 1),
+    );
+    let _ = syscall::sys_sig_action(USR1, syscall::SIG_DEFAULT);
+
+    // Pages of a file, mapped to read: given up, they are read from the
+    // file again.
+    const NAME: &[u8] = b"/tmp/dtest-out";
+    let reread = nameserver::lookup_retry(b"vfs", 20).and_then(|vfs_tid| {
+        let o = vfs::open_with(vfs_tid, NAME, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+        for i in 0..4u8 {
+            vfs::write(vfs_tid, o.handle, &[b'k' + i; 4096], i as u32 * 4096).ok()?;
+        }
+        let (slot, _) = vfs::map(vfs_tid, o.handle, false).ok()?;
+        let made = syscall::sys_object_map(slot, FILE_OUT_AT, 4, 0, 0);
+        let _ = syscall::sys_cap_delete(slot);
+        let _ = vfs::close(vfs_tid, o.handle);
+        made.ok()?;
+        let whole = |()| (0..4u8).all(|i| page_is(FILE_OUT_AT + i as usize * 4096, b'k' + i));
+        let read = whole(());
+        // Other pages given up, and their frames used again, while these
+        // are mapped: a page that is mapped is not one the cache gives up.
+        let _ = syscall::sys_page_out(OUT_AT, OUT_PAGES);
+        for page in 0..OUT_PAGES {
+            unsafe { out_word(page).write_volatile(out_what(page)) };
+        }
+        let stayed = whole(()) && out_kept(0..OUT_PAGES);
+        let free_then = syscall::sys_mem_info().0;
+        let given = syscall::sys_page_out(FILE_OUT_AT, 4) == Ok(4);
+        let freed = syscall::sys_mem_info().0 + 1 >= free_then + 4;
+        let again = whole(());
+        let _ = syscall::sys_munmap(FILE_OUT_AT, 4);
+        let _ = vfs::unlink(vfs_tid, NAME);
+        Some((read && stayed, given && freed, again))
+    });
+    check(
+        "a page of a file that is mapped stays while others are given up around it",
+        matches!(reread, Some((true, _, _))),
+    );
+    check("pages of a file mapped to read are given up when they are asked for", matches!(reread, Some((_, true, _))));
+    check("and read from the file again", matches!(reread, Some((_, _, true))));
+
+    // And the thing itself. The kernel keeps the last of memory back from
+    // programs — a hundred and twenty-eighth of it, between half a megabyte
+    // and eight — so what a program can have is what is free less that.
+    // This one wants more, by half a megabyte at most: a page written out
+    // goes through the file server to a disk, and comes back the same way.
+    let (free, _) = syscall::sys_mem_info();
+    let (room, used) = syscall::sys_swap_room();
+    println!("        {} MiB free, {} MiB to write memory out to", free / 256, room / 256);
+    let kept_back = (syscall::sys_mem_total().0 / 128).clamp(128, 2048);
+    let over = (room.saturating_sub(used) / 4).min(128);
+    // Its page tables are memory too, a page for every 512: what it asks
+    // for and those together come to what there is and that much more.
+    let want = (free.saturating_sub(kept_back) + over) * 512 / 513;
+    let mut text = [0u8; 20];
+    let pages = decimal(want, &mut text);
+    let before = syscall::sys_ticks();
+    let (out0, back0) = syscall::sys_swap_traffic();
+    let filled = run(b"dchild", &[b"fill", pages]);
+    let (out1, back1) = syscall::sys_swap_traffic();
+    println!(
+        "        {} pages written and read back in {} ms; {} written out, {} read back in",
+        want,
+        (syscall::sys_ticks() - before) * 10,
+        out1 - out0,
+        back1 - back0
+    );
+    check("a program that wants more memory than the machine has is not ended for it", filled.is_some_and(|code| code >= 0));
+    check("and every page holds what was written to it", filled == Some(0));
+    check("some of them having been written out", out1 > out0);
+    syscall::sleep_ticks(5);
+    let (free_after, _) = syscall::sys_mem_info();
+    // What is still out is other programs', which were not using it: this
+    // one, the shell that started it.
+    println!("        {} pages are out now, {} before", syscall::sys_swap_room().1, used);
+    check("and its memory is back when it has gone", free_after + 512 >= free);
+
+    let _ = syscall::sys_munmap(OUT_AT, OUT_SPAN);
+    for fd in 3..7 {
+        let _ = syscall::sys_fd_close(fd);
+    }
+}
+
 /// Turning the machine off is for whoever holds the right to, and this
 /// program does not: it asks for none in its manifest, and neither does the
 /// one it starts to try. That the checks are reached at all is most of what
@@ -6651,6 +6949,7 @@ pub extern "C" fn _start() -> ! {
         ("power", test_power),
         ("frames", test_frames),
         ("fork", test_fork),
+        ("pressure", test_pressure),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);
