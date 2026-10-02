@@ -1407,6 +1407,8 @@ pub extern "C" fn _start() -> ! {
     unsafe { QUIET = to_be_mounted };
     if to_be_mounted {
         mounts::to_be_mounted();
+        // Its `dev` is a directory on its disk. The devices are the root's.
+        devices::disable();
     }
     say!("[vfs] Started.");
 
@@ -1575,7 +1577,9 @@ pub extern "C" fn _start() -> ! {
     };
 
     if unsafe { FS_TYPE } == FsType::Ext2 {
-        ext2_dir::note_dev_dir(ext2_state());
+        if !to_be_mounted {
+            ext2_dir::note_dev_dir(ext2_state());
+        }
         if !ext2_state().read_only {
             recover_orphans();
         }

@@ -221,6 +221,16 @@ const BLOCK_ID: u64 = 0xFFFF_FD00;
 /// A directory entry's type for one.
 const DT_BLK: u8 = 6;
 
+/// Whether there is a `/dev` here at all. A filesystem mounted in another
+/// has none: its `dev` is a directory like any other on its disk, and the
+/// devices are the root's.
+static mut ENABLED: bool = true;
+
+/// This server's filesystem has no `/dev` of the server's own.
+pub fn disable() {
+    unsafe { ENABLED = false };
+}
+
 /// What a path names, as far as this module is concerned.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Lookup {
@@ -235,6 +245,9 @@ pub enum Lookup {
 /// Where `path` lands, spelled any way: repeated slashes, `.` and `..` are
 /// taken as they would be walked from the root.
 pub fn lookup(path: &[u8]) -> Lookup {
+    if !unsafe { ENABLED } {
+        return Lookup::Elsewhere;
+    }
     // The first two components that survive are all that matter: nothing
     // under /dev is a directory, so anything deeper is missing. `extra`
     // counts the components past the ones kept.

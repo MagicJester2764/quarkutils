@@ -804,6 +804,11 @@ reads a file on a mounted disk. `docs/vfs.md` has the requests.
   any program could then speak as user 0, and the root's file server ended
   when that program did. `qfuzz` sends all of them, and `dtest mounts`
   checks the refusal.
+- **A mounted filesystem's server has no `/dev`.** The devices are the
+  root server's (`devices::disable`). A file server treats `dev` at its own
+  root as theirs, and one serving a mount did too: `/mnt/dev` could not be
+  made, and installing a system into a mounted root stopped at its first
+  directory.
 - **A mounted filesystem's server has no name.** It is not registered, so
   nobody can look it up and call it: the capability for it goes from the
   program that started it to the server it is mounted in, with the request
