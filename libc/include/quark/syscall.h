@@ -28,6 +28,9 @@
    program's process id. Said, every time: it is the call's third argument. */
 #define QUARK_RAISE_BY_TASK 0UL
 #define QUARK_RAISE_BY_PID  1UL
+/* For the task named and no other: run there, and held back there, it
+   waits there. */
+#define QUARK_RAISE_THREAD  4UL
 /* Jobs. A wait can ask to hear of a child that has stopped, or been started
    again, and can name a process group of children (0 for the caller's own);
    an answer about a stop or a start has QUARK_WAIT_REPORT beside the child's
@@ -223,6 +226,10 @@
 /* Turn the machine off (0) or start it again (1): for a holder of the right
    to. It returns only if the machine is still on. In the hardware block. */
 #define SYS_POWER           119
+#define SYS_SIG_MASK        120
+#define SYS_SIG_RETURN      121
+#define SYS_SIG_STACK       122
+#define SYS_SIG_WAIT        123
 #define SYS_ABI_VERSION     240
 
 /* What the kernel returns for "no". Not an errno: each call says what it
@@ -239,17 +246,36 @@
 #define QUARK_DONTWAIT      1UL
 #define QUARK_WOULD_BLOCK   ((unsigned long)0xFFFFFFFEUL)
 
-/* What a read of a terminal, a poll or a pollset wait answers when a signal
-   this program handles arrived instead; a sleep (SYS_RECV_TIMEOUT on the
-   caller's own id) answers QUARK_SLEEP_INTERRUPTED, where 1 is the time
-   running out. The signal is collected with SYS_SIG_TAKE. */
+/* What a wait answers when a signal ended it; a sleep (SYS_RECV_TIMEOUT on
+   the caller's own id) answers QUARK_SLEEP_INTERRUPTED, where 1 is the time
+   running out. To a program that has said it wants Unix's answers
+   (QUARK_SIG_UNIX, below) it says what came of it: QUARK_INTERRUPTED, a
+   handler ran that did not ask for SA_RESTART; QUARK_RESTART, one ran that
+   did; QUARK_AGAIN, nothing ran here, and the call is made again. */
 #define QUARK_INTERRUPTED       ((unsigned long)0xFFFFFFFDUL)
+#define QUARK_RESTART           ((unsigned long)0xFFFFFFFCUL)
+#define QUARK_AGAIN             ((unsigned long)0xFFFFFFFBUL)
 #define QUARK_SLEEP_INTERRUPTED 2UL
-/* SYS_SIG_ACTION's second argument. */
+/* SYS_SIG_ACTION's second argument: what the signal does, nothing, the
+   program is told and runs a handler itself, or the kernel runs it. For
+   signal 0 with QUARK_SIG_RUN, the fifth argument is where handlers are
+   entered and the fourth has QUARK_SIG_UNIX for Unix's answers. */
 #define QUARK_SIG_DEFAULT   0UL
 #define QUARK_SIG_IGNORE    1UL
 #define QUARK_SIG_HANDLE    2UL
+#define QUARK_SIG_RUN       3UL
+#define QUARK_SIG_UNIX      1UL
 #define QUARK_SIG_ASK       ((unsigned long)-1)
+/* SYS_SIG_MASK's first argument besides SIG_BLOCK (0), SIG_UNBLOCK (1) and
+   SIG_SETMASK (2): wait under the mask given; say what is waiting and held
+   back. */
+#define QUARK_SIG_MASK_WAIT    3UL
+#define QUARK_SIG_MASK_PENDING 4UL
+/* SYS_POLL's fifth argument, for a mask to wait under in its fourth; and
+   SYS_POLLSET_WAIT's fifth, a mask with this bit — signal 9's, which is
+   never held back — set to say it is one. */
+#define QUARK_POLL_UNDER       1UL
+#define QUARK_POLLSET_UNDER    (1UL << 8)
 
 /* The system call wrappers.
  *

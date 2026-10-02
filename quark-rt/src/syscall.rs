@@ -148,6 +148,10 @@ pub const SYS_GETRANDOM: u64 = 116;
 pub const SYS_CPUS: u64 = 117;
 pub const SYS_MSI_ALLOC: u64 = 118;
 pub const SYS_POWER: u64 = 119;
+pub const SYS_SIG_MASK: u64 = 120;
+pub const SYS_SIG_RETURN: u64 = 121;
+pub const SYS_SIG_STACK: u64 = 122;
+pub const SYS_SIG_WAIT: u64 = 123;
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
@@ -1639,6 +1643,9 @@ pub const SIGSTOP: u64 = 19;
 pub const SIGTSTP: u64 = 20;
 pub const SIGTTIN: u64 = 21;
 pub const SIGTTOU: u64 = 22;
+/// A terminal's size has changed: for whoever is in front of it, and
+/// nothing to a program that has not asked.
+pub const SIGWINCH: u64 = 28;
 
 /// What a program does about a signal: what the signal does, nothing, or run
 /// a handler of its own.
@@ -1666,6 +1673,109 @@ pub fn sys_sig_action(signo: u64, what: u64) -> Result<u64, ()> {
 /// What this program does about `signo`, left as it is.
 pub fn sys_sig_action_get(signo: u64) -> Result<u64, ()> {
     sys_sig_action(signo, u64::MAX)
+}
+
+/// What [`sys_sig_action`] answers for a signal with a handler the kernel
+/// runs ([`sys_sig_handle`]).
+pub const SIG_RUN: u64 = 3;
+/// How such a handler is run: with its own signal not held back; once,
+/// after which the signal is as if nothing had been said; on the stack the
+/// task named for the purpose ([`sys_sig_stack`]).
+pub const SIG_NODEFER: u64 = 1;
+pub const SIG_RESETHAND: u64 = 2;
+pub const SIG_ONSTACK: u64 = 4;
+/// And what it cuts short is to be made again: a program that said it
+/// wants Unix's answers ([`sys_sig_enter_at`]) is answered [`RESTART`].
+pub const SIG_RESTARTS: u64 = 8;
+
+/// What a call a signal cut short answers a program that has said it wants
+/// to know, besides [`INTERRUPTED`]: a handler ran that asked for the call to
+/// be made again; or nothing was run here, and the call is simply made
+/// again.
+pub const RESTART: u64 = 0xFFFF_FFFC;
+pub const AGAIN: u64 = 0xFFFF_FFFB;
+
+/// Raise `signo` for task `tid` and no other: its handler runs there, and
+/// while that task holds it back it waits there.
+pub fn sys_sig_raise_thread(tid: usize, signo: u64) -> Result<(), ()> {
+    let ret = unsafe { syscall3(SYS_SIG_RAISE, tid as u64, signo, 4) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// What is waiting for this task that it holds back, as a set.
+pub fn sys_sig_pending() -> u64 {
+    unsafe { syscall2(SYS_SIG_MASK, 4, 0) }
+}
+
+/// Take one of `set` that is waiting, or that arrives within `span` (ticks,
+/// or nanoseconds with the top bit set; 0 not to wait, `u64::MAX` for ever),
+/// without its handler running: the signal and who raised it — a process id
+/// with the top bit set when it was a program. `None` if the time ran out;
+/// `Err` if another signal's handler ended the wait.
+pub fn sys_sig_wait_for(set: u64, span: u64) -> Result<Option<(u64, u64)>, ()> {
+    let mut who = 0u64;
+    match unsafe { syscall3(SYS_SIG_WAIT, set, span, &mut who as *mut u64 as u64) } {
+        0 => Ok(None),
+        n if n <= 64 => Ok(Some((n, who))),
+        _ => Err(()),
+    }
+}
+
+/// Have the kernel run a handler for `signo`: when the signal is raised, a
+/// task of this program that is not holding it back is turned aside on its
+/// way out of the kernel — within a tick, whatever it was doing — and goes
+/// on where [`sys_sig_enter_at`] said, with RDI pointing at a record of
+/// where it was (`signal::Frame`), which it gives to `SYS_SIG_RETURN` when it
+/// has done. `mask` is held back besides the signal itself while that runs;
+/// `flags` says how it is run in its low byte and is the program's own
+/// above it, handed back in the frame; and so is `cookie`, the program's
+/// word for which handler this is. Answers with what the program said about
+/// the signal before.
+///
+/// `signal::handle` is this with the entry and the return written.
+pub fn sys_sig_handle(signo: u64, mask: u64, flags: u64, cookie: u64) -> Result<u64, ()> {
+    let ret = unsafe { syscall5(SYS_SIG_ACTION, signo, SIG_RUN, mask, flags, cookie) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret) }
+}
+
+/// Say where this program's handlers are entered — one place for every
+/// signal — and, with `unix`, that a call a signal cuts short is to answer
+/// as Unix would have it ([`RESTART`], [`AGAIN`]).
+pub fn sys_sig_enter_at(entry: usize, unix: bool) -> Result<(), ()> {
+    let ret = unsafe { syscall5(SYS_SIG_ACTION, 0, SIG_RUN, 0, unix as u64, entry as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// What [`sys_sig_mask`] is asked to do with the signals it is given.
+pub const SIG_BLOCK: u64 = 0;
+pub const SIG_UNBLOCK: u64 = 1;
+pub const SIG_SETMASK: u64 = 2;
+
+/// Change which signals the calling task holds back — bit `n - 1` for
+/// signal `n` — and learn which it held back before. A signal held back by
+/// every task of a program waits, whatever it would have done; it is this
+/// task's own, a new thread begins with its maker's, a forked child with
+/// its parent's, and `exec` keeps it.
+pub fn sys_sig_mask(how: u64, set: u64) -> u64 {
+    unsafe { syscall2(SYS_SIG_MASK, how, set) }
+}
+
+/// What the calling task holds back.
+pub fn sys_sig_mask_get() -> u64 {
+    unsafe { syscall2(SYS_SIG_MASK, u64::MAX, 0) }
+}
+
+/// Hold back exactly `set` and wait for a signal that is then not held
+/// back; what was held back before is again when the wait is over.
+pub fn sys_sig_wait(set: u64) {
+    let _ = unsafe { syscall2(SYS_SIG_MASK, 3, set) };
+}
+
+/// Name a stack for handlers that ask to be run on one (`SIG_ONSTACK`):
+/// `size` bytes from `base`, or none with a size of 0. The calling task's.
+pub fn sys_sig_stack(base: usize, size: usize) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_SIG_STACK, base as u64, size as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
 /// Raise `signo` for the program `tid` is a task of. `signo` 0 raises
@@ -2288,7 +2398,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 19;
+pub const ABI_VERSION_MINOR: u32 = 20;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
