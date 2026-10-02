@@ -97,6 +97,95 @@ pub fn split<'a>(
     Ok(n)
 }
 
+/// Where a command's input comes from and its output goes, when it is not
+/// where the shell's does. The names are as they were typed, quotes and all:
+/// [`split`] each to have the word.
+#[derive(Clone, Copy, Default)]
+pub struct Redirects<'a> {
+    /// `< FILE`
+    pub input: Option<&'a [u8]>,
+    /// `> FILE`, or `>> FILE`
+    pub output: Option<&'a [u8]>,
+    /// Whether the output is added to what the file has.
+    pub append: bool,
+}
+
+/// Take the redirections out of a command: `< FILE`, `> FILE` and `>> FILE`,
+/// outside quotes, wherever in it they are. What is left is copied to
+/// `rest`; how long that is, and what was asked for.
+pub fn redirects<'a>(line: &'a [u8], rest: &mut [u8; STORE]) -> Result<(usize, Redirects<'a>), &'static str> {
+    let mut found = Redirects::default();
+    let mut len = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < line.len() {
+        let c = line[i];
+        match quote {
+            Some(b'"') if c == b'\\' && i + 1 < line.len() => {
+                // The pair is copied whole, and the second is not a quote.
+                if len + 2 > STORE {
+                    return Err("line too long");
+                }
+                rest[len] = c;
+                rest[len + 1] = line[i + 1];
+                len += 2;
+                i += 2;
+                continue;
+            }
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'>' || c == b'<' => {
+                let append = c == b'>' && line.get(i + 1) == Some(&b'>');
+                i += if append { 2 } else { 1 };
+                while line.get(i) == Some(&b' ') {
+                    i += 1;
+                }
+                // The name: up to a space, or another redirection, outside
+                // quotes.
+                let start = i;
+                let mut q: Option<u8> = None;
+                while i < line.len() {
+                    match (q, line[i]) {
+                        (Some(b'"'), b'\\') => i += 1,
+                        (Some(open), ch) if ch == open => q = None,
+                        (Some(_), _) => {}
+                        (None, b'"' | b'\'') => q = Some(line[i]),
+                        (None, b' ' | b'>' | b'<') => break,
+                        (None, _) => {}
+                    }
+                    i += 1;
+                }
+                let name = &line[start..i.min(line.len())];
+                if name.is_empty() {
+                    return Err("a redirection wants a file to go to");
+                }
+                if c == b'<' {
+                    found.input = Some(name);
+                } else {
+                    found.output = Some(name);
+                    found.append = append;
+                }
+                // A space where it was, so that what was either side of it
+                // is still two words.
+                if len < STORE {
+                    rest[len] = b' ';
+                    len += 1;
+                }
+                continue;
+            }
+            None => {}
+        }
+        if len >= STORE {
+            return Err("line too long");
+        }
+        rest[len] = c;
+        len += 1;
+        i += 1;
+    }
+    Ok((len, found))
+}
+
 /// Split `line` into the stages of a pipeline, at every `|` outside quotes.
 /// Returns how many there are, or `None` if there are more than `out` holds.
 pub fn stages<'a>(line: &'a [u8], out: &mut [&'a [u8]]) -> Option<usize> {

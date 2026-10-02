@@ -20,7 +20,7 @@ pub extern "C" fn _start() -> ! {
         Ok(h) => h,
         Err(e) => {
             if let Ok(s) = core::str::from_utf8(path) {
-                println!("ls: cannot open '{}': error {}", s, e);
+                println!("ls: {}: {}", s, vfs::why(e));
             }
             syscall::sys_exit_code(1);
         }

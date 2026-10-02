@@ -56,9 +56,9 @@ pub extern "C" fn _start() -> ! {
 
         let (handle, size, is_dir) = match vfs::open(vfs_tid, path) {
             Ok(h) => h,
-            Err(_) => {
+            Err(code) => {
                 if let Ok(s) = core::str::from_utf8(path) {
-                    println!("cat: {}: not found", s);
+                    println!("cat: {}: {}", s, vfs::why(code));
                 }
                 failed = true;
                 continue;

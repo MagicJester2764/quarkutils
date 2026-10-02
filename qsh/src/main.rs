@@ -268,13 +268,58 @@ fn is_builtin(cmd: &[u8]) -> bool {
 const NOT_RUN: i32 = 127;
 
 /// Run one command to completion. Returns its exit status.
-fn cmd_exec(argv: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
-    let info = match cmd_spawn(argv, vfs_tid, true, true) {
+/// The one word a redirection names, unquoted.
+fn file_named<'a>(typed: &[u8], store: &'a mut [u8; words::STORE]) -> Option<&'a [u8]> {
+    let mut one: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
+    match words::split(typed, store, &mut one) {
+        Ok(1) => Some(one[0]),
+        _ => None,
+    }
+}
+
+/// Open the file a redirection names and put it where the child reads or
+/// writes. The descriptor is the child's alone: the shell's copy is closed.
+fn redirect_to(vfs_tid: usize, child: usize, fd: usize, typed: &[u8], flags: u64) -> bool {
+    let mut store = [0u8; words::STORE];
+    let Some(path) = file_named(typed, &mut store) else {
+        println!("qsh: a redirection wants one file to go to");
+        return false;
+    };
+    match vfs::open_fd(vfs_tid, path, flags, 0o644) {
+        Ok(opened) => {
+            let given = syscall::sys_fd_dup(child, fd, opened).is_ok();
+            let _ = syscall::sys_fd_close(opened);
+            if !given {
+                println!("qsh: {}: could not be handed over", core::str::from_utf8(path).unwrap_or("?"));
+            }
+            given
+        }
+        Err(code) => {
+            println!("qsh: {}: {}", core::str::from_utf8(path).unwrap_or("?"), vfs::why(code));
+            false
+        }
+    }
+}
+
+fn cmd_exec(argv: &[&[u8]], vfs_tid: usize, input_tid: usize, redirect: &words::Redirects) -> i32 {
+    let info = match cmd_spawn(argv, vfs_tid, redirect.input.is_none(), redirect.output.is_none()) {
         Some(i) => i,
         None => return NOT_RUN,
     };
+    // `< FILE` and `> FILE`: opened by the shell, as whoever is typing, and
+    // given to the program in place of the terminal.
+    let wired = redirect.input.is_none_or(|file| redirect_to(vfs_tid, info.tid, 0, file, vfs::OPEN_READ))
+        && redirect.output.is_none_or(|file| {
+            let how = if redirect.append { vfs::OPEN_APPEND } else { vfs::OPEN_TRUNCATE };
+            redirect_to(vfs_tid, info.tid, 1, file, vfs::OPEN_WRITE | vfs::OPEN_CREATE | how)
+        });
+    if !wired {
+        info.discard();
+        return NOT_RUN;
+    }
     if info.start().is_err() {
         println!("shell: failed to start task");
+        info.discard();
         return NOT_RUN;
     }
 
@@ -327,9 +372,23 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     let mut spawned = 0;
 
     for i in 0..n {
+        // The first stage may be given a file to read and the last a file
+        // to write; anywhere else the pipe is what is read and written.
+        let mut rest = [0u8; words::STORE];
+        let (rest_len, redirect) = match words::redirects(stages[i], &mut rest) {
+            Ok(found) => found,
+            Err(why) => {
+                println!("qsh: {}", why);
+                break;
+            }
+        };
+        if (redirect.input.is_some() && i > 0) || (redirect.output.is_some() && i + 1 < n) {
+            println!("qsh: only the first of a pipeline reads a file, and only the last writes one");
+            break;
+        }
         let mut store = [0u8; words::STORE];
         let mut argv: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
-        let argc = match words::split(stages[i], &mut store, &mut argv) {
+        let argc = match words::split(&rest[..rest_len], &mut store, &mut argv) {
             Ok(argc) => argc,
             Err(why) => {
                 println!("qsh: {}", why);
@@ -348,10 +407,21 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
             break;
         }
 
-        let info = match cmd_spawn(&argv[..argc], vfs_tid, i == 0, i + 1 == n) {
+        let from_shell = i == 0 && redirect.input.is_none();
+        let to_shell = i + 1 == n && redirect.output.is_none();
+        let info = match cmd_spawn(&argv[..argc], vfs_tid, from_shell, to_shell) {
             Some(v) => v,
             None => break,
         };
+        let wired = redirect.input.is_none_or(|file| redirect_to(vfs_tid, info.tid, 0, file, vfs::OPEN_READ))
+            && redirect.output.is_none_or(|file| {
+                let how = if redirect.append { vfs::OPEN_APPEND } else { vfs::OPEN_TRUNCATE };
+                redirect_to(vfs_tid, info.tid, 1, file, vfs::OPEN_WRITE | vfs::OPEN_CREATE | how)
+            });
+        if !wired {
+            info.discard();
+            break;
+        }
 
         // Reading end from the previous stage, writing end to the next. The
         // ends replace the stdin/stdout cmd_spawn duplicated from the shell.
@@ -369,8 +439,8 @@ fn cmd_pipeline(stages: &[&[u8]], vfs_tid: usize, input_tid: usize) -> i32 {
     // A stage that never loaded leaves the pipeline unrunnable; tear down the
     // tasks already created rather than leaking their slots.
     if spawned != n {
-        for i in 0..spawned {
-            let _ = syscall::sys_task_kill(infos[i].tid);
+        for info in infos.into_iter().take(spawned) {
+            info.discard();
         }
         return NOT_RUN;
     }
@@ -453,10 +523,12 @@ fn set_status(name: &[u8], code: i32) {
 static mut HOME: [u8; 64] = [0; 64];
 static mut HOME_LEN: usize = 0;
 
-/// Remember the home directory: argv[1], which login passes, or /home/root.
+/// Remember the home directory: argv[1], which login passes, or — for a
+/// shell started to run one command, or started in `.` — wherever it is.
 fn home_init() {
     let home = match args::argv(1) {
         Some(h) if h.first() == Some(&b'/') && h.len() <= 64 => h,
+        Some(b"-c") | Some(b".") => b"." as &[u8],
         _ => b"/home/root" as &[u8],
     };
     unsafe {
@@ -535,13 +607,39 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
     };
-    // Start at home; if it is not there, wherever the shell was put.
-    if let Err(code) = vfs::chdir(vfs_tid, home_get()) {
+    // Start at home; if it is not there, wherever the shell was put. A
+    // shell told to stay where it is has nowhere to go — and is not told
+    // that it may not go there, which is what `su USER -c ...` typed in a
+    // directory USER may not enter used to begin by saying.
+    if home_get() == b"." {
+        let mut here = [0u8; 64];
+        if let Ok(len) = vfs::getcwd(vfs_tid, &mut here) {
+            unsafe {
+                HOME[..len].copy_from_slice(&here[..len]);
+                HOME_LEN = len;
+            }
+        }
+    } else if let Err(code) = vfs::chdir(vfs_tid, home_get()) {
         let shown = core::str::from_utf8(home_get()).unwrap_or("?");
         println!("shell: {}: {}", shown, dir_error(code));
     }
 
     let input_tid = nameserver::lookup(b"input").unwrap_or(0);
+
+    // `qsh -c LINE`: one line, run as if it had been typed, and this ends
+    // with what it ended with. What `su -c` hands a shell.
+    if args::argv(1) == Some(&b"-c"[..]) {
+        match args::argv(2) {
+            Some(line) => {
+                run_line(line, vfs_tid, input_tid);
+                syscall::sys_exit_code(unsafe { LAST_STATUS });
+            }
+            None => {
+                println!("usage: qsh -c LINE");
+                syscall::sys_exit_code(2);
+            }
+        }
+    }
     // On a terminal, a read of nothing is the end: Ctrl-D was typed at the
     // prompt, or the terminal has gone. From the input server it is a line
     // that was interrupted, and the next read is the next line.
@@ -614,89 +712,110 @@ pub extern "C" fn _start() -> ! {
         }
         let line = &line[start..];
 
-        // Pipeline: split on '|' before anything else, since the first word of
-        // `a | b` is a stage command rather than a builtin. A quoted bar is
-        // not a pipe.
-        let mut stages: [&[u8]; MAX_STAGES + 1] = [b""; MAX_STAGES + 1];
-        let Some(nstages) = words::stages(line, &mut stages).filter(|&n| n <= MAX_STAGES) else {
-            println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
-            continue;
-        };
-        if nstages > 1 {
-            let code = cmd_pipeline(&stages[..nstages], vfs_tid, input_tid);
-            set_status(b"pipeline", code);
-            continue;
-        }
-
-        let mut store = [0u8; words::STORE];
-        let mut argv: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
-        let argc = match words::split(line, &mut store, &mut argv) {
-            Ok(n) => n,
-            Err(why) => {
-                println!("qsh: {}", why);
-                continue;
-            }
-        };
-        if argc == 0 {
-            continue;
-        }
-        let argv = &argv[..argc];
-        let cmd = argv[0];
-        let args = &argv[1..];
-
-        // Builtin: exit
-        if cmd == b"exit" {
-            syscall::sys_exit();
-        }
-
-        // Builtin: cd
-        if cmd == b"cd" {
-            cmd_cd(args.first().copied(), vfs_tid);
-            continue;
-        }
-
-        // Builtin: pwd
-        if cmd == b"pwd" {
-            let mut buf = [0u8; vfs::MAX_PATH + 1];
-            match vfs::getcwd(vfs_tid, &mut buf) {
-                Ok(len) => println!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?")),
-                Err(_) => println!("pwd: the directory has been removed"),
-            }
-            continue;
-        }
-
-        // Builtin: status
-        if cmd == b"status" {
-            println!("{}", unsafe { LAST_STATUS });
-            continue;
-        }
-
-        // Builtin: kill [-9] <tid>
-        if cmd == b"kill" {
-            let (sig, tid_arg) = match args {
-                [b"-9", tid] => (syscall::SIG_KILL, *tid),
-                [tid] => (syscall::SIG_TERM, *tid),
-                _ => {
-                    println!("usage: kill [-9] <tid>");
-                    continue;
-                }
-            };
-            match parse_usize(tid_arg) {
-                Some(tid) => {
-                    if syscall::sys_signal(tid, sig).is_err() {
-                        println!("kill: failed to signal task {}", tid);
-                    }
-                }
-                None => println!("usage: kill [-9] <tid>"),
-            }
-            continue;
-        }
-
-        // External command. Relative paths in its arguments are its own
-        // business: it starts in the shell's directory.
-        let code = cmd_exec(argv, vfs_tid, input_tid);
-        set_status(cmd, code);
+        run_line(line, vfs_tid, input_tid);
     }
+}
+
+/// Run one line: a command, or a pipeline of them.
+fn run_line(line: &[u8], vfs_tid: usize, input_tid: usize) {
+    // Pipeline: split on '|' before anything else, since the first word of
+    // `a | b` is a stage command rather than a builtin. A quoted bar is
+    // not a pipe.
+    let mut stages: [&[u8]; MAX_STAGES + 1] = [b""; MAX_STAGES + 1];
+    let Some(nstages) = words::stages(line, &mut stages).filter(|&n| n <= MAX_STAGES) else {
+        println!("shell: pipeline too long (max {} stages)", MAX_STAGES);
+        return;
+    };
+    if nstages > 1 {
+        let code = cmd_pipeline(&stages[..nstages], vfs_tid, input_tid);
+        set_status(b"pipeline", code);
+        return;
+    }
+
+    // Where its input comes from and its output goes, taken out of the
+    // line before it is split into words.
+    let mut rest = [0u8; words::STORE];
+    let (rest_len, redirect) = match words::redirects(line, &mut rest) {
+        Ok(found) => found,
+        Err(why) => {
+            println!("qsh: {}", why);
+            return;
+        }
+    };
+    let line = &rest[..rest_len];
+
+    let mut store = [0u8; words::STORE];
+    let mut argv: [&[u8]; words::MAX_WORDS] = [b""; words::MAX_WORDS];
+    let argc = match words::split(line, &mut store, &mut argv) {
+        Ok(n) => n,
+        Err(why) => {
+            println!("qsh: {}", why);
+            return;
+        }
+    };
+    if argc == 0 {
+        return;
+    }
+    let argv = &argv[..argc];
+    let cmd = argv[0];
+    let args = &argv[1..];
+    if is_builtin(cmd) && (redirect.input.is_some() || redirect.output.is_some()) {
+        println!("qsh: {}: what the shell does itself has no output to send anywhere", core::str::from_utf8(cmd).unwrap_or("?"));
+        return;
+    }
+
+    // Builtin: exit
+    if cmd == b"exit" {
+        syscall::sys_exit();
+    }
+
+    // Builtin: cd
+    if cmd == b"cd" {
+        cmd_cd(args.first().copied(), vfs_tid);
+        return;
+    }
+
+    // Builtin: pwd
+    if cmd == b"pwd" {
+        let mut buf = [0u8; vfs::MAX_PATH + 1];
+        match vfs::getcwd(vfs_tid, &mut buf) {
+            Ok(len) => println!("{}", core::str::from_utf8(&buf[..len]).unwrap_or("?")),
+            Err(_) => println!("pwd: the directory has been removed"),
+        }
+        return;
+    }
+
+    // Builtin: status
+    if cmd == b"status" {
+        println!("{}", unsafe { LAST_STATUS });
+        return;
+    }
+
+    // Builtin: kill [-9] <tid>
+    if cmd == b"kill" {
+        let (sig, tid_arg) = match args {
+            [b"-9", tid] => (syscall::SIG_KILL, *tid),
+            [tid] => (syscall::SIG_TERM, *tid),
+            _ => {
+                println!("usage: kill [-9] <tid>");
+                return;
+            }
+        };
+        match parse_usize(tid_arg) {
+            Some(tid) => {
+                if syscall::sys_signal(tid, sig).is_err() {
+                    println!("kill: failed to signal task {}", tid);
+                }
+            }
+            None => println!("usage: kill [-9] <tid>"),
+        }
+        return;
+    }
+
+    // External command. Relative paths in its arguments are its own
+    // business: it starts in the shell's directory.
+    let code = cmd_exec(argv, vfs_tid, input_tid, &redirect);
+    set_status(cmd, code);
 }
 
 fn parse_usize(s: &[u8]) -> Option<usize> {

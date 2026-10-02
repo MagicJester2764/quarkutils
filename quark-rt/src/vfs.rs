@@ -316,6 +316,31 @@ pub fn seek(vfs_tid: usize, fd: usize, offset: i64, whence: u64) -> Result<u64, 
         .map(|r| r.data[0])
 }
 
+/// What a refusal means, to somebody reading it: the words a program puts
+/// after a path. "Not found" for everything is how a file somebody may not
+/// read came to look like a file that is not there.
+pub fn why(code: u64) -> &'static str {
+    match code {
+        ERR_NOT_FOUND => "no such file or directory",
+        ERR_PERMISSION => "permission denied",
+        ERR_NOT_DIR => "not a directory",
+        ERR_IS_DIR => "is a directory",
+        ERR_EXISTS => "it is there already",
+        ERR_NOT_EMPTY => "the directory is not empty",
+        ERR_READ_ONLY => "the filesystem cannot be written",
+        ERR_NO_SPACE => "no room left on the filesystem",
+        ERR_NAME_TOO_LONG => "the name is too long",
+        ERR_LOOP => "too many symbolic links",
+        ERR_TOO_MANY_OPEN => "too many files are open",
+        ERR_BUSY => "it is in use",
+        ERR_CROSS_DEVICE => "that is on another filesystem",
+        ERR_NOT_SUPPORTED => "that cannot be done to it",
+        ERR_INVALID_PATH => "that is not a name a file can have",
+        ERR_IO => "the disk could not be read or written",
+        _ => "the file server refused",
+    }
+}
+
 /// Change a file's mode, owner or times. `which` is a set of `ATTR_*` saying
 /// which of the rest are meant.
 pub fn set_attr(
