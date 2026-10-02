@@ -173,7 +173,13 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
-the part about what a second processor changes, and passes on one. `runtests <list>` runs the
+the part about what a second processor changes, and passes on one. `dtest
+msi` is about a device that interrupts by message, and needs one: QEMU's
+`edu` (`-device edu`, which a distribution that ships `dtest` gives the
+machines it tests on) and its driver running (`start /usr/bin/edu` in
+`/etc/init.conf`): seven checks more. Without them it says so and checks
+nothing.
+`runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service.
 
@@ -232,8 +238,14 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   when the request names it: handles are global numbers.
 - **No task holds a `PhysRange` wider than one device.** init is started with
   the framebuffer and its boot modules, `fb` holds the framebuffer and lends it
-  on, and no driver holds any. `dtest physical` walks every CSpace and fails
-  otherwise.
+  on, and a driver holds the registers of its own device and nothing else.
+  `dtest physical` walks every CSpace and fails otherwise. A driver's range
+  is one it minted for itself, from the right to *device memory*
+  (`CapReq::device_memory()`, the kernel's `DeviceMemory`): the firmware
+  chooses where a device is, so only its driver, reading the device's
+  configuration, knows what to ask for. That right is one for every device
+  — as the I/O ports are — and reaches no memory: `dtest msi` has a driver
+  ask for the kernel's and for an interrupt controller's, and be refused.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init`. A spawner mints

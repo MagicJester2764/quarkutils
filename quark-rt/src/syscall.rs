@@ -146,6 +146,7 @@ pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
 pub const SYS_GETRANDOM: u64 = 116;
 pub const SYS_CPUS: u64 = 117;
+pub const SYS_MSI_ALLOC: u64 = 118;
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
@@ -864,6 +865,35 @@ pub fn sys_irq_register(irq: u8) -> Result<(), ()> {
 
 pub fn sys_irq_ack(irq: u8) {
     unsafe { syscall1(SYS_IRQ_ACK, irq as u64) };
+}
+
+/// An interrupt of a driver's own, for a device that sends its interrupts
+/// as messages (MSI): the number the kernel will tell the driver of it by,
+/// and what to program the device with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msi {
+    /// The interrupt's number, 16 or above: the tag of the kernel's
+    /// message, as a line's number is.
+    pub irq: u8,
+    /// The lower half of the address the device sends to. The upper is 0.
+    pub address: u32,
+    /// What it sends.
+    pub data: u16,
+}
+
+/// Ask for an interrupt of this task's own. It is registered for it from
+/// now on, as [`sys_irq_register`] registers a task for a line, until it
+/// ends; there is nothing to acknowledge.
+///
+/// Needs the capability for any interrupt, and a machine whose processors
+/// have local APICs — a message is sent to one. `Err` otherwise, or when
+/// the thirty-two there are have all been given out.
+pub fn sys_msi_alloc() -> Result<Msi, ()> {
+    let ret = unsafe { syscall0(SYS_MSI_ALLOC) };
+    if ret == u64::MAX {
+        return Err(());
+    }
+    Ok(Msi { irq: (ret >> 48) as u8, data: (ret >> 32) as u16, address: ret as u32 })
 }
 
 pub fn sys_map_phys(phys: usize, virt: usize, pages: usize) -> Result<(), ()> {
@@ -1914,6 +1944,10 @@ pub const CAP_TYPE_SET_UID: u64 = 6;
 /// of its endpoint, which no other task will ever have.
 pub const CAP_TYPE_ENDPOINT: u64 = 8;
 pub const CAP_TYPE_MEMOBJECT: u64 = 9;
+/// The right to map the registers of the machine's devices: its holder may
+/// mint a `PhysRange` over any range that lies wholly in device memory —
+/// the addresses the firmware's memory map leaves out — and map with that.
+pub const CAP_TYPE_DEVICE_MEMORY: u64 = 10;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -2041,7 +2075,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 13;
+pub const ABI_VERSION_MINOR: u32 = 14;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

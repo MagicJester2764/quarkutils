@@ -5285,6 +5285,56 @@ fn test_smp() {
     check("two threads calling one server at once are each answered, every time", both == Some(true));
 }
 
+/// A device that interrupts by sending a message, and the driver it takes:
+/// what a driver is given to reach a device with. The driver is `edu`, for
+/// the device of that name QEMU has; a distribution starts it, and on a
+/// machine with no such device there is nothing here to check.
+fn test_msi() {
+    use quark_rt::ipc::Message;
+    println!("a device's own interrupt:");
+    let Some(edu) = nameserver::lookup_retry(b"edu", 2) else {
+        println!("        no driver for a device that interrupts by message is running: not checked");
+        return;
+    };
+    let ask2 = |tag: u64, with: u64, and: u64| {
+        let mut reply = Message::empty();
+        let msg = Message { sender: 0, tag, data: [with, and, 0, 0, 0, 0] };
+        (syscall::sys_call(edu, &msg, &mut reply).is_ok() && reply.tag == 0).then_some(reply.data)
+    };
+    let ask = |tag: u64, with: u64| ask2(tag, with, 0);
+    let who = ask(1, 0);
+    check(
+        "a driver with the right to device memory maps its device's registers, and they answer",
+        matches!(who, Some(d) if d[0] & 0xFF == 0xED && d[1] == 1),
+    );
+    // That right reaches where devices are and nowhere else. The driver is
+    // asked to try: memory, where the kernel is; a processor's interrupt
+    // controller, which is among the devices' addresses and is nobody's to
+    // map; and a range that begins among devices and ends in that.
+    let may = |from: u64, to: u64| ask2(3, from, to).map(|d| d[0] == 1);
+    check("which is not a right to memory: the kernel's is refused", may(0x10_0000, 0x10_1000) == Some(false));
+    check(
+        "nor to an interrupt controller's registers, nor to a range that runs into them",
+        may(0xFEE0_0000, 0xFEE0_1000) == Some(false) && may(0xFEDF_F000, 0xFEE0_1000) == Some(false),
+    );
+    // And it is the driver's because it was given it. This program was not.
+    const TRIAL_SLOT: usize = 49;
+    let here = syscall::sys_cap_mint(TRIAL_SLOT, syscall::CAP_TYPE_PHYS_RANGE, 0xFEDF_0000, 0xFEDF_1000);
+    let _ = syscall::sys_cap_delete(TRIAL_SLOT);
+    check("a program without it is given no range at all", here.is_err());
+    check(
+        "and is given an interrupt that is the device's alone",
+        matches!(who, Some(d) if d[2] >= 16 && d[3] == 1),
+    );
+    let first = ask(2, 0x0000_0001);
+    check(
+        "a message the device sends arrives as that interrupt",
+        matches!((who, first), (Some(w), Some(d)) if d[0] == 1 && d[1] == 1 && d[2] == w[2]),
+    );
+    let again = (2..5u64).filter(|&n| matches!(ask(2, 1 << n), Some(d) if d[0] == 1 && d[1] == 1 << n)).count();
+    check("and every time it sends one", again == 3);
+}
+
 /// The word a thread asks to have cleared when it ends, as every thread a C
 /// library makes does: 1 while the thread is there.
 static JOIN_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -5441,6 +5491,7 @@ pub extern "C" fn _start() -> ! {
         ("flags", test_flags),
         ("wire", test_wire),
         ("threads", test_threads),
+        ("msi", test_msi),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);

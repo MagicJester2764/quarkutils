@@ -74,6 +74,18 @@ impl CapReq {
         CapReq { cap_type: syscall::CAP_TYPE_PHYS_RANGE, param0: start, param1: end }
     }
 
+    /// The registers of the machine's devices. Which address a device is at
+    /// is the firmware's choice and known only when the machine is running,
+    /// so a driver cannot ask for its device's by number as it can a port:
+    /// it asks for the right to map where devices are, reads its own
+    /// device's address out of the device's configuration, and mints a
+    /// range for exactly that (`sys_cap_mint` with `CAP_TYPE_PHYS_RANGE`).
+    /// Only `init` is started holding it, so only what `init` starts can be
+    /// given it.
+    pub const fn device_memory() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_DEVICE_MEMORY, param0: 0, param1: 0 }
+    }
+
     /// Permission to allocate physical frames, up to `max_pages` (0 = no cap).
     pub const fn phys_alloc(max_pages: u64) -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_PHYS_ALLOC, param0: max_pages, param1: 0 }

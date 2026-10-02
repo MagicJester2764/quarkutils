@@ -28,6 +28,9 @@ disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
 mount/  umount/     A filesystem put at a directory, by starting a file server for it.
 net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
+edu/                QEMU's teaching device: the smallest driver there is for
+                    a device whose registers are memory and whose interrupt
+                    is a message. Started by a `start` line in init.conf.
 
 fb/                 The framebuffer device: owns the display, decides who draws.
 qtty/               The text console. What the machine boots into, and to
@@ -53,7 +56,8 @@ useradd/ userdel/ groupadd/ gpasswd/ id/
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/   Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     686 checks of the kernel, made through the ABI.
+dtest/  dchild/     686 checks of the kernel, made through the ABI, and
+                    seven more on a machine with a device to ask `edu` about.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
