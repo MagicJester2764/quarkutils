@@ -556,7 +556,12 @@ fn test_callee_gone() {
 /// anybody types.
 fn test_discard() {
     println!("a child that is not started:");
-    let before = (2..64).filter(|&t| syscall::sys_task_info(t).is_ok()).count();
+    // This program's own children, and nobody else's: what else is running
+    // on the machine comes and goes as it likes, and a program that ended
+    // while these were counted made one fewer of "all the tasks there are".
+    let me = syscall::sys_getpid() as usize;
+    let mine = || (2..64).filter(|&t| matches!(syscall::sys_task_info(t), Ok((_, parent, _)) if parent == me)).count();
+    let before = mine();
     let mut all = true;
     for _ in 0..80 {
         match load_child(&[b"dchild", b"quit"]) {
