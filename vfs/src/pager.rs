@@ -259,6 +259,22 @@ pub fn idle(inode_num: u32, id: u64) {
     }
 }
 
+/// TAG_OBJECT_CLEAN: memory is short. Whatever was written through a
+/// mapping and is mapped no longer goes to its file now, so that the kernel
+/// can give the page up; what is still mapped to be written stays dirty,
+/// and stays.
+pub fn clean() {
+    if ext2_state().read_only {
+        return;
+    }
+    let mapped: [Option<Mapped>; MAX_MAPPED] = *table();
+    for m in mapped.into_iter().flatten() {
+        if let Err(code) = write_back(m.inode, m.id) {
+            quark_rt::println!("[vfs] could not write back inode {} ({})", m.inode, code);
+        }
+    }
+}
+
 /// `CLIENT_BUF` holds `len` bytes of `inode` read from the disk at `offset`.
 /// Any of it a mapping has cached is newer: copy that over it.
 pub fn read_through(inode: u32, offset: u64, len: usize) {

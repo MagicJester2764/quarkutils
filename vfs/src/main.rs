@@ -1818,6 +1818,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         quark_rt::ipc::TAG_OBJECT_IDLE if sender == 0 => {
             transacted(|| pager::idle(msg.data[0] as u32, msg.data[1]))
         }
+        quark_rt::ipc::TAG_OBJECT_CLEAN if sender == 0 => transacted(pager::clean),
         TAG_TRUNCATE => transacted(|| handle_truncate(disk, sender, msg)),
         TAG_STATFS => handle_statfs(sender),
         // Everything said to have been written is on the disk when this is
