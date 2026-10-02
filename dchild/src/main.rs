@@ -19,7 +19,12 @@
 //! until that closes; `lock2 PATH` locks byte 1, says so, waits for byte 0,
 //! and says so again once it has it. `unlinked PATH` makes a file, removes it
 //! while holding it open, and waits for ever: stopping the machine then is a
-//! crash with an orphan on the disk. `hog` reserves four gigabytes and
+//! crash with an orphan on the disk. `crashed DIR` leaves that orphan in DIR
+//! and beside it a file of a known pattern, synced, and says so; with
+//! `writing` after it, it then changes the directory for as long as it is
+//! let — files written and cut short, renamed, removed, directories made
+//! and taken away — so that the machine is stopped with a change half
+//! recorded. `hog` reserves four gigabytes and
 //! touches them until something stops it. `mapwrite PATH` maps a file shared,
 //! writes into it, and exits without asking for it to be written back.
 //! `fault` writes through a null pointer; `sleep` sleeps ten seconds.
@@ -312,6 +317,12 @@ pub extern "C" fn _start() -> ! {
             let _ = syscall::sys_recv(TID_ANY, &mut msg);
         }
     }
+    if quark_rt::args::argv(1) == Some(&b"crashed"[..]) {
+        crashed(
+            quark_rt::args::argv(2).unwrap_or(b"/tmp"),
+            quark_rt::args::argv(3) == Some(&b"writing"[..]),
+        );
+    }
     if quark_rt::args::argv(1) == Some(&b"cwd"[..]) {
         let found = nameserver::lookup_retry(b"vfs", 20).is_some_and(|vfs| {
             vfs::open(vfs, b"passwd").map(|(h, _, _)| vfs::close(vfs, h)).is_ok()
@@ -426,6 +437,101 @@ pub extern "C" fn _start() -> ! {
         *held += 1;
     }
     println!("[dchild] sent, and took the shared lock");
+    syscall::sys_exit_code(0);
+}
+
+/// Page `n` of the file a crash test leaves: every byte says which page it
+/// is in and where.
+fn crash_page(page: &mut [u8; 4096], n: u32) {
+    for (i, b) in page.iter_mut().enumerate() {
+        *b = (n as usize * 131 + i * 7 + 3) as u8;
+    }
+}
+
+/// What a machine is stopped in the middle of: see the top of the file.
+fn crashed(dir: &[u8], writing: bool) -> ! {
+    fn path<'a>(buf: &'a mut [u8; 128], dir: &[u8], name: &[u8]) -> &'a [u8] {
+        let d = dir.len().min(100);
+        buf[..d].copy_from_slice(&dir[..d]);
+        buf[d..d + name.len()].copy_from_slice(name);
+        &buf[..d + name.len()]
+    }
+    let Some(vfs) = nameserver::lookup_retry(b"vfs", 20) else {
+        syscall::sys_exit_code(1);
+    };
+    let (mut a, mut b, mut c) = ([0u8; 128], [0u8; 128], [0u8; 128]);
+    let orphan = path(&mut a, dir, b"/crash-orphan");
+    let synced = path(&mut b, dir, b"/crash-synced");
+    let unsynced = path(&mut c, dir, b"/crash-unsynced");
+    let (mut d, mut e) = ([0u8; 128], [0u8; 128]);
+    let renamed = path(&mut d, dir, b"/crash-renamed");
+    let made = path(&mut e, dir, b"/crash-directory");
+    let mut page = [0u8; 4096];
+
+    let left = (|| {
+        // Held open and removed: the handle is never closed.
+        let o = vfs::open_with(vfs, orphan, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+        let data = [0x5Au8; 1000];
+        for i in 0..5 {
+            vfs::write(vfs, o.handle, &data, i * 1000).ok()?;
+        }
+        vfs::unlink(vfs, orphan).ok()?;
+        // Written, and waited for.
+        let o = vfs::open_with(vfs, synced, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok()?;
+        for n in 0..75u32 {
+            crash_page(&mut page, n);
+            vfs::write(vfs, o.handle, &page, n * 4096).ok()?;
+        }
+        vfs::sync(vfs).ok()?;
+        Some(())
+    })();
+    if left.is_none() {
+        println!("dchild: could not leave the files in {}", core::str::from_utf8(dir).unwrap_or("?"));
+        syscall::sys_exit_code(1);
+    }
+    if !writing {
+        println!("left {}", core::str::from_utf8(dir).unwrap_or("?"));
+        loop {
+            let mut msg = Message::empty();
+            let _ = syscall::sys_recv(TID_ANY, &mut msg);
+        }
+    }
+    println!("writing {}", core::str::from_utf8(dir).unwrap_or("?"));
+    // And changed without waiting, for ever, in turns that make every way
+    // a change is recorded happen: a few pages and then something that
+    // commits them; seventy, which is more than one transaction takes; a
+    // few and a pause, which commits them by itself. Most turns are short,
+    // because what a stop is looking for is the moment a transaction is in
+    // the journal and not yet where it belongs, and short turns are mostly
+    // that moment.
+    const PAGES: [u32; 12] = [2, 1, 3, 2, 70, 1, 2, 4, 1, 3, 2, 1];
+    for turn in 0usize.. {
+        let Ok(o) = vfs::open_with(vfs, unsynced, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) else {
+            syscall::sys_exit_code(1);
+        };
+        for n in 0..PAGES[turn % PAGES.len()] {
+            crash_page(&mut page, n);
+            if vfs::write(vfs, o.handle, &page, n * 4096).is_err() {
+                syscall::sys_exit_code(1);
+            }
+        }
+        let _ = vfs::close(vfs, o.handle);
+        match turn % 6 {
+            // A name moved and a file removed: an inode freed, and made
+            // again by the next turn's open.
+            1 => {
+                let _ = vfs::rename(vfs, unsynced, renamed);
+                let _ = vfs::unlink(vfs, renamed);
+            }
+            3 => {
+                let _ = vfs::mkdir(vfs, made);
+                let _ = vfs::rmdir(vfs, made);
+            }
+            // Nothing asked of the file server for a while.
+            4 => syscall::sleep_ms(40),
+            _ => {}
+        }
+    }
     syscall::sys_exit_code(0);
 }
 
