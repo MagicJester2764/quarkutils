@@ -893,11 +893,19 @@ impl DeferredTasks {
 
     /// Start each deferred task one at a time, waiting for each to exit
     /// before starting the next (prevents interleaved output).
+    ///
+    /// Waiting for *it*: anything else that ends meanwhile — a driver a
+    /// `start` line asked for, which found no device — is collected and the
+    /// wait goes on. It used to take whichever child ended first for the
+    /// one it had just started.
     fn start_sequentially(&mut self) {
         for i in 0..self.count {
             if let Some(info) = self.spawns[i].take() {
-                let _ = info.start();
-                let _ = syscall::sys_wait();
+                let tid = info.tid;
+                if info.start().is_err() {
+                    continue;
+                }
+                while matches!(syscall::sys_wait(), Ok((ended, _)) if ended != tid) {}
             }
         }
     }
@@ -909,10 +917,18 @@ impl DeferredTasks {
 /// something from the future:
 ///
 /// ```text
+/// start PATH [ARGUMENT...]  a program to start and leave running: a driver
+///                           or a server, before anything is run
 /// run PATH [ARGUMENT...]    a program to run to its end before the session,
 ///                           in the order the lines are in
 /// session PATH              what the session is
 /// ```
+///
+/// `start` is how a distribution adds a driver to the ones this program
+/// knows by name. It is given what its manifest asks for, as they are —
+/// this task holds everything, the right to map a device's registers
+/// included — and is not waited for; one that finds no device ends, and is
+/// collected.
 ///
 /// `run` is for what has to be done once at boot by a program that can read
 /// a file — loading the console's font is the first. A distribution that
@@ -995,6 +1011,30 @@ fn spawn_session(
     }
 }
 
+/// Load a program a `start` line of `/etc/init.conf` names, wire what it
+/// prints to the console, and start it now.
+fn start_program(vfs_tid: usize, path: &[u8], arguments: &[&[u8]], console_pipe: usize) -> bool {
+    if path.len() > 64 || !path.starts_with(b"/") {
+        return false;
+    }
+    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
+    let Ok(info) = spawn::load_path(vfs_tid, path, VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) else {
+        return false;
+    };
+    if console_pipe != 0 {
+        let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+        let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
+    }
+    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let mut argv: [&[u8]; MAX_RUN_ARGS + 1] = [b""; MAX_RUN_ARGS + 1];
+    argv[0] = name;
+    let n = arguments.len().min(MAX_RUN_ARGS);
+    argv[1..1 + n].copy_from_slice(&arguments[..n]);
+    let _ = spawn::set_args(&info, &argv[..1 + n], &SPAWN_SCRATCH);
+    println!("[init] Started {} (TID {})", core::str::from_utf8(name).unwrap_or("a program"), info.tid);
+    info.start().is_ok()
+}
+
 fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
     let mut deferred = DeferredTasks::new();
 
@@ -1007,6 +1047,18 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
     // What the distribution asked for, if it asked: the programs to run
     // first, in order, and then the session.
     if let Some(config) = Config::read(vfs_tid) {
+        for mut words in config.each(b"start") {
+            let Some(path) = words.next() else { continue };
+            let mut arguments: [&[u8]; MAX_RUN_ARGS] = [b""; MAX_RUN_ARGS];
+            let mut n = 0;
+            for word in words.take(MAX_RUN_ARGS) {
+                arguments[n] = word;
+                n += 1;
+            }
+            if !start_program(vfs_tid, path, &arguments[..n], console_pipe) {
+                println!("[init] /etc/init.conf asks for a program to be started that will not load.");
+            }
+        }
         for mut words in config.each(b"run") {
             let Some(path) = words.next() else { continue };
             let mut arguments: [&[u8]; MAX_RUN_ARGS] = [b""; MAX_RUN_ARGS];

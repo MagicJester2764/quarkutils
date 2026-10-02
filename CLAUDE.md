@@ -412,10 +412,12 @@ number. Rust is unchanged: `quark_rt` spawns, waits and kills by task id, and
 shows both.
 
 **A session runs on a terminal when the distribution says so.** `init` reads
-`/etc/init.conf`: `run <path> [arguments]` lines name programs to run to
-their end, in order, before anybody is let in — loading the console's font
-is the first use — and `session <path>` there names what it starts once the
-filesystem is up. With no such file that is `login`, on the console as it
+`/etc/init.conf`: `start <path> [arguments]` lines name programs to start
+and leave running — a driver or a server besides the ones `init` knows by
+name, given what its manifest asks for; `run <path> [arguments]` lines name
+programs to run to their end, in order, before anybody is let in — loading
+the console's font is the first use — and `session <path>` there names what
+it starts once the filesystem is up. With no such file that is `login`, on the console as it
 always was: standard input a message to `input`, output the console's pipe.
 A distribution that names `getty` gets a real terminal instead: `getty` asks
 the console for its pty (`TAG_TTY_OPEN`), opens the slave, and runs `login`
