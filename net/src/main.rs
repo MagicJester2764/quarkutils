@@ -406,8 +406,9 @@ static mut NET: NetState = NetState {
 // ---------------------------------------------------------------------------
 
 fn alloc_dma_pages(count: usize, vaddr: usize) -> usize {
-    // Allocate physically contiguous pages (required for DMA)
-    let first = match syscall::sys_phys_alloc(count) {
+    // Physically contiguous pages, below four gigabytes: the card is told
+    // where they are in registers thirty-two bits wide.
+    let first = match syscall::sys_phys_alloc_low(count) {
         Ok(f) => f,
         Err(()) => return 0,
     };

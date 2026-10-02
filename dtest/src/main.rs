@@ -5339,6 +5339,64 @@ fn test_msi() {
     check("and every time it sends one", again == 3);
 }
 
+/// Where a frame of ordinary memory is mapped to be written to and read.
+const FRAME_AT: usize = 0xAD_0000_0000;
+
+/// Which memory a frame comes from. Ordinary memory is given out from the
+/// top of what the machine has, and memory a device will be told the
+/// address of from below four gigabytes: a network card's registers are
+/// thirty-two bits wide, and on a machine with more memory than that the
+/// lowest frame that is free is not always one it can reach. On a machine
+/// with less, the two ends are the two ends of the same four gigabytes, and
+/// the checks are of that.
+fn test_frames() {
+    println!("frames:");
+    const LINE: usize = 1 << 32;
+    let (frames, end) = syscall::sys_mem_total();
+    println!("        {} MiB of memory, the last of it at {:#x}", frames / 256, end * 4096);
+    check("the kernel says how much memory there is, and where it ends", frames >= 16 * 256 && end >= frames);
+    let (free_before, _) = syscall::sys_mem_info();
+
+    let low = syscall::sys_phys_alloc_low(1);
+    check("a frame for a device is below four gigabytes", matches!(low, Ok(at) if at % 4096 == 0 && at + 4096 <= LINE));
+    let run = syscall::sys_phys_alloc_low(16);
+    check("and so are sixteen in a row", matches!(run, Ok(at) if at % 4096 == 0 && at + 16 * 4096 <= LINE));
+
+    let any = syscall::sys_phys_alloc(1);
+    let above = end > LINE / 4096;
+    check(
+        "ordinary memory comes from the other end: above four gigabytes, where there is memory there",
+        matches!((any, low), (Ok(any), Ok(low)) if any > low && (!above || any >= LINE)),
+    );
+    // And it is memory, wherever it is: what is written is what is read.
+    let kept = any.is_ok_and(|frame| {
+        if syscall::sys_map_phys(frame, FRAME_AT, 1).is_err() {
+            return false;
+        }
+        let words = unsafe { core::slice::from_raw_parts_mut(FRAME_AT as *mut u64, 512) };
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = 0x5EED_0000_0000_0000 | (frame as u64 ^ i as u64);
+        }
+        let kept = words.iter().enumerate().all(|(i, &word)| word == 0x5EED_0000_0000_0000 | (frame as u64 ^ i as u64));
+        let _ = syscall::sys_munmap(FRAME_AT, 1);
+        kept
+    });
+    check("and holds what is written to it", kept);
+
+    if let Ok(at) = low {
+        let _ = syscall::sys_phys_free(at, 1);
+    }
+    if let Ok(at) = run {
+        let _ = syscall::sys_phys_free(at, 16);
+    }
+    if let Ok(at) = any {
+        let _ = syscall::sys_phys_free(at, 1);
+    }
+    let (free_after, _) = syscall::sys_mem_info();
+    // A page table for the mapping may have stayed.
+    check("all of it goes back", free_after + 4 >= free_before);
+}
+
 /// Turning the machine off is for whoever holds the right to, and this
 /// program does not: it asks for none in its manifest, and neither does the
 /// one it starts to try. That the checks are reached at all is most of what
@@ -5757,6 +5815,7 @@ pub extern "C" fn _start() -> ! {
         ("msi", test_msi),
         ("clock", test_clock),
         ("power", test_power),
+        ("frames", test_frames),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);

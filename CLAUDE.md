@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 710 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 716 checks made from
 user space through the ABI, with a recap of what failed before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
@@ -251,6 +251,16 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   configuration, knows what to ask for. That right is one for every device
   — as the I/O ports are — and reaches no memory: `dtest msi` has a driver
   ask for the kernel's and for an interrupt controller's, and be refused.
+- **A frame a device is told the address of is asked for below four
+  gigabytes** (`sys_phys_alloc_low`). Ordinary memory comes from the top of
+  what the machine has, and on a machine with more than four gigabytes that
+  is above what a register of thirty-two bits can say: the network card was
+  handed half an address for its ring, and nothing arrived or left. It
+  passes on every machine with four gigabytes or fewer, which is every
+  machine the acceptance runs on unless it is told otherwise (`MEM=6G` to a
+  distribution's `boot-test.sh`). A new driver whose device reads and
+  writes memory itself asks for low frames; one that copies through ports
+  or its own mapped registers does not care.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init`. A spawner mints

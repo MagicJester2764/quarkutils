@@ -743,8 +743,22 @@ pub fn sys_task_start(tid: usize, rip: u64, rsp: u64, cr3: usize) -> Result<(), 
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// `count` frames in a row, of ordinary memory: wherever the kernel has
+/// them, which on a machine with more than four gigabytes is above that.
+/// Answers with the address of the first.
 pub fn sys_phys_alloc(count: usize) -> Result<usize, ()> {
-    let ret = unsafe { syscall1(SYS_PHYS_ALLOC, count as u64) };
+    let ret = unsafe { syscall2(SYS_PHYS_ALLOC, count as u64, 0) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// `count` frames in a row below four gigabytes: memory a device is told
+/// the address of. A network card's ring and a disk controller's table are
+/// registers thirty-two bits wide, and a frame above that is one the device
+/// cannot be told of — it is handed the low half of the address and writes
+/// to whatever is there. `Err` when there is none below, whatever is free
+/// above.
+pub fn sys_phys_alloc_low(count: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall2(SYS_PHYS_ALLOC, count as u64, 1) };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
@@ -838,8 +852,15 @@ pub fn sys_object_sync(addr: usize, pages: usize) -> Result<(), ()> {
 
 /// Free frames in the machine, and pages charged to this task.
 pub fn sys_mem_info() -> (usize, usize) {
-    let ret = unsafe { syscall0(SYS_MEM_INFO) };
+    let ret = unsafe { syscall1(SYS_MEM_INFO, 0) };
     ((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize)
+}
+
+/// How much memory the machine has, in frames of 4 KiB; and where it ends,
+/// as the number of the frame after the last — more than a million
+/// (0x100000) of them is a machine with memory above four gigabytes.
+pub fn sys_mem_total() -> (usize, usize) {
+    unsafe { (syscall1(SYS_MEM_INFO, 1) as usize, syscall1(SYS_MEM_INFO, 2) as usize) }
 }
 
 /// Fill as much of `buf` as one call gives (at most a mebibyte) with random
@@ -2219,7 +2240,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 16;
+pub const ABI_VERSION_MINOR: u32 = 17;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
