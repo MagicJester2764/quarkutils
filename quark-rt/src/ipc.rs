@@ -53,6 +53,10 @@ pub const TAG_OBJECT_IDLE: u64 = 0xFFFF_0006;
 /// A program asked, through the kernel, for an object's written pages to reach
 /// its file: `data` is `[cookie, object id]`, sender marked as for a page-in.
 pub const TAG_OBJECT_SYNC: u64 = 0xFFFF_0007;
+/// From the kernel, sender 0: memory is short, and pages of this pager's
+/// that nothing maps could be given up if they were written. It names no
+/// object: the pager writes what is dirty in each it has.
+pub const TAG_OBJECT_CLEAN: u64 = 0xFFFF_000B;
 /// From the kernel, sender 0: an object this task serves is named by no
 /// descriptor any more. No data — collect with `sys_fd_reap` until it is empty.
 pub const TAG_FD_RELEASED: u64 = 0xFFFF_0008;

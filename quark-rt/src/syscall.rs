@@ -154,6 +154,7 @@ pub const SYS_OBJECT_CREATE: u64 = 194;
 pub const SYS_OBJECT_MAP: u64 = 195;
 pub const SYS_OBJECT_CTL: u64 = 196;
 pub const SYS_OBJECT_SYNC: u64 = 197;
+pub const SYS_PAGE_OUT: u64 = 198;
 
 /// `sys_object_map`'s flags.
 pub const OBJECT_MAP_WRITE: u64 = 1;
@@ -165,6 +166,16 @@ pub const OBJECT_READ_PAGE: u64 = 1;
 pub const OBJECT_WRITE_PAGE: u64 = 2;
 pub const OBJECT_TAKE_DIRTY: u64 = 3;
 pub const OBJECT_RELEASE: u64 = 4;
+/// Make this object the one memory is written out to when there is not
+/// enough of it. For a holder of [`CAP_TYPE_SWAP`]; one object at a time.
+pub const OBJECT_SWAP: u64 = 5;
+/// Take a dirty page to write: as [`OBJECT_TAKE_DIRTY`], but the page is
+/// neither clean nor dirty until [`OBJECT_WRITTEN`] says how it went — so
+/// that a page whose writing failed is not given up as if it had not.
+pub const OBJECT_TAKE_OUT: u64 = 6;
+/// A page taken with [`OBJECT_TAKE_OUT`] was written (`a` = 1) or could not
+/// be (`a` = 0); `b` is the page.
+pub const OBJECT_WRITTEN: u64 = 7;
 /// [`OBJECT_RELEASE`]'s answer while a task other than the pager holds a
 /// capability for the object — it was given one to map with and has not
 /// mapped yet. Nothing was released, and nothing will say when the
@@ -853,6 +864,40 @@ pub fn sys_object_sync(addr: usize, pages: usize) -> Result<(), ()> {
 /// Free frames in the machine, and pages charged to this task.
 pub fn sys_mem_info() -> (usize, usize) {
     let ret = unsafe { syscall1(SYS_MEM_INFO, 0) };
+    ((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize)
+}
+
+/// Where memory is written out to when there is not enough of it: how many
+/// pages of room there are, and how many are in use. Nought and nought on a
+/// machine with nowhere.
+pub fn sys_swap_room() -> (usize, usize) {
+    let ret = unsafe { syscall1(SYS_MEM_INFO, 3) };
+    if ret == u64::MAX {
+        return (0, 0);
+    }
+    ((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize)
+}
+
+/// Give up `pages` pages of this program's own from `addr`: its own memory
+/// is written out, now, to wherever the machine writes memory out to, and
+/// pages of files it maps to read go back to being untouched; the frames
+/// are free when this returns. What is there is unchanged, and comes back
+/// when it is next touched. Answers with how many pages were given up —
+/// none of its own on a machine with nowhere to write them, and never one
+/// that a system call another thread is in is using, one a `fork` left in
+/// two programs, or the page it is told of signals through.
+pub fn sys_page_out(addr: usize, pages: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall2(SYS_PAGE_OUT, addr as u64, pages as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// How busy that has been: pages written out, and pages read back, since
+/// the machine started.
+pub fn sys_swap_traffic() -> (usize, usize) {
+    let ret = unsafe { syscall1(SYS_MEM_INFO, 4) };
+    if ret == u64::MAX {
+        return (0, 0);
+    }
     ((ret >> 32) as usize, (ret & 0xFFFF_FFFF) as usize)
 }
 
@@ -2113,6 +2158,9 @@ pub const CAP_TYPE_CLOCK: u64 = 11;
 /// The right to turn the machine off and to start it again
 /// (`sys_power_off`, `sys_restart`).
 pub const CAP_TYPE_POWER: u64 = 12;
+/// The right to be where memory is written out to: to hold every program's
+/// unused pages, and hand them back (`OBJECT_SWAP`).
+pub const CAP_TYPE_SWAP: u64 = 13;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -2240,7 +2288,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 18;
+pub const ABI_VERSION_MINOR: u32 = 19;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

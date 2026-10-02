@@ -114,6 +114,13 @@ impl CapReq {
     pub const fn power() -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_POWER, param0: 0, param1: 0 }
     }
+
+    /// Be where memory is written out to when there is not enough of it
+    /// (`OBJECT_SWAP`). For the one program a system starts to do that:
+    /// whoever holds it is handed pages of every program's memory.
+    pub const fn swap() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_SWAP, param0: 0, param1: 0 }
+    }
 }
 
 /// A manifest as it sits in the image: a header the scanner can recognise,
