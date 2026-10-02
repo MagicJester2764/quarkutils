@@ -193,6 +193,12 @@ pub extern "C" fn _start() -> ! {
         let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_IOPORT, 0xCF9, 0xCF9);
         let _ = syscall::sys_cap_grant(tid, SCRATCH, 4);
         let _ = syscall::sys_cap_delete(SCRATCH);
+        // Root may say who a task is; nobody else's session can.
+        if entry.uid == 0 {
+            let _ = syscall::sys_cap_mint(SCRATCH, syscall::CAP_TYPE_SET_UID, 0, 0);
+            let _ = syscall::sys_cap_grant(tid, SCRATCH, 5);
+            let _ = syscall::sys_cap_delete(SCRATCH);
+        }
 
         // Wire file descriptors
         let _ = syscall::sys_fd_dup(tid, 0, 0); // stdin

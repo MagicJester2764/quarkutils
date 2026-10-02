@@ -119,6 +119,14 @@
 #define QUARK_PGROUP_SET    1UL
 #define QUARK_SESSION_GET   2UL
 #define QUARK_SESSION_NEW   3UL
+/* The groups a task is in besides its own: arg0 = 0 to read and 1 to set,
+   arg1 a task (0 for the caller), arg2 where the ids are, arg3 how many.
+   And saying who a task is, which is a server's to do. */
+#define SYS_GROUPS          212
+#define QUARK_GROUPS_GET    0UL
+#define QUARK_GROUPS_SET    1UL
+#define QUARK_MAX_GROUPS    16
+#define SYS_IDENTIFY        213
 
 /* 0x90  time */
 #define SYS_TIMER_CREATE    146

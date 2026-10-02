@@ -132,6 +132,9 @@ pub const SYS_PTY_CTL: u64 = 209;
 pub const SYS_PTY_OPEN: u64 = 210;
 /// Process groups and sessions.
 pub const SYS_PGROUP: u64 = 211;
+/// The groups a task is in besides its own, and saying who a task is.
+pub const SYS_GROUPS: u64 = 212;
+pub const SYS_IDENTIFY: u64 = 213;
 pub const SYS_TIMER_CREATE: u64 = 146;
 pub const SYS_TIMER_SET: u64 = 147;
 pub const SYS_TIMER_GET: u64 = 148;
@@ -388,6 +391,42 @@ pub fn sys_set_uid(tid: usize, uid: u32) -> Result<(), ()> {
 
 pub fn sys_set_gid(tid: usize, gid: u32) -> Result<(), ()> {
     let ret = unsafe { syscall2(SYS_SET_GID, tid as u64, gid as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+/// How many groups a task may be in besides its own.
+pub const MAX_GROUPS: usize = 16;
+
+/// The groups `tid` is in besides its own (0 for the caller's), into `out`:
+/// as many as fit. How many there are, which is how to ask with no room.
+pub fn sys_groups(tid: usize, out: &mut [u32]) -> Result<usize, ()> {
+    let ret = unsafe { syscall4(SYS_GROUPS, 0, tid as u64, out.as_mut_ptr() as u64, out.len() as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// Say which groups `tid` is in besides its own: the caller (0), or a child
+/// it has created and not started. Needs `SetUid`.
+pub fn sys_set_groups(tid: usize, groups: &[u32]) -> Result<(), ()> {
+    let ret = unsafe { syscall4(SYS_GROUPS, 1, tid as u64, groups.as_ptr() as u64, groups.len() as u64) };
+    if ret == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Say who a task is — its user, its group and its groups, in one step —
+/// for a server that holds `SetUid`. `client` is a task in a call to this
+/// one, and `target` is that task or a child it has created and not started:
+/// the kernel checks which as it acts, where a check made before a
+/// `sys_set_uid` would be about whatever had the number by then.
+pub fn sys_identify(client: usize, target: usize, uid: u32, gid: u32, groups: &[u32]) -> Result<(), ()> {
+    let ret = unsafe {
+        syscall5(
+            SYS_IDENTIFY,
+            client as u64,
+            target as u64,
+            (uid as u64) << 32 | gid as u64,
+            groups.as_ptr() as u64,
+            groups.len() as u64,
+        )
+    };
     if ret == 0 { Ok(()) } else { Err(()) }
 }
 
@@ -2032,7 +2071,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 8;
+pub const ABI_VERSION_MINOR: u32 = 9;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

@@ -21,6 +21,9 @@ quark_rt::manifest!([
     CapReq::ioport(0xB004, 0xB004),
     // The reset control register: `shutdown -r`.
     CapReq::ioport(0xCF9, 0xCF9),
+    // The right to say who a task is, where the session holds it — root's
+    // does — for the programs root runs that say it.
+    CapReq::set_uid(),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

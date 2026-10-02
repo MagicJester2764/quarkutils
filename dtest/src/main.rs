@@ -12,7 +12,9 @@ use quark_rt::manifest::CapReq;
 use quark_rt::wl::wire;
 use quark_rt::{nameserver, print, println, spawn, sync, syscall, thread, vfs};
 
-quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64)]);
+// The right to say who a task is, is what `identity` checks the use of. A
+// shell that does not hold it cannot give it, and the section says so.
+quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64), CapReq::set_uid()]);
 
 static mut PASSED: u32 = 0;
 static mut FAILED: u32 = 0;
@@ -275,6 +277,159 @@ fn test_program_table() {
         "a program cannot claim to have been killed",
         run(b"dchild", &[b"claim"]) == Some(245),
     );
+}
+
+/// What a client asks a server that may say who it is: see `dchild whoami`.
+const ASK_WHO: u64 = 0x52;
+
+/// A number as its digits.
+fn decimal(mut n: usize, out: &mut [u8; 20]) -> &[u8] {
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    &out[at..]
+}
+
+/// Who a task is: its user, its group, the groups it is in besides, and
+/// the one way a server may say so about somebody else.
+fn test_identity() {
+    use quark_rt::ipc::{Message, TID_ANY};
+    println!("identity:");
+    let me = syscall::sys_getpid() as usize;
+    let mut was = [0u32; syscall::MAX_GROUPS];
+    let Ok(had) = syscall::sys_groups(0, &mut was) else {
+        check("a task says which groups it is in", false);
+        return;
+    };
+    check("a task says which groups it is in", had <= syscall::MAX_GROUPS);
+    let mut got = [0u32; syscall::MAX_GROUPS];
+    check("and anybody's can be read", syscall::sys_groups(INIT_TID, &mut got).is_ok());
+
+    // Setting them is saying who a task is, and that takes the right to.
+    let may = (0..64).any(|slot| {
+        matches!(syscall::sys_cap_read(me, slot), Ok(c) if c.cap_type == syscall::CAP_TYPE_SET_UID && c.valid)
+    });
+    if !may {
+        check(
+            "without the right to say who a task is, its groups cannot be set",
+            syscall::sys_set_groups(0, &[7]).is_err(),
+        );
+        println!("  (the rest needs SetUid, which this was not started with)");
+        return;
+    }
+    check("a holder of SetUid sets its own", syscall::sys_set_groups(0, &[7, 9, 11]).is_ok());
+    check("and they read back", syscall::sys_groups(0, &mut got) == Ok(3) && got[..3] == [7, 9, 11]);
+    check("asking with no room says how many", syscall::sys_groups(0, &mut []) == Ok(3));
+    let mut one = [0u32; 1];
+    check("with room for one, one is written", syscall::sys_groups(0, &mut one) == Ok(3) && one[0] == 7);
+    check("seventeen is one too many", syscall::sys_set_groups(0, &[1; 17]).is_err());
+
+    // A task is who its creator is.
+    check(
+        "a program started here is in them too",
+        run(b"dchild", &[b"groups", b"7", b"9", b"11"]) == Some(0),
+    );
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let mut mine = [0u32; syscall::MAX_GROUPS];
+            let same = syscall::sys_groups(0, &mut mine) == Ok(3) && mine[..3] == [7, 9, 11];
+            syscall::sys_exit_program(if same { 7 } else { 8 });
+        }
+        Ok(child) => check("and so is a forked copy", wait_for(child) == Some(7)),
+        Err(()) => check("fork", false),
+    }
+
+    // A child still being made is its maker's to say this of; one that has
+    // started is not.
+    match load_child(&[b"dchild", b"groups", b"21"]) {
+        Some(child) => {
+            let tid = child.tid;
+            check("a child being prepared can be given its own", syscall::sys_set_groups(tid, &[21]).is_ok());
+            check("and starts in them", child.start().is_ok() && wait_for(tid) == Some(0));
+        }
+        None => check("loaded a child to prepare", false),
+    }
+    match load_child(&[b"dchild", b"sleep"]) {
+        Some(child) => {
+            let tid = child.tid;
+            let started = child.start().is_ok();
+            check(
+                "a task that has started cannot have them set from outside",
+                started && syscall::sys_set_groups(tid, &[1]).is_err(),
+            );
+            let _ = syscall::sys_task_kill(tid);
+            let _ = wait_for(tid);
+        }
+        None => check("loaded a child to start", false),
+    }
+
+    // A server says who a client is, while the client is asking it to.
+    let mut text = [0u8; 20];
+    let Some(child) = load_child(&[b"dchild", b"whoami", decimal(me, &mut text)]) else {
+        check("loaded a client", false);
+        return;
+    };
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0)
+        .is_ok()
+        && syscall::sys_cap_grant_any(child.tid, syscall::SLOT_SCRATCH).is_ok();
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    check("let the client call us", granted);
+    check(
+        "a task that is not calling cannot be told who it is",
+        syscall::sys_identify(child.tid, child.tid, 1, 1, &[]).is_err(),
+    );
+    let client = child.tid;
+    if child.start().is_err() {
+        check("started the client", false);
+        return;
+    }
+    let (mut asked, mut stranger, mut too_many, mut itself, mut its_child) = (false, false, false, false, false);
+    let mut theirs = 0;
+    for _ in 0..200 {
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, 5).is_err() {
+            // 3 is `sys_task_info`'s state for a task that has exited.
+            if !matches!(syscall::sys_task_info(client), Ok((state, _, _)) if state != 3) {
+                break;
+            }
+            continue;
+        }
+        if msg.sender != client || msg.tag != ASK_WHO {
+            continue;
+        }
+        asked = true;
+        theirs = msg.data[0] as usize;
+        // Somebody else's task, named by a client: not the client's to
+        // have anything said of.
+        stranger = syscall::sys_identify(client, INIT_TID, 9, 9, &[]).is_err();
+        too_many = syscall::sys_identify(client, client, 9, 9, &[1; 17]).is_err();
+        itself = syscall::sys_identify(client, client, 1234, 5678, &[42, 43]).is_ok();
+        its_child = syscall::sys_identify(client, theirs, 4321, 8765, &[44]).is_ok();
+        let _ = syscall::sys_reply(client, &Message { sender: 0, tag: 0, data: [0; 6] });
+    }
+    check("the client asked who it is", asked);
+    check("a stranger's task is not a client's to have named", stranger);
+    check("nor may it be put in seventeen groups", too_many);
+    check("a client that is calling is told who it is", itself);
+    check("and so is a child it has made and not started", its_child);
+    check("which is what they both then are", wait_for(client) == Some(31));
+    // The child the client made was never started and its maker has gone:
+    // nobody else will end it.
+    if theirs != 0 {
+        let _ = syscall::sys_task_kill(theirs);
+    }
+    check(
+        "a client that has stopped calling is not",
+        syscall::sys_identify(client, client, 0, 0, &[]).is_err(),
+    );
+
+    check("this task's groups are put back", syscall::sys_set_groups(0, &was[..had]).is_ok());
 }
 
 /// A file as a descriptor: in the kernel's table, with its position kept by
@@ -4246,6 +4401,7 @@ pub extern "C" fn _start() -> ! {
         ("close", test_close),
         ("fds", test_fd_table),
         ("program", test_program_table),
+    ("identity", test_identity),
         ("served", test_served),
         ("fdfiles", test_file_descriptors),
         ("signals", test_signals),

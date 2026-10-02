@@ -32,6 +32,10 @@
 //! status 5: descriptor 3, which the thread never closes, has to close.
 //! `claim` ends the program with status -11, as if a fault had: a parent
 //! has to be told 245, since a negative status is the kernel's to give.
+//! `groups N...` exits 0 if the groups it is in are exactly those numbers.
+//! `whoami TID` is a client of a server at TID that may say who a task is:
+//! it makes a child it never starts, asks about itself and the child, and
+//! exits with a bit for each thing it then finds to be so.
 //! `fdclient TID` is a client of a server at TID that serves descriptors: it
 //! asks for one, reads and writes through it, copies and closes it, and exits
 //! with a bit for each thing that worked.
@@ -72,10 +76,49 @@ extern "C" fn quit() -> ! {
 /// The requests `dtest` answers as a server of descriptors, and the two
 /// cookies it serves.
 const ASK_OPEN: u64 = 0x51;
+/// What `whoami` asks its server: who am I, and who is this child of mine.
+const ASK_WHO: u64 = 0x52;
 const ASK_HELD: u64 = 0x52;
 const ASK_CHDIR: u64 = 0x53;
 const COOKIE_FILE: u64 = 0x5151;
 const COOKIE_DIR: u64 = 0x7700_0000_0077;
+
+/// A number an argument spells.
+fn number(text: &[u8]) -> usize {
+    text.iter().fold(0usize, |n, &d| n.wrapping_mul(10).wrapping_add(d.wrapping_sub(b'0') as usize % 10))
+}
+
+/// Ask a server who this is, and who a child of this task's is that was
+/// made and never started. A bit of the answer for each thing that is then
+/// so: the server answered; this task is user 1234 in group 5678; in groups
+/// 42 and 43 besides; the child is user 4321 in group 8765; in group 44.
+fn who_am_i(server: usize) -> i32 {
+    let made = syscall::sys_task_create().ok();
+    let msg = Message { sender: 0, tag: ASK_WHO, data: [made.unwrap_or(0) as u64, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    let mut ok = 0;
+    if matches!(syscall::sys_call_timeout(server, &msg, &mut reply, 200), syscall::CallOutcome::Replied)
+        && reply.tag == 0
+    {
+        ok |= 1;
+    }
+    if syscall::sys_get_uid() == (1234, 5678) {
+        ok |= 2;
+    }
+    let mut groups = [0u32; syscall::MAX_GROUPS];
+    if syscall::sys_groups(0, &mut groups) == Ok(2) && groups[..2] == [42, 43] {
+        ok |= 4;
+    }
+    if let Some(child) = made {
+        if syscall::sys_get_tuid(child) == Ok((4321, 8765)) {
+            ok |= 8;
+        }
+        if syscall::sys_groups(child, &mut groups) == Ok(1) && groups[0] == 44 {
+            ok |= 16;
+        }
+    }
+    ok
+}
 
 /// Everything a client does with a descriptor a server gave it. One bit of
 /// the answer for each thing that came out right.
@@ -221,6 +264,18 @@ pub extern "C" fn _start() -> ! {
         // program ending and not a race it happened to lose.
         syscall::sleep_ticks(5);
         syscall::sys_exit_program(5);
+    }
+    if quark_rt::args::argv(1) == Some(&b"groups"[..]) {
+        let mut groups = [0u32; syscall::MAX_GROUPS];
+        let n = syscall::sys_groups(0, &mut groups).unwrap_or(usize::MAX);
+        let wanted = quark_rt::args::argc().saturating_sub(2);
+        let same = n == wanted
+            && (0..wanted).all(|i| quark_rt::args::argv(i + 2).is_some_and(|a| number(a) as u32 == groups[i]));
+        syscall::sys_exit_program(if same { 0 } else { 1 + n.min(100) as i32 });
+    }
+    if quark_rt::args::argv(1) == Some(&b"whoami"[..]) {
+        let server = quark_rt::args::argv(2).map_or(0, number);
+        syscall::sys_exit_program(who_am_i(server));
     }
     if quark_rt::args::argv(1) == Some(&b"claim"[..]) {
         syscall::sys_exit_program(-11);
