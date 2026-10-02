@@ -27,7 +27,8 @@
 //! recorded. `hog` reserves four gigabytes and
 //! touches them until something stops it. `mapwrite PATH` maps a file shared,
 //! writes into it, and exits without asking for it to be written back.
-//! `fault` writes through a null pointer; `sleep` sleeps ten seconds.
+//! `fault` writes through a null pointer; `sleep` sleeps ten seconds; `late`
+//! sleeps a fifth of one and ends with status 3, having answered nobody.
 //! `leave` starts a thread that never ends and then ends the program with
 //! status 5: descriptor 3, which the thread never closes, has to close.
 //! `claim` ends the program with status -11, as if a fault had: a parent
@@ -36,6 +37,15 @@
 //! `whoami TID` is a client of a server at TID that may say who a task is:
 //! it makes a child it never starts, asks about itself and the child, and
 //! exits with a bit for each thing it then finds to be so.
+//! `user DIR` is run as somebody who is not root, in a directory root laid
+//! out, and exits with a bit for each thing it finds as it should be: what
+//! it may read, what it may not, and what it may take out of a directory.
+//! `userfat DIR NAME` is the same for a filesystem that keeps no owners.
+//! `usersys TID` is the rest of what such a user is not allowed, the ending
+//! of root's task TID among it. `authuser NAME OTHER OLD NEW` asks the
+//! server that says who somebody is to change passwords, its own and
+//! OTHER's; `become NAME ID PASSWORD` asks it to make this program NAME
+//! with this account's own password, and exits 0 if it is then user ID.
 //! `fdclient TID` is a client of a server at TID that serves descriptors: it
 //! asks for one, reads and writes through it, copies and closes it, and exits
 //! with a bit for each thing that worked.
@@ -116,6 +126,207 @@ fn who_am_i(server: usize) -> i32 {
         if syscall::sys_groups(child, &mut groups) == Ok(1) && groups[0] == 44 {
             ok |= 16;
         }
+    }
+    ok
+}
+
+/// Who `dtest` says a child is before it runs `user` or `usersys`.
+const USER: u32 = 4000;
+const USER_GROUP: u32 = 4000;
+/// And a group it is in besides.
+const ALSO_IN: u32 = 4001;
+
+/// A path in `dir`.
+fn under<'a>(dir: &[u8], name: &[u8], out: &'a mut [u8; 160]) -> &'a [u8] {
+    let n = dir.len().min(120);
+    out[..n].copy_from_slice(&dir[..n]);
+    out[n] = b'/';
+    out[n + 1..n + 1 + name.len()].copy_from_slice(name);
+    &out[..n + 1 + name.len()]
+}
+
+/// What a user who is not root finds in a directory `dtest` laid out as
+/// root. A bit of the answer for each thing that is as it should be.
+fn as_user(dir: &[u8]) -> i32 {
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else { return 0 };
+    let no = Err(vfs::ERR_PERMISSION);
+    let (mut one, mut two) = ([0u8; 160], [0u8; 160]);
+    // Whether a path opens with `flags`. What opened is closed again.
+    let opens = |path: &[u8], flags: u64| {
+        vfs::open_with(v, path, flags).map(|o| {
+            let _ = vfs::close(v, o.handle);
+        })
+    };
+    // Whether a file that opens can be written through what opened.
+    let writes = |path: &[u8]| {
+        vfs::open(v, path).and_then(|(h, _, _)| {
+            let wrote = vfs::write(v, h, b"x", 0).map(drop);
+            let _ = vfs::close(v, h);
+            wrote
+        })
+    };
+    let mode = |path: &[u8], mode: u32| vfs::set_attr(v, path, vfs::ATTR_MODE, mode, 0, 0, 0, 0);
+    let mut ok = 0;
+
+    // Root's own file.
+    if opens(under(dir, b"secret", &mut one), 0) == no {
+        ok |= 1;
+    }
+    // A file of a group this user is in besides its own: read, not written.
+    let shared = under(dir, b"shared", &mut one);
+    let mut text = [0u8; 8];
+    let read = vfs::open(v, shared).is_ok_and(|(h, _, _)| {
+        let got = vfs::read(v, h, &mut text, 0) == Ok(6) && &text[..6] == b"shared";
+        let _ = vfs::close(v, h);
+        got
+    });
+    if read && writes(shared) == no && opens(shared, vfs::OPEN_TRUNCATE) == no {
+        ok |= 2;
+    }
+    // A file anybody may read, in a directory only root may change.
+    let open = under(dir, b"open", &mut one);
+    if opens(open, 0).is_ok()
+        && writes(open) == no
+        && opens(open, vfs::OPEN_TRUNCATE) == no
+        && vfs::unlink(v, open) == no
+        && opens(under(dir, b"new", &mut two), vfs::OPEN_CREATE) == no
+        && vfs::mkdir(v, under(dir, b"newdir", &mut two)) == no
+    {
+        ok |= 4;
+    }
+    // A directory anybody may make files in, and only a file's owner take
+    // them out of.
+    let mut three = [0u8; 160];
+    let roots = under(dir, b"sticky/roots", &mut one);
+    let mine = under(dir, b"sticky/mine", &mut two);
+    let made = opens(mine, vfs::OPEN_CREATE).is_ok();
+    if made
+        && vfs::unlink(v, roots) == no
+        && vfs::rename(v, roots, under(dir, b"sticky/taken", &mut three)) == no
+        && vfs::rename(v, mine, roots) == no
+        && vfs::rmdir(v, under(dir, b"sticky/rootsdir", &mut three)) == no
+    {
+        ok |= 8;
+    }
+    if made
+        && vfs::rename(v, mine, under(dir, b"sticky/moved", &mut three)).is_ok()
+        && vfs::unlink(v, under(dir, b"sticky/moved", &mut three)).is_ok()
+    {
+        ok |= 16;
+    }
+    // A directory of root's own: not looked in, and nothing in it reached.
+    if opens(under(dir, b"private", &mut one), 0) == no && opens(under(dir, b"private/inside", &mut two), 0) == no {
+        ok |= 32;
+    }
+    // A file's mode is its owner's to change; whose it is, is root's.
+    let kept = under(dir, b"sticky/kept", &mut two);
+    let own = opens(kept, vfs::OPEN_CREATE).is_ok();
+    if own
+        && mode(kept, 0o600).is_ok()
+        && vfs::lstat(v, kept).is_ok_and(|st| st.mode & 0o7777 == 0o600 && st.uid == USER && st.gid == USER_GROUP)
+        && vfs::set_attr(v, kept, vfs::ATTR_GID, 0, 0, ALSO_IN, 0, 0).is_ok()
+        && vfs::set_attr(v, kept, vfs::ATTR_UID, 0, 0, 0, 0, 0) == no
+        && vfs::set_attr(v, kept, vfs::ATTR_GID, 0, 0, 0, 0, 0) == no
+        && mode(under(dir, b"open", &mut one), 0o666) == no
+    {
+        ok |= 64;
+    }
+    if own {
+        let _ = vfs::unlink(v, kept);
+    }
+    ok
+}
+
+/// A file `name` in `dir`, on a filesystem that keeps no owners, as a user.
+/// A bit for its being read, and one for nothing about it being changed.
+fn user_fat(dir: &[u8], name: &[u8]) -> i32 {
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else { return 0 };
+    let no = Err(vfs::ERR_PERMISSION);
+    let (mut one, mut two) = ([0u8; 160], [0u8; 160]);
+    let file = under(dir, name, &mut one);
+    let Ok((h, _, _)) = vfs::open(v, file) else { return 0 };
+    let mut text = [0u8; 64];
+    let mut ok = 0;
+    if vfs::read(v, h, &mut text, 0).is_ok_and(|n| n > 0) {
+        ok |= 1;
+    }
+    let written = vfs::write(v, h, b"x", 0).map(drop);
+    let cut = vfs::truncate(v, h, 0);
+    let _ = vfs::close(v, h);
+    if written == no
+        && cut == no
+        && vfs::open_with(v, file, vfs::OPEN_TRUNCATE).map(drop) == no
+        && vfs::unlink(v, file) == no
+        && vfs::rename(v, file, under(dir, b"MOVED.BIN", &mut two)) == no
+        && vfs::open_with(v, under(dir, b"NEW.TXT", &mut two), vfs::OPEN_CREATE).map(drop) == no
+        && vfs::mkdir(v, under(dir, b"NEWDIR", &mut two)) == no
+    {
+        ok |= 2;
+    }
+    ok
+}
+
+/// What else a user is not allowed. A bit for each thing that is so.
+fn user_sys(victim: usize) -> i32 {
+    let me = syscall::sys_getpid() as usize;
+    let mut ok = 0;
+    let mut groups = [0u32; syscall::MAX_GROUPS];
+    if syscall::sys_get_uid() == (USER, USER_GROUP) && syscall::sys_groups(0, &mut groups) == Ok(1) && groups[0] == ALSO_IN
+    {
+        ok |= 1;
+    }
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else { return ok };
+    // The passwords.
+    if vfs::open(v, b"/etc/shadow").err() == Some(vfs::ERR_PERMISSION) {
+        ok |= 2;
+    }
+    // Who it is, is not its own to say.
+    if syscall::sys_set_uid(me, 0).is_err()
+        && syscall::sys_set_gid(me, 0).is_err()
+        && syscall::sys_set_groups(0, &[0]).is_err()
+        && syscall::sys_get_uid() == (USER, USER_GROUP)
+    {
+        ok |= 4;
+    }
+    // Somebody else's program is not its to end.
+    if syscall::sys_task_kill(victim).is_err()
+        && matches!(syscall::sys_task_info(victim), Ok((state, _, _)) if state != DEAD)
+    {
+        ok |= 8;
+    }
+    // What it makes is its own.
+    let path: &[u8] = b"/tmp/dtest-user-file";
+    let _ = vfs::unlink(v, path);
+    if vfs::open_with(v, path, vfs::OPEN_CREATE).map(|o| vfs::close(v, o.handle)).is_ok()
+        && vfs::lstat(v, path).is_ok_and(|st| st.uid == USER && st.gid == USER_GROUP)
+        && vfs::unlink(v, path).is_ok()
+    {
+        ok |= 16;
+    }
+    // And the account files are not its to change.
+    if vfs::open_with(v, b"/etc/passwd", vfs::OPEN_TRUNCATE).err() == Some(vfs::ERR_PERMISSION)
+        && vfs::unlink(v, b"/etc/passwd") == Err(vfs::ERR_PERMISSION)
+        && vfs::open_with(v, b"/etc/dtest-made", vfs::OPEN_CREATE).err() == Some(vfs::ERR_PERMISSION)
+    {
+        ok |= 32;
+    }
+    ok
+}
+
+/// Passwords, asked for as an ordinary user. A bit for each thing that is
+/// as it should be: another's is not this one's to set, its own is not set
+/// by somebody who does not know it, and is by somebody who does.
+fn auth_user(name: &[u8], other: &[u8], old: &[u8], new: &[u8]) -> i32 {
+    use quark_rt::auth;
+    let mut ok = 0;
+    if auth::passwd(other, b"", b"not for this user to set") == Err(auth::ERR_NOT_ALLOWED) {
+        ok |= 1;
+    }
+    if auth::passwd(name, b"not the old one", new) == Err(auth::ERR_WRONG) {
+        ok |= 2;
+    }
+    if auth::passwd(name, old, new).is_ok() {
+        ok |= 4;
     }
     ok
 }
@@ -277,12 +488,41 @@ pub extern "C" fn _start() -> ! {
         let server = quark_rt::args::argv(2).map_or(0, number);
         syscall::sys_exit_program(who_am_i(server));
     }
+
+    if quark_rt::args::argv(1) == Some(&b"user"[..]) {
+        syscall::sys_exit_program(as_user(quark_rt::args::argv(2).unwrap_or(b"")));
+    }
+    if quark_rt::args::argv(1) == Some(&b"userfat"[..]) {
+        let arg = |i| quark_rt::args::argv(i).unwrap_or(b"");
+        syscall::sys_exit_program(user_fat(arg(2), arg(3)));
+    }
+    if quark_rt::args::argv(1) == Some(&b"usersys"[..]) {
+        syscall::sys_exit_program(user_sys(quark_rt::args::argv(2).map_or(0, number)));
+    }
+    if quark_rt::args::argv(1) == Some(&b"authuser"[..]) {
+        let arg = |i| quark_rt::args::argv(i).unwrap_or(b"");
+        syscall::sys_exit_program(auth_user(arg(2), arg(3), arg(4), arg(5)));
+    }
+    if quark_rt::args::argv(1) == Some(&b"become"[..]) {
+        let arg = |i| quark_rt::args::argv(i).unwrap_or(b"");
+        let me = syscall::sys_getpid() as usize;
+        let status = match quark_rt::auth::bless(me, arg(2), arg(4), quark_rt::auth::OWN) {
+            Ok(_) if syscall::sys_get_uid().0 as usize == number(arg(3)) => 0,
+            Ok(_) => 1,
+            Err(code) => 100 + code as i32,
+        };
+        syscall::sys_exit_program(status);
+    }
     if quark_rt::args::argv(1) == Some(&b"claim"[..]) {
         syscall::sys_exit_program(-11);
     }
     if quark_rt::args::argv(1) == Some(&b"fault"[..]) {
         unsafe { core::ptr::write_volatile(core::hint::black_box(0usize) as *mut u8, 1) };
         syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"late"[..]) {
+        syscall::sleep_ticks(20);
+        syscall::sys_exit_code(3);
     }
     if quark_rt::args::argv(1) == Some(&b"sleep"[..]) {
         syscall::sleep_ticks(1000);

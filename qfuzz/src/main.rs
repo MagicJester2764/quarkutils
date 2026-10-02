@@ -69,6 +69,7 @@ enum Kind {
     Net,
     Disk,
     Keyboard,
+    Auth,
 }
 
 struct Target {
@@ -104,7 +105,36 @@ const TARGETS: &[Target] = &[
     // has is one it would be given — and then the writes below are writes.
     Target { name: b"disk0", kind: Kind::Disk, tags: &[0, 1, 2, 3, 4, 6, 7, 8, 9] },
     Target { name: b"keyboard", kind: Kind::Keyboard, tags: &[0, 1, 2, 3, 4, 5, 6, 7, 8] },
+    // Who somebody is. This runs as root, whom it asks for no password: a
+    // request that named an account would be granted. None does — see
+    // `NO_ACCOUNT` — so every one of them is to be refused, and afterwards
+    // this program is who it was and the passwords are what they were.
+    Target { name: b"auth", kind: Kind::Auth, tags: &[1, 2, 3] },
 ];
+
+/// What every name lent to `auth` begins with: no account's name does.
+const NO_ACCOUNT: u8 = b'~';
+/// Who this program was, and a sum of the passwords, before `auth` was sent
+/// anything.
+static mut WHO_BEFORE: (u32, u32) = (0, 0);
+static mut SHADOW_BEFORE: u64 = 0;
+
+/// A sum of `/etc/shadow`; 0 where it cannot be read.
+fn shadow_sum() -> u64 {
+    let Some(v) = nameserver::lookup(b"vfs") else { return 0 };
+    let Ok((h, _, _)) = vfs::open(v, b"/etc/shadow") else { return 0 };
+    let mut sum = 0xCBF2_9CE4_8422_2325u64;
+    let mut at = 0u32;
+    let mut buf = [0u8; 512];
+    while let Ok(n @ 1..) = vfs::read(v, h, &mut buf, at) {
+        for &b in &buf[..n as usize] {
+            sum = (sum ^ b as u64).wrapping_mul(0x100_0000_01B3);
+        }
+        at += n;
+    }
+    let _ = vfs::close(v, h);
+    sum
+}
 
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
@@ -252,6 +282,21 @@ fn steer(kind: Kind, rng: &mut Rng, tag: &mut u64, data: &mut [u64; 6]) {
         }
         return;
     }
+    if kind == Kind::Auth {
+        // Lengths that what is lent can hold, most of the time, so that a
+        // request is read rather than turned away for its size; and now and
+        // then this program itself as the task to be made somebody.
+        if rng.below(4) != 0 {
+            for w in &mut data[..3] {
+                *w = rng.below(48);
+            }
+            if *tag == 2 {
+                data[0] = if rng.below(2) == 0 { syscall::sys_getpid() } else { rng.below(64) };
+                data[3] = rng.below(8);
+            }
+        }
+        return;
+    }
     if kind != Kind::Net {
         return;
     }
@@ -293,6 +338,9 @@ fn fuzz(rng: &mut Rng, t: &Target, tid: usize, rounds: u32) -> Tally {
         if len > 0 {
             for b in buf[..len].iter_mut() {
                 *b = if t.kind == Kind::Vfs { name_byte(rng) } else { rng.next() as u8 };
+            }
+            if t.kind == Kind::Auth {
+                buf[0] = NO_ACCOUNT;
             }
             let access = rng.pick(&[LEND_READ, LEND_WRITE, LEND_READ | LEND_WRITE]);
             with.buf = buf.as_ptr() as u64;
@@ -442,6 +490,12 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
         }
         Kind::Disk => fail("writes for a program that has claimed nothing", !refused(tid, 2)),
         Kind::Keyboard => fail("answers a program that is not input", !refused(tid, 5)),
+        Kind::Auth => {
+            let (who, shadow) = unsafe { (WHO_BEFORE, SHADOW_BEFORE) };
+            fail("made this program somebody else", syscall::sys_get_uid() != who)?;
+            fail("changed the passwords", shadow_sum() != shadow)?;
+            fail("no longer says whether a password is needed", quark_rt::auth::needs(b"~nobody") != Ok(true))
+        }
     }
 }
 
@@ -563,6 +617,12 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     } else {
         NetBefore::default()
     };
+    if t.kind == Kind::Auth {
+        unsafe {
+            WHO_BEFORE = syscall::sys_get_uid();
+            SHADOW_BEFORE = shadow_sum();
+        }
+    }
     if t.kind == Kind::Net && !net_before.pinged {
         println!("  note  net: 10.0.2.2 does not answer pings here, so that is not checked");
     }

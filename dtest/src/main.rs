@@ -432,6 +432,147 @@ fn test_identity() {
     check("this task's groups are put back", syscall::sys_set_groups(0, &was[..had]).is_ok());
 }
 
+/// Passwords and the files accounts are kept in: the runtime's own code, run
+/// where it will be used. The hashes are Drepper's test vectors, which every
+/// C library's `crypt` also has to produce.
+fn test_passwords() {
+    use quark_rt::accounts::{self, Rights};
+    use quark_rt::crypt;
+    println!("passwords:");
+    let hash = |password: &[u8], setting: &[u8], want: &[u8]| {
+        let mut out = [0u8; crypt::MAX_HASH];
+        crypt::sha512_crypt(password, setting, &mut out).is_some_and(|n| &out[..n] == want)
+    };
+    check(
+        "SHA-512 of three letters is what it is everywhere",
+        crypt::sha512(b"abc")[..8] == [0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba],
+    );
+    const HELLO: &[u8] =
+        b"$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1";
+    check("a password hashes as it does on any Unix", hash(b"Hello world!", b"$6$saltstring", HELLO));
+    check(
+        "with the rounds it is told, and sixteen characters of salt",
+        hash(
+            b"Hello world!",
+            b"$6$rounds=10000$saltstringsaltstring",
+            b"$6$rounds=10000$saltstringsaltst$OW1/O6BYHV6BcXZu8QVeXbDWra3Oeqh0sbHbbMCVNSnCM/UrjmM0Dp8vOuZeHBy/YTBmSK6H9qs/y3RnOaw5v.",
+        ),
+    );
+    check(
+        "a password longer than a block of the hash",
+        hash(
+            b"a very much longer text to encrypt.  This one even stretches over morethan one line.",
+            b"$6$rounds=1400$anotherlongsaltstring",
+            b"$6$rounds=1400$anotherlongsalts$POfYwTEok97VWcjxIiSOjiykti.o/pQs.wPvMxQ6Fm7I6IoYN3CmLs66x9t0oSwbtEW7o7UmJEiDwGqd8p4ur1",
+        ),
+    );
+    check("the right password opens it", crypt::verify(b"Hello world!", HELLO));
+    check("a wrong one does not", !crypt::verify(b"Hello world?", HELLO));
+    check("nor does anything open a locked account", !crypt::verify(b"", b"!") && !crypt::verify(b"x", b"*"));
+    let mut one = [0u8; crypt::MAX_HASH];
+    let mut two = [0u8; crypt::MAX_HASH];
+    let a = crypt::make(b"secret", &[1; 12], &mut one);
+    let b = crypt::make(b"secret", &[2; 12], &mut two);
+    check(
+        "a new hash is one that verifies",
+        a.is_some_and(|n| crypt::verify(b"secret", &one[..n]) && !crypt::verify(b"Secret", &one[..n])),
+    );
+    check("and is salted: the same password twice is two hashes", a.is_some() && b.is_some() && one != two);
+
+    let passwd = b"root:x:0:0:root:/root:/usr/bin/bash\n# a note\nnate:x:1000:1000:Nate:/home/nate:/usr/bin/qsh\nold:5:5:/home/old:/usr/bin/QSH.ELF\n";
+    check(
+        "an account is read as Unix writes it",
+        accounts::user_named(passwd, b"nate").is_some_and(|u| u.uid == 1000 && u.home == b"/home/nate"),
+    );
+    check(
+        "and as this system first wrote it",
+        accounts::user_named(passwd, b"old").is_some_and(|u| u.uid == 5 && u.shell == b"/usr/bin/QSH.ELF"),
+    );
+    let group = b"root:x:0:\nwheel:x:10:root,nate\nnate:x:1000:\nvideo:x:39:nate\n";
+    let mut groups = [0u32; accounts::MAX_GROUPS];
+    check(
+        "the groups somebody is in are the ones that list them",
+        accounts::groups_of(group, b"nate", 1000, &mut groups) == 2 && groups[..2] == [10, 39],
+    );
+    check(
+        "with no rights file, root has every right and nobody else has any",
+        accounts::rights_of(None, b"root", 0).has(Rights::ALL) && accounts::rights_of(None, b"nate", 1000) == Rights::NONE,
+    );
+    check(
+        "with one, an account has what its line says",
+        accounts::rights_of(Some(b"nate power become\n"), b"nate", 1000).has(Rights::POWER | Rights::BECOME)
+            && !accounts::rights_of(Some(b"nate power become\n"), b"nate", 1000).has(Rights::TASKS),
+    );
+    let mut out = [0u8; 256];
+    check(
+        "a line is replaced where it is and the rest left alone",
+        accounts::with_record(b"a:1\nb:2\nc:3\n", b"b", b':', Some(b"b:9"), &mut out)
+            .is_some_and(|n| &out[..n] == b"a:1\nb:9\nc:3\n"),
+    );
+    check(
+        "a name that would break a file is not a name",
+        !accounts::name_ok(b"a:b") && !accounts::name_ok(b"") && !accounts::name_ok(b"Root") && accounts::name_ok(b"amy_2"),
+    );
+}
+
+/// A call to a task that ends without answering. The caller is answered by
+/// the ending — a failure — and not left until somebody collects the task:
+/// the somebody is its parent, and here the parent is the caller.
+fn test_callee_gone() {
+    use quark_rt::ipc::Message;
+    println!("a call to a task that goes:");
+    let Some(child) = load_child(&[b"dchild", b"late"]) else {
+        check("loaded a child that will go", false);
+        return;
+    };
+    let tid = child.tid;
+    let may = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0).is_ok();
+    if !may || child.start().is_err() {
+        let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+        check("started a child that will go", false);
+        return;
+    }
+    let before = syscall::sys_ticks();
+    let mut reply = Message::empty();
+    let ask = Message { sender: 0, tag: 1, data: [0; 6] };
+    // Five seconds, which is how long this waits if nothing ends the call.
+    let outcome = syscall::sys_call_timeout(tid, &ask, &mut reply, 500);
+    let took = syscall::sys_ticks() - before;
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    // The answer is the kernel's: a message from the task that went, with
+    // the tag every refusal has.
+    let failed = match outcome {
+        syscall::CallOutcome::Failed => true,
+        syscall::CallOutcome::Replied => reply.tag == u64::MAX,
+        syscall::CallOutcome::TimedOut => false,
+    };
+    check("its parent, in a call to it, is answered when it ends", failed && took < 200);
+    check("and can then collect it", wait_for(tid) == Some(3));
+}
+
+/// A child that is built and then not wanted: what `login` has when the
+/// password was wrong. It has to go back whole — the task, and the address
+/// space with the image in it — or sixty-four wrong passwords are the last
+/// anybody types.
+fn test_discard() {
+    println!("a child that is not started:");
+    let before = (2..64).filter(|&t| syscall::sys_task_info(t).is_ok()).count();
+    let mut all = true;
+    for _ in 0..80 {
+        match load_child(&[b"dchild", b"quit"]) {
+            Some(child) => child.discard(),
+            None => {
+                all = false;
+                break;
+            }
+        }
+    }
+    check("eighty are built and taken back, in a table of sixty-four", all);
+    let after = (2..64).filter(|&t| syscall::sys_task_info(t).is_ok()).count();
+    check("and no task is left of them", after == before);
+    check("the next one still runs", run(b"dchild", &[b"quit"]) == Some(0));
+}
+
 /// A file as a descriptor: in the kernel's table, with its position kept by
 /// the server, so that everything a descriptor can do a file can do.
 fn test_file_descriptors() {
@@ -1955,6 +2096,15 @@ fn nothing_at(at: usize) -> bool {
     free
 }
 
+/// Who the checks of what a user may do are made as: nobody the system has
+/// an account for. `dchild` knows the same three numbers.
+const USER: u32 = 4000;
+const USER_GROUP: u32 = 4000;
+/// A group that user is in besides its own.
+const ALSO_IN: u32 = 4001;
+/// Room for the account files to be read and rewritten in.
+const ACCOUNTS_AT: usize = 0xA9_0000_0000;
+
 /// Wait for one particular child, collecting any other on the way.
 fn wait_for(tid: usize) -> Option<i32> {
     loop {
@@ -3233,6 +3383,383 @@ fn spill(vfs_tid: usize, path: &[u8], bytes: &[u8]) -> Result<(), u64> {
     result
 }
 
+/// A path in `dir`.
+fn under<'a>(dir: &[u8], name: &[u8], out: &'a mut [u8; 160]) -> &'a [u8] {
+    let n = dir.len().min(120);
+    out[..n].copy_from_slice(&dir[..n]);
+    out[n] = b'/';
+    out[n + 1..n + 1 + name.len()].copy_from_slice(name);
+    &out[..n + 1 + name.len()]
+}
+
+/// Whether this task may say who another is.
+fn holds_set_uid() -> bool {
+    let me = syscall::sys_getpid() as usize;
+    (0..64).any(|slot| {
+        matches!(syscall::sys_cap_read(me, slot), Ok(c) if c.cap_type == syscall::CAP_TYPE_SET_UID && c.valid)
+    })
+}
+
+/// How many capabilities of one kind a task holds.
+fn holds(tid: usize, cap_type: u64) -> usize {
+    (0..64).filter(|&slot| matches!(syscall::sys_cap_read(tid, slot), Ok(c) if c.cap_type == cap_type && c.valid)).count()
+}
+
+/// What `dchild user` looks at, laid out in `dir` as root.
+fn lay_out_for_user(v: usize, dir: &[u8]) -> bool {
+    let mut path = [0u8; 160];
+    let mode = |path: &[u8], mode: u32| vfs::set_attr(v, path, vfs::ATTR_MODE, mode, 0, 0, 0, 0).is_ok();
+    let mut ok = vfs::mkdir(v, dir).is_ok() && mode(dir, 0o755);
+    let secret = under(dir, b"secret", &mut path);
+    ok &= spill(v, secret, b"secret").is_ok() && mode(secret, 0o600);
+    let shared = under(dir, b"shared", &mut path);
+    ok &= spill(v, shared, b"shared").is_ok()
+        && vfs::set_attr(v, shared, vfs::ATTR_MODE | vfs::ATTR_GID, 0o640, 0, ALSO_IN, 0, 0).is_ok();
+    let open = under(dir, b"open", &mut path);
+    ok &= spill(v, open, b"open").is_ok() && mode(open, 0o644);
+    let sticky = under(dir, b"sticky", &mut path);
+    ok &= vfs::mkdir(v, sticky).is_ok() && mode(sticky, 0o1777);
+    ok &= spill(v, under(dir, b"sticky/roots", &mut path), b"roots").is_ok();
+    ok &= vfs::mkdir(v, under(dir, b"sticky/rootsdir", &mut path)).is_ok();
+    let private = under(dir, b"private", &mut path);
+    ok &= vfs::mkdir(v, private).is_ok() && mode(private, 0o700);
+    ok &= spill(v, under(dir, b"private/inside", &mut path), b"inside").is_ok();
+    ok
+}
+
+/// Take that away again, and whatever a run that stopped half way left.
+fn clear_for_user(v: usize, dir: &[u8]) {
+    let mut path = [0u8; 160];
+    for name in [
+        &b"secret"[..],
+        b"shared",
+        b"open",
+        b"new",
+        b"sticky/roots",
+        b"sticky/mine",
+        b"sticky/moved",
+        b"sticky/taken",
+        b"sticky/kept",
+        b"private/inside",
+    ] {
+        let _ = vfs::unlink(v, under(dir, name, &mut path));
+    }
+    for name in [&b"sticky/rootsdir"[..], b"newdir", b"sticky", b"private"] {
+        let _ = vfs::rmdir(v, under(dir, name, &mut path));
+    }
+    let _ = vfs::rmdir(v, dir);
+}
+
+/// Run `dchild` as a user who is not root, and say how it ended.
+fn run_as_user(args: &[&[u8]]) -> Option<i32> {
+    let child = load_child(args)?;
+    let tid = child.tid;
+    // The user last: saying who a task is takes being allowed to, and the
+    // order here is the order a program that gives its own rights up uses.
+    let said = syscall::sys_set_gid(tid, USER_GROUP).is_ok()
+        && syscall::sys_set_groups(tid, &[ALSO_IN]).is_ok()
+        && syscall::sys_set_uid(tid, USER).is_ok();
+    if !said {
+        child.discard();
+        return None;
+    }
+    child.start().ok()?;
+    wait_for(tid)
+}
+
+/// The same checks twice: on the filesystem the system runs from, and on
+/// one mounted in it, where a second server is told who is asking.
+macro_rules! user_checks {
+    ($($what:literal),* $(,)?) => {
+        const AS_USER: &[&str] = &[$($what),*];
+        const AS_USER_MOUNTED: &[&str] = &[$(concat!("through a mount: ", $what)),*];
+    };
+}
+user_checks![
+    "root's own file does not open for a user",
+    "a file of a group the user is in besides its own is read, and not written",
+    "a file anybody may read is read, and not written, removed or joined by another",
+    "where anybody may make files, another's is not removed, moved or replaced",
+    "and the user's own is",
+    "a directory of root's own is not looked in",
+    "a file's mode is its owner's to change, and whose it is, is root's",
+];
+
+/// Lay `dir` out, run `dchild user` there as a user, and check each thing
+/// it reports.
+fn as_a_user(v: usize, dir: &[u8], names: &[&'static str]) {
+    clear_for_user(v, dir);
+    let laid = lay_out_for_user(v, dir);
+    let status = if laid { run_as_user(&[b"dchild", b"user", dir]) } else { None };
+    // A status of 128 or more is a program that fell over.
+    let bits = status.filter(|s| (0..128).contains(s)).unwrap_or(0);
+    for (i, &name) in names.iter().enumerate() {
+        check(name, bits & (1 << i) != 0);
+    }
+    clear_for_user(v, dir);
+}
+
+/// What somebody who is not root may do, and may not: the file server's
+/// rules and the kernel's, asked of them by a program that is that user.
+fn test_users() {
+    println!("users:");
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the file server", false);
+        return;
+    };
+    if syscall::sys_get_uid().0 != 0 || !holds_set_uid() {
+        println!("  (needs root, and the right to say who a task is)");
+        return;
+    }
+    as_a_user(v, b"/tmp/dtest-users", AS_USER);
+
+    // The rest of what a user is not: a task of root's to try to end.
+    let Some(victim) = load_child(&[b"dchild", b"sleep"]) else {
+        check("loaded a program of root's", false);
+        return;
+    };
+    let victim_tid = victim.tid;
+    if victim.start().is_err() {
+        check("started a program of root's", false);
+        return;
+    }
+    let mut text = [0u8; 20];
+    let status = run_as_user(&[b"dchild", b"usersys", decimal(victim_tid, &mut text)]);
+    let bits = status.filter(|s| (0..128).contains(s)).unwrap_or(0);
+    check("a program started as a user is that user, in the groups it was put in", bits & 1 != 0);
+    check("the passwords do not open for it", bits & 2 != 0);
+    check("who it is, is not its own to say", bits & 4 != 0);
+    check("root's program is not its to end", bits & 8 != 0);
+    check("a file it makes is its own", bits & 16 != 0);
+    check("and the accounts are not its to change", bits & 32 != 0);
+    check(
+        "root's program is still there, and root ends it",
+        syscall::sys_task_kill(victim_tid).is_ok() && wait_for(victim_tid).is_some(),
+    );
+}
+
+/// The one line of `/etc/rights` for `name`: `rights` as its words, or no
+/// line at all. Whether it was written.
+fn set_rights(v: usize, name: &[u8], rights: Option<&[u8]>, work: &mut [u8]) -> bool {
+    use quark_rt::accounts;
+    let (old_buf, out) = work.split_at_mut(accounts::WORK / 5);
+    let old = accounts::read(v, b"", b"rights", old_buf);
+    let mut line = [0u8; 96];
+    let line = rights.map(|r| {
+        let n = name.len();
+        line[..n].copy_from_slice(name);
+        line[n] = b' ';
+        line[n + 1..n + 1 + r.len()].copy_from_slice(r);
+        &line[..n + 1 + r.len()]
+    });
+    let Some(len) = accounts::with_record(old.unwrap_or(b""), name, b' ', line, out) else {
+        return false;
+    };
+    // A file this made, with nothing left in it, goes: a system that had no
+    // such file is one where root is root, and is left that way.
+    if len == 0 || out[..len].iter().all(|b| b.is_ascii_whitespace()) {
+        let _ = vfs::unlink(v, b"/etc/rights");
+        return true;
+    }
+    accounts::write(v, b"", b"rights", &out[..len], 0o644).is_ok()
+}
+
+/// Load `dchild`, have the server make it `user` — asked as root, who is
+/// asked for no password — run it, and say how it ended.
+fn run_blessed(user: &[u8], args: &[&[u8]]) -> Option<i32> {
+    let child = load_child(args)?;
+    let tid = child.tid;
+    if quark_rt::auth::bless(tid, user, b"", 0).is_err() {
+        child.discard();
+        return None;
+    }
+    child.start().ok()?;
+    wait_for(tid)
+}
+
+/// The server that says who somebody is, asked the way `login` and `su`
+/// ask it: an account is made, given a password, become, and taken away.
+fn test_auth() {
+    use quark_rt::accounts::{self, NewUser};
+    use quark_rt::auth;
+    println!("auth:");
+    if nameserver::lookup_retry(auth::NAME, 5).is_none() {
+        println!("  (nothing here says who anybody is)");
+        return;
+    }
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else {
+        check("find the file server", false);
+        return;
+    };
+    check(
+        "a name nobody has is asked for a password like any other",
+        auth::needs(b"dtest-nobody-at-all") == Ok(true),
+    );
+    if syscall::sys_get_uid().0 != 0 {
+        println!("  (the rest makes an account, and needs root)");
+        return;
+    }
+    if syscall::sys_mmap(ACCOUNTS_AT, accounts::WORK / 4096).is_err() {
+        check("memory to rewrite the accounts in", false);
+        return;
+    }
+    let work = unsafe { core::slice::from_raw_parts_mut(ACCOUNTS_AT as *mut u8, accounts::WORK) };
+    const NAME: &[u8] = b"dtestuser";
+    const OTHER: &[u8] = b"dtestother";
+    const FIRST: &[u8] = b"the first password";
+    const SECOND: &[u8] = b"a second one, longer than the first and with a comma";
+    const THIRD: &[u8] = b"3rd";
+    // Whatever a run that stopped half way left.
+    let _ = accounts::remove_user(v, b"", NAME, work);
+    let _ = accounts::remove_user(v, b"", OTHER, work);
+    let _ = set_rights(v, NAME, None, work);
+
+    let new = |name| NewUser { name, uid: None, group: None, about: b"dtest", home: None, shell: None, make_home: false };
+    let made = accounts::add_user(v, b"", &new(NAME), work);
+    let other = accounts::add_user(v, b"", &new(OTHER), work);
+    check("two accounts are made", made.is_ok() && other.is_ok());
+    let (Ok((uid, gid)), Ok((other_uid, _))) = (made, other) else {
+        let _ = accounts::remove_user(v, b"", NAME, work);
+        let _ = accounts::remove_user(v, b"", OTHER, work);
+        let _ = syscall::sys_munmap(ACCOUNTS_AT, accounts::WORK / 4096);
+        return;
+    };
+
+    // One child, made and never started, to be said things about.
+    let Some(child) = load_child(&[b"dchild", b"quit"]) else {
+        check("loaded a child to bless", false);
+        return;
+    };
+    let tid = child.tid;
+    let who = || syscall::sys_get_tuid(tid);
+    check(
+        "a new account is locked: no password makes anybody it",
+        auth::bless(tid, NAME, b"", auth::CHECK) == Err(auth::ERR_LOCKED) && who() == Ok((0, 0)),
+    );
+    check(
+        "root is asked for none, and its child is made that user",
+        auth::bless(tid, NAME, b"", 0) == Ok((uid, gid)) && who() == Ok((uid, gid)),
+    );
+    check(
+        "holding nothing an account with no rights is not given",
+        holds(tid, syscall::CAP_TYPE_TASK_MGMT) == 0
+            && holds(tid, syscall::CAP_TYPE_IOPORT) == 0
+            && holds(tid, syscall::CAP_TYPE_SET_UID) == 0,
+    );
+    check("root gives the account a password", auth::passwd(NAME, b"", FIRST).is_ok());
+    check("which it is then asked for", auth::needs(NAME) == Ok(true));
+    check("the password opens it", auth::bless(tid, NAME, FIRST, auth::CHECK) == Ok((uid, gid)));
+    check(
+        "nobody is made a user nobody is, and is told no more than that it was wrong",
+        auth::bless(tid, b"dtest-nobody-at-all", FIRST, auth::CHECK) == Err(auth::ERR_WRONG),
+    );
+    // Three wrong ones, and then the right one has to wait.
+    let wrong = (0..3).all(|_| auth::bless(tid, NAME, b"not the password", auth::CHECK) == Err(auth::ERR_WRONG));
+    check("a wrong password does not", wrong);
+    check(
+        "after three of them even the right one waits",
+        auth::bless(tid, NAME, FIRST, auth::CHECK) == Err(auth::ERR_WAIT),
+    );
+    syscall::sleep_ticks(130);
+    check("and a moment later it opens again", auth::bless(tid, NAME, FIRST, auth::CHECK) == Ok((uid, gid)));
+
+    // Whose task it is.
+    check(
+        "a task that is not the asker's child is not the asker's to have named",
+        auth::bless(INIT_TID, NAME, FIRST, auth::CHECK) == Err(auth::ERR_NOT_YOURS),
+    );
+    match load_child(&[b"dchild", b"sleep"]) {
+        Some(running) => {
+            let running_tid = running.tid;
+            let started = running.start().is_ok();
+            check(
+                "nor is a child that has been started",
+                started
+                    && auth::bless(running_tid, NAME, FIRST, auth::CHECK) == Err(auth::ERR_NOT_YOURS)
+                    && syscall::sys_get_tuid(running_tid) == Ok((0, 0)),
+            );
+            let _ = syscall::sys_task_kill(running_tid);
+            let _ = wait_for(running_tid);
+        }
+        None => check("loaded a child to start", false),
+    }
+
+    // A password changed is the old one gone.
+    check("root changes the password", auth::passwd(NAME, b"", SECOND).is_ok());
+    check(
+        "the old one no longer opens it, and the new one does",
+        auth::bless(tid, NAME, FIRST, auth::CHECK) == Err(auth::ERR_WRONG)
+            && auth::bless(tid, NAME, SECOND, auth::CHECK) == Ok((uid, gid)),
+    );
+    child.discard();
+
+    // As the user.
+    check(
+        "the user changes its own with the old one, and nobody else's",
+        run_blessed(NAME, &[b"dchild", b"authuser", NAME, OTHER, SECOND, THIRD]) == Some(7),
+    );
+    let mut text = [0u8; 20];
+    let other_id = decimal(other_uid as usize, &mut text);
+    check(
+        "an account that may not become another is not made one by its own password",
+        run_blessed(NAME, &[b"dchild", b"become", OTHER, other_id, THIRD])
+            == Some(100 + auth::ERR_NOT_ALLOWED as i32),
+    );
+
+    // What an account may do is what its sessions are handed.
+    check("the account is given the right to become another", set_rights(v, NAME, Some(b"become"), work));
+    check(
+        "and then its own password makes it one",
+        run_blessed(NAME, &[b"dchild", b"become", OTHER, other_id, THIRD]) == Some(0),
+    );
+    check(
+        "though not a wrong one",
+        run_blessed(NAME, &[b"dchild", b"become", OTHER, other_id, b"not it"]) == Some(100 + auth::ERR_WRONG as i32),
+    );
+    let handed = |rights: &[u8], work: &mut [u8]| {
+        if !set_rights(v, NAME, Some(rights), work) {
+            return None;
+        }
+        let child = load_child(&[b"dchild", b"quit"])?;
+        let blessed = auth::bless(child.tid, NAME, b"", 0).is_ok();
+        let has = (
+            holds(child.tid, syscall::CAP_TYPE_TASK_MGMT),
+            holds(child.tid, syscall::CAP_TYPE_IOPORT),
+            holds(child.tid, syscall::CAP_TYPE_SET_UID),
+        );
+        child.discard();
+        blessed.then_some(has)
+    };
+    check(
+        "an account that may end programs is handed the right to, and no more",
+        handed(b"tasks", work) == Some((1, 0, 0)),
+    );
+    check(
+        "one that may turn the machine off, the ports that do it",
+        handed(b"power", work) == Some((1, 3, 0)),
+    );
+    check(
+        "and neither the right to say who anybody is",
+        handed(b"power tasks become", work) == Some((1, 3, 0)),
+    );
+
+    check(
+        "the accounts are taken away again",
+        set_rights(v, NAME, None, work)
+            && accounts::remove_user(v, b"", NAME, work).is_ok()
+            && accounts::remove_user(v, b"", OTHER, work).is_ok(),
+    );
+    check(
+        "and nobody is made a user that has gone",
+        load_child(&[b"dchild", b"quit"]).is_some_and(|c| {
+            let refused = auth::bless(c.tid, NAME, THIRD, auth::CHECK) == Err(auth::ERR_WRONG);
+            c.discard();
+            refused
+        }),
+    );
+    let _ = syscall::sys_munmap(ACCOUNTS_AT, accounts::WORK / 4096);
+}
+
 /// A filesystem mounted in another: a server of its own, reached through the
 /// one its directory is in.
 fn test_mounts() {
@@ -3418,6 +3945,12 @@ fn test_mounts() {
             && vfs::mkdir(vfs_tid, at) == Err(vfs::ERR_EXISTS),
     );
 
+    // Somebody who is not root, asking through the server above: this one
+    // is told who is asking, and in which groups.
+    if syscall::sys_get_uid().0 == 0 && holds_set_uid() {
+        as_a_user(vfs_tid, b"/tmp/dtest-mnt/users", AS_USER_MOUNTED);
+    }
+
     // Being in it.
     let mut cwd = [0u8; 64];
     check(
@@ -3572,6 +4105,14 @@ fn test_mounts() {
             && vfs::open(vfs_tid, b"/tmp/dtest-mnt/GONE.TXT").err() == Some(vfs::ERR_NOT_FOUND)
             && vfs::rmdir(vfs_tid, b"/tmp/dtest-mnt/EFI") == Err(vfs::ERR_NOT_EMPTY),
     );
+    // Nothing in it is anybody's, so there is nothing to ask of a user but
+    // whether it is root.
+    if syscall::sys_get_uid().0 == 0 && holds_set_uid() {
+        check(
+            "it is anybody's to read, and root's alone to change",
+            run_as_user(&[b"dchild", b"userfat", b"/tmp/dtest-mnt/EFI", b"BOOT.BIN"]) == Some(3),
+        );
+    }
     check("it is unmounted", run(b"umount", &[at]) == Some(0));
     check("and its checker finds nothing wrong", run(b"fsck.fat", &[b"-n", dev]) == Some(0));
 
@@ -4401,7 +4942,12 @@ pub extern "C" fn _start() -> ! {
         ("close", test_close),
         ("fds", test_fd_table),
         ("program", test_program_table),
-    ("identity", test_identity),
+        ("identity", test_identity),
+        ("passwords", test_passwords),
+        ("discard", test_discard),
+        ("gone", test_callee_gone),
+        ("users", test_users),
+        ("auth", test_auth),
         ("served", test_served),
         ("fdfiles", test_file_descriptors),
         ("signals", test_signals),
