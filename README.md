@@ -57,7 +57,7 @@ ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     716 checks of the kernel, made through the ABI, and
+dtest/  dchild/     720 checks of the kernel, made through the ABI, and
                     seven more on a machine with a device to ask `edu` about.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.

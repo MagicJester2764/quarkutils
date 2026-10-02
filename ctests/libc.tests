@@ -38,3 +38,4 @@ crypttest
 smptest
 watchtest
 clocktest
+avxtest

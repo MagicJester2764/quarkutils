@@ -4775,6 +4775,273 @@ extern "C" fn fpu_worker() -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// The wider registers: sixteen of 256 bits (AVX), and where the processor
+/// has them thirty-two of 512 and seven mask registers (AVX-512). A word of
+/// each task's pattern in every sixty-four bits of every one.
+fn wide_pattern(seed: u64, words: &mut [u64]) {
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = fpu_pattern(seed, i as u64);
+    }
+}
+
+/// What a program looks at to know whether it may use the wide registers:
+/// that the processor has AVX, that the kernel has turned on the saving of
+/// more than SSE's state, and which state it said it saves. Whether the
+/// processor has AVX, whether a program may use it, and whether it may use
+/// AVX-512.
+fn wide_registers() -> (bool, bool, bool) {
+    let features = core::arch::x86_64::__cpuid(1);
+    let has = features.ecx & (1 << 28) != 0;
+    // The kernel's part: OSXSAVE, and then what it saves.
+    if !has || features.ecx & (1 << 27) == 0 {
+        return (has, false, false);
+    }
+    let (lo, hi): (u32, u32);
+    unsafe { core::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    let saved = (hi as u64) << 32 | lo as u64;
+    let avx512 = core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 16) != 0;
+    (has, saved & 0b110 == 0b110, avx512 && saved & 0xE6 == 0xE6)
+}
+
+unsafe fn ymm_load(vals: &[u64; 64]) {
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{v} + 0*32]",
+            "vmovdqu ymm1, [{v} + 1*32]",
+            "vmovdqu ymm2, [{v} + 2*32]",
+            "vmovdqu ymm3, [{v} + 3*32]",
+            "vmovdqu ymm4, [{v} + 4*32]",
+            "vmovdqu ymm5, [{v} + 5*32]",
+            "vmovdqu ymm6, [{v} + 6*32]",
+            "vmovdqu ymm7, [{v} + 7*32]",
+            "vmovdqu ymm8, [{v} + 8*32]",
+            "vmovdqu ymm9, [{v} + 9*32]",
+            "vmovdqu ymm10, [{v} + 10*32]",
+            "vmovdqu ymm11, [{v} + 11*32]",
+            "vmovdqu ymm12, [{v} + 12*32]",
+            "vmovdqu ymm13, [{v} + 13*32]",
+            "vmovdqu ymm14, [{v} + 14*32]",
+            "vmovdqu ymm15, [{v} + 15*32]",
+            v = in(reg) vals.as_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+unsafe fn ymm_read() -> [u64; 64] {
+    let mut vals = [0u64; 64];
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu [{v} + 0*32], ymm0",
+            "vmovdqu [{v} + 1*32], ymm1",
+            "vmovdqu [{v} + 2*32], ymm2",
+            "vmovdqu [{v} + 3*32], ymm3",
+            "vmovdqu [{v} + 4*32], ymm4",
+            "vmovdqu [{v} + 5*32], ymm5",
+            "vmovdqu [{v} + 6*32], ymm6",
+            "vmovdqu [{v} + 7*32], ymm7",
+            "vmovdqu [{v} + 8*32], ymm8",
+            "vmovdqu [{v} + 9*32], ymm9",
+            "vmovdqu [{v} + 10*32], ymm10",
+            "vmovdqu [{v} + 11*32], ymm11",
+            "vmovdqu [{v} + 12*32], ymm12",
+            "vmovdqu [{v} + 13*32], ymm13",
+            "vmovdqu [{v} + 14*32], ymm14",
+            "vmovdqu [{v} + 15*32], ymm15",
+            v = in(reg) vals.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+    vals
+}
+
+unsafe fn zmm_load(vals: &[u64; 256], masks: &[u64; 8]) {
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu64 zmm0, [{v} + 0*64]",
+            "vmovdqu64 zmm1, [{v} + 1*64]",
+            "vmovdqu64 zmm2, [{v} + 2*64]",
+            "vmovdqu64 zmm3, [{v} + 3*64]",
+            "vmovdqu64 zmm4, [{v} + 4*64]",
+            "vmovdqu64 zmm5, [{v} + 5*64]",
+            "vmovdqu64 zmm6, [{v} + 6*64]",
+            "vmovdqu64 zmm7, [{v} + 7*64]",
+            "vmovdqu64 zmm8, [{v} + 8*64]",
+            "vmovdqu64 zmm9, [{v} + 9*64]",
+            "vmovdqu64 zmm10, [{v} + 10*64]",
+            "vmovdqu64 zmm11, [{v} + 11*64]",
+            "vmovdqu64 zmm12, [{v} + 12*64]",
+            "vmovdqu64 zmm13, [{v} + 13*64]",
+            "vmovdqu64 zmm14, [{v} + 14*64]",
+            "vmovdqu64 zmm15, [{v} + 15*64]",
+            "vmovdqu64 zmm16, [{v} + 16*64]",
+            "vmovdqu64 zmm17, [{v} + 17*64]",
+            "vmovdqu64 zmm18, [{v} + 18*64]",
+            "vmovdqu64 zmm19, [{v} + 19*64]",
+            "vmovdqu64 zmm20, [{v} + 20*64]",
+            "vmovdqu64 zmm21, [{v} + 21*64]",
+            "vmovdqu64 zmm22, [{v} + 22*64]",
+            "vmovdqu64 zmm23, [{v} + 23*64]",
+            "vmovdqu64 zmm24, [{v} + 24*64]",
+            "vmovdqu64 zmm25, [{v} + 25*64]",
+            "vmovdqu64 zmm26, [{v} + 26*64]",
+            "vmovdqu64 zmm27, [{v} + 27*64]",
+            "vmovdqu64 zmm28, [{v} + 28*64]",
+            "vmovdqu64 zmm29, [{v} + 29*64]",
+            "vmovdqu64 zmm30, [{v} + 30*64]",
+            "vmovdqu64 zmm31, [{v} + 31*64]",
+            "kmovq k1, [{k} + 1*8]",
+            "kmovq k2, [{k} + 2*8]",
+            "kmovq k3, [{k} + 3*8]",
+            "kmovq k4, [{k} + 4*8]",
+            "kmovq k5, [{k} + 5*8]",
+            "kmovq k6, [{k} + 6*8]",
+            "kmovq k7, [{k} + 7*8]",
+            v = in(reg) vals.as_ptr(),
+            k = in(reg) masks.as_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+unsafe fn zmm_read(vals: &mut [u64; 256], masks: &mut [u64; 8]) {
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu64 [{v} + 0*64], zmm0",
+            "vmovdqu64 [{v} + 1*64], zmm1",
+            "vmovdqu64 [{v} + 2*64], zmm2",
+            "vmovdqu64 [{v} + 3*64], zmm3",
+            "vmovdqu64 [{v} + 4*64], zmm4",
+            "vmovdqu64 [{v} + 5*64], zmm5",
+            "vmovdqu64 [{v} + 6*64], zmm6",
+            "vmovdqu64 [{v} + 7*64], zmm7",
+            "vmovdqu64 [{v} + 8*64], zmm8",
+            "vmovdqu64 [{v} + 9*64], zmm9",
+            "vmovdqu64 [{v} + 10*64], zmm10",
+            "vmovdqu64 [{v} + 11*64], zmm11",
+            "vmovdqu64 [{v} + 12*64], zmm12",
+            "vmovdqu64 [{v} + 13*64], zmm13",
+            "vmovdqu64 [{v} + 14*64], zmm14",
+            "vmovdqu64 [{v} + 15*64], zmm15",
+            "vmovdqu64 [{v} + 16*64], zmm16",
+            "vmovdqu64 [{v} + 17*64], zmm17",
+            "vmovdqu64 [{v} + 18*64], zmm18",
+            "vmovdqu64 [{v} + 19*64], zmm19",
+            "vmovdqu64 [{v} + 20*64], zmm20",
+            "vmovdqu64 [{v} + 21*64], zmm21",
+            "vmovdqu64 [{v} + 22*64], zmm22",
+            "vmovdqu64 [{v} + 23*64], zmm23",
+            "vmovdqu64 [{v} + 24*64], zmm24",
+            "vmovdqu64 [{v} + 25*64], zmm25",
+            "vmovdqu64 [{v} + 26*64], zmm26",
+            "vmovdqu64 [{v} + 27*64], zmm27",
+            "vmovdqu64 [{v} + 28*64], zmm28",
+            "vmovdqu64 [{v} + 29*64], zmm29",
+            "vmovdqu64 [{v} + 30*64], zmm30",
+            "vmovdqu64 [{v} + 31*64], zmm31",
+            "kmovq [{k} + 1*8], k1",
+            "kmovq [{k} + 2*8], k2",
+            "kmovq [{k} + 3*8], k3",
+            "kmovq [{k} + 4*8], k4",
+            "kmovq [{k} + 5*8], k5",
+            "kmovq [{k} + 6*8], k6",
+            "kmovq [{k} + 7*8], k7",
+            v = in(reg) vals.as_mut_ptr(),
+            k = in(reg) masks.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Whether the task that used the wide registers after this one found them
+/// empty, as a new task's are; and whether it is to use the widest.
+static WIDE_EMPTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static WIDEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut WIDE_VALUES: [u64; 256] = [0; 256];
+
+extern "C" fn wide_worker() -> ! {
+    use core::sync::atomic::Ordering;
+    FPU_GO.acquire();
+    // A new task's are nought: not what the task that made it had in them,
+    // and not what whoever ran last left.
+    let found = unsafe { ymm_read() };
+    WIDE_EMPTY.store(found.iter().all(|&word| word == 0), Ordering::SeqCst);
+    // And then they are this task's.
+    let values = unsafe { &mut *(&raw mut WIDE_VALUES) };
+    wide_pattern(0xB0B, values);
+    unsafe {
+        if WIDEST.load(Ordering::SeqCst) {
+            let mut masks = [0u64; 8];
+            wide_pattern(0xB0B5, &mut masks);
+            zmm_load(values, &masks);
+        } else {
+            ymm_load(values[..64].try_into().unwrap());
+        }
+    }
+    FPU_RAN.release();
+    syscall::sys_exit_code(0);
+}
+
+/// The wide registers are a task's own as the SSE ones are, where a program
+/// may use them at all.
+fn test_wide_registers() {
+    use core::sync::atomic::Ordering;
+    let (has, may, widest) = wide_registers();
+    if !has {
+        println!("        this processor has no AVX: the wide registers are not checked");
+        return;
+    }
+    check("the kernel says the wide registers may be used", may);
+    if !may {
+        return;
+    }
+    WIDEST.store(widest, Ordering::SeqCst);
+    let Ok(_t) = thread::spawn_with_stack(wide_worker, 16) else {
+        check("start a task to share the wide registers with", false);
+        return;
+    };
+    let mut mine = [0u64; 256];
+    let mut masks = [0u64; 8];
+    wide_pattern(0xA11CE, &mut mine);
+    wide_pattern(0xA11CE5, &mut masks);
+    let (mut found, mut found_masks) = ([0u64; 256], [0u64; 8]);
+    unsafe {
+        if widest {
+            zmm_load(&mine, &masks);
+        } else {
+            ymm_load(mine[..64].try_into().unwrap());
+        }
+    }
+    FPU_GO.release();
+    // Blocks, so the worker runs and loads its own pattern.
+    FPU_RAN.acquire();
+    unsafe {
+        if widest {
+            zmm_read(&mut found, &mut found_masks);
+        } else {
+            found[..64].copy_from_slice(&ymm_read());
+        }
+    }
+    // The upper half of each of the first sixteen is what SSE never saved,
+    // and is the half that says; the lower half is a register compiled code
+    // may use for its own purposes between the two looks.
+    let upper = |i: usize| i % 4 >= 2;
+    let kept = (0..64).filter(|&i| upper(i)).all(|i| found[i] == mine[i]);
+    check("the upper half of every wide register survives another task using them", kept);
+    check("and a new task finds them empty", WIDE_EMPTY.load(Ordering::SeqCst));
+    if widest {
+        // Thirty-two registers of eight words: of the first sixteen, the
+        // words above the first two; of the rest, every word.
+        let wider = |i: usize| i / 8 >= 16 || i % 8 >= 2;
+        check(
+            "and so does every register of the widest kind, and every mask register",
+            (0..256).filter(|&i| wider(i)).all(|i| found[i] == mine[i]) && found_masks[1..] == masks[1..],
+        );
+    } else {
+        println!("        this processor has no AVX-512: the widest registers are not checked");
+    }
+}
+
 fn test_fpu() {
     println!("floating-point state:");
     // A new task starts from a clean state rather than whatever the last task
@@ -4805,6 +5072,7 @@ fn test_fpu() {
         "none of them is the other task's",
         vals[0] != fpu_pattern(0xB0B, 0),
     );
+    test_wide_registers();
 }
 
 /// Where the pages first touched with the direction flag set go.

@@ -312,6 +312,15 @@ program has spent running read as the time since boot.
 
 There is no time zone but what `TZ` spells out.
 
+## Wide registers
+
+A program compiled for AVX, AVX2 or AVX-512 runs where the processor has
+them: the kernel saves each task's, and `__builtin_cpu_supports` — which
+asks the processor and then asks what the system saves — says so. Nothing
+in the C library chooses a routine by what the processor has, musl having
+no such mechanism for a static program; a library that does its own
+choosing (pixman, zlib-ng) finds them.
+
 ## What is refused
 
 A call the layer has no answer for returns `ENOSYS`, on purpose: a C library

@@ -169,8 +169,10 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 716 checks made from
-user space through the ABI, with a recap of what failed before the count. A
+`dtest` is the kernel's test suite as much as this tree's: 720 checks made from
+user space through the ABI — four of them of registers only some processors
+have, and not made where there are none — with a recap of what failed before
+the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
 the part about what a second processor changes, and passes on one. `dtest
