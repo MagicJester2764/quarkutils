@@ -43,11 +43,18 @@ long __quark_fork(void) {
         return -LX_EAGAIN;
     }
     if (child == 0) {
+        /* One thread, in a copy of the memory as it stood: a lock another
+           thread held when the copy was taken is held by nobody here. */
         __quark_sig_forked();
+        __quark_locks_forked();
         return 0;
     }
     unsigned long pid = __syscall1(SYS_PID, child);
     return pid == QUARK_ERR ? (long)child : (long)pid;
+}
+
+void __quark_locks_forked(void) {
+    __quark_arena_forked();
 }
 
 #define PAGE_SIZE 4096UL

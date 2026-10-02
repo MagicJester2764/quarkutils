@@ -223,6 +223,40 @@ typedef unsigned long size_t;
 #define MMAP_BASE   0x93000000000UL
 #define MMAP_LIMIT  0x9F000000000UL
 static unsigned long mmap_next = MMAP_BASE;
+/* Choosing an address, mapping there and stepping past it are three steps,
+   and every thread of a program allocates. Two that chose the same address
+   had one mapping refused — the kernel does not map over what is there —
+   and the program was told there was no memory: a keymap that could not be
+   read, a `malloc` that came back null, on a machine with a gigabyte free.
+   One thread at a time is in the arena. */
+static int arena_lock;
+
+/* The lock: 0 free, 1 held, 2 held and somebody is waiting on it. A futex,
+   so that waiting is the kernel's and a holder that is not running is not
+   spun at. */
+void __quark_lock(int *lock) {
+    int seen = 0;
+    if (__atomic_compare_exchange_n(lock, &seen, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        return;
+    }
+    if (seen != 2) {
+        seen = __atomic_exchange_n(lock, 2, __ATOMIC_ACQUIRE);
+    }
+    while (seen != 0) {
+        __syscall2(SYS_FUTEX_WAIT, (unsigned long)lock, 2);
+        seen = __atomic_exchange_n(lock, 2, __ATOMIC_ACQUIRE);
+    }
+}
+
+void __quark_unlock(int *lock) {
+    if (__atomic_exchange_n(lock, 0, __ATOMIC_RELEASE) == 2) {
+        __syscall2(SYS_FUTEX_WAKE, (unsigned long)lock, 1);
+    }
+}
+
+void __quark_arena_forked(void) {
+    arena_lock = 0;
+}
 
 #define PAGE_SIZE 4096UL
 /* What sys_munmap will take in one call. */
@@ -281,8 +315,10 @@ static long do_mmap(unsigned long len, long flags) {
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    __quark_lock(&arena_lock);
     unsigned long at = mmap_next;
     if (pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
+        __quark_unlock(&arena_lock);
         trace("mmap-arena-full", (long)pages);
         return -LX_ENOMEM;
     }
@@ -291,10 +327,12 @@ static long do_mmap(unsigned long len, long flags) {
         how |= QUARK_MAP_ACCOUNT;
     }
     if (__syscall3(SYS_MAP_ANON, at, pages, how) == QUARK_ERR) {
+        __quark_unlock(&arena_lock);
         trace("mmap-failed-pages", (long)pages);
         return -LX_ENOMEM;
     }
     mmap_next = at + pages * PAGE_SIZE;
+    __quark_unlock(&arena_lock);
     return (long)at;
 }
 
@@ -304,8 +342,10 @@ static long do_mmap_fd(long fd, unsigned long len) {
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    __quark_lock(&arena_lock);
     unsigned long at = mmap_next;
     if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
+        __quark_unlock(&arena_lock);
         return -LX_ENOMEM;
     }
     /* The whole region is mapped, whatever the caller asked to see of it --
@@ -315,10 +355,12 @@ static long do_mmap_fd(long fd, unsigned long len) {
        already occupied, and the kernel refuses to map over them. */
     unsigned long got = __syscall2(SYS_MMAP_FD, (unsigned long)fd, at);
     if (got == QUARK_ERR) {
+        __quark_unlock(&arena_lock);
         return -LX_ENODEV;
     }
     unsigned long real = (got + PAGE_SIZE - 1) / PAGE_SIZE;
     mmap_next = at + (real > pages ? real : pages) * PAGE_SIZE;
+    __quark_unlock(&arena_lock);
     return (long)at;
 }
 
@@ -334,12 +376,10 @@ static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    unsigned long at = mmap_next;
-    if (pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
-        return -LX_ENOMEM;
-    }
     int shared = (flags & LX_MAP_SHARED) != 0;
     int write = (prot & LX_PROT_WRITE) != 0;
+    /* The server is asked first, and outside the arena's lock: it is a call
+       to another program, which may take as long as a disk does. */
     unsigned long slot;
     long bad = __quark_file_map(fd, shared && write, &slot);
     if (bad) {
@@ -347,14 +387,18 @@ static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long
     }
     unsigned long how = (write ? QUARK_OBJECT_WRITE : 0) | (shared ? QUARK_OBJECT_SHARED : 0) |
                         ((prot & LX_PROT_EXEC) ? QUARK_OBJECT_EXEC : 0);
-    unsigned long r = __syscall5(SYS_OBJECT_MAP, slot, at, pages,
-                                 (unsigned long)off / PAGE_SIZE, how);
-    __syscall1(SYS_CAP_DELETE, slot);
-    if (r == QUARK_ERR) {
-        return -LX_ENOMEM;
+    __quark_lock(&arena_lock);
+    unsigned long at = mmap_next;
+    unsigned long r = QUARK_ERR;
+    if (pages <= (MMAP_LIMIT - at) / PAGE_SIZE) {
+        r = __syscall5(SYS_OBJECT_MAP, slot, at, pages, (unsigned long)off / PAGE_SIZE, how);
     }
-    mmap_next = at + pages * PAGE_SIZE;
-    return (long)at;
+    if (r != QUARK_ERR) {
+        mmap_next = at + pages * PAGE_SIZE;
+    }
+    __quark_unlock(&arena_lock);
+    __syscall1(SYS_CAP_DELETE, slot);
+    return r == QUARK_ERR ? -LX_ENOMEM : (long)at;
 }
 
 static long do_munmap(unsigned long at, unsigned long len) {

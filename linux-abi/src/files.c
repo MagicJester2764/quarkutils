@@ -103,10 +103,26 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 
+/* The note of what a descriptor is, read and written whole and in order:
+   another thread may be asking about the same descriptor, and one that
+   reads "a file" must find the handle already there. */
+static unsigned char kind_of(long fd) {
+    return __atomic_load_n(&kind[fd], __ATOMIC_ACQUIRE);
+}
+
+static void note_kernels(long fd) {
+    __atomic_store_n(&kind[fd], KERNELS, __ATOMIC_RELEASE);
+}
+
+static void note_file(long fd, unsigned long handle) {
+    __atomic_store_n(&handle_of[fd], (unsigned short)handle, __ATOMIC_RELAXED);
+    __atomic_store_n(&kind[fd], A_FILE, __ATOMIC_RELEASE);
+}
+
 /* Something has changed what `fd` names, or is about to. */
 void __quark_fd_forget(long fd) {
     if (fd >= 0 && fd < MAX_FDS) {
-        kind[fd] = UNKNOWN;
+        __atomic_store_n(&kind[fd], UNKNOWN, __ATOMIC_RELEASE);
     }
 }
 
@@ -115,20 +131,22 @@ static int is_file(long fd, unsigned long *handle) {
     if (fd < 0 || fd >= MAX_FDS) {
         return 0;
     }
-    if (kind[fd] == UNKNOWN) {
+    unsigned char is = kind_of(fd);
+    if (is == UNKNOWN) {
         unsigned long h;
         if (quark_vfs_handle(fd, &h) == 0) {
-            handle_of[fd] = (unsigned short)h;
-            kind[fd] = A_FILE;
+            note_file(fd, h);
+            is = A_FILE;
         } else {
-            kind[fd] = KERNELS;
+            note_kernels(fd);
+            is = KERNELS;
         }
     }
-    if (kind[fd] != A_FILE) {
+    if (is != A_FILE) {
         return 0;
     }
     if (handle) {
-        *handle = handle_of[fd];
+        *handle = __atomic_load_n(&handle_of[fd], __ATOMIC_RELAXED);
     }
     return 1;
 }
@@ -307,7 +325,7 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
            find no writer, which is how a pipe says it has ended. `info.size`
            is what to wait on, and nothing if the other end is there. */
         if (fd >= 0 && fd < MAX_FDS) {
-            kind[fd] = KERNELS;
+            note_kernels(fd);
         }
         while (info.size && !(flags & LX_O_NONBLOCK)) {
             unsigned long r = __syscall2(SYS_PIPE_PEER, (unsigned long)fd, info.size);
@@ -325,8 +343,7 @@ long __quark_openat(long dirfd, const char *path, long flags, long mode) {
         }
         __quark_fd_set_nonblock(fd, (flags & LX_O_NONBLOCK) != 0);
     } else if (fd >= 0 && fd < MAX_FDS) {
-        handle_of[fd] = (unsigned short)info.handle;
-        kind[fd] = A_FILE;
+        note_file(fd, info.handle);
     }
     if (flags & LX_O_CLOEXEC_) {
         __syscall3(SYS_FD_FLAGS, (unsigned long)fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
@@ -1495,7 +1512,12 @@ long __quark_flock(long fd, long op) {
 /* Which descriptors a program has asked to be non-blocking. One bit per
    descriptor; a file's means nothing, because the VFS is a synchronous call
    and there is nothing to wait for. It is this program's own note and does
-   not outlive it: what a program is exec'd into holding starts as waiting. */
+   not outlive it: what a program is exec'd into holding starts as waiting.
+
+   One word for every descriptor, and so changed with one instruction: two
+   threads marking two descriptors at once, each reading the word and
+   writing it back, lost one of the marks — and a descriptor that was asked
+   not to wait and waits is a program that stops. */
 static unsigned long nonblock_mask;
 
 /* Say that a descriptor was made non-blocking when it was created, which is
@@ -1505,14 +1527,15 @@ void __quark_fd_set_nonblock(long fd, int on) {
         return;
     }
     if (on) {
-        nonblock_mask |= 1ul << fd;
+        __atomic_fetch_or(&nonblock_mask, 1ul << fd, __ATOMIC_SEQ_CST);
     } else {
-        nonblock_mask &= ~(1ul << fd);
+        __atomic_fetch_and(&nonblock_mask, ~(1ul << fd), __ATOMIC_SEQ_CST);
     }
 }
 
 int __quark_fd_is_nonblock(long fd) {
-    return fd >= 0 && fd < MAX_FDS && (nonblock_mask & (1ul << fd)) != 0;
+    return fd >= 0 && fd < MAX_FDS &&
+           (__atomic_load_n(&nonblock_mask, __ATOMIC_SEQ_CST) & (1ul << fd)) != 0;
 }
 
 #define LX_FD_CLOEXEC 1

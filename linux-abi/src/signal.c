@@ -49,17 +49,25 @@
 /* The two a program may not refuse. */
 #define UNBLOCKABLE (BIT(LX_SIGKILL) | BIT(LX_SIGSTOP))
 
-/* What a program has said about each signal. */
+/* What a program has said about each signal. Four words, read and written
+   whole under `actions_lock`: one thread says while another is being told of
+   the signal, and half of each is a handler called with the other's flags. */
 static struct lx_ksigaction actions[NSIG + 1];
+static int actions_lock;
 /* Which of those it has said since it started. One it has not is as it was
    started: nothing said — or ignored, if whatever exec'd it was ignoring the
    signal, which the kernel kept and this program's memory did not. */
 static unsigned long known;
-/* Raised, with a handler, and not yet run. */
+/* Raised, with a handler, and not yet run. A bit is taken by whichever
+   thread clears it, and by no other: two threads on their way out of two
+   calls both see it set. */
 static unsigned long pending;
 /* The mask. One for the program rather than one a thread: the C library
    blocks everything around the places it must not be interrupted and puts
-   back what it found, and that comes out the same either way. */
+   back what it found, and that comes out the same either way — for one
+   thread. Two threads doing it at once put back what the *other* had
+   blocked, and it is each change that is one step here, not the pair. A
+   mask a thread can call its own needs the kernel to keep it. */
 static unsigned long blocked;
 /* Set to 1 by the kernel when a signal with a handler arrives. */
 static volatile unsigned int hint;
@@ -87,23 +95,37 @@ static void take(void) {
     }
 }
 
-static struct lx_ksigaction *action_of(long sig) {
-    if (!(known & BIT(sig))) {
+/* What is said about `sig` now: a copy, because it is another thread's to
+   change. */
+static struct lx_ksigaction action_of(long sig) {
+    if (!(__atomic_load_n(&known, __ATOMIC_ACQUIRE) & BIT(sig))) {
         unsigned long was = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_ASK);
-        actions[sig].handler = was == QUARK_SIG_IGNORE ? LX_SIG_IGN : LX_SIG_DFL;
-        actions[sig].flags = 0;
-        actions[sig].restorer = 0;
-        actions[sig].mask = 0;
-        known |= BIT(sig);
+        __quark_lock(&actions_lock);
+        if (!(known & BIT(sig))) {
+            actions[sig].handler = was == QUARK_SIG_IGNORE ? LX_SIG_IGN : LX_SIG_DFL;
+            actions[sig].flags = 0;
+            actions[sig].restorer = 0;
+            actions[sig].mask = 0;
+            __atomic_fetch_or(&known, BIT(sig), __ATOMIC_RELEASE);
+        }
+        __quark_unlock(&actions_lock);
     }
-    return &actions[sig];
+    __quark_lock(&actions_lock);
+    struct lx_ksigaction a = actions[sig];
+    __quark_unlock(&actions_lock);
+    return a;
+}
+
+/* Take `sig` from what is waiting: true for one caller. */
+static int claim(long sig) {
+    return (__atomic_fetch_and(&pending, ~BIT(sig), __ATOMIC_SEQ_CST) & BIT(sig)) != 0;
 }
 
 /* Call the handler for `sig`. Says whether one ran (QUARK_SIG_RAN), and
    whether a call it cut short that *can* be made again should say EINTR
    instead (QUARK_SIG_EINTR): the handler was not installed with SA_RESTART. */
 static int run(long sig) {
-    struct lx_ksigaction a = *action_of(sig);
+    struct lx_ksigaction a = action_of(sig);
     if (a.handler == LX_SIG_IGN) {
         return 0;
     }
@@ -115,14 +137,15 @@ static int run(long sig) {
         }
         return 0;
     }
-    unsigned long saved = blocked;
-    unsigned long during = saved | a.mask;
+    unsigned long during = a.mask;
     if (!(a.flags & LX_SA_NODEFER)) {
         during |= BIT(sig);
     }
-    blocked = during & ~UNBLOCKABLE;
+    unsigned long saved = __atomic_fetch_or(&blocked, during & ~UNBLOCKABLE, __ATOMIC_SEQ_CST);
     if (a.flags & LX_SA_RESETHAND) {
+        __quark_lock(&actions_lock);
         actions[sig].handler = LX_SIG_DFL;
+        __quark_unlock(&actions_lock);
         __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_DEFAULT);
     }
     if (a.flags & LX_SA_SIGINFO) {
@@ -144,7 +167,7 @@ static int run(long sig) {
     /* A handler that left by longjmp never gets here, and the mask it left
        with is its program's to put right — which is what sigsetjmp saves it
        for. */
-    blocked = saved;
+    __atomic_store_n(&blocked, saved, __ATOMIC_SEQ_CST);
     return QUARK_SIG_RAN | ((a.flags & LX_SA_RESTART) ? 0 : QUARK_SIG_EINTR);
 }
 
@@ -176,8 +199,9 @@ int __quark_sig_deliver(void) {
             break;
         }
         long sig = __builtin_ctzl(ready) + 1;
-        __sync_fetch_and_and(&pending, ~BIT(sig));
-        interrupts |= run(sig);
+        if (claim(sig)) {
+            interrupts |= run(sig);
+        }
     }
     return interrupts;
 }
@@ -190,10 +214,12 @@ int __quark_sig_interrupted(void) {
     return __quark_sig_deliver();
 }
 
-/* In the child of a fork: what was waiting was the parent's. */
+/* In the child of a fork: what was waiting was the parent's, and so was
+   whichever thread held the lock. */
 void __quark_sig_forked(void) {
     pending = 0;
     hint = 0;
+    actions_lock = 0;
 }
 
 long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksigaction *old,
@@ -201,8 +227,7 @@ long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksig
     if (sig < 1 || sig > NSIG || size != 8) {
         return -LX_EINVAL;
     }
-    struct lx_ksigaction *now = action_of(sig);
-    struct lx_ksigaction was = *now;
+    struct lx_ksigaction was = action_of(sig);
     if (act) {
         if (sig == LX_SIGKILL || sig == LX_SIGSTOP) {
             return -LX_EINVAL;
@@ -215,7 +240,9 @@ long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksig
         if (how == QUARK_SIG_HANDLE && !kernel_knows_where) {
             take();
         }
-        *now = *act;
+        __quark_lock(&actions_lock);
+        actions[sig] = *act;
+        __quark_unlock(&actions_lock);
         __syscall2(SYS_SIG_ACTION, (unsigned long)sig, how);
         /* A signal waiting for a handler that is no longer there. */
         if (how == QUARK_SIG_IGNORE || (how == QUARK_SIG_DEFAULT && harmless(sig))) {
@@ -233,15 +260,17 @@ long __quark_sigprocmask(long how, const unsigned long *set, unsigned long *old,
     if (size != 8) {
         return -LX_EINVAL;
     }
-    unsigned long was = blocked;
+    unsigned long was;
     if (set) {
         unsigned long m = *set & ~UNBLOCKABLE;
         switch (how) {
-        case 0: blocked = was | m; break;  /* SIG_BLOCK */
-        case 1: blocked = was & ~m; break; /* SIG_UNBLOCK */
-        case 2: blocked = m; break;        /* SIG_SETMASK */
+        case 0: was = __atomic_fetch_or(&blocked, m, __ATOMIC_SEQ_CST); break;   /* SIG_BLOCK */
+        case 1: was = __atomic_fetch_and(&blocked, ~m, __ATOMIC_SEQ_CST); break; /* SIG_UNBLOCK */
+        case 2: was = __atomic_exchange_n(&blocked, m, __ATOMIC_SEQ_CST); break; /* SIG_SETMASK */
         default: return -LX_EINVAL;
         }
+    } else {
+        was = __atomic_load_n(&blocked, __ATOMIC_SEQ_CST);
     }
     if (old) {
         *old = was;
@@ -253,9 +282,7 @@ long __quark_sigprocmask(long how, const unsigned long *set, unsigned long *old,
 /* The mask, for a call that waits under a different one (ppoll, pselect):
    put `mask` in place and return what was there. */
 unsigned long __quark_sig_swap_mask(unsigned long mask) {
-    unsigned long was = blocked;
-    blocked = mask & ~UNBLOCKABLE;
-    return was;
+    return __atomic_exchange_n(&blocked, mask & ~UNBLOCKABLE, __ATOMIC_SEQ_CST);
 }
 
 long __quark_sigpending(unsigned long *set, unsigned long size) {
@@ -283,21 +310,20 @@ long __quark_sigsuspend(const unsigned long *mask, unsigned long size) {
     if (mask && size != 8) {
         return -LX_EINVAL;
     }
-    unsigned long saved = blocked;
-    if (mask) {
-        blocked = *mask & ~UNBLOCKABLE;
-    }
+    unsigned long saved = mask ? __atomic_exchange_n(&blocked, *mask & ~UNBLOCKABLE, __ATOMIC_SEQ_CST)
+                               : __atomic_load_n(&blocked, __ATOMIC_SEQ_CST);
     for (;;) {
         if (hint) {
             take();
         }
-        if (pending & ~blocked) {
-            __quark_sig_deliver();
+        /* Until a handler has run *here*: one that another thread took and
+           ran on its way out of a call is not what this was waiting for. */
+        if ((pending & ~blocked) && (__quark_sig_deliver() & QUARK_SIG_RAN)) {
             break;
         }
         doze(0xFFFFFFFFUL);
     }
-    blocked = saved;
+    __atomic_store_n(&blocked, saved, __ATOMIC_SEQ_CST);
     return -LX_EINTR;
 }
 
@@ -322,7 +348,9 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
         unsigned long have = pending & want;
         if (have) {
             long sig = __builtin_ctzl(have) + 1;
-            __sync_fetch_and_and(&pending, ~BIT(sig));
+            if (!claim(sig)) {
+                continue;
+            }
             if (info) {
                 unsigned long *words = info;
                 for (int i = 1; i < 16; i++) {
@@ -412,7 +440,7 @@ long __quark_tkill(long tid, long sig) {
     if (sig == 0) {
         return 0;
     }
-    unsigned long handler = action_of(sig)->handler;
+    unsigned long handler = action_of(sig).handler;
     if (handler == LX_SIG_IGN) {
         return 0;
     }

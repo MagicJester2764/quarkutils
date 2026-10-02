@@ -46,6 +46,23 @@
 /* How many descriptors a program has: as many as the kernel's table holds. */
 #define MAX_FDS 64
 
+/* A lock for the few words this layer keeps between calls: an `int`, 0 when
+   nobody has it. Every thread of a program comes through here, and with
+   more than one processor two of them are in here at the same moment —
+   which they could always have been, a tick apart, and almost never were.
+   What is kept is small: where the next mapping goes, which descriptors
+   were asked not to wait, what was said about each signal. A word that one
+   instruction changes is changed with an atomic one instead, and has no
+   lock.
+
+   Not held across anything that runs a handler, and a child of `fork` —
+   which is one thread, and may have been made while another held a lock —
+   begins with all of them free (`__quark_locks_forked`). */
+void __quark_lock(int *lock);
+void __quark_unlock(int *lock);
+void __quark_locks_forked(void);
+void __quark_arena_forked(void);
+
 /* A terminal by its name, for a `stat` and for `ttyname`: in pty.c. */
 long __quark_pty_slave_number(long fd);
 long __quark_pty_held(const char *path);
