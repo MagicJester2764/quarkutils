@@ -4967,6 +4967,291 @@ fn test_call_storm() {
     let _ = syscall::sys_cap_delete(STORM_SLOT);
 }
 
+// --- more than one processor ---
+
+/// Where the counters of a child that spins are mapped: a `u64` for each of
+/// its threads, which it adds to without making a call.
+const BEATS_AT: usize = 0xAB_0000_0000;
+/// A page one thread reads while another unmaps it.
+const GONE_AT: usize = 0xAC_0000_0000;
+const CALLERS_SLOT: usize = 47;
+
+fn beat(slot: usize) -> u64 {
+    unsafe { core::ptr::read_volatile((BEATS_AT + slot * 8) as *const u64) }
+}
+
+/// Whether every one of the first `threads` counters moves within `ticks`.
+fn all_beating(threads: usize, ticks: u64) -> bool {
+    let mut before = [0u64; 4];
+    for (slot, was) in before.iter_mut().enumerate().take(threads) {
+        *was = beat(slot);
+    }
+    let start = syscall::sys_ticks();
+    while syscall::sys_ticks() - start < ticks {
+        if (0..threads).all(|slot| beat(slot) != before[slot]) {
+            return true;
+        }
+        syscall::sleep_ticks(1);
+    }
+    false
+}
+
+/// Whether none of the first `threads` counters moves in five ticks.
+fn none_beating(threads: usize) -> bool {
+    let mut before = [0u64; 4];
+    for (slot, was) in before.iter_mut().enumerate().take(threads) {
+        *was = beat(slot);
+    }
+    syscall::sleep_ticks(5);
+    (0..threads).all(|slot| beat(slot) == before[slot])
+}
+
+/// Start `dchild spin N` counting in `memory`, which is mapped at
+/// [`BEATS_AT`] here: its task.
+fn start_spinner(memory: usize, threads: &[u8]) -> Option<usize> {
+    let child = load_child(&[b"dchild", b"spin", threads])?;
+    let tid = child.tid;
+    if syscall::sys_fd_dup(tid, 3, memory).is_err() {
+        child.discard();
+        return None;
+    }
+    child.start().ok()?;
+    Some(tid)
+}
+
+static GONE_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GONE_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Reads one page for ever, so that the processor it runs on always has the
+/// page's translation to hand.
+extern "C" fn gone_reader() -> ! {
+    use core::sync::atomic::Ordering;
+    while !GONE_STOP.load(Ordering::Relaxed) {
+        unsafe { core::ptr::read_volatile(GONE_AT as *const u64) };
+        GONE_READS.fetch_add(1, Ordering::Relaxed);
+    }
+    syscall::sys_exit_code(0);
+}
+
+static CALLERS_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CALLERS_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// How many calls the second caller made, and whether every one was
+/// answered with its own answer.
+static CALLERS_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CALLERS_WRONG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Calls the echo server until told to stop, from its own thread — and so,
+/// with more than one processor, at the same time as the thread that
+/// started it is calling the same server.
+extern "C" fn second_caller() -> ! {
+    use core::sync::atomic::Ordering;
+    use quark_rt::ipc::Message;
+    let to = CALLERS_TO.load(Ordering::Relaxed);
+    let mut made = 0u64;
+    let mut reply = Message::empty();
+    while !CALLERS_STOP.load(Ordering::Relaxed) {
+        made += 1;
+        // Tags of its own, so that an answer meant for the other caller
+        // cannot pass for one meant for this.
+        let ask = Message { sender: 0, tag: (1 << 40) | made, data: [0; 6] };
+        let outcome = syscall::sys_call_timeout(to, &ask, &mut reply, 100);
+        if !matches!(outcome, syscall::CallOutcome::Replied) || reply.tag != ask.tag + 1 {
+            CALLERS_WRONG.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+    CALLERS_MADE.store(made, Ordering::Relaxed);
+    syscall::sys_exit_code(0);
+}
+
+/// What a second processor changes, held to what one processor does: a
+/// task that is not the caller may be running, in ring 3, at the moment
+/// something is done to it.
+///
+/// Every check here is true with one processor too, except the first two,
+/// which say what the number of processors is and whether two threads were
+/// seen to run at once — and those are held to that number, either way.
+fn test_smp() {
+    use core::sync::atomic::Ordering;
+    use quark_rt::ipc::Message;
+    use syscall::ChildNews;
+    println!("processors:");
+    let (count, on) = syscall::sys_cpus();
+    println!("        {} of them, and this is number {}", count, on);
+    check(
+        "the kernel says how many processors there are, and which this is",
+        (1..=16).contains(&count) && on < count,
+    );
+
+    // Two threads that can only get anywhere if both are running.
+    let together = run(b"dchild", &[b"together"]);
+    check(
+        "two threads run at the same time, if and only if there are two processors",
+        matches!(together, Some(bits) if bits & !3 == 0 && (bits & 1 != 0) == (count > 1)),
+    );
+    check(
+        "and are then on different ones",
+        matches!(together, Some(bits) if bits & !3 == 0 && (bits & 2 != 0) == (count > 1)),
+    );
+
+    // A program whose three threads are in ring 3 whenever anybody looks,
+    // and never in the kernel: what it is to end one, and to stop one, from
+    // a processor it is not on.
+    let memory = syscall::sys_memfd_create(1).ok().filter(|&fd| syscall::sys_mmap_fd(fd, BEATS_AT).is_ok());
+    let (free_before, _) = syscall::sys_mem_info();
+    let spinner = memory.and_then(|fd| start_spinner(fd, b"2"));
+    check("a program's threads all run", spinner.is_some() && all_beating(3, 100));
+    if let Some(tid) = spinner {
+        check(
+            "one running on other processors is ended, and is there to collect",
+            syscall::sys_task_kill(tid).is_ok() && wait_for(tid) == Some(-9),
+        );
+        // Its other threads were told a moment after its first: none of them
+        // is what this task waited for.
+        syscall::sleep_ticks(2);
+        check("and none of its threads goes on running", none_beating(3));
+        let (free_after, _) = syscall::sys_mem_info();
+        check("and its memory comes back", free_after + 64 >= free_before);
+    }
+
+    let spinner = memory.and_then(|fd| start_spinner(fd, b"1"));
+    if let Some(tid) = spinner.filter(|_| all_beating(2, 100)) {
+        let pid = syscall::sys_pid(tid).unwrap_or(0);
+        check(
+            "a program stopped while it runs on other processors is said to have stopped",
+            syscall::sys_sig_raise_pid(pid, syscall::SIGSTOP).is_ok()
+                && syscall::sys_wait_job(pid, syscall::WAIT_STOPPED) == Ok(Some(ChildNews::Stopped(pid, 19))),
+        );
+        syscall::sleep_ticks(2);
+        check("and has: none of its threads is running", none_beating(2));
+        check(
+            "and every one of them goes on when it is continued",
+            syscall::sys_sig_raise_pid(pid, syscall::SIGCONT).is_ok() && all_beating(2, 100),
+        );
+        let _ = syscall::sys_task_kill(tid);
+        let _ = wait_for(tid);
+    } else {
+        check("start a program to stop", false);
+    }
+    if let Some(fd) = memory {
+        let _ = syscall::sys_munmap(BEATS_AT, 1);
+        let _ = syscall::sys_fd_close(fd);
+    }
+
+    // A child that ends while its parent waits for it is the parent's to
+    // collect: woken for it, the parent says which child it was and takes
+    // it apart. A processor with nothing to do also takes dead tasks apart,
+    // and once got to this one first — the parent was told that process 0
+    // had ended. Many times, because it was a race.
+    let mut named = 0;
+    for _ in 0..40 {
+        let Some(child) = load_child(&[b"dchild", b"quit"]) else { break };
+        let tid = child.tid;
+        let pid = syscall::sys_pid(tid).unwrap_or(0);
+        if child.start().is_ok() && syscall::sys_wait_for_pid(pid) == Ok((pid, 0)) {
+            named += 1;
+        }
+    }
+    check("a child waited for by name is the child the wait answers with, every time", named == 40);
+
+    // A processor remembers where a page is. Taking the page away has to
+    // reach every processor that has the program's memory loaded.
+    check(
+        "a page one thread replaces is the new page to a thread on another processor",
+        run(b"dchild", &[b"tlb"]) == Some(0),
+    );
+    // And the other half: the page is simply gone. The thread reading it is
+    // made to ask this task what to do about its faults, so that the fault
+    // is something to hear of and not the end of the program.
+    let me = syscall::sys_getpid() as usize;
+    let gone = syscall::sys_mmap(GONE_AT, 1).ok().and_then(|()| {
+        GONE_STOP.store(false, Ordering::Relaxed);
+        let reader = thread::spawn_with_stack(gone_reader, 4).ok()?;
+        syscall::sys_set_pager(reader.tid(), me).ok()?;
+        let start = syscall::sys_ticks();
+        while GONE_READS.load(Ordering::Relaxed) < 1000 && syscall::sys_ticks() - start < 100 {
+            syscall::sleep_ticks(1);
+        }
+        let read = GONE_READS.load(Ordering::Relaxed) >= 1000;
+        let unmapped = syscall::sys_munmap(GONE_AT, 1).is_ok();
+        // By the time that call has returned, the page is gone from the
+        // reader's processor too: it does not read it again. Looked at at
+        // once, and without a call, because a processor that was not told
+        // forgets by itself before long — the next time it changes what it
+        // is running — and a check that waited would pass for that reason.
+        let then = GONE_READS.load(Ordering::Relaxed);
+        for _ in 0..400_000 {
+            core::hint::spin_loop();
+        }
+        let stopped = GONE_READS.load(Ordering::Relaxed) - then <= 1;
+        // Its next read found nothing there, and this task is asked.
+        let mut fault = Message::empty();
+        let asked = stopped
+            && syscall::sys_recv_timeout(reader.tid(), &mut fault, 100).is_ok()
+            && fault.tag == syscall::TAG_PAGE_FAULT
+            && fault.data[0] as usize == GONE_AT;
+        // Whatever happened, the reader ends: with a page under it again,
+        // and an answer if it is waiting for one.
+        GONE_STOP.store(true, Ordering::Relaxed);
+        let _ = syscall::sys_mmap(GONE_AT, 1);
+        if asked || syscall::sys_recv_timeout(reader.tid(), &mut fault, 20).is_ok() {
+            let _ = syscall::sys_reply(reader.tid(), &Message::empty());
+        }
+        let _ = syscall::sys_wait_for(reader.tid());
+        let _ = syscall::sys_munmap(GONE_AT, 1);
+        Some(read && unmapped && asked)
+    });
+    check("and a page one thread unmaps is gone for a thread on another", gone == Some(true));
+
+    check(
+        "two threads that touch a new page at the same moment are both given it",
+        run(b"dchild", &[b"touch"]) == Some(0),
+    );
+    check(
+        "four threads adding to one number under a lock lose nothing",
+        run(b"dchild", &[b"count"]) == Some(0),
+    );
+
+    // Two threads, one server, at once: the kernel is one processor's at a
+    // time, and every call has to come out the other side its own.
+    let echo = load_child(&[b"dchild", b"echo"]).and_then(|child| {
+        let tid = child.tid;
+        child.start().ok()?;
+        mint_endpoint(CALLERS_SLOT, tid).then_some(tid)
+    });
+    let both = echo.and_then(|tid| {
+        CALLERS_TO.store(tid, Ordering::Relaxed);
+        CALLERS_STOP.store(false, Ordering::Relaxed);
+        CALLERS_WRONG.store(false, Ordering::Relaxed);
+        let second = thread::spawn_with_stack(second_caller, 8).ok()?;
+        let start = syscall::sys_ticks();
+        let mut made = 0u64;
+        let mut right = true;
+        let mut reply = Message::empty();
+        while right && syscall::sys_ticks() - start < 100 {
+            made += 1;
+            let ask = Message { sender: 0, tag: made, data: [0; 6] };
+            let outcome = syscall::sys_call_timeout(tid, &ask, &mut reply, 100);
+            right = matches!(outcome, syscall::CallOutcome::Replied) && reply.tag == made + 1;
+        }
+        CALLERS_STOP.store(true, Ordering::Relaxed);
+        let _ = syscall::sys_wait_for(second.tid());
+        let theirs = CALLERS_MADE.load(Ordering::Relaxed);
+        println!("        {} calls from one thread and {} from another, in a second", made, theirs);
+        let stopped = matches!(
+            syscall::sys_call_timeout(tid, &Message::empty(), &mut reply, 100),
+            syscall::CallOutcome::Replied
+        );
+        if !stopped {
+            let _ = syscall::sys_task_kill(tid);
+        }
+        let _ = wait_for(tid);
+        Some(right && !CALLERS_WRONG.load(Ordering::Relaxed) && made >= 100 && theirs >= 100)
+    });
+    let _ = syscall::sys_cap_delete(CALLERS_SLOT);
+    check("two threads calling one server at once are each answered, every time", both == Some(true));
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -5016,6 +5301,7 @@ pub extern "C" fn _start() -> ! {
         ("fpu", test_fpu),
         ("flags", test_flags),
         ("wire", test_wire),
+        ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);
     let known = only.is_none_or(|o| SECTIONS.iter().any(|(name, _)| o == name.as_bytes()));

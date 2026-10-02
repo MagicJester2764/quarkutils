@@ -145,6 +145,7 @@ pub const SYS_IRQ_ACK: u64 = 113;
 pub const SYS_IOPORT: u64 = 114;
 pub const SYS_IOPORT_REP: u64 = 115;
 pub const SYS_GETRANDOM: u64 = 116;
+pub const SYS_CPUS: u64 = 117;
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
@@ -837,6 +838,18 @@ pub fn sys_mem_info() -> (usize, usize) {
 pub fn sys_getrandom(buf: &mut [u8]) -> Result<usize, ()> {
     let ret = unsafe { syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0) };
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// How many processors the system is running on, and which of them — from 0
+/// — the caller was on when it asked.
+///
+/// The second is true of that instant and of no other: a task is run by
+/// whichever processor takes it next, and may be on another before this has
+/// returned. It is for a test to see that there is more than one, and for a
+/// statistic; nothing can be built on it.
+pub fn sys_cpus() -> (usize, usize) {
+    let ret = unsafe { syscall0(SYS_CPUS) };
+    ((ret & 0xFFFF_FFFF) as usize, (ret >> 32) as usize)
 }
 
 pub fn sys_irq_register(irq: u8) -> Result<(), ()> {
@@ -2017,7 +2030,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 9;
+pub const ABI_VERSION_MINOR: u32 = 10;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

@@ -169,9 +169,11 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 662 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 678 checks made from
 user space through the ABI, with a recap of what failed before the count. A
-check that times out or is refused says which. `runtests <list>` runs the
+check that times out or is refused says which. It is run on one processor
+and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
+the part about what a second processor changes, and passes on one. `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service.
 
@@ -282,6 +284,18 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   `space_death_notice`) and answers anything else with that tag as the
   unknown request it is. The nameserver used to forget a service, and `fb`
   give up the console's display, because a program said so.
+- **What a program starts is running before the call that started it
+  returns**, if a processor is free — and since the kernel started using
+  every processor the machine has, one usually is. Give a child everything
+  first — its descriptors, its capabilities, its place with a server — and
+  start it last, as `quark_rt::spawn` does; what a thread reads has to be
+  there before `thread::spawn`. With one processor the starter went on
+  until it waited, and code that handed a child something *after* starting
+  it worked by that accident. The same is true the other way round: a
+  client is no longer stopped while a server it is not calling works, and
+  two threads of a program really are in the same memory at the same
+  moment. A shared word is an atomic or is under a `sync` lock; "nothing
+  else can be running" was never a rule here, and is now not even true.
 - **Waiting means blocking.** Programs run in four bands — drivers, servers,
   ordinary programs, idle — and a task in a better band that spins on
   `sys_yield` is immediately runnable again, so nothing below it ever runs.

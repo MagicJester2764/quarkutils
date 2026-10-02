@@ -65,6 +65,20 @@
 //! seconds: something a parent can see has stopped. `leader` begins a
 //! session, takes descriptor 0 as its terminal, says on descriptor 3 how
 //! that went, a bit for each thing, and reads the terminal.
+//!
+//! And for a machine with more than one processor. `spin N` counts in the
+//! memory at descriptor 3, in ring 3 and without a call, on this task and
+//! on N threads beside it: a program that can be seen to be running, and to
+//! have stopped. `together` has two threads hand a word back and forth by
+//! spinning, a hundred thousand times, and exits with a bit for having
+//! managed it in a second — which takes two processors — and a bit for the
+//! two having been seen on different ones. `tlb` has one thread read a page
+//! while another takes it away and puts a different one there, and exits 0
+//! if the reader never saw the page that had gone. `touch` has two threads
+//! write to each of two thousand new pages at the same moment, which ends
+//! the program if the second to fault is told the page it was promised is
+//! not there. `count` has four threads add to one number under a lock and
+//! to another without, and exits 0 if neither lost anything.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
@@ -89,6 +103,282 @@ const DEAD: u8 = 3;
 
 extern "C" fn quit() -> ! {
     syscall::sys_exit_code(0);
+}
+
+// --- more than one processor ---
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// Where `spin` maps the memory its parent gave it, and counts.
+const BEATS: usize = 0xB5_0000_0000;
+/// The page `tlb` takes away and puts back, and where it puts what takes
+/// the frame the page had.
+const TLB_AT: usize = 0xB6_0000_0000;
+const BALLAST_AT: usize = 0xB7_0000_0000;
+/// The pages `touch` writes to for the first time, twice at once.
+const TOUCH_AT: usize = 0xB8_0000_0000;
+const TOUCH_PAGES: usize = 2000;
+
+/// Wait a moment for another thread. With one processor that is giving it
+/// the processor; with more it is doing nothing, because the other thread
+/// is running, and a call here would be the slow part.
+fn pause(alone: bool) {
+    if alone {
+        syscall::sys_yield();
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
+/// Count, in slot `slot` of the memory at [`BEATS`], for ever and without
+/// a system call: something that is in ring 3 whenever it is looked at.
+extern "C" fn beat_for_ever(slot: usize) -> ! {
+    let at = (BEATS + slot * 8) as *mut u64;
+    loop {
+        unsafe { core::ptr::write_volatile(at, core::ptr::read_volatile(at).wrapping_add(1)) };
+        core::hint::spin_loop();
+    }
+}
+
+fn spin(threads: usize) -> ! {
+    if syscall::sys_mmap_fd(CONN, BEATS).is_err() {
+        syscall::sys_exit_program(1);
+    }
+    for slot in 1..=threads {
+        if thread::spawn_with_arg(beat_for_ever, slot, 4).is_err() {
+            syscall::sys_exit_program(2);
+        }
+    }
+    beat_for_ever(0)
+}
+
+/// Whose turn it is in `together`: 1 the partner's, 0 this task's.
+static TURN: AtomicU32 = AtomicU32::new(0);
+/// The processor the partner was last seen on, and one.
+static PARTNER_ON: AtomicUsize = AtomicUsize::new(0);
+static DONE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn partner() -> ! {
+    let mut rounds = 0u32;
+    loop {
+        while TURN.load(Ordering::Acquire) != 1 {
+            if DONE.load(Ordering::Relaxed) {
+                syscall::sys_exit_code(0);
+            }
+            core::hint::spin_loop();
+        }
+        rounds = rounds.wrapping_add(1);
+        if rounds % 2048 == 0 {
+            PARTNER_ON.store(syscall::sys_cpus().1 + 1, Ordering::Relaxed);
+        }
+        TURN.store(0, Ordering::Release);
+    }
+}
+
+/// Two threads hand a word back and forth, each spinning until it is its
+/// turn. With two processors that is a few million exchanges a second. With
+/// one, each exchange waits for the end of somebody's turn at the
+/// processor, and there are thirty of those a second.
+fn together() -> i32 {
+    const ROUNDS: u32 = 100_000;
+    const TICKS: u64 = 100;
+    let Ok(t) = thread::spawn_with_stack(partner, 4) else {
+        return 8;
+    };
+    let start = syscall::sys_ticks();
+    let late = || syscall::sys_ticks() - start > TICKS;
+    let mut rounds = 0u32;
+    let mut apart = false;
+    'rounds: while rounds < ROUNDS {
+        TURN.store(1, Ordering::Release);
+        let mut spins = 0u32;
+        while TURN.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins % 65536 == 0 && late() {
+                break 'rounds;
+            }
+        }
+        rounds += 1;
+        if rounds % 2048 == 0 {
+            let theirs = PARTNER_ON.load(Ordering::Relaxed);
+            if theirs != 0 && theirs - 1 != syscall::sys_cpus().1 {
+                apart = true;
+            }
+            if late() {
+                break;
+            }
+        }
+    }
+    DONE.store(true, Ordering::Release);
+    let _ = syscall::sys_wait_for(t.tid());
+    (rounds >= ROUNDS) as i32 | (apart as i32) << 1
+}
+
+/// `tlb`: which page is at [`TLB_AT`] — twice the number written in it —
+/// and odd while it is being changed.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+/// The reader's answer to an odd generation: it is not looking.
+static NOT_LOOKING: AtomicU32 = AtomicU32::new(0);
+static READS: AtomicU64 = AtomicU64::new(0);
+/// How often the reader saw something other than the page that was there.
+static STALE: AtomicU32 = AtomicU32::new(0);
+static ALONE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn tlb_reader() -> ! {
+    let alone = ALONE.load(Ordering::Relaxed);
+    loop {
+        let generation = GENERATION.load(Ordering::Acquire);
+        if generation == u32::MAX {
+            syscall::sys_exit_code(0);
+        }
+        if generation % 2 == 1 {
+            NOT_LOOKING.store(generation, Ordering::Release);
+            while GENERATION.load(Ordering::Acquire) == generation {
+                pause(alone);
+            }
+            continue;
+        }
+        // The page is not changed until this thread has said it is not
+        // looking, so what is read here is the page of this generation —
+        // if the processor is reading the page that is mapped.
+        let seen = unsafe { core::ptr::read_volatile(TLB_AT as *const u64) };
+        if seen != (generation / 2) as u64 {
+            STALE.fetch_add(1, Ordering::Relaxed);
+        }
+        READS.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// One thread reads a page, over and over, so that its processor has the
+/// page's translation to hand. The other unmaps the page, has something
+/// else take the frame it had, and maps a new page in its place with a new
+/// number in it. The reader must then read the new number: a processor that
+/// was not told goes on reading the frame the old page had, which is now
+/// somebody else's.
+fn tlb() -> i32 {
+    const ROUNDS: u32 = 300;
+    let alone = syscall::sys_cpus().0 == 1;
+    ALONE.store(alone, Ordering::Relaxed);
+    if syscall::sys_mmap(TLB_AT, 1).is_err() {
+        return 2;
+    }
+    let Ok(t) = thread::spawn_with_stack(tlb_reader, 4) else {
+        return 2;
+    };
+    let read_once = || {
+        let read = READS.load(Ordering::Acquire);
+        while READS.load(Ordering::Acquire) == read {
+            pause(alone);
+        }
+    };
+    let mut ballast: Option<usize> = None;
+    for k in 1..=ROUNDS {
+        read_once();
+        GENERATION.store(2 * k - 1, Ordering::Release);
+        while NOT_LOOKING.load(Ordering::Acquire) != 2 * k - 1 {
+            pause(alone);
+        }
+        let here = BALLAST_AT + k as usize * 4096;
+        if syscall::sys_munmap(TLB_AT, 1).is_err()
+            || syscall::sys_mmap(here, 1).is_err()
+            || syscall::sys_mmap(TLB_AT, 1).is_err()
+        {
+            return 2;
+        }
+        unsafe { core::ptr::write_volatile(TLB_AT as *mut u64, k as u64) };
+        if let Some(old) = ballast.replace(here) {
+            let _ = syscall::sys_munmap(old, 1);
+        }
+        GENERATION.store(2 * k, Ordering::Release);
+    }
+    read_once();
+    GENERATION.store(u32::MAX, Ordering::Release);
+    let _ = syscall::sys_wait_for(t.tid());
+    (STALE.load(Ordering::Relaxed) != 0) as i32
+}
+
+/// `touch`: the page both threads are to write to next, and how many the
+/// second thread has written.
+static STEP: AtomicUsize = AtomicUsize::new(usize::MAX);
+static TOUCHED: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn toucher() -> ! {
+    let alone = ALONE.load(Ordering::Relaxed);
+    for page in 0..TOUCH_PAGES {
+        while STEP.load(Ordering::Acquire) != page {
+            pause(alone);
+        }
+        unsafe { core::ptr::write_volatile((TOUCH_AT + page * 4096 + 1) as *mut u8, 0x5A) };
+        TOUCHED.store(page + 1, Ordering::Release);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// Two threads write to the same new page at the same moment, two thousand
+/// times. Both fault: the page is promised and has no memory yet. One is
+/// given it. The other was told the same thing by its processor an instant
+/// earlier, and by the time the kernel hears it the page is there — which
+/// has to be no fault at all, and used to be "nothing is promised here".
+fn touch() -> i32 {
+    let alone = syscall::sys_cpus().0 == 1;
+    ALONE.store(alone, Ordering::Relaxed);
+    if syscall::sys_map_anon(TOUCH_AT, TOUCH_PAGES, false).is_err() {
+        return 2;
+    }
+    let Ok(t) = thread::spawn_with_stack(toucher, 4) else {
+        return 2;
+    };
+    for page in 0..TOUCH_PAGES {
+        STEP.store(page, Ordering::Release);
+        unsafe { core::ptr::write_volatile((TOUCH_AT + page * 4096) as *mut u8, 0xA5) };
+        while TOUCHED.load(Ordering::Acquire) != page + 1 {
+            pause(alone);
+        }
+    }
+    let _ = syscall::sys_wait_for(t.tid());
+    // One page, written by both: neither was given a page of its own.
+    let whole = (0..TOUCH_PAGES).all(|page| unsafe {
+        let at = (TOUCH_AT + page * 4096) as *const u8;
+        core::ptr::read_volatile(at) == 0xA5 && core::ptr::read_volatile(at.add(1)) == 0x5A
+    });
+    !whole as i32
+}
+
+static TALLY: sync::Mutex<u64> = sync::Mutex::new(0);
+static LOOSE: AtomicU64 = AtomicU64::new(0);
+const EACH: u64 = 20_000;
+
+extern "C" fn counter() -> ! {
+    add_to_both();
+    syscall::sys_exit_code(0);
+}
+
+fn add_to_both() {
+    for _ in 0..EACH {
+        *TALLY.lock() += 1;
+        LOOSE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Four threads add to one number under a lock and to another with an
+/// atomic instruction. A lock that let two in at once loses some of the
+/// first; nothing can lose any of the second, which is there to show the
+/// threads all ran.
+fn count() -> i32 {
+    let mut threads = [0usize; 3];
+    for slot in threads.iter_mut() {
+        match thread::spawn_with_stack(counter, 4) {
+            Ok(t) => *slot = t.tid(),
+            Err(()) => return 2,
+        }
+    }
+    add_to_both();
+    for tid in threads {
+        let _ = syscall::sys_wait_for(tid);
+    }
+    let right = *TALLY.lock() == 4 * EACH && LOOSE.load(Ordering::Relaxed) == 4 * EACH;
+    !right as i32
 }
 
 /// The requests `dtest` answers as a server of descriptors, and the two
@@ -585,6 +875,21 @@ pub extern "C" fn _start() -> ! {
             Err(code) => 100 + code as i32,
         };
         syscall::sys_exit_program(status);
+    }
+    if quark_rt::args::argv(1) == Some(&b"spin"[..]) {
+        spin(quark_rt::args::argv(2).map_or(0, number));
+    }
+    if quark_rt::args::argv(1) == Some(&b"together"[..]) {
+        syscall::sys_exit_program(together());
+    }
+    if quark_rt::args::argv(1) == Some(&b"tlb"[..]) {
+        syscall::sys_exit_program(tlb());
+    }
+    if quark_rt::args::argv(1) == Some(&b"touch"[..]) {
+        syscall::sys_exit_program(touch());
+    }
+    if quark_rt::args::argv(1) == Some(&b"count"[..]) {
+        syscall::sys_exit_program(count());
     }
     if quark_rt::args::argv(1) == Some(&b"claim"[..]) {
         syscall::sys_exit_program(-11);

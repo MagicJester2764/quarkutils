@@ -80,6 +80,13 @@ too. The difference is only visible to code that mixes the two kinds.
   the other threads; ending them here means unwinding what they hold in a
   server, so it is refused rather than half done.
 - `exit` ends every thread of the program. `pthread_exit` ends one.
+- **Threads run at the same time**, on as many processors as the machine
+  has: `sysconf(_SC_NPROCESSORS_ONLN)`, `nproc` and `sched_getaffinity` say
+  how many, and `sched_getcpu` which one a thread is on at that moment.
+  Every thread may run on every processor, and `sched_setaffinity` cannot
+  change that: nothing pins one. The kernel itself serves one processor at
+  a time, so threads that compute run in parallel and threads that make
+  system calls take turns at them.
 - A child that has ended waits to be collected, as a zombie does, and is
   collected by `wait`. `wait4` reports no resource usage: the structure is
   zeroed.

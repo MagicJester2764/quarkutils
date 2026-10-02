@@ -138,6 +138,7 @@
 
 /* 0x70  hardware */
 #define SYS_GETRANDOM       116
+#define SYS_CPUS            117
 
 /* 0x80  futex */
 #define SYS_FUTEX_WAIT      128

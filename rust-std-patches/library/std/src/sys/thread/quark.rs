@@ -82,7 +82,10 @@ pub fn current_os_id() -> Option<u64> {
 }
 
 pub fn available_parallelism() -> io::Result<NonZero<usize>> {
-    Ok(NonZero::new(1).unwrap())
+    // The processors the kernel is running programs on. Nothing pins a task
+    // to fewer, so that is what a program may spread its work over.
+    let (processors, _) = quark_rt::syscall::sys_cpus();
+    Ok(NonZero::new(processors).unwrap_or(NonZero::<usize>::MIN))
 }
 
 pub fn yield_now() {

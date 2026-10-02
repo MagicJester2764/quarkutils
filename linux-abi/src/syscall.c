@@ -151,6 +151,7 @@ typedef unsigned long size_t;
 #define LX_setfsgid        123
 #define LX_arch_prctl      158
 #define LX_sched_getaffinity 204
+#define LX_getcpu          309
 #define LX_futex           202
 #define LX_gettid          186
 #define LX_set_tid_address 218
@@ -840,9 +841,11 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return -LX_EINVAL;
 
-    /* Quark is uniprocessor, and deliberately: several kernel invariants
-       depend on it. One CPU, which is a fact rather than a placeholder, and
-       reporting it is what makes `nproc` right. */
+    /* Every task may run on every processor the kernel is using: nothing
+       pins one yet, so the mask a task is asked for is all of them. That is
+       what makes `nproc` right, and `sysconf(_SC_NPROCESSORS_ONLN)`, which
+       is this call and a count of its bits. It said one for as long as there
+       was one. */
     case LX_sched_getaffinity: {
         unsigned long size = (unsigned long)a2;
         unsigned char *mask = (unsigned char *)a3;
@@ -852,8 +855,25 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         for (unsigned long i = 0; i < size; i++) {
             mask[i] = 0;
         }
-        mask[0] = 1;
+        unsigned long cpus = __syscall0(SYS_CPUS) & 0xFFFFFFFFUL;
+        for (unsigned long i = 0; i < cpus && i / 8 < size; i++) {
+            mask[i / 8] |= (unsigned char)(1u << (i % 8));
+        }
         return (long)sizeof(unsigned long);
+    }
+
+    /* Which processor this is, as of the question: a task is moved between
+       them at any moment. There is one memory node. */
+    case LX_getcpu: {
+        unsigned *cpu = (unsigned *)a1;
+        unsigned *node = (unsigned *)a2;
+        if (cpu) {
+            *cpu = (unsigned)(__syscall0(SYS_CPUS) >> 32);
+        }
+        if (node) {
+            *node = 0;
+        }
+        return 0;
     }
 
     case LX_set_tid_address:
