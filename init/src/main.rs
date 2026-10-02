@@ -341,11 +341,14 @@ fn hex(mut n: usize, buf: &mut [u8; 18]) -> usize {
     2 + count
 }
 
+/// Whether a boot module's name begins with `needle`, in either case: the
+/// name is a file's on a FAT partition, and comes back in capitals from one
+/// this system's own tools wrote.
 fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
     }
-    haystack[..needle.len()] == *needle
+    haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 fn to_upper(b: u8) -> u8 {
