@@ -131,10 +131,17 @@ fn ata_identify() -> bool {
     syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_IDENTIFY);
     ata_400ns_delay();
 
-    // Check if drive exists
+    // Check if drive exists. Nothing at all answers 0xFF: no controller
+    // at these ports — a machine whose disks are on AHCI, as QEMU's q35 —
+    // where the busy bit is set for ever, and waiting for it to clear would
+    // be a driver spinning ahead of everything else.
     let status = ata_read_status();
     if status == 0 {
         println!("[disk] No drive detected on primary master.");
+        return false;
+    }
+    if status == 0xFF {
+        println!("[disk] No disk controller at the IDE ports.");
         return false;
     }
 
