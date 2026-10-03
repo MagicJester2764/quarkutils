@@ -296,10 +296,37 @@ from the machine's clock at boot as UTC. `clock_settime` and `settimeofday`
 set it, for a program that holds the right to — root's shell does, and what
 it starts — and are `EPERM` for one that does not. Setting the date moves no
 wait: a sleep until a time on the clock that says the date is turned into
-how long that is when the sleep begins. The clocks that count the time a
-program has spent running read as the time since boot.
+how long that is when the sleep begins.
 
 There is no time zone but what `TZ` spells out.
+
+## What a process uses, and how it runs
+
+- **The time a process has run is counted, to the nanosecond.**
+  `CLOCK_PROCESS_CPUTIME_ID` is every thread's together and
+  `CLOCK_THREAD_CPUTIME_ID` the calling thread's. `getrusage`, `times` and
+  `wait4` say the same, divided between the program and the kernel — which
+  part was which is sampled, each tick looking at where it finds the
+  process, as Linux does when it is not told more — and how many times it
+  gave the processor up and had it taken. The rest of a `struct rusage` is
+  nought.
+- **A child's use is its parent's once collected**: `RUSAGE_CHILDREN`, and
+  the children's half of `times`, count every child the process has waited
+  for, with what each of those collected of its own. A child nobody waits
+  for counts for nobody.
+- **`nice`, `getpriority` and `setpriority` are the kernel's**, for a
+  process: how nice it is decides its share of the processor against the
+  other ordinary programs, by Linux's weights — one at 10 has about a ninth
+  of what one at nought has. A child has its parent's and `exec` keeps it.
+  Anybody may be nicer; to be less nice takes the right root's shell has,
+  and is `EACCES` without it. `PRIO_PGRP` and `PRIO_USER` mean only the
+  caller's own process, and are `EINVAL` for any other.
+- **`RLIMIT_CPU` is the kernel's**: past the soft limit a process is sent
+  `SIGXCPU`, once a second, and at the hard one it is killed, as on Linux.
+  A child inherits it, and raising the hard limit takes the same right.
+  The other limits are kept nowhere: setting one says it succeeded, and
+  asking says what the system has — 64 descriptors — or that there is no
+  limit. `prlimit` is for the caller's own process.
 
 ## Wide registers
 

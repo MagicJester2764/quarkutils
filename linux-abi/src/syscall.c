@@ -562,6 +562,7 @@ static long do_uname(char *u) {
     return 0;
 }
 
+#define LX_RLIMIT_CPU    0
 #define LX_RLIMIT_STACK  3
 #define LX_RLIMIT_NOFILE 7
 #define LX_RLIM_INFINITY (~0UL)
@@ -569,6 +570,12 @@ static long do_uname(char *u) {
 static long do_getrlimit(long what, unsigned long *lim) {
     if (!lim) {
         return -LX_EFAULT;
+    }
+    if (what == LX_RLIMIT_CPU) {
+        /* The kernel's: seconds of processor time, soft and hard. */
+        lim[0] = lim[1] = LX_RLIM_INFINITY;
+        __syscall4(SYS_CPU_LIMIT, 0, 0, (unsigned long)lim, 1);
+        return 0;
     }
     unsigned long v;
     switch (what) {
@@ -579,6 +586,45 @@ static long do_getrlimit(long what, unsigned long *lim) {
     lim[0] = v; /* soft */
     lim[1] = v; /* hard */
     return 0;
+}
+
+static long do_setrlimit(long what, const unsigned long *lim) {
+    if (!lim) {
+        return -LX_EFAULT;
+    }
+    if (what != LX_RLIMIT_CPU) {
+        /* Not kept: a program that lowers one is told it did. */
+        return 0;
+    }
+    if (lim[0] > lim[1]) {
+        return -LX_EINVAL;
+    }
+    unsigned long r = __syscall4(SYS_CPU_LIMIT, lim[0], lim[1], 0, 0);
+    return r == 0 ? 0 : r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_EINVAL;
+}
+
+/* What was used, as SYS_USAGE says it: nanoseconds in the program and in the
+   kernel for it, and how many times it gave the processor up and had it
+   taken. Whose: 0 this program, 1 the children it collected, 2 this thread. */
+static void usage_of(unsigned long whose, unsigned long u[4]) {
+    if (__syscall2(SYS_USAGE, whose, (unsigned long)u) == QUARK_ERR) {
+        u[0] = u[1] = u[2] = u[3] = 0;
+    }
+}
+
+/* That, as a struct rusage: two timevals and fourteen counts, of which the
+   last two are the switches. */
+static void fill_rusage(void *out, const unsigned long u[4]) {
+    long *w = out;
+    for (int i = 0; i < 18; i++) {
+        w[i] = 0;
+    }
+    w[0] = (long)(u[0] / 1000000000UL);
+    w[1] = (long)(u[0] % 1000000000UL / 1000);
+    w[2] = (long)(u[1] / 1000000000UL);
+    w[3] = (long)(u[1] % 1000000000UL / 1000);
+    w[16] = (long)u[2];
+    w[17] = (long)u[3];
 }
 
 /* Linux's struct sysinfo: uptime, three load averages, then memory in units
@@ -969,6 +1015,12 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (a3 & 8 /* WCONTINUED */) {
             how |= QUARK_WAIT_CONTINUED;
         }
+        /* What the child used is what the children collected used, after
+           this, less what they had before it. */
+        unsigned long before[4] = {0, 0, 0, 0};
+        if (a4) {
+            usage_of(1, before);
+        }
         unsigned long got;
         for (;;) {
             got = __syscall2(SYS_WAIT_FOR, who, how);
@@ -1002,12 +1054,13 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
                 *status = code < 0 ? (-code & 0x7F) : ((code & 0xFF) << 8);
             }
         }
-        /* How long it ran is not kept. */
         if (a4) {
-            unsigned char *usage = (unsigned char *)a4;
-            for (int i = 0; i < 144; i++) {
-                usage[i] = 0;
+            unsigned long after[4];
+            usage_of(1, after);
+            for (int i = 0; i < 4; i++) {
+                after[i] -= before[i];
             }
+            fill_rusage((void *)a4, after);
         }
         return pid;
     }
@@ -1062,10 +1115,24 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return (long)count;
     }
-    case LX_getpriority:
-        return 20; /* the raw call's "nice 0" */
-    case LX_setpriority:
-        return 0;
+    /* How nice a process is, which the kernel keeps for the program. The raw
+       call answers 20 less it, as Linux's does, and the C library takes it
+       back. One process, or this one for a group or a user of nought. */
+    case LX_getpriority: {
+        if (a1 != 0 && a2 != 0) {
+            return -LX_EINVAL;
+        }
+        unsigned long r = __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, QUARK_ERR);
+        return r > 39 ? -LX_ESRCH : 40 - (long)r;
+    }
+    case LX_setpriority: {
+        if (a1 != 0 && a2 != 0) {
+            return -LX_EINVAL;
+        }
+        long nice = a3 < -20 ? -20 : a3 > 19 ? 19 : a3;
+        unsigned long r = __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, (unsigned long)nice);
+        return r == QUARK_NOT_ALLOWED ? -LX_EACCES : r > 39 ? -LX_ESRCH : 0;
+    }
     case LX_sched_yield:
         __syscall0(SYS_YIELD);
         return 0;
@@ -1237,6 +1304,16 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         struct lx_timespec *ts = (struct lx_timespec *)a2;
         if (!ts) {
             return -LX_EFAULT;
+        }
+        /* The time this program, or this thread, has run: in it and in the
+           kernel for it. */
+        if (a1 == LX_CLOCK_PROCESS_CPUTIME || a1 == LX_CLOCK_THREAD_CPUTIME) {
+            unsigned long u[4];
+            usage_of(a1 == LX_CLOCK_PROCESS_CPUTIME ? 0 : 2, u);
+            unsigned long ran = u[0] + u[1];
+            ts->tv_sec = (long)(ran / 1000000000UL);
+            ts->tv_nsec = (long)(ran % 1000000000UL);
+            return 0;
         }
         /* The kernel's clock, in nanoseconds. The real-time clocks are the
            date — the one read at boot, or set since — and every other clock
@@ -1456,27 +1533,45 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_getrlimit:
         return do_getrlimit(a1, (unsigned long *)a2);
     case LX_setrlimit:
-        return 0;
-    case LX_prlimit64:
-        if (a2 != 0 && a2 != __quark_getpid()) {
+        return do_setrlimit(a1, (const unsigned long *)a2);
+    case LX_prlimit64: {
+        /* pid, resource, new, old: this process only. */
+        if (a1 != 0 && a1 != __quark_getpid()) {
             return -LX_ESRCH;
         }
-        return a4 ? do_getrlimit(a2 ? a1 : a1, (unsigned long *)a4) : 0;
-
-    /* What a program has used is not counted. Zeroes are what `time` then
-       prints, which is at least not a lie about a number nobody kept. */
-    case LX_getrusage:
-        if (a2) {
-            unsigned char *usage = (unsigned char *)a2;
-            for (int i = 0; i < 144; i++) {
-                usage[i] = 0;
+        if (a4) {
+            long r = do_getrlimit(a2, (unsigned long *)a4);
+            if (r) {
+                return r;
             }
         }
+        return a3 ? do_setrlimit(a2, (const unsigned long *)a3) : 0;
+    }
+
+    /* What was used, which the kernel counts: RUSAGE_SELF, RUSAGE_CHILDREN
+       and RUSAGE_THREAD. */
+    case LX_getrusage: {
+        if (a1 != 0 && a1 != -1 && a1 != 1) {
+            return -LX_EINVAL;
+        }
+        unsigned long u[4];
+        usage_of(a1 == 0 ? 0 : a1 == -1 ? 1 : 2, u);
+        if (a2) {
+            fill_rusage((void *)a2, u);
+        }
         return 0;
+    }
     case LX_times: {
         if (a1) {
+            /* In ticks, a hundred a second. */
+            unsigned long self[4], children[4];
+            usage_of(0, self);
+            usage_of(1, children);
             long *t = (long *)a1;
-            t[0] = t[1] = t[2] = t[3] = 0;
+            t[0] = (long)(self[0] / 10000000UL);
+            t[1] = (long)(self[1] / 10000000UL);
+            t[2] = (long)(children[0] / 10000000UL);
+            t[3] = (long)(children[1] / 10000000UL);
         }
         /* Ticks since boot, at the hundred a second Linux counts in too. */
         return (long)__syscall0(SYS_TICKS);

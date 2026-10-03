@@ -230,6 +230,9 @@
 #define SYS_SIG_RETURN      121
 #define SYS_SIG_STACK       122
 #define SYS_SIG_WAIT        123
+#define SYS_USAGE           124
+#define SYS_NICE            125
+#define SYS_CPU_LIMIT       126
 #define SYS_ABI_VERSION     240
 
 /* What the kernel returns for "no". Not an errno: each call says what it
