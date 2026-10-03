@@ -152,6 +152,84 @@ pub const SYS_SIG_MASK: u64 = 120;
 pub const SYS_SIG_RETURN: u64 = 121;
 pub const SYS_SIG_STACK: u64 = 122;
 pub const SYS_SIG_WAIT: u64 = 123;
+pub const SYS_USAGE: u64 = 124;
+pub const SYS_NICE: u64 = 125;
+pub const SYS_CPU_LIMIT: u64 = 126;
+
+/// What was used of the machine ([`sys_usage`]): nanoseconds in the
+/// program, nanoseconds in the kernel for it, and how many times it gave the
+/// processor up and had it taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub user_ns: u64,
+    pub system_ns: u64,
+    pub voluntary: u64,
+    pub involuntary: u64,
+}
+
+impl Usage {
+    /// Nanoseconds run, in the program and in the kernel.
+    pub fn total_ns(&self) -> u64 {
+        self.user_ns + self.system_ns
+    }
+}
+
+/// Whose use [`sys_usage`] says: this program's, the children it has
+/// collected, this task's.
+pub const USAGE_PROGRAM: u64 = 0;
+pub const USAGE_CHILDREN: u64 = 1;
+pub const USAGE_TASK: u64 = 2;
+const USAGE_OF: u64 = 3;
+
+/// What this program, the children it has collected, or this task has used.
+pub fn sys_usage(whose: u64) -> Result<Usage, ()> {
+    usage(whose, 0)
+}
+
+/// What the program task `tid` is a task of has used. Anybody may ask.
+pub fn sys_usage_of(tid: usize) -> Result<Usage, ()> {
+    usage(USAGE_OF, tid as u64)
+}
+
+fn usage(whose: u64, of: u64) -> Result<Usage, ()> {
+    let mut out = [0u64; 4];
+    let ret = unsafe { syscall3(SYS_USAGE, whose, out.as_mut_ptr() as u64, of) };
+    if ret == u64::MAX {
+        return Err(());
+    }
+    Ok(Usage { user_ns: out[0], system_ns: out[1], voluntary: out[2], involuntary: out[3] })
+}
+
+/// How nice process `pid` (0 for this one) is, -20 to 19, set to `nice`
+/// unless that is `None`: the share of its band it has while it and another
+/// are both computing. Anybody may be nicer; to be less nice takes
+/// `TaskMgmt`. Answers with how nice it was.
+pub fn sys_nice(pid: u64, nice: Option<i64>) -> Result<i64, Refused> {
+    let new = nice.map_or(u64::MAX, |n| n as u64);
+    match unsafe { syscall2(SYS_NICE, pid, new) } {
+        ret @ 0..=39 => Ok(ret as i64 - 20),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// How many seconds of processor time this program may have — SIGXCPU past
+/// `soft`, the end at `hard`, `u64::MAX` for none — and what it was.
+/// Raising the hard limit takes `TaskMgmt`.
+pub fn sys_cpu_limit(soft: u64, hard: u64) -> Result<(u64, u64), Refused> {
+    let mut old = [0u64; 2];
+    match unsafe { syscall4(SYS_CPU_LIMIT, soft, hard, old.as_mut_ptr() as u64, 0) } {
+        0 => Ok((old[0], old[1])),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// How many seconds of processor time this program may have, as
+/// [`sys_cpu_limit`] says it.
+pub fn sys_cpu_limit_get() -> (u64, u64) {
+    let mut old = [u64::MAX; 2];
+    let _ = unsafe { syscall4(SYS_CPU_LIMIT, 0, 0, old.as_mut_ptr() as u64, 1) };
+    (old[0], old[1])
+}
 pub const SYS_MAP_ANON: u64 = 192;
 pub const SYS_MEM_INFO: u64 = 193;
 pub const SYS_OBJECT_CREATE: u64 = 194;
@@ -2398,7 +2476,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 21;
+pub const ABI_VERSION_MINOR: u32 = 22;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
