@@ -869,9 +869,12 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   drives something to the device manager, lent with the call, instead of
   starting it. The rest are installed in `/usr/lib/drivers` (`DRIVERS` in
   the Makefile), which the device manager reads when `init` says the root is
-  up — before anything in `/etc/init.conf` runs. It takes either only from
-  its parent: a program that could hand it a driver would be handed a
-  device.
+  up — before anything in `/etc/init.conf` runs — and it answers only once
+  each driver it started there is in its loop (it calls it, which waits
+  until the driver receives): a driver's line about itself, printed a
+  moment after the login prompt, pushed the prompt off the line it was
+  waited for on. It takes either only from its parent: a program that
+  could hand it a driver would be handed a device.
 - **The device manager is the drivers' parent**, watches them, and collects
   one that ends; its device has no driver again. Nothing starts it again
   (the service manager will).

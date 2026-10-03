@@ -58,6 +58,9 @@ const SCRATCH: Scratch = Scratch { elf: 0x83_0000_0000, stack: 0x84_0000_0000, a
 /// device's and its line's.
 const MANIFEST_SCRATCH: usize = 12;
 const GRANT_SCRATCH: usize = syscall::SLOT_SCRATCH;
+/// Where the right to call a driver is kept while it is asked whether it
+/// is up.
+const PING_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -188,9 +191,39 @@ fn driver_name(file: &[u8], out: &mut [u8; 16]) -> usize {
     n
 }
 
+/// Wait, two seconds at most, for driver `tid` to be in its loop: to be
+/// receiving, which is where a call to it is taken. What it printed as it
+/// started is then on the console before whatever its starter does next —
+/// a login prompt, which a driver's line after it pushed off its own.
+fn settle(tid: usize) {
+    let _ = syscall::sys_cap_delete(PING_SLOT);
+    if syscall::sys_cap_mint(PING_SLOT, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0).is_ok() {
+        let ping = Message { sender: 0, tag: TAG_PING, data: [0; 6] };
+        let mut reply = Message::empty();
+        let _ = syscall::sys_call_timeout(tid, &ping, &mut reply, 200);
+    }
+    let _ = syscall::sys_cap_delete(PING_SLOT);
+}
+
 /// The root is up: every driver in `/usr/lib/drivers`, for whatever it
-/// drives that has no driver yet.
+/// drives that has no driver yet — and up, before this answers.
 fn from_files() -> u64 {
+    let mut before = [0usize; MAX_DEVICES];
+    for (i, slot) in table().iter().enumerate() {
+        before[i] = slot.map_or(0, |s| s.driver);
+    }
+    let started = read_files();
+    for (i, slot) in table().iter().enumerate() {
+        if let Some(slot) = slot.filter(|s| s.driver != 0 && s.driver != before[i]) {
+            settle(slot.driver);
+        }
+    }
+    started
+}
+
+/// Start every driver in `/usr/lib/drivers` for whatever it drives that has
+/// no driver yet: how many.
+fn read_files() -> u64 {
     let Some(vfs_tid) = nameserver::lookup(b"vfs") else { return 0 };
     let Ok((dir, _, true)) = vfs::open(vfs_tid, devices::DRIVERS) else { return 0 };
     let mut started = 0;

@@ -62,7 +62,10 @@ so a driver started some other way holds no device, and says so.
 - **`/usr/lib/drivers`**, for everything else. When `init` has a root it
   tells the device manager so (`TAG_FILES`), before anything in
   `/etc/init.conf` runs, and the device manager reads every file there. A
-  distribution installs a driver there; `edu` is one.
+  distribution installs a driver there; `edu` is one. The device manager
+  answers only once each driver it started there has reached its loop (a
+  call to it has been taken), two seconds at most each: what a driver says
+  as it starts is said before the session's first prompt.
 
 A device already driven is not offered again, so a driver in both places is
 started from the first. The device manager takes either request from its
