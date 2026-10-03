@@ -286,6 +286,27 @@ static unsigned long arena_next(void) {
     return mmap_next;
 }
 
+/* A line every two gigabytes, which a mapping smaller than that does not
+   cross. pixman's stress test reaches an image through its address with
+   bits 63 and 31 turned over, adds the offset to that and turns them back,
+   which is the address only while the image stays on one side of such a
+   line. On Linux a buffer seldom crosses one; here, where the arena only
+   goes up — from a random start, and in steps of gigabytes when the test
+   asks for its masks — one did, now and then, and the test read four
+   gigabytes from where it meant to. */
+#define ARENA_LINE (1UL << 31)
+
+/* Where a mapping of `pages` goes: the next address, or the next line if it
+   would cross one and need not. With the arena's lock held. */
+static unsigned long arena_place(unsigned long pages) {
+    unsigned long at = arena_next();
+    unsigned long len = pages * PAGE_SIZE;
+    if (len < ARENA_LINE && at / ARENA_LINE != (at + len - 1) / ARENA_LINE) {
+        at = (at + ARENA_LINE - 1) & ~(ARENA_LINE - 1);
+    }
+    return at;
+}
+
 static void unmap_pages(unsigned long at, unsigned long pages) {
     unsigned long done = 0;
     while (done < pages) {
@@ -340,8 +361,8 @@ static long do_mmap(unsigned long len, long flags) {
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     __quark_lock(&arena_lock);
-    unsigned long at = arena_next();
-    if (pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
+    unsigned long at = arena_place(pages);
+    if (at >= MMAP_LIMIT || pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
         __quark_unlock(&arena_lock);
         trace("mmap-arena-full", (long)pages);
         return -LX_ENOMEM;
@@ -367,8 +388,8 @@ static long do_mmap_fd(long fd, unsigned long len) {
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     __quark_lock(&arena_lock);
-    unsigned long at = arena_next();
-    if (at + pages * PAGE_SIZE > MMAP_LIMIT) {
+    unsigned long at = arena_place(pages);
+    if (at >= MMAP_LIMIT || pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
         __quark_unlock(&arena_lock);
         return -LX_ENOMEM;
     }
@@ -412,9 +433,9 @@ static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long
     unsigned long how = (write ? QUARK_OBJECT_WRITE : 0) | (shared ? QUARK_OBJECT_SHARED : 0) |
                         ((prot & LX_PROT_EXEC) ? QUARK_OBJECT_EXEC : 0);
     __quark_lock(&arena_lock);
-    unsigned long at = arena_next();
+    unsigned long at = arena_place(pages);
     unsigned long r = QUARK_ERR;
-    if (pages <= (MMAP_LIMIT - at) / PAGE_SIZE) {
+    if (at < MMAP_LIMIT && pages <= (MMAP_LIMIT - at) / PAGE_SIZE) {
         r = __syscall5(SYS_OBJECT_MAP, slot, at, pages, (unsigned long)off / PAGE_SIZE, how);
     }
     if (r != QUARK_ERR) {

@@ -11,6 +11,14 @@
  * the address the next mapping was going to use was gone, so every mapping
  * after it failed as well.
  *
+ * Nor one that crossed a line every two gigabytes. pixman's stress test
+ * reaches an image through its address with bits 63 and 31 turned over, adds
+ * the offset to that, and turns them back: which is the address only while
+ * the image does not cross such a line. Now and then one did — the arena
+ * only goes up, from a random start, and the test's masks carry it on in
+ * steps of gigabytes — and the test read four gigabytes from where it meant
+ * to.
+ *
  * Exits 0 only if every check holds.
  */
 #include <stdio.h>
@@ -46,6 +54,29 @@ static int use(size_t len)
     return munmap(p, len) == 0 && ok;
 }
 
+/* Whether `count` mappings of `len` bytes, each smaller than two gigabytes,
+   all fit between two of the lines. */
+static int none_crosses(size_t len, int count)
+{
+    const unsigned long line = 2 * GiB;
+    void *maps[64];
+    int ok = 1, made = 0;
+    for (int i = 0; i < count && i < 64; i++) {
+        maps[i] = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (maps[i] == MAP_FAILED) {
+            ok = 0;
+            break;
+        }
+        made++;
+        unsigned long at = (unsigned long)maps[i];
+        if (at / line != (at + len - 1) / line)
+            ok = 0;
+    }
+    for (int i = 0; i < made; i++)
+        munmap(maps[i], len);
+    return ok;
+}
+
 static int malloc_works(size_t len)
 {
     char *p = malloc(len);
@@ -68,6 +99,10 @@ int main(void)
     /* How pixman asked. */
     check("calloc of 64 GiB is NULL", calloc(1, 64 * GiB) == NULL);
     check("and malloc works after it", malloc_works(4 * MiB));
+    /* Ten gigabytes of them is four or five lines, from wherever the arena
+       began. */
+    check("no mapping smaller than two gigabytes crosses a line every two",
+          none_crosses(256 * MiB + 4096, 40));
     puts(failed ? "mmaptest: FAIL" : "mmaptest: ok");
     return failed;
 }

@@ -344,7 +344,10 @@ A program's stack, what `malloc` gives and what `mmap` gives with no
 address asked for are each somewhere else every time the program runs: a
 random number of pages into a window of their own, chosen by `execve` for
 the stack and by the C layer, the first time it is wanted, for the rest. A
-forked child is in its parent's places. A program's code is where it was
+forked child is in its parent's places. A mapping smaller than two
+gigabytes never crosses a multiple of two gigabytes: pixman's stress test
+turns bit 31 of an image's address over, adds to it and turns it back,
+which is the address only while the image does not. A program's code is where it was
 linked: nothing is built to be loaded anywhere (PIE), and `dlopen` has
 nothing to load.
 
