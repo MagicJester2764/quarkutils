@@ -240,16 +240,28 @@ pub extern "C" fn _start() -> ! {
         let mut buf = [0u8; 256];
         let mut busy = false;
 
-        if pipe_open {
+        // What the pipe has is drawn to the end of a line before anything
+        // the terminal has: a line from each is two lines. Read a piece at a
+        // time and drawn in between, a line of the boot was cut where a
+        // piece ended and the login prompt that came after it was drawn
+        // inside it — on four processors, where the two arrive together.
+        for _ in 0..64 {
+            if !pipe_open {
+                break;
+            }
             match syscall::sys_fd_read_nb(0, &mut buf) {
                 // Every writer has gone. That is the end of the pipe and not
                 // of this program: it is a server with a name, and somebody
                 // may yet ask it for its terminal.
                 0 => pipe_open = false,
-                n if n == syscall::WOULD_BLOCK || n == u64::MAX => {}
+                n if n == syscall::WOULD_BLOCK || n == u64::MAX => break,
                 n => {
-                    draw(&buf[..n as usize], false);
+                    let n = n as usize;
+                    draw(&buf[..n], false);
                     busy = true;
+                    if buf[n - 1] == b'\n' {
+                        break;
+                    }
                 }
             }
         }
