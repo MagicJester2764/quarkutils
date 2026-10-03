@@ -155,6 +155,36 @@ pub const SYS_SIG_WAIT: u64 = 123;
 pub const SYS_USAGE: u64 = 124;
 pub const SYS_NICE: u64 = 125;
 pub const SYS_CPU_LIMIT: u64 = 126;
+pub const SYS_DEVICE_CLAIM: u64 = 127;
+
+/// A PCI device, by bus, device and function, as `SYS_DEVICE_CLAIM` names
+/// one.
+pub fn pci_device(bus: u8, device: u8, function: u8) -> u64 {
+    (bus as u64) << 8 | ((device & 0x1F) as u64) << 3 | (function & 7) as u64
+}
+
+/// Make PCI device `bdf` ([`pci_device`]) this program's to drive. On a
+/// machine with an IOMMU the device then reaches the memory this program
+/// was given for devices ([`sys_phys_alloc`]) and nothing else, and the
+/// answer is `true`; `false` is a claim nothing on this machine can
+/// enforce. Another program's device, or a program that may not configure
+/// devices, is refused.
+pub fn sys_device_claim(bdf: u64) -> Result<bool, Refused> {
+    match unsafe { syscall2(SYS_DEVICE_CLAIM, bdf, 0) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// How many times device `bdf`, this program's, has reached for memory it
+/// may not.
+pub fn sys_device_stopped(bdf: u64) -> Result<u64, Refused> {
+    match unsafe { syscall2(SYS_DEVICE_CLAIM, bdf, 1) } {
+        ret @ (NOT_ALLOWED | u64::MAX) => Err(refusal(ret)),
+        count => Ok(count),
+    }
+}
 
 /// What was used of the machine ([`sys_usage`]): nanoseconds in the
 /// program, nanoseconds in the kernel for it, and how many times it gave the
@@ -2476,7 +2506,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 22;
+pub const ABI_VERSION_MINOR: u32 = 23;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
