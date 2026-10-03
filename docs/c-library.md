@@ -77,9 +77,6 @@ too. The difference is only visible to code that mixes the two kinds.
   does depends on the difference; a program that calls `clone` that way
   itself and expects to see what the child wrote will not. `CLONE_VM` with
   neither `CLONE_THREAD` nor `CLONE_VFORK` is `ENOSYS`.
-- **A program with more than one thread cannot `exec`.** POSIX has `exec` end
-  the other threads; ending them here means unwinding what they hold in a
-  server, so it is refused rather than half done.
 - `exit` ends every thread of the program. `pthread_exit` ends one.
 - **A thread is joined, never waited for.** It is no child: `waitpid(-1)`
   in a program with threads and no child processes is `ECHILD`, and is
