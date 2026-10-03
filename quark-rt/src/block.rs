@@ -54,6 +54,11 @@ pub const TAG_RELEASE: u64 = 6;
 pub const TAG_RESCAN: u64 = 7;
 /// Write several: `[lba, volume, count]`, lending `count * 512` bytes.
 pub const TAG_WRITE_SECTORS: u64 = 8;
+/// Which partition a volume is: `[_, volume]`. Anybody may ask. The reply is
+/// the partition's own GUID as the table keeps it, sixteen bytes in two
+/// words — what names it whichever disk it is on and whatever its driver is
+/// called (`root.cfg`'s `root partuuid`). Nought for a volume with none.
+pub const TAG_ID: u64 = 9;
 
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
@@ -132,6 +137,68 @@ pub fn info(server: usize, volume: u64) -> Result<Info, u64> {
     })
 }
 
+/// Which partition a volume is: its GUID as the table keeps it, or noughts.
+pub fn id(server: usize, volume: u64) -> Result<[u8; 16], u64> {
+    let r = call(server, TAG_ID, [0, volume, 0, 0, 0, 0])?;
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&r.data[0].to_le_bytes());
+    id[8..].copy_from_slice(&r.data[1].to_le_bytes());
+    Ok(id)
+}
+
+/// A GUID written the usual way, `0fc63daf-8483-4772-8e79-3d69d8477de4`, as
+/// a partition table keeps it: the first three fields little-endian.
+pub fn guid_from_text(text: &[u8]) -> Option<[u8; 16]> {
+    let digits: [u8; 32] = {
+        let mut d = [0u8; 32];
+        let mut n = 0;
+        for (i, &c) in text.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                if c != b'-' {
+                    return None;
+                }
+                continue;
+            }
+            if n == 32 {
+                return None;
+            }
+            d[n] = (c as char).to_digit(16)? as u8;
+            n += 1;
+        }
+        if n != 32 || text.len() != 36 {
+            return None;
+        }
+        d
+    };
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = digits[2 * i] << 4 | digits[2 * i + 1];
+    }
+    bytes[0..4].reverse();
+    bytes[4..6].reverse();
+    bytes[6..8].reverse();
+    Some(bytes)
+}
+
+/// A GUID as a partition table keeps it, written the usual way, into `out`.
+pub fn guid_to_text(guid: &[u8; 16], out: &mut [u8; 36]) {
+    let mut bytes = *guid;
+    bytes[0..4].reverse();
+    bytes[4..6].reverse();
+    bytes[6..8].reverse();
+    let hex = b"0123456789abcdef";
+    let mut n = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out[n] = b'-';
+            n += 1;
+        }
+        out[n] = hex[(b >> 4) as usize];
+        out[n + 1] = hex[(b & 0xF) as usize];
+        n += 2;
+    }
+}
+
 /// Take a volume for this task alone.
 pub fn claim(server: usize, volume: u64) -> Result<(), u64> {
     call(server, TAG_CLAIM, [0, volume, 0, 0, 0, 0]).map(|_| ())
@@ -191,6 +258,12 @@ pub trait Device {
     fn read(&mut self, lba: u64, count: u32, into: &mut [u8]) -> bool;
     /// Write `count` sectors at `lba` out of `from`.
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool;
+    /// Whether the disk has gone — a USB disk pulled out. Asked each time
+    /// the server is woken, which its driver does to say so; the server's
+    /// task ends there, and its name with it.
+    fn gone(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -200,9 +273,11 @@ struct Volume {
     kind: u64,
     /// The task that has claimed it; 0 for nobody.
     claimant: usize,
+    /// Its partition's own GUID, as the table keeps it.
+    id: [u8; 16],
 }
 
-const NO_VOLUME: Volume = Volume { start: 0, sectors: 0, kind: KIND_WHOLE, claimant: 0 };
+const NO_VOLUME: Volume = Volume { start: 0, sectors: 0, kind: KIND_WHOLE, claimant: 0, id: [0; 16] };
 
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -255,7 +330,9 @@ fn scan<D: Device>(dev: &mut D, volumes: &mut [Volume; MAX_VOLUMES], sector: &mu
                 } else {
                     KIND_OTHER
                 };
-                volumes[n + 1] = Volume { start: first, sectors: end - first + 1, kind, claimant: 0 };
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&e[16..32]);
+                volumes[n + 1] = Volume { start: first, sectors: end - first + 1, kind, claimant: 0, id };
                 last = n + 1;
             }
             return last + 1;
@@ -272,7 +349,7 @@ fn scan<D: Device>(dev: &mut D, volumes: &mut [Volume; MAX_VOLUMES], sector: &mu
                 continue;
             }
             let kind = if kind == 0xEF { KIND_EFI } else { KIND_DATA };
-            volumes[n + 1] = Volume { start: first, sectors: count, kind, claimant: 0 };
+            volumes[n + 1] = Volume { start: first, sectors: count, kind, claimant: 0, id: [0; 16] };
             last = n + 1;
         }
     }
@@ -295,10 +372,18 @@ pub fn register_disk() -> Option<[u8; 5]> {
     (0..4u8).map(|n| [b'd', b'i', b's', b'k', b'0' + n]).find(|name| crate::nameserver::register(name).is_ok())
 }
 
+/// As [`register_disk`], for a disk that can be pulled out: the *last* of
+/// `disk3` to `disk0` that nobody has. The disks a machine starts with keep
+/// the first names whenever a USB disk's driver is ready, and a disk put back
+/// is given the name it had.
+pub fn register_removable_disk() -> Option<[u8; 5]> {
+    (0..4u8).rev().map(|n| [b'd', b'i', b's', b'k', b'0' + n]).find(|name| crate::nameserver::register(name).is_ok())
+}
+
 pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
     let buf = unsafe { core::slice::from_raw_parts_mut(page as *mut u8, MAX_SECTORS as usize * SECTOR) };
     let mut volumes = [NO_VOLUME; MAX_VOLUMES];
-    volumes[0] = Volume { start: 0, sectors: dev.sectors(), kind: KIND_WHOLE, claimant: 0 };
+    volumes[0] = Volume { start: 0, sectors: dev.sectors(), kind: KIND_WHOLE, claimant: 0, id: [0; 16] };
     let mut count = scan(dev, &mut volumes, &mut buf[..]);
 
     loop {
@@ -308,6 +393,9 @@ pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
             msg = earlier;
         } else if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
             continue;
+        }
+        if dev.gone() {
+            syscall::sys_exit_code(0);
         }
         if let Some(dead) = death_notice(&msg) {
             for v in volumes.iter_mut().filter(|v| v.claimant == dead) {
@@ -329,6 +417,12 @@ pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
                     tag: TAG_OK,
                     data: [v.sectors, v.start, v.kind, claimant, count as u64, 0],
                 }
+            }
+            TAG_ID if !known => status(TAG_ERROR, ERR_NO_VOLUME),
+            TAG_ID => {
+                let id = volumes[volume].id;
+                let word = |half: &[u8]| u64::from_le_bytes(half.try_into().unwrap_or([0; 8]));
+                Message { sender: 0, tag: TAG_OK, data: [word(&id[..8]), word(&id[8..]), 0, 0, 0, 0] }
             }
             TAG_CLAIM if !known => status(TAG_ERROR, ERR_NO_VOLUME),
             TAG_CLAIM => {

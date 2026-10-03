@@ -34,6 +34,8 @@ ahci/               A SATA disk on an AHCI controller, likewise: what the
                     q35 machine has, and nearly every PC since SATA.
 nvme/               An NVMe disk: queues in memory, a namespace, a message
                     for an interrupt.
+usb/                A USB controller (xHCI) and what is plugged into it:
+                    hubs, keyboards and mice into `input`, disks as diskN.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
@@ -71,7 +73,7 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
                     holds anything: they ask `auth`.
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
-ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/
+ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/ lsusb/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.

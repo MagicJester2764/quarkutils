@@ -13,6 +13,7 @@ pub mod crypt;
 pub mod devices;
 pub mod font;
 pub mod ipc;
+pub mod keys;
 pub mod layout;
 pub mod manifest;
 pub mod session;
@@ -31,6 +32,7 @@ pub mod pci;
 pub mod socket;
 pub mod random;
 pub mod vfs;
+pub mod usb;
 pub mod virtio;
 pub mod wm;
 

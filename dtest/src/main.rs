@@ -3201,6 +3201,21 @@ fn test_disks() {
         matches!((efi, root), (Ok(a), Ok(b)) if a.start + a.sectors <= b.start && b.start + b.sectors <= whole.sectors),
     );
     check("a volume that is not there is not there", block::info(disk, 16) == Err(block::ERR_NO_VOLUME));
+    check(
+        "a partition says which it is, and the whole disk is none",
+        block::id(disk, 2).is_ok_and(|id| id != [0; 16]) && block::id(disk, 0) == Ok([0; 16]),
+    );
+    check(
+        "a GUID as it is written is the GUID as a table keeps it",
+        block::guid_from_text(b"0fc63daf-8483-4772-8e79-3d69d8477de4") == Some(block::GUID_DATA)
+            && block::guid_from_text(b"0fc63daf-8483-4772-8e79-3d69d8477de").is_none()
+            && block::guid_from_text(b"0fc63daf+8483-4772-8e79-3d69d8477de4").is_none()
+            && {
+                let mut text = [0u8; 36];
+                block::guid_to_text(&block::GUID_EFI, &mut text);
+                &text == b"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+            },
+    );
 
     let mut sector = [0u8; 512];
     let last = efi.map_or(0, |v| v.sectors);
@@ -5838,6 +5853,86 @@ fn test_msi() {
 /// What is in the machine, who holds which device, and what a driver may do
 /// with its own: the device manager's list, every program's capabilities,
 /// and `edu`, the driver for QEMU's test device, asked to try.
+/// A USB controller and what is plugged into it, on a machine with one.
+///
+/// The machine the acceptance gives one has a keyboard, a mouse and a disk
+/// on it, and no i8042: that anything was typed at all is the keyboard's
+/// check. What is asked here is that the controller is driven, what is
+/// plugged in is driven as what it is, and that the disk is a disk.
+fn test_usb() {
+    use quark_rt::{block, devices, usb};
+    println!("usb:");
+    let manager = nameserver::lookup_retry(devices::NAME, 2);
+    let controller = manager.and_then(|m| {
+        (0..64).map_while(|i| devices::entry(m, i)).find(|d| d.header.class == 0x0C_0330)
+    });
+    let Some(controller) = controller else {
+        println!("  (no USB controller here; nothing to ask)");
+        return;
+    };
+    check("the device manager started the USB driver for the controller", controller.driver_name() == b"usb");
+    let server = usb::controllers().next().map(|(_, tid)| tid);
+    check("the driver says what is plugged in", server.is_some());
+    let Some(server) = server else { return };
+    let mut plugged = [usb::Device::default(); 16];
+    let mut n = 0;
+    while n < plugged.len() {
+        let Some(device) = usb::device(server, n) else { break };
+        plugged[n] = device;
+        n += 1;
+    }
+    let plugged = &plugged[..n];
+    if n == 0 {
+        println!("  (nothing plugged in; nothing more to ask)");
+        return;
+    }
+    let has = |role: u8| plugged.iter().any(|d| d.roles & role != 0);
+    check("a keyboard is plugged in and driven", has(usb::ROLE_KEYBOARD));
+    check("and a mouse", has(usb::ROLE_MOUSE));
+    check("and a disk", has(usb::ROLE_DISK));
+    check(
+        "each with an address of its own and a name",
+        plugged.iter().all(|d| d.slot != 0 && d.vendor != 0 && !d.name().is_empty())
+            && (1..n).all(|i| plugged[..i].iter().all(|e| e.slot != plugged[i].slot)),
+    );
+    if has(usb::ROLE_HUB) {
+        check("what is behind a hub is driven too", plugged.iter().any(|d| d.depth > 0 && d.roles != 0));
+    }
+
+    // The disk is a thread of the driver's program, serving as any disk does.
+    let space = syscall::sys_task_space(server).ok();
+    let disk = (0..4u8)
+        .filter_map(|n| nameserver::lookup(&[b'd', b'i', b's', b'k', b'0' + n]))
+        .find(|&tid| space.is_some() && syscall::sys_task_space(tid).ok() == space);
+    check("the disk is a diskN, served by the driver's program", disk.is_some());
+    let Some(disk) = disk else { return };
+    let whole = block::info(disk, 0);
+    check("which says how big it is", whole.is_ok_and(|w| w.sectors > 0));
+    let Ok(whole) = whole else { return };
+    let mut sector = [0u8; 512];
+    check(
+        "and reads: its first sector ends as a boot sector does",
+        block::read(disk, 0, 0, &mut sector).is_ok() && sector[510] == 0x55 && sector[511] == 0xAA,
+    );
+    // Its last sector written and read back, and put back as it was.
+    let last = whole.sectors - 1;
+    let mut was = [0u8; 512];
+    let mut back = [0u8; 512];
+    let pattern: [u8; 512] = core::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0x5A);
+    let written = block::claim(disk, 0).is_ok()
+        && block::read(disk, 0, last, &mut was).is_ok()
+        && block::write(disk, 0, last, &pattern).is_ok()
+        && block::read(disk, 0, last, &mut back).is_ok()
+        && back == pattern
+        && block::write(disk, 0, last, &was).is_ok();
+    let _ = block::release(disk, 0);
+    check("and is written: what goes to its last sector comes back", written);
+    check(
+        "eight sectors at a time, as every disk's requests may be",
+        block::read(disk, 0, 0, &mut [0u8; 4096]).is_ok(),
+    );
+}
+
 fn test_devices() {
     use quark_rt::devices;
     use quark_rt::ipc::Message;
@@ -8165,6 +8260,7 @@ pub extern "C" fn _start() -> ! {
         ("msi", test_msi),
         ("iommu", test_iommu),
         ("devices", test_devices),
+        ("usb", test_usb),
         ("layout", test_layout),
         ("clock", test_clock),
         ("power", test_power),

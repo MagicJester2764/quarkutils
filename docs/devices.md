@@ -64,9 +64,11 @@ so a driver started some other way holds no device, and says so.
   tells the device manager so (`TAG_FILES`), before anything in
   `/etc/init.conf` runs, and the device manager reads every file there. A
   distribution installs a driver there; `edu` is one. The device manager
-  answers only once each driver it started there has reached its loop (a
-  call to it has been taken), two seconds at most each: what a driver says
-  as it starts is said before the session's first prompt.
+  answers only once every driver it started — the boot image's too — has
+  answered a call, two seconds at most each: what a driver says as it
+  starts is said before the session's first prompt. A USB controller's
+  driver answers once what was plugged in as the machine started has been
+  seen to.
 
 A device already driven is not offered again, so a driver in both places is
 started from the first. The device manager takes either request from its
@@ -112,6 +114,36 @@ one MSI-X message (`pci::interrupt`), which each queue is told to send — or,
 with no MSI-X, its line. Only the modern half of a transitional device is
 driven.
 
+## USB
+
+An xHCI controller's driver, `usb`, is in the boot image and drives what is
+plugged into the controller as well as the controller: one program for all
+of it, whose first thread alone touches the controller.
+
+- **What is plugged in** is given an address, asked what it is, and
+  configured: its first configuration, and each interface of it that is a
+  hub, a keyboard or a mouse that speaks the boot protocol (what a BIOS
+  reads), or a disk that speaks bulk-only SCSI. Plugged in or pulled out at
+  any time, at a root port or a hub's.
+- **Keys and movement** go to `input`. The driver offers itself
+  (`TAG_INPUT_SOURCE`), and `input` asks the device manager whether it is a
+  driver it started (`TAG_IS_DRIVER`) before it takes any: a program that
+  could make itself a source of keys could type into the console. A key is
+  said the way the i8042's driver says one (`quark_rt::keys`), and a key held
+  down is typed again, after half a second and thirty times a second.
+- **A disk** is a thread of the program serving `block` as the *last* free
+  `diskN` — `disk3` downwards, so that the disks the machine started with
+  keep the first names — its reads and writes handed to the first thread.
+  Pulled out, the thread ends and its name goes with it; put back, it is a
+  disk again, by the same name if nothing took it meanwhile.
+- **What there is** is answered by a second thread, registered as the first
+  free of `usb0` to `usb3` (`quark_rt::usb`); `lsusb` asks every one.
+
+Not driven yet: USB 3 hubs (a USB 3 device on a root port is), a keyboard or
+mouse that does not speak the boot protocol — a tablet's absolute pointer,
+which needs its report descriptor read — more than one unit of a disk, a disk
+whose blocks are not 512 bytes, and anything isochronous (sound, cameras).
+
 ## Asking what is there
 
 The device manager registers as `devices` and answers anybody:
@@ -120,8 +152,9 @@ The device manager registers as `devices` and answers anybody:
 |---|---|---|
 | 3 | the device at index `data[0]`, in order of address | the first three words of the kernel's description (address, header, pin and line, MSI and MSI-X; ids; class and revision), the driver's task or 0, and its name in two words |
 | 4 | BAR `data[1]` of the device at address `data[0]` | where, how long, flags (1 ports, 2 64-bit, 4 prefetchable) |
+| 5 | is the program `data[0]` (a space id) a driver started here? | `[1 if it is, else 0]` |
 
 Past the last device, or a BAR there is not, the answer's tag is
-`u64::MAX`. `quark_rt::devices` is the client, and `lspci` (`-v` for
-interrupts, BARs and drivers) is all it is used for so far. Tags 1 and 2 are
-`init`'s, above.
+`u64::MAX`. `quark_rt::devices` is the client: `lspci` (`-v` for
+interrupts, BARs and drivers) asks tags 3 and 4, and `input` tag 5. Tags 1
+and 2 are `init`'s, above.

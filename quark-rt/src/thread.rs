@@ -10,10 +10,11 @@
 //! register is set up per thread. Everything here is shared: use `sync` for
 //! anything two threads both touch.
 //!
-//! A thread is part of its program: it starts holding a copy of the
-//! capabilities and descriptors its creator holds, and servers that keep things
-//! per program (the VFS's open files) let it use them. A copy, not a share —
-//! what either is given afterwards is its own.
+//! A thread is part of its program: it uses its program's capabilities and
+//! descriptors, so what one thread is given the others have, and servers that
+//! keep things per program (the VFS's open files) let it use them. It used to
+//! start with a copy of its creator's, as they stood: a service one thread
+//! looked up was refused to another.
 //!
 //! Spawning needs no capability for the first sixteen threads (`TaskMgmt` lifts
 //! the limit), and a stack is ordinary memory.

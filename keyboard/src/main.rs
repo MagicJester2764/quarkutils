@@ -2,6 +2,7 @@
 #![no_main]
 
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
+use quark_rt::keys::{self, Modifiers};
 use quark_rt::nameserver;
 use quark_rt::{println, syscall};
 
@@ -55,12 +56,6 @@ const TAG_MOUSE_EVENT: u64 = 7;
 // Key event types
 const KEY_PRESS: u64 = 1;
 const KEY_RELEASE: u64 = 2;
-
-// Modifier flags
-const MOD_SHIFT: u8 = 1 << 0;
-const MOD_CTRL: u8 = 1 << 1;
-const MOD_ALT: u8 = 1 << 2;
-const MOD_CAPSLOCK: u8 = 1 << 3;
 
 // Ring buffer for key events
 const KEY_BUF_SIZE: usize = 64;
@@ -245,27 +240,35 @@ fn sign_extend(value: u8, negative: bool) -> i32 {
     if negative { value as i32 - 256 } else { value as i32 }
 }
 
-/// Wait for the controller to take what was last written to it.
+/// Wait for the controller's status to say `ready`: a few hundred looks,
+/// which is all a controller that is there takes, and then a millisecond
+/// between looks, a tenth of a second at most.
 ///
 /// Bounded: a controller that never clears the bit must not become a driver
 /// that never returns, and on a machine with no mouse that is exactly what
-/// would happen during start-up.
-fn wait_writable() -> bool {
-    for _ in 0..100_000 {
-        if syscall::sys_ioport_read(PORT_STATUS) & STATUS_INPUT_FULL == 0 {
+/// would happen during start-up. And mostly asleep: this is in the drivers'
+/// band, and every look it spins on is a look nothing below it gets to run
+/// in — a hundred thousand of them a wait, on a machine whose controller
+/// was not there, kept the file server from starting.
+fn wait_status(ready: impl Fn(u64) -> bool) -> bool {
+    for look in 0..500 {
+        if ready(syscall::sys_ioport_read(PORT_STATUS)) {
             return true;
+        }
+        if look >= 400 {
+            syscall::sleep_ms(1);
         }
     }
     false
 }
 
+/// Wait for the controller to take what was last written to it.
+fn wait_writable() -> bool {
+    wait_status(|status| status & STATUS_INPUT_FULL == 0)
+}
+
 fn wait_readable() -> bool {
-    for _ in 0..100_000 {
-        if syscall::sys_ioport_read(PORT_STATUS) & STATUS_OUTPUT_FULL != 0 {
-            return true;
-        }
-    }
-    false
+    wait_status(|status| status & STATUS_OUTPUT_FULL != 0)
 }
 
 fn command(byte: u8) {
@@ -385,43 +388,19 @@ impl KeyBuffer {
     }
 }
 
-// Scancode set 1 tables (index = scancode, value = ASCII)
-// Only the lower 128 entries (make codes); break code = make | 0x80
-#[rustfmt::skip]
-static SCANCODE_UNSHIFTED: [u8; 128] = [
-    0,  27, b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'0',b'-',b'=', 8,  9,   // 0x00-0x0F
-    b'q',b'w',b'e',b'r',b't',b'y',b'u',b'i',b'o',b'p',b'[',b']', 10,  0, b'a',b's', // 0x10-0x1F
-    b'd',b'f',b'g',b'h',b'j',b'k',b'l',b';',b'\'',b'`', 0, b'\\',b'z',b'x',b'c',b'v', // 0x20-0x2F
-    b'b',b'n',b'm',b',',b'.',b'/', 0, b'*', 0, b' ', 0,  0,  0,  0,  0,  0,   // 0x30-0x3F
-    0,   0,  0,  0,  0,  0,  0,  b'7',b'8',b'9',b'-',b'4',b'5',b'6',b'+',b'1', // 0x40-0x4F
-    b'2',b'3',b'0',b'.', 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x50-0x5F
-    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,       // 0x60-0x6F
-    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,       // 0x70-0x7F
-];
-
-#[rustfmt::skip]
-static SCANCODE_SHIFTED: [u8; 128] = [
-    0,  27, b'!',b'@',b'#',b'$',b'%',b'^',b'&',b'*',b'(',b')',b'_',b'+', 8,  9,   // 0x00-0x0F
-    b'Q',b'W',b'E',b'R',b'T',b'Y',b'U',b'I',b'O',b'P',b'{',b'}', 10,  0, b'A',b'S', // 0x10-0x1F
-    b'D',b'F',b'G',b'H',b'J',b'K',b'L',b':',b'"',b'~', 0, b'|',b'Z',b'X',b'C',b'V', // 0x20-0x2F
-    b'B',b'N',b'M',b'<',b'>',b'?', 0, b'*', 0, b' ', 0,  0,  0,  0,  0,  0,   // 0x30-0x3F
-    0,   0,  0,  0,  0,  0,  0,  b'7',b'8',b'9',b'-',b'4',b'5',b'6',b'+',b'1', // 0x40-0x4F
-    b'2',b'3',b'0',b'.', 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x50-0x5F
-    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,       // 0x60-0x6F
-    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,       // 0x70-0x7F
-];
-
-// Scancodes for modifier keys
-const SC_LSHIFT: u8 = 0x2A;
-const SC_RSHIFT: u8 = 0x36;
-const SC_LCTRL: u8 = 0x1D;
-const SC_LALT: u8 = 0x38;
-const SC_CAPSLOCK: u8 = 0x3A;
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     println!("[keyboard] Started.");
+
+    // Nothing at the ports reads all ones, which no controller says of
+    // itself — every bit, the two that are errors among them. A machine with
+    // no i8042 has its keys from USB, and nothing here to drive.
+    if syscall::sys_ioport_read(PORT_STATUS) & 0xFF == 0xFF {
+        println!("[keyboard] No i8042 here; keys come from USB.");
+        syscall::sys_exit_code(0);
+    }
 
     // Register for IRQ 1 (keyboard)
     if syscall::sys_irq_register(1).is_err() {
@@ -443,7 +422,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     let mut keybuf = KeyBuffer::new();
-    let mut modifiers: u8 = 0;
+    let mut modifiers = Modifiers::default();
     let mut extended = false;
     let mut waiting_client: Option<usize> = None;
     // Who holds the keyboard, and where the capability to notify it is.
@@ -623,7 +602,7 @@ pub extern "C" fn _start() -> ! {
 fn handle_scancode(
     raw: u8,
     extended: &mut bool,
-    modifiers: &mut u8,
+    modifiers: &mut Modifiers,
     keybuf: &mut KeyBuffer,
     claimant: usize,
     waiting_client: &mut Option<usize>,
@@ -633,7 +612,7 @@ fn handle_scancode(
         return;
     }
     let press = raw & 0x80 == 0;
-    if *extended {
+    let code = if *extended {
         *extended = false;
         // The keys set 1 says with a prefix: the arrows and the block above
         // them, and the right-hand Ctrl and Alt. They were dropped, so no
@@ -643,88 +622,31 @@ fn handle_scancode(
         // the scancode already *is* that code, which is what a compositor
         // sends its clients; these are the ones where the two differ, and
         // their codes are above every unprefixed one, so nothing collides.
-        let (code, ascii) = match raw & 0x7F {
-            0x1C => (96, b'\n'), // keypad Enter
-            0x1D => (97, 0),     // right Ctrl
-            0x35 => (98, b'/'),  // keypad /
-            0x38 => (100, 0),    // right Alt
-            0x47 => (102, 0),    // Home
-            0x48 => (103, 0),    // Up
-            0x49 => (104, 0),    // Page Up
-            0x4B => (105, 0),    // Left
-            0x4D => (106, 0),    // Right
-            0x4F => (107, 0),    // End
-            0x50 => (108, 0),    // Down
-            0x51 => (109, 0),    // Page Down
-            0x52 => (110, 0),    // Insert
-            0x53 => (111, 0),    // Delete
+        match raw & 0x7F {
+            0x1C => 96,  // keypad Enter
+            0x1D => 97,  // right Ctrl
+            0x35 => 98,  // keypad /
+            0x38 => 100, // right Alt
+            0x47 => 102, // Home
+            0x48 => 103, // Up
+            0x49 => 104, // Page Up
+            0x4B => 105, // Left
+            0x4D => 106, // Right
+            0x4F => 107, // End
+            0x50 => 108, // Down
+            0x51 => 109, // Page Down
+            0x52 => 110, // Insert
+            0x53 => 111, // Delete
             // A fake shift the controller sends around some of the above,
             // and keys this has no name for.
             _ => return,
-        };
-        match code {
-            97 if press => *modifiers |= MOD_CTRL,
-            97 => *modifiers &= !MOD_CTRL,
-            100 if press => *modifiers |= MOD_ALT,
-            100 => *modifiers &= !MOD_ALT,
-            _ => {}
         }
-        deliver(KeyEvent { press, ascii, scancode: code, modifiers: *modifiers }, keybuf, claimant, waiting_client);
-        return;
-    }
-
-    let scancode = raw & 0x7F;
-
-    // Update modifier state
-    match scancode {
-        SC_LSHIFT | SC_RSHIFT => {
-            if press {
-                *modifiers |= MOD_SHIFT;
-            } else {
-                *modifiers &= !MOD_SHIFT;
-            }
-        }
-        SC_LCTRL => {
-            if press {
-                *modifiers |= MOD_CTRL;
-            } else {
-                *modifiers &= !MOD_CTRL;
-            }
-        }
-        SC_LALT => {
-            if press {
-                *modifiers |= MOD_ALT;
-            } else {
-                *modifiers &= !MOD_ALT;
-            }
-        }
-        SC_CAPSLOCK => {
-            if press {
-                *modifiers ^= MOD_CAPSLOCK;
-            }
-        }
-        _ => {}
-    }
-
-    // Translate to ASCII
-    let use_shifted = (*modifiers & MOD_SHIFT != 0) ^ (*modifiers & MOD_CAPSLOCK != 0);
-    let mut ascii = if use_shifted {
-        SCANCODE_SHIFTED[scancode as usize]
     } else {
-        SCANCODE_UNSHIFTED[scancode as usize]
+        raw & 0x7F
     };
-
-    // Ctrl transformation: Ctrl+letter produces 0x01-0x1A
-    if *modifiers & MOD_CTRL != 0 && ascii.is_ascii_lowercase() {
-        ascii &= 0x1F;
-    }
-
-    deliver(
-        KeyEvent { press, ascii, scancode, modifiers: *modifiers },
-        keybuf,
-        claimant,
-        waiting_client,
-    );
+    let modifiers = modifiers.key(code, press);
+    let ascii = keys::ascii(code, modifiers);
+    deliver(KeyEvent { press, ascii, scancode: code, modifiers }, keybuf, claimant, waiting_client);
 }
 
 /// Hand a key to whoever is waiting for one, or keep it until somebody asks.

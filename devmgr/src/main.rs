@@ -29,9 +29,11 @@
 //! It is each driver's parent: it watches them, and one that ends is
 //! collected and its device is driverless again. And it says what it found
 //! to anybody who asks ([`devices::TAG_DEVICE`], [`devices::TAG_BAR`]),
-//! which is all `lspci` is.
+//! which is all `lspci` is — and whether a program is one of its drivers
+//! ([`devices::TAG_IS_DRIVER`]), which is how `input` knows to take keys
+//! from a USB host controller's driver and from nobody else.
 
-use quark_rt::devices::{self, Device as Entry, TAG_BAR, TAG_DEVICE, TAG_FILES, TAG_OFFER};
+use quark_rt::devices::{self, Device as Entry, TAG_BAR, TAG_DEVICE, TAG_FILES, TAG_IS_DRIVER, TAG_OFFER};
 use quark_rt::ipc::{death_notice, Message, TAG_PING, TID_ANY};
 use quark_rt::manifest::{self, CapReq};
 use quark_rt::pci::{self, Info};
@@ -206,17 +208,13 @@ fn settle(tid: usize) {
 }
 
 /// The root is up: every driver in `/usr/lib/drivers`, for whatever it
-/// drives that has no driver yet — and up, before this answers.
+/// drives that has no driver yet — and every driver up, the boot image's
+/// too, before this answers. A USB controller's driver says it is up once
+/// what was plugged in as the machine started has been seen to.
 fn from_files() -> u64 {
-    let mut before = [0usize; MAX_DEVICES];
-    for (i, slot) in table().iter().enumerate() {
-        before[i] = slot.map_or(0, |s| s.driver);
-    }
     let started = read_files();
-    for (i, slot) in table().iter().enumerate() {
-        if let Some(slot) = slot.filter(|s| s.driver != 0 && s.driver != before[i]) {
-            settle(slot.driver);
-        }
+    for slot in table().iter().flatten().filter(|s| s.driver != 0) {
+        settle(slot.driver);
     }
     started
 }
@@ -282,6 +280,17 @@ fn answer(msg: &Message, parent: usize) -> Message {
                 Some(bar) => ok([bar.base, bar.size, bar.flags, 0, 0, 0]),
                 None => no,
             }
+        }
+        TAG_IS_DRIVER => {
+            // By program, which a number that is never used again names:
+            // asked about a thread of a driver, or a driver that has gone.
+            let space = msg.data[0];
+            let driver = space != 0
+                && table()
+                    .iter()
+                    .flatten()
+                    .any(|s| s.driver != 0 && syscall::sys_task_space(s.driver) == Ok(space));
+            ok([driver as u64, 0, 0, 0, 0, 0])
         }
         TAG_PING => Message::empty(),
         _ => no,

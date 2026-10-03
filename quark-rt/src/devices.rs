@@ -14,6 +14,7 @@
 //! | [`TAG_FILES`] | its parent | the root is up: start what [`DRIVERS`] has | `[how many devices drivers were started for]` |
 //! | [`TAG_DEVICE`] | anybody | the device at index `data[0]` | the first three words of the kernel's record, the driver's task (0 for none), and its name in two words |
 //! | [`TAG_BAR`] | anybody | BAR `data[1]` of the device at address `data[0]` | `[where, how long, flags]` |
+//! | [`TAG_IS_DRIVER`] | anybody | is the program `data[0]` (a space id, `sys_task_space`) a driver it started? | `[1 if it is, else 0]` |
 //!
 //! An index past the last device, a BAR there is not and a request from
 //! anybody else are answered with tag `u64::MAX`.
@@ -31,6 +32,9 @@ pub const TAG_OFFER: u64 = 1;
 pub const TAG_FILES: u64 = 2;
 pub const TAG_DEVICE: u64 = 3;
 pub const TAG_BAR: u64 = 4;
+/// Asked by `input` before it takes keys from a program: a program the
+/// device manager started for a device is a driver, and nothing else is.
+pub const TAG_IS_DRIVER: u64 = 5;
 
 /// A device, and its driver if it has one.
 #[derive(Clone, Copy, Debug)]

@@ -72,6 +72,7 @@ enum Kind {
     Auth,
     Devices,
     Card,
+    Usb,
 }
 
 struct Target {
@@ -96,7 +97,7 @@ const TARGETS: &[Target] = &[
     Target {
         name: b"input",
         kind: Kind::Input,
-        tags: &[0, 1, 2, 3, 0x200, 0x201, 0x202, 0x203, 0x204, 0x205, 0x206],
+        tags: &[0, 1, 2, 3, 0x200, 0x201, 0x202, 0x203, 0x204, 0x205, 0x206, 0x207],
     },
     Target {
         name: b"net",
@@ -115,12 +116,18 @@ const TARGETS: &[Target] = &[
     // The device manager. What starts a driver — an offer, and the root
     // being up — it takes from its parent alone, so every one of those here
     // is refused, and afterwards no device has a driver it did not have.
-    Target { name: b"devices", kind: Kind::Devices, tags: &[1, 2, 3, 4] },
+    Target { name: b"devices", kind: Kind::Devices, tags: &[1, 2, 3, 4, 5] },
     // The network card. It answers the stack, which has claimed it, and
     // nobody else: a program that could send frames, or read what comes,
     // would be the network.
     Target { name: b"eth0", kind: Kind::Card, tags: &[0, 1, 2, 3] },
+    // A USB controller's driver, where there is one. It answers anybody what
+    // is plugged in, and keys and movement to `input` alone.
+    Target { name: b"usb0", kind: Kind::Usb, tags: &[0, 1, 2, 3, 4, 5, 6, 7] },
 ];
+
+/// Whether what the USB controller's driver said was plugged in, before.
+static mut USB_BEFORE: bool = false;
 
 /// How many devices the device manager said had a driver, before it was
 /// sent anything.
@@ -530,6 +537,10 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
             fail("started or lost a driver", driven != unsafe { DRIVEN_BEFORE })
         }
         Kind::Card => fail("answers a program that has not claimed it", !refused(tid, quark_rt::nic::TAG_RECEIVE)),
+        Kind::Usb => {
+            fail("stopped saying what is plugged in", unsafe { USB_BEFORE } && quark_rt::usb::device(tid, 0).is_none())?;
+            fail("gave keys to a program that is not input", !refused(tid, 5))
+        }
     }
 }
 
@@ -583,13 +594,17 @@ pub extern "C" fn _start() -> ! {
     let _ = syscall::sys_fd_write(1, b"\x1b[0m\x1b[2J\x1b[H");
     println!("qfuzz: seed {}, {} requests to each service", seed, rounds);
     let mut failed = 0;
+    let mut here = 0;
     for (t, outcome) in TARGETS.iter().zip(outcomes.iter()) {
         report(t, outcome);
-        if !matches!(outcome, Outcome::Ran(_, Ok(()))) {
+        if !matches!(outcome, Outcome::Absent) {
+            here += 1;
+        }
+        if !matches!(outcome, Outcome::Ran(_, Ok(())) | Outcome::Absent) {
             failed += 1;
         }
     }
-    println!("qfuzz: seed {}: {} of {} services failed", seed, failed, TARGETS.len());
+    println!("qfuzz: seed {}: {} of {} services failed", seed, failed, here);
     syscall::sys_exit_code(failed);
 }
 
@@ -598,12 +613,16 @@ enum Outcome {
     /// Not fuzzed, and why.
     Skipped(&'static str),
     Ran(Tally, Result<(), Problem>),
+    /// Not on this machine, and not everywhere is: a USB controller, an
+    /// i8042.
+    Absent,
 }
 
 fn report(t: &Target, outcome: &Outcome) {
     let _ = syscall::sys_fd_write(1, b"\x1b[0m");
     match outcome {
         Outcome::Skipped(why) => println!("  FAIL  {}: {}", show(t.name), why),
+        Outcome::Absent => println!("  --    {}: not here", show(t.name)),
         Outcome::Ran(tally, problem) => {
             print!(
                 "  {}  {}: {} answered, {} timed out, {} not sent",
@@ -625,7 +644,9 @@ fn report(t: &Target, outcome: &Outcome) {
 /// Fuzz one service and check on it.
 fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     let Some(tid) = nameserver::lookup(t.name) else {
-        return Outcome::Skipped("not registered");
+        // A USB controller, and an i8042, are not on every machine.
+        let optional = matches!(t.kind, Kind::Usb | Kind::Keyboard);
+        return if optional { Outcome::Absent } else { Outcome::Skipped("not registered") };
     };
     // Refusing a harmless request is what makes the rest safe to send.
     let probe = match t.kind {
@@ -660,6 +681,9 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     }
     if t.kind == Kind::Devices {
         unsafe { DRIVEN_BEFORE = devices(tid).1 };
+    }
+    if t.kind == Kind::Usb {
+        unsafe { USB_BEFORE = quark_rt::usb::device(tid, 0).is_some() };
     }
     if t.kind == Kind::Net && !net_before.pinged {
         println!("  note  net: 10.0.2.2 does not answer pings here, so that is not checked");

@@ -382,6 +382,13 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   claim until that claimant dies, and refuses everybody else (error 5). A
   program that could reach the disk driver could write any sector, and one
   that could reach the keyboard's would read whatever anybody typed.
+- **Only a driver is a source of keys.** `input` takes keys from a program
+  that offers itself only when the device manager says the program is a
+  driver it started (`TAG_IS_DRIVER`, by its space id, which is never used
+  twice). A program that could make itself a source could type into the
+  console as whoever is logged in. The answer is the device manager's
+  because only it knows, and `input` looks it up when it starts, before
+  anybody could have taken its name.
 - **Only the kernel reports a death.** Any program that can call a server can
   send `TAG_TASK_DIED`; what it cannot do is send as sender 0. A server
   believes a notice through `quark_rt::ipc::death_notice` (or
@@ -730,13 +737,22 @@ notifies it of each one, and a finished line waits for a reader. It never
 waits on the keyboard itself, so a reader waiting for a line holds up nobody
 else's request.
 
-Both come from one driver. A PS/2 mouse is not a second device: it is the same
-i8042 answering on the same data port 0x60, with IRQ 12 instead of 1 and bit 5
-of the status port saying which device a byte came from. `keyboard` holds
-both lines and routes on that bit — never on which interrupt fired, because a
-byte for one device can be waiting when the other's interrupt arrives. Two
-drivers sharing port 0x60 would take each other's bytes, and the symptom of
-losing that race is a keyboard that types rubbish or stops.
+On a PC both come from one driver. A PS/2 mouse is not a second device: it is
+the same i8042 answering on the same data port 0x60, with IRQ 12 instead of 1
+and bit 5 of the status port saying which device a byte came from. `keyboard`
+holds both lines and routes on that bit — never on which interrupt fired,
+because a byte for one device can be waiting when the other's interrupt
+arrives. Two drivers sharing port 0x60 would take each other's bytes, and the
+symptom of losing that race is a keyboard that types rubbish or stops.
+
+And from every USB keyboard and mouse: `input` asks each *source* in turn —
+the i8042's driver, found by name when it starts, and any driver the device
+manager says it started that offers itself (`TAG_INPUT_SOURCE`), which a USB
+controller's does. A key is said the same way whichever keyboard it was
+typed on: its Linux code and the ASCII it types, by one table
+(`quark_rt::keys`), which the i8042's scancodes and a USB keyboard's usages
+are both turned into. A machine with no i8042 at all has its keys from USB
+and nowhere else, and `input` starts all the same.
 
 Some things to know before changing any of it:
 
@@ -887,10 +903,12 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   starting it. The rest are installed in `/usr/lib/drivers` (`DRIVERS` in
   the Makefile), which the device manager reads when `init` says the root is
   up — before anything in `/etc/init.conf` runs — and it answers only once
-  each driver it started there is in its loop (it calls it, which waits
-  until the driver receives): a driver's line about itself, printed a
-  moment after the login prompt, pushed the prompt off the line it was
-  waited for on. It takes either only from its parent: a program that
+  every driver it started, the boot image's too, says it is up (it calls
+  each, which waits until the driver receives, two seconds at most): a
+  driver's line about itself, printed a moment after the login prompt,
+  pushed the prompt off the line it was waited for on. A USB controller's
+  driver answers once what was plugged in as the machine started has been
+  seen to, which is also when its keyboard can be typed on. It takes either only from its parent: a program that
   could hand it a driver would be handed a device.
 - **The device manager is the drivers' parent**, watches them, and collects
   one that ends; its device has no driver again. Nothing starts it again
@@ -901,10 +919,23 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   its structures are named by capabilities of the vendor's kind and mapped
   from its BARs, its queues are pages of the driver's own memory, and its
   interrupt is one MSI-X message, which each queue is told to send, or its
-  line. `virtblk` and `virtnet`
-  are its block and network devices; QEMU's are transitional, and only
-  their modern half is driven.
-
+  line. `virtblk` and `virtnet` are its block and network devices; QEMU's
+  are transitional, and only their modern half is driven.
+- **A USB controller is one program, and so is everything plugged into
+  it** (`usb`, for an xHCI controller). Its first thread has the
+  controller: commands, the event ring, giving each device plugged in an
+  address, and every transfer — a hub's ports are driven as the
+  controller's own are, a keyboard's and a mouse's reports (the boot
+  protocol's) become keys and movement for `input`. A disk is a thread of
+  the program running `block::serve` as `diskN`, which hands each read and
+  write to the first thread and waits; pulled out, it ends at once
+  (`block::Device::gone`) and its name with it. It takes the *last* free
+  name (`block::register_removable_disk`, `disk3` downwards), so the disks
+  the machine started with keep theirs whenever it is plugged in, and one
+  put back has the name it had. A second thread answers `input` and anybody asking what is
+  plugged in (`usb0`, `quark_rt::usb`, `lsusb`), so that nothing waits on
+  the controller to be answered. It is in the boot image, because a USB
+  keyboard may be the only keyboard there is.
 ## The network
 
 `net` is the stack — Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, a resolver —
@@ -1293,6 +1324,13 @@ removed.
   driver that ends leaves its device without one until the machine starts
   again. A device's driver is one program, so a second card of a kind has
   a second driver that cannot register the first one's name.
+- **USB is what a PC's keyboard, mouse and disks need, and no more.**
+  Keyboards and mice that speak the boot protocol — not a tablet, whose
+  absolute pointer needs its report descriptor read — disks of 512-byte
+  blocks and one unit, hubs of USB 2 and 1, and nothing isochronous. A
+  USB 3 hub is not driven, and what is behind one is not seen. A keyboard's
+  lights are not lit. One program drives a controller and all of it, so a
+  fault in one device's handling takes every device on the controller.
 - **A seat is nobody's.** `input` and `fb` give the keyboard and the display
   to whoever claims them, which is how `wm` runs; nothing ties a claim to
   the session at the console, so a user's program can take the keyboard out

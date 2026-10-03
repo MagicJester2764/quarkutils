@@ -283,13 +283,58 @@ fn find_module(name: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// How long the root's disk is waited for, by its partition: a USB disk's
+/// driver, or a SATA disk's that is spinning up, can take seconds to say
+/// it is there.
+const ROOT_WAIT_MS: u64 = 30_000;
+
+/// The disk that has partition `id`, waited for: the driver's name and the
+/// volume. Each disk's driver takes the first free `diskN` when it is ready,
+/// so which disk is `disk0` is a matter of which driver was quickest.
+fn root_by_partition(id: &[u8; 16]) -> Option<Root> {
+    let started = syscall::sys_clock();
+    let mut said = false;
+    loop {
+        for n in 0..4u8 {
+            let name = [b'd', b'i', b's', b'k', b'0' + n];
+            let Some(tid) = nameserver::lookup(&name) else { continue };
+            let Ok(whole) = quark_rt::block::info(tid, 0) else { continue };
+            for volume in 1..whole.volumes.min(100) {
+                if quark_rt::block::id(tid, volume).as_ref() == Ok(id) {
+                    let mut root = Root { driver: [0; 16], driver_len: 5, volume: [0; 8], volume_len: 0 };
+                    root.driver[..5].copy_from_slice(&name);
+                    if volume >= 10 {
+                        root.volume[root.volume_len] = b'0' + (volume / 10) as u8;
+                        root.volume_len += 1;
+                    }
+                    root.volume[root.volume_len] = b'0' + (volume % 10) as u8;
+                    root.volume_len += 1;
+                    return Some(root);
+                }
+            }
+        }
+        let waited = syscall::sys_clock().wrapping_sub(started) / 1_000_000;
+        if waited >= ROOT_WAIT_MS {
+            println!("[init] No disk has the root's partition; the first disk is tried");
+            return None;
+        }
+        if waited >= 1000 && !said {
+            println!("[init] Waiting for the disk the root is on");
+            said = true;
+        }
+        syscall::sleep_ms(50);
+    }
+}
+
 /// Where the root is, if whoever installed this system wrote it down.
 ///
 /// The bootloader hands over every file beside the kernel, and one of them
-/// can be `root.cfg`: a line of text, `root DRIVER VOLUME`. An installer
-/// writes it, because only the installer knows which partition it put the
-/// system on. Without one the file server decides for itself, which is right
-/// for a disk laid out the way an image built on another machine is.
+/// can be `root.cfg`: a line of text, `root partuuid GUID` — the partition
+/// itself, on whichever disk it turns out to be — or `root DRIVER VOLUME`.
+/// An image's build or an installer writes it, because only they know which
+/// partition they put the system on. Without one the file server decides
+/// for itself, which is right for a machine with one disk laid out the way
+/// an image built on another machine is.
 fn root_from_config() -> Option<Root> {
     let (phys, size) = find_module(b"root.cfg")?;
     let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -306,6 +351,13 @@ fn root_from_config() -> Option<Root> {
             continue;
         }
         let (Some(driver), Some(volume)) = (words.next(), words.next()) else { continue };
+        if driver == b"partuuid" {
+            if let Some(id) = quark_rt::block::guid_from_text(volume) {
+                let _ = syscall::sys_munmap(ROOT_CFG_BASE, pages);
+                return root_by_partition(&id);
+            }
+            continue;
+        }
         if driver.len() > 16 || volume.len() > 8 || !volume.iter().all(u8::is_ascii_digit) {
             continue;
         }

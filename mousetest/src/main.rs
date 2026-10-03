@@ -1,13 +1,14 @@
 #![no_std]
 #![no_main]
 
-//! The i8042's other device, on its own.
+//! The mouse, on its own: the i8042's other device, or a USB one.
 //!
 //! This exists because a mouse and a keyboard share one controller and one data
 //! port, and the way that goes wrong is a keyboard that types rubbish or stops.
 //! Coupling "does the demultiplex work" to "does `wl_pointer` work" would make
-//! one failure look like the other, so this asks the driver directly and prints
-//! what it gets: no compositor, no protocol, nothing between.
+//! one failure look like the other, so this asks `input` directly and prints
+//! what it gets: no compositor, no protocol, nothing between. A USB mouse and
+//! keyboard come through the same claim, from the USB controller's driver.
 //!
 //! Type while moving. The point is not that the pointer moves — it is that the
 //! keys still arrive while it does.

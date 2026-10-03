@@ -28,6 +28,13 @@
 //! Claims stack, as the display's do: a compositor started inside another
 //! takes the keys, and they go back to the outer one when it lets go.
 //!
+//! The keys come from every keyboard there is, and the pointer from every
+//! mouse: from the i8042's driver, found by name when this starts, and from
+//! any driver the device manager says it started (a USB host controller's),
+//! which offers itself (`TAG_INPUT_SOURCE`). Only the device manager's word
+//! makes a program a source: one that could make itself one could type into
+//! the console as whoever is logged in.
+//!
 //! Nobody holding the keyboard, keys are cooked as they are typed: the driver
 //! says when one arrives, this takes everything waiting, echoes it and edits
 //! the line, and a finished line waits here until somebody reads it. A reader
@@ -92,6 +99,14 @@ const TAG_INPUT_POLL_MOUSE: u64 = 0x205;
 /// what a pointer packet carries is the driver's business, and a field added
 /// there reaches a compositor without a change here.
 const TAG_INPUT_MOUSE: u64 = 0x206;
+/// A driver of keyboards or mice offers itself, with the right to call it:
+/// taken if the device manager says the caller's program is a driver it
+/// started. From then on it is asked for keys and movement as the i8042's
+/// driver is, and it tells this server when it has some.
+const TAG_INPUT_SOURCE: u64 = 0x207;
+/// The device manager's question: is the program `data[0]` (a space id) a
+/// driver it started? `data[0]` of the answer is 1 if it is.
+const TAG_IS_DRIVER: u64 = 5;
 
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
@@ -108,8 +123,10 @@ const READ_MAX: usize = 40;
 const MAX_READERS: usize = 64;
 /// How many programs can hold the keyboard, one above another.
 const MAX_CLAIMANTS: usize = 8;
-/// Keys taken from the driver in one go. More are taken on the next notice.
+/// Keys taken from the drivers in one go. More are taken on the next notice.
 const DRAIN_MAX: usize = 1024;
+/// Where keys and movement come from, at most.
+const MAX_SOURCES: usize = 8;
 
 /// Finished lines, oldest first: what a terminal calls its input queue. A
 /// read takes at most one line of it, and a long line in as many reads as it
@@ -186,7 +203,12 @@ struct KeyEvent {
 }
 
 struct Server {
-    kbd: usize,
+    /// The drivers keys and movement come from: the i8042's first, if there
+    /// is one, then those the device manager vouched for.
+    sources: [usize; MAX_SOURCES],
+    nsources: usize,
+    /// The device manager, asked who is a driver; 0 for none.
+    devices: usize,
     /// The line being typed.
     line: [u8; LINE_BUF_SIZE],
     line_len: usize,
@@ -247,7 +269,7 @@ impl Server {
             return;
         }
         for _ in 0..DRAIN_MAX {
-            let Some(ev) = get_key_nb(self.kbd) else { break };
+            let Some(ev) = self.next_key() else { break };
             if ev.press {
                 self.typed(ev.ascii);
             }
@@ -313,9 +335,56 @@ impl Server {
         // A claimant that dies without releasing would otherwise keep the
         // keys from everybody below it, down to a console nobody can type at.
         let _ = syscall::sys_task_watch(sender);
-        // Whatever the driver still has was typed at something else. Throw it
-        // away rather than delivering it to a compositor.
-        flush(self.kbd);
+        // Whatever the drivers still have was typed at something else. Throw
+        // it away rather than delivering it to a compositor.
+        self.flush();
+        ok()
+    }
+
+    /// The next key any source has, without waiting for one.
+    fn next_key(&self) -> Option<KeyEvent> {
+        self.sources[..self.nsources].iter().find_map(|&tid| get_key_nb(tid))
+    }
+
+    /// The next movement any source has, without waiting for one.
+    fn next_movement(&self) -> Option<Message> {
+        self.sources[..self.nsources].iter().find_map(|&tid| get_mouse_nb(tid))
+    }
+
+    /// Throw away whatever the drivers have.
+    fn flush(&self) {
+        for _ in 0..DRAIN_MAX {
+            if self.next_key().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// A driver offers itself as a source, with the right to call it: the
+    /// device manager is asked whether its program is a driver it started.
+    fn add_source(&mut self, sender: usize) -> Message {
+        let Ok(slot) = syscall::sys_cap_take_any(sender) else {
+            return error();
+        };
+        let space = syscall::sys_task_space(sender).unwrap_or(0);
+        let ask = Message { sender: 0, tag: TAG_IS_DRIVER, data: [space, 0, 0, 0, 0, 0] };
+        let mut answer = Message::empty();
+        let vouched = self.devices != 0
+            && space != 0
+            && matches!(syscall::sys_call_timeout(self.devices, &ask, &mut answer, 100), syscall::CallOutcome::Replied)
+            && answer.tag == TAG_OK
+            && answer.data[0] == 1;
+        if self.sources[..self.nsources].contains(&sender) {
+            let _ = syscall::sys_cap_delete(slot);
+            return if vouched { ok() } else { error() };
+        }
+        if !vouched || self.nsources == MAX_SOURCES || syscall::sys_task_watch(sender).is_err() {
+            let _ = syscall::sys_cap_delete(slot);
+            return error();
+        }
+        self.sources[self.nsources] = sender;
+        self.nsources += 1;
+        println!("[input] keys and movement from tid {} too", sender);
         ok()
     }
 
@@ -326,13 +395,21 @@ impl Server {
     fn handed_down(&mut self) {
         match self.claims.top() {
             0 => self.keys_waiting(),
-            _ => flush(self.kbd),
+            _ => self.flush(),
         }
     }
 
     fn task_died(&mut self, dead: usize) {
         if dead == self.foreground {
             self.foreground = 0;
+        }
+        if dead == self.devices {
+            // Nobody to vouch for a source any more; those there are stay.
+            self.devices = 0;
+        }
+        if let Some(i) = self.sources[..self.nsources].iter().position(|&t| t == dead) {
+            self.sources.copy_within(i + 1..self.nsources, i);
+            self.nsources -= 1;
         }
         self.forget_reader(dead);
         if let Some(top) = self.claims.remove(dead) {
@@ -371,29 +448,35 @@ impl Server {
 pub extern "C" fn _start() -> ! {
     println!("[input] Started.");
 
-    // Discover keyboard service
-    let kbd_tid = match nameserver::lookup(b"keyboard") {
-        Some(tid) => tid,
-        None => {
-            println!("[input] Keyboard service not found!");
-            syscall::sys_exit();
+    // The i8042's driver, if there is one, and the device manager, who says
+    // which other programs are drivers. Both were started before this.
+    let mut sources = [0usize; MAX_SOURCES];
+    let mut nsources = 0;
+    match nameserver::lookup(b"keyboard") {
+        Some(tid) if claim_keyboard(tid) => {
+            println!("[input] Found keyboard at TID {}", tid);
+            sources[0] = tid;
+            nsources = 1;
         }
-    };
-    println!("[input] Found keyboard at TID {}", kbd_tid);
+        Some(_) => println!("[input] The keyboard belongs to somebody else."),
+        None => println!("[input] No i8042 keyboard; keys from drivers that offer them."),
+    }
+    let devices = nameserver::lookup(b"devices").unwrap_or(0);
+    if devices != 0 {
+        let _ = syscall::sys_task_watch(devices);
+    }
 
     // Register as "input" with nameserver
     if nameserver::register(b"input").is_ok() {
         println!("[input] Registered with nameserver.");
     }
 
-    if !claim_keyboard(kbd_tid) {
-        println!("[input] The keyboard belongs to somebody else.");
-    }
-
     println!("[input] Ready.");
 
     let mut s = Server {
-        kbd: kbd_tid,
+        sources,
+        nsources,
+        devices,
         line: [0; LINE_BUF_SIZE],
         line_len: 0,
         cooked: Cooked { buf: [0; COOKED_SIZE], len: 0 },
@@ -461,7 +544,8 @@ pub extern "C" fn _start() -> ! {
                     continue;
                 }
             },
-            TAG_INPUT_POLL if s.claims.top() == sender => match get_key_nb(kbd_tid) {
+            TAG_INPUT_SOURCE => s.add_source(sender),
+            TAG_INPUT_POLL if s.claims.top() == sender => match s.next_key() {
                 Some(ev) => Message {
                     sender: 0,
                     tag: TAG_INPUT_KEY,
@@ -476,16 +560,10 @@ pub extern "C" fn _start() -> ! {
                 },
                 None => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
             },
-            TAG_INPUT_POLL_MOUSE if s.claims.top() == sender => {
-                let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
-                let mut got = Message::empty();
-                match syscall::sys_call_timeout(kbd_tid, &ask, &mut got, 20) {
-                    syscall::CallOutcome::Replied if got.tag == TAG_MOUSE_EVENT => {
-                        Message { sender: 0, tag: TAG_INPUT_MOUSE, data: got.data }
-                    }
-                    _ => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
-                }
-            }
+            TAG_INPUT_POLL_MOUSE if s.claims.top() == sender => match s.next_movement() {
+                Some(got) => Message { sender: 0, tag: TAG_INPUT_MOUSE, data: got.data },
+                None => Message { sender: 0, tag: TAG_INPUT_NONE, data: [0; 6] },
+            },
             // Liveness probe: answered at once, doing nothing else.
             TAG_PING => Message { sender: 0, tag: TAG_PING, data: [0; 6] },
             _ => error(),
@@ -532,12 +610,13 @@ fn get_key_nb(kbd_tid: usize) -> Option<KeyEvent> {
     })
 }
 
-/// Throw away whatever the driver has.
-fn flush(kbd_tid: usize) {
-    for _ in 0..DRAIN_MAX {
-        if get_key_nb(kbd_tid).is_none() {
-            break;
-        }
+/// Take a movement from the driver if one is waiting, without blocking.
+fn get_mouse_nb(tid: usize) -> Option<Message> {
+    let ask = Message { sender: 0, tag: TAG_GET_MOUSE_NB, data: [0; 6] };
+    let mut got = Message::empty();
+    match syscall::sys_call_timeout(tid, &ask, &mut got, 20) {
+        syscall::CallOutcome::Replied if got.tag == TAG_MOUSE_EVENT => Some(got),
+        _ => None,
     }
 }
 
