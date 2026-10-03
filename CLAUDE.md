@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 818 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 821 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
@@ -295,6 +295,16 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   distribution's `boot-test.sh`). A new driver whose device reads and
   writes memory itself asks for low frames; one that copies through ports
   or its own mapped registers does not care.
+- **Where a program puts a thing is chosen at random** (`quark_rt::layout`,
+  `__quark_random_pages` in the C layer): a child's stack by whoever builds
+  it (`spawn`, `execve`), and a heap, threads' stacks and storage, and the
+  C layer's `mmap` arena by the program, the first time each is wanted —
+  a random number of pages into a window of its own, from
+  `SYS_GETRANDOM`. A new region a runtime puts things in is a window and a
+  random start too, or an address learned from one run of a program is one
+  to aim at in every run. A forked child keeps its parent's: it is the
+  same program. `dtest layout` and `layouttest` run a program twice and
+  look.
 - **A driver whose device copies memory claims the device first**
   (`sys_device_claim`), before it lets the device master the bus, and
   gives it only memory from `sys_phys_alloc`. On a machine with an IOMMU

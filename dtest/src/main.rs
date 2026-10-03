@@ -5628,6 +5628,40 @@ fn test_smp() {
 /// what a driver is given to reach a device with. The driver is `edu`, for
 /// the device of that name QEMU has; a distribution starts it, and on a
 /// machine with no such device there is nothing here to check.
+/// Where one run of a program put its stack, its heap and a thread's stack,
+/// as it says (`dchild where`).
+fn where_it_was() -> Option<[u64; 3]> {
+    use quark_rt::ipc::Message;
+    let me = syscall::sys_getpid() as usize;
+    let mut text = [0u8; 20];
+    let child = load_child(&[b"dchild", b"where", decimal(me, &mut text)])?;
+    let t = child.tid;
+    let _ = syscall::sys_cap_delete(SELF_SLOT);
+    let told = mint_endpoint(SELF_SLOT, me) && syscall::sys_cap_grant(t, SELF_SLOT, 20).is_ok();
+    let _ = syscall::sys_cap_delete(SELF_SLOT);
+    if !told || child.start().is_err() {
+        return None;
+    }
+    let mut msg = Message::empty();
+    let heard = syscall::sys_recv_timeout(t, &mut msg, 300).is_ok() && msg.tag == 1;
+    let _ = syscall::sys_reply(t, &Message::empty());
+    let _ = wait_for(t);
+    heard.then_some([msg.data[0], msg.data[1], msg.data[2]])
+}
+
+fn test_layout() {
+    println!("where a program's things are:");
+    let (Some(one), Some(two)) = (where_it_was(), where_it_was()) else {
+        check("a program says where its things are", false);
+        return;
+    };
+    // Each is a random number of pages into a window of a gigabyte or more:
+    // two runs that agreed on any of them would be one in half a million.
+    check("its stack is somewhere else each time it is run", one[0] != two[0]);
+    check("and its heap", one[1] != two[1]);
+    check("and its threads' stacks", one[2] != 0 && two[2] != 0 && one[2] != two[2]);
+}
+
 /// Where `test_iommu` maps a page of its own, for a device to be kept from.
 const IOMMU_PAGE: usize = 0xB9_0000_0000;
 
@@ -7962,6 +7996,7 @@ pub extern "C" fn _start() -> ! {
         ("threads", test_threads),
         ("msi", test_msi),
         ("iommu", test_iommu),
+        ("layout", test_layout),
         ("clock", test_clock),
         ("power", test_power),
         ("frames", test_frames),

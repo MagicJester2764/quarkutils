@@ -86,6 +86,8 @@
 //! not there. `count` has four threads add to one number under a lock and
 //! to another without, and exits 0 if neither lost anything.
 
+extern crate alloc;
+
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
 use quark_rt::{nameserver, println, sync, syscall, thread, vfs};
@@ -417,6 +419,15 @@ fn compute_for(ns: u64) {
             return;
         }
     }
+}
+
+/// Where a thread of `where` found its stack.
+static THREAD_STACK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn where_is_my_stack() -> ! {
+    let local = 0u8;
+    THREAD_STACK_SEEN.store(core::hint::black_box(&local) as *const u8 as u64, Ordering::SeqCst);
+    syscall::sys_exit_code(0);
 }
 
 /// So many seconds, or none for "-".
@@ -1091,6 +1102,25 @@ pub extern "C" fn _start() -> ! {
             let mut msg = Message::empty();
             let _ = syscall::sys_recv(TID_ANY, &mut msg);
         }
+    }
+    // Say where this run of a program put its stack, its heap and a thread's
+    // stack, to the task named, and end.
+    if quark_rt::args::argv(1) == Some(&b"where"[..]) {
+        let main = number(quark_rt::args::argv(2).unwrap_or(b"0"));
+        let local = 0u8;
+        let stack = core::hint::black_box(&local) as *const u8 as u64;
+        let heap = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(0u64)) as u64;
+        if let Ok(t) = thread::spawn_with_stack(where_is_my_stack, 8) {
+            t.join();
+        }
+        let told = Message {
+            sender: 0,
+            tag: 1,
+            data: [stack, heap, THREAD_STACK_SEEN.load(Ordering::SeqCst), 0, 0, 0],
+        };
+        let mut reply = Message::empty();
+        let _ = syscall::sys_call(main, &told, &mut reply);
+        syscall::sys_exit_code(0);
     }
     // Compute for so many milliseconds of this program's time, and end.
     if quark_rt::args::argv(1) == Some(&b"compute"[..]) {
