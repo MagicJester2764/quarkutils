@@ -15,7 +15,8 @@ pub extern "C" fn _start() -> ! {
     // number. A task id is a slot in the kernel's table, reused as soon as it
     // is free, and is what this system's own calls take. Both are shown; a
     // thread shares its program's process id and has a task id of its own.
-    println!("  PID  PPID  TID  STATE  UID");
+    // How nice it is and how long it has run are its program's.
+    println!("  PID  PPID  TID  STATE  UID  NI       TIME");
     for tid in 0..MAX_TASKS {
         if let Ok((state, parent, uid)) = syscall::sys_task_info(tid) {
             if state == 3 { continue; } // skip Dead tasks
@@ -28,7 +29,22 @@ pub extern "C" fn _start() -> ! {
             // about 0, the kernel answers for the caller.
             let pid = if tid == 0 { 0 } else { syscall::sys_pid(tid).unwrap_or(0) };
             let ppid = if parent == 0 { 0 } else { syscall::sys_pid(parent).unwrap_or(0) };
-            println!("{:5} {:5} {:4}  {:5}  {:3}", pid, ppid, tid, state_str, uid);
+            let nice = if pid == 0 { 0 } else { syscall::sys_nice(pid, None).unwrap_or(0) };
+            // Minutes, seconds and hundredths, as `ps` and `top` print it.
+            let ran = if tid == 0 { 0 } else { syscall::sys_usage_of(tid).map_or(0, |u| u.total_ns()) };
+            let hundredths = ran / 10_000_000;
+            println!(
+                "{:5} {:5} {:4}  {:5}  {:3} {:3} {:4}:{:02}.{:02}",
+                pid,
+                ppid,
+                tid,
+                state_str,
+                uid,
+                nice,
+                hundredths / 6000,
+                hundredths / 100 % 60,
+                hundredths % 100
+            );
         }
     }
     syscall::sys_exit();
