@@ -5628,6 +5628,96 @@ fn test_smp() {
 /// what a driver is given to reach a device with. The driver is `edu`, for
 /// the device of that name QEMU has; a distribution starts it, and on a
 /// machine with no such device there is nothing here to check.
+/// Where `test_iommu` maps a page of its own, for a device to be kept from.
+const IOMMU_PAGE: usize = 0xB9_0000_0000;
+
+fn test_iommu() {
+    use quark_rt::ipc::Message;
+    const MS: u64 = 1_000_000;
+    println!("a device's memory:");
+    let Some(edu) = nameserver::lookup_retry(b"edu", 2) else {
+        println!("        no driver for a device that copies memory is running: not checked");
+        return;
+    };
+    let ask = |tag: u64, data: [u64; 6]| {
+        let mut reply = Message::empty();
+        let msg = Message { sender: 0, tag, data };
+        (syscall::sys_call(edu, &msg, &mut reply).is_ok() && reply.tag == 0).then_some(reply.data)
+    };
+    // Through the device, eight bytes: 0 is the driver's own page.
+    let copy = |from: u64, to: u64| ask(4, [from, to, 8, 0, 0, 0]);
+    let stopped = || ask(5, [0; 6]).map_or(u64::MAX, |d| d[0]);
+    let Some(own) = copy(0, 0) else {
+        check("the device's driver copies through it", false);
+        return;
+    };
+    if own[4] != 1 {
+        println!("        no IOMMU guards the device on this machine: where it reaches is not checked");
+        return;
+    }
+    if own[5] != 1 {
+        println!("        the device cannot address the pages its driver has: not checked");
+        return;
+    }
+    check(
+        "a device copies between pages its driver was given",
+        own[0] == 1 && own[1] == u64::from_le_bytes(*b"edu-own."),
+    );
+    // Whose a device is: a driver's, which configures it — this program
+    // cannot, so it claims nothing, not even a device nobody has — and only
+    // one driver's. The network card is the network driver's, where there is
+    // one: QEMU's RTL8139.
+    check(
+        "a program that may not configure devices claims none",
+        syscall::sys_device_claim(syscall::pci_device(0, 0, 0)) == Err(syscall::Refused::NotAllowed),
+    );
+    match ask(7, [0x10EC, 0x8139, 0, 0, 0, 0]).map(|d| d[0]) {
+        Some(3) => println!("        no network card here to be another driver's: not checked"),
+        answer => check("and a device another driver has claimed is not another's to claim", answer == Some(2)),
+    }
+    // A driver that could write to the IOMMU's registers could turn it off.
+    // They are where devices are, and are kept out of the right to map
+    // what is there — at the address QEMU gives its IOMMU.
+    check(
+        "nor may a driver map the IOMMU's own registers",
+        ask(3, [0xFED9_0000, 0xFED9_1000, 0, 0, 0, 0]).map(|d| d[0]) == Some(0),
+    );
+
+    // A page of this program's, which the device's driver was not given,
+    // where the device can address it.
+    let secret = u64::from_le_bytes(*b"dtest-se");
+    let page = syscall::sys_phys_alloc_low(1).ok().filter(|&p| (p as u64) < 1 << 28);
+    let mapped = page.is_some_and(|p| syscall::sys_map_phys(p, IOMMU_PAGE, 1).is_ok());
+    if !mapped {
+        check("a page the device can address", false);
+        return;
+    }
+    let page = page.unwrap_or(0) as u64;
+    unsafe { core::ptr::write_volatile(IOMMU_PAGE as *mut u64, secret) };
+    let before = stopped();
+    let read = copy(page, 0);
+    check(
+        "and cannot read a page its driver was not given",
+        read.is_some_and(|r| r[0] == 1 && r[1] != secret),
+    );
+    let write = copy(0, page);
+    let kept = unsafe { core::ptr::read_volatile(IOMMU_PAGE as *const u64) };
+    check("nor write one", write.is_some_and(|r| r[0] == 1) && kept == secret);
+    // What the unit stopped is looked at on the tick.
+    syscall::sleep_ns(30 * MS);
+    let after = stopped();
+    check("and the kernel counts what it stopped", before != u64::MAX && after >= before + 2);
+    let _ = syscall::sys_munmap(IOMMU_PAGE, 1);
+    let _ = syscall::sys_phys_free(page as usize, 1);
+    // And what the driver gives back, the device no longer reaches: its
+    // copy there is one more stopped.
+    let given = ask(6, [0; 6]);
+    check(
+        "a page its driver gives back is one it no longer reaches",
+        given.is_some_and(|g| g[0] == 1 && g[1] != u64::MAX && g[2] == g[1] + 1 && g[3] == 1),
+    );
+}
+
 fn test_msi() {
     use quark_rt::ipc::Message;
     println!("a device's own interrupt:");
@@ -7871,6 +7961,7 @@ pub extern "C" fn _start() -> ! {
         ("wire", test_wire),
         ("threads", test_threads),
         ("msi", test_msi),
+        ("iommu", test_iommu),
         ("clock", test_clock),
         ("power", test_power),
         ("frames", test_frames),

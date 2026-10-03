@@ -212,7 +212,12 @@ msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
 machines it tests on) and its driver running (`start /usr/bin/edu` in
 `/etc/init.conf`): seven checks more. Without them it says so and checks
-nothing.
+nothing. `dtest iommu` is about where that device may copy memory, and
+needs an IOMMU between it and memory as well (QEMU's `intel-iommu`, on its
+q35 chipset): eight checks more — that it copies between its driver's pages
+and not to or from a page of `dtest`'s, that what its driver gives back it
+no longer reaches, that the kernel counts what it stopped, and whose a
+device is. Without an IOMMU it says so and checks nothing.
 `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service.
@@ -290,6 +295,15 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   distribution's `boot-test.sh`). A new driver whose device reads and
   writes memory itself asks for low frames; one that copies through ports
   or its own mapped registers does not care.
+- **A driver whose device copies memory claims the device first**
+  (`sys_device_claim`), before it lets the device master the bus, and
+  gives it only memory from `sys_phys_alloc`. On a machine with an IOMMU
+  that is all the device can reach, at the same addresses — a ring in
+  anonymous memory, or a page of somebody else's, is a write that never
+  arrives, and a line on the serial console saying so — and a device
+  nobody has claimed reaches nothing at all. `net` and `edu` claim theirs.
+  The claim is refused for another driver's device: there is one driver
+  for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init`. A spawner mints
