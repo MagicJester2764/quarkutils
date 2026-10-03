@@ -28,6 +28,10 @@ pub const DEFAULT_STACK_PAGES: usize = 4;
 /// rather than into the next thread's stack.
 const THREAD_STACK_BASE: usize = 0x7FFF_0000_0000;
 const THREAD_STACK_STRIDE: usize = 0x10_0000;
+/// How far below the base the program's thread stacks begin, chosen once
+/// (`layout`): a gigabyte of pages, under which they go on downwards.
+const THREAD_STACK_WINDOW_PAGES: usize = 1 << 18;
+static THREAD_STACKS_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Hands out stack regions. Callers used to pass a slot number, which meant
 /// every caller had to know what every other caller had used — unworkable for
@@ -102,7 +106,8 @@ fn start(entry: u64, arg: u64, slot: usize, stack_pages: usize) -> Result<Thread
     // use it the moment it starts. It is ordinary memory, which any task may
     // map: it used to be frames from `sys_phys_alloc`, which needs a
     // capability, so a program started without one could not make a thread.
-    let top = THREAD_STACK_BASE - slot * THREAD_STACK_STRIDE;
+    let base = crate::layout::chosen(&THREAD_STACKS_AT, THREAD_STACK_BASE, THREAD_STACK_WINDOW_PAGES, false);
+    let top = base - slot * THREAD_STACK_STRIDE;
     let bottom = top - stack_pages * crate::spawn::PAGE_SIZE;
     let mut mapped = 0;
     while mapped < stack_pages {

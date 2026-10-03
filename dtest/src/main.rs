@@ -2293,7 +2293,7 @@ fn test_spawned_memory() {
         "a gift cannot replace a page the child has",
         made && syscall::sys_addrspace_give(
             info.cr3,
-            spawn::STACK_TOP - spawn::PAGE_SIZE,
+            info.stack_top as usize - spawn::PAGE_SIZE,
             GIFT,
             1,
             1,

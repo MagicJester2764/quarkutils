@@ -43,8 +43,11 @@ pub const PHDRS_AT: usize = PAGE_SIZE - 16 - MAX_PHDRS * PHDR_SIZE;
 
 const PT_PHDR: u32 = 6;
 
-/// Top of the user stack, in the child. Stacks grow down from here.
+/// The highest a child's stack may reach. Where in the two gigabytes below
+/// it each child's ends is chosen at random (`layout`), and is the child's
+/// `Spawned::stack_top`. Stacks grow down.
 pub const STACK_TOP: usize = 0x7FFF_FFFF_F000;
+const STACK_WINDOW_PAGES: usize = 1 << 19;
 /// 1 MiB, matching the kernel's own `USER_STACK_PAGES`. A spawner maps this
 /// eagerly, so it is memory spent per task rather than reserved address
 /// space — see the note there for why it is this size and not eight
@@ -235,9 +238,11 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         return Err(());
     };
 
+    // Where the child's stack ends, which is its own: chosen for it.
+    let stack_top = STACK_TOP - crate::layout::random_pages(STACK_WINDOW_PAGES) * PAGE_SIZE;
     let loaded = build(elf, segs, base, scratch.elf)
         .and_then(|()| give_image(cr3, segs, base, scratch.elf))
-        .and_then(|()| give_stack(cr3, scratch.stack));
+        .and_then(|()| give_stack(cr3, scratch.stack, stack_top));
     if loaded.is_err() {
         // What was not given is still ours. Left mapped it would be in the
         // way of the next load, which never maps over anything.
@@ -254,7 +259,7 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         return Err(());
     }
 
-    Ok(Spawned { tid, entry, stack_top: STACK_TOP as u64, cr3, phdrs, phnum: kept })
+    Ok(Spawned { tid, entry, stack_top: stack_top as u64, cr3, phdrs, phnum: kept })
 }
 
 /// Read and check the loadable segments into `out`, returning how many there
@@ -361,9 +366,9 @@ fn give_image(cr3: usize, segs: &[Segment], base: usize, at: usize) -> Result<()
 
 /// Build the stack at `at` and move it into the child. Fresh memory is
 /// zeroed, which is all a stack needs.
-fn give_stack(cr3: usize, at: usize) -> Result<(), ()> {
+fn give_stack(cr3: usize, at: usize, top: usize) -> Result<(), ()> {
     map_fresh(at, STACK_PAGES)?;
-    give(cr3, STACK_TOP - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES, true)
+    give(cr3, top - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES, true)
 }
 
 /// Map `pages` of fresh, zeroed memory at `at`, or nothing.

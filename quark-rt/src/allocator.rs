@@ -9,8 +9,11 @@ use core::ptr;
 use crate::sync::Mutex;
 
 /// Where the heap starts looking for space — above all existing user
-/// mappings. A starting point, not a reservation: see [`AllocInner::grow`].
+/// mappings, and a random number of pages into the first half of what it
+/// may use (`layout`). A starting point, not a reservation: see
+/// [`AllocInner::grow`].
 const HEAP_START: usize = 0x90_0000_0000;
+const HEAP_WINDOW_PAGES: usize = 1 << 22;
 
 /// One past the last address the heap will probe.
 const HEAP_LIMIT: usize = 0x98_0000_0000;
@@ -56,7 +59,7 @@ impl AllocInner {
     const fn new() -> Self {
         AllocInner {
             free_head: ptr::null_mut(),
-            heap_top: HEAP_START,
+            heap_top: 0,
         }
     }
 
@@ -78,6 +81,9 @@ impl AllocInner {
         let pages = (min_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         let size = pages * PAGE_SIZE;
 
+        if self.heap_top == 0 {
+            self.heap_top = HEAP_START + crate::layout::random_pages(HEAP_WINDOW_PAGES) * PAGE_SIZE;
+        }
         let mut vaddr = self.heap_top;
         let mut probes = 0;
         while crate::syscall::sys_mmap(vaddr, pages).is_err() {

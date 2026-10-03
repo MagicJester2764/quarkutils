@@ -12,6 +12,7 @@ pub mod console;
 pub mod crypt;
 pub mod font;
 pub mod ipc;
+pub mod layout;
 pub mod manifest;
 pub mod session;
 pub mod signal;
