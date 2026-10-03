@@ -4,22 +4,22 @@
 
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::nameserver;
-use quark_rt::pci;
+use quark_rt::nic;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// The RTL8139: the device manager starts this for one, holding that card,
-// whose ports this mints from it and whose line it is given. Frames for the
-// card's own receive and transmit buffers, which it reaches by DMA — but no
-// physical range: a client lends its data with the call rather than naming a
-// page for this driver to map, which it once could do anywhere in memory. It
-// held every port on the machine and every interrupt line once, because
-// which of them were the card's was not known until it looked.
+// The network stack, and nothing else: above whatever card its driver
+// serves as `eth0` (`quark_rt::nic`), it holds no device, no port and no
+// memory of anybody's — a client lends its data with the call, and the
+// card's driver is lent each frame. It was the RTL8139's driver too once,
+// holding every port on the machine and every interrupt line.
+//
+// In the drivers' band all the same, as it was then: in the servers' it
+// waited for `init`, which starts the system in the drivers' band, and had
+// the network up only after somebody had been asked to log in.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
-    CapReq::drives(0x10EC, 0x8139),
-    CapReq::phys_alloc(64),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -58,80 +58,17 @@ const TAG_ERROR: u64 = u64::MAX;
 // The card
 // ---------------------------------------------------------------------------
 
-/// Where this program mints the card's ports.
-const PORTS_SLOT: usize = 10;
+/// How long to wait for the first card to be registered: its driver is
+/// started beside this, and has a card to reset first.
+const CARD_WAIT_MS: u64 = 30_000;
 
-/// The card this was started for: its ports and its line. It is this
-/// program's from here on (`pci::claim`), and on a machine with an IOMMU it
-/// reaches the rings and buffers this asks the kernel for and nothing else.
-fn the_card() -> Option<(u16, u8)> {
-    let device = pci::this_device()?;
-    let info = pci::info(device)?;
-    let (io_base, _) = pci::ports(device, 0, PORTS_SLOT)?;
-    if pci::claim(device).is_err() {
-        println!("[net] the card is another program's.");
-        return None;
-    }
-    // Its ports, and copying memory itself: the second only now that it is
-    // this program's.
-    if pci::enable(device, pci::COMMAND_PORTS | pci::COMMAND_MASTER).is_err() {
-        println!("[net] the card may not be turned on.");
-        return None;
-    }
-    Some((io_base, info.header.line))
-}
-
-// ---------------------------------------------------------------------------
-// Port I/O helpers
-// ---------------------------------------------------------------------------
-
-fn inb(port: u16) -> u8 { syscall::sys_ioport_read(port) as u8 }
-fn inw(port: u16) -> u16 { syscall::sys_ioport_read16(port) }
-fn inl(port: u16) -> u32 { syscall::sys_ioport_read32(port) }
-fn outb(port: u16, val: u8) { syscall::sys_ioport_write(port, val) }
-fn outw(port: u16, val: u16) { syscall::sys_ioport_write16(port, val) }
-fn outl(port: u16, val: u32) { syscall::sys_ioport_write32(port, val) }
-
-// ---------------------------------------------------------------------------
-// RTL8139 registers and constants
-// ---------------------------------------------------------------------------
-
-const REG_IDR: u16 = 0x00;     // MAC address (6 bytes)
-const REG_TSD0: u16 = 0x10;    // TX status descriptor 0
-const REG_TSAD0: u16 = 0x20;   // TX start address descriptor 0
-const REG_RBSTART: u16 = 0x30; // RX buffer start (physical)
-const REG_CR: u16 = 0x37;      // Command register
-const REG_CAPR: u16 = 0x38;    // Current address of packet read
-const REG_IMR: u16 = 0x3C;     // Interrupt mask
-const REG_ISR: u16 = 0x3E;     // Interrupt status
-const REG_TCR: u16 = 0x40;     // TX config
-const REG_RCR: u16 = 0x44;     // RX config
-const REG_CONFIG1: u16 = 0x52; // Config register 1
-
-const CR_RST: u8 = 0x10;
-const CR_RE: u8 = 0x08;
-const CR_TE: u8 = 0x04;
-const CR_BUFE: u8 = 0x01;
-
-const ISR_ROK: u16 = 0x0001;
-const ISR_TOK: u16 = 0x0004;
-
-// RCR: accept physical match + multicast + broadcast, wrap, 8K buf, max DMA
-const RCR_VALUE: u32 = 0x0000_E78E;
-
-// TCR: standard IFG, max DMA burst
-const TCR_VALUE: u32 = 0x0300_0700;
-
-// ---------------------------------------------------------------------------
-// Buffer layout
-// ---------------------------------------------------------------------------
-
-const RX_BUF_PAGES: usize = 3;     // 12K > 8K + 16 + 1500 wrap pad
-const NUM_TX_DESC: usize = 4;
+/// The most a frame built here may be.
 const MAX_PKT: usize = 1536;
 
-const RX_BUF_VADDR: usize = 0x89_0000_0000;
-const TX_BUF_VADDR: usize = 0x89_0010_0000;
+/// The card frames go out on and come in from: its driver, as claimed.
+fn card() -> nic::Link {
+    nic::Link { tid: unsafe { NET.card } }
+}
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -296,17 +233,13 @@ struct DnsCacheEntry {
 }
 
 struct NetState {
-    io_base: u16,
-    irq: u8,
+    /// The card's driver.
+    card: usize,
     mac: [u8; 6],
     ip: [u8; 4],
     netmask: [u8; 4],
     gateway: [u8; 4],
     dns_server: [u8; 4],
-    rx_offset: usize,
-    tx_cur: usize,
-    rx_phys: usize,
-    tx_phys: [usize; NUM_TX_DESC],
     arp_cache: [ArpEntry; 8],
     pending_udp: Option<UdpReader>,
     pending_icmp: Option<PendingIcmp>,
@@ -328,17 +261,12 @@ struct NetState {
 }
 
 static mut NET: NetState = NetState {
-    io_base: 0,
-    irq: 0,
+    card: 0,
     mac: [0; 6],
     ip: DEFAULT_IP,
     netmask: DEFAULT_NETMASK,
     gateway: DEFAULT_GATEWAY,
     dns_server: DEFAULT_DNS,
-    rx_offset: 0,
-    tx_cur: 0,
-    rx_phys: 0,
-    tx_phys: [0; NUM_TX_DESC],
     arp_cache: {
         const EMPTY: ArpEntry = ArpEntry { ip: [0; 4], mac: [0; 6], valid: false };
         [EMPTY; 8]
@@ -379,143 +307,38 @@ static mut NET: NetState = NetState {
 };
 
 // ---------------------------------------------------------------------------
-// DMA buffer allocation
-// ---------------------------------------------------------------------------
-
-fn alloc_dma_pages(count: usize, vaddr: usize) -> usize {
-    // Physically contiguous pages, below four gigabytes: the card is told
-    // where they are in registers thirty-two bits wide.
-    let first = match syscall::sys_phys_alloc_low(count) {
-        Ok(f) => f,
-        Err(()) => return 0,
-    };
-    for i in 0..count {
-        if syscall::sys_map_phys(first + i * 4096, vaddr + i * 4096, 1).is_err() { return 0; }
-        unsafe { core::ptr::write_bytes((vaddr + i * 4096) as *mut u8, 0, 4096); }
-    }
-    first
-}
-
-// ---------------------------------------------------------------------------
-// RTL8139 initialization
-// ---------------------------------------------------------------------------
-
-fn rtl8139_init() -> bool {
-    let (io_base, irq) = match the_card() {
-        Some(x) => x,
-        None => {
-            println!("[net] RTL8139 not found on PCI bus.");
-            return false;
-        }
-    };
-
-    println!("[net] RTL8139 at I/O {:#x}, IRQ {}", io_base, irq);
-
-    unsafe {
-        NET.io_base = io_base;
-        NET.irq = irq;
-    }
-
-    // Power on
-    outb(io_base + REG_CONFIG1, 0x00);
-
-    // Software reset
-    outb(io_base + REG_CR, CR_RST);
-    for _ in 0..10000 {
-        if inb(io_base + REG_CR) & CR_RST == 0 { break; }
-        syscall::sys_yield();
-    }
-
-    // Read MAC address
-    unsafe {
-        for i in 0..6 {
-            NET.mac[i] = inb(io_base + REG_IDR + i as u16);
-        }
-        println!("[net] MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            NET.mac[0], NET.mac[1], NET.mac[2], NET.mac[3], NET.mac[4], NET.mac[5]);
-    }
-
-    // Allocate RX ring buffer
-    let rx_phys = alloc_dma_pages(RX_BUF_PAGES, RX_BUF_VADDR);
-    if rx_phys == 0 {
-        println!("[net] Failed to allocate RX buffer.");
-        return false;
-    }
-    unsafe { NET.rx_phys = rx_phys; }
-
-    // Allocate TX buffers (one page per descriptor)
-    for i in 0..NUM_TX_DESC {
-        let phys = alloc_dma_pages(1, TX_BUF_VADDR + i * 4096);
-        if phys == 0 {
-            println!("[net] Failed to allocate TX buffer {}.", i);
-            return false;
-        }
-        unsafe { NET.tx_phys[i] = phys; }
-    }
-
-    // Configure NIC
-    outl(io_base + REG_RBSTART, rx_phys as u32);
-    outw(io_base + REG_IMR, ISR_ROK | ISR_TOK);
-    outl(io_base + REG_RCR, RCR_VALUE);
-    outl(io_base + REG_TCR, TCR_VALUE);
-    outb(io_base + REG_CR, CR_RE | CR_TE);
-    outw(io_base + REG_CAPR, 0xFFF0);
-
-    println!("[net] RTL8139 initialized.");
-    true
-}
-
-// ---------------------------------------------------------------------------
-// Raw packet TX/RX
+// Frames, through the card
 // ---------------------------------------------------------------------------
 
 fn send_raw(data: &[u8]) {
-    if data.len() > MAX_PKT { return; }
-
-    let desc = unsafe { NET.tx_cur };
-    let io_base = unsafe { NET.io_base };
-    let tx_vaddr = TX_BUF_VADDR + desc * 4096;
-    let tx_phys = unsafe { NET.tx_phys[desc] };
-
-    unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), tx_vaddr as *mut u8, data.len());
+    if data.len() <= nic::FRAME {
+        let _ = card().send(data);
     }
-
-    outl(io_base + REG_TSAD0 + (desc as u16 * 4), tx_phys as u32);
-    outl(io_base + REG_TSD0 + (desc as u16 * 4), data.len() as u32);
-
-    unsafe { NET.tx_cur = (desc + 1) % NUM_TX_DESC; }
 }
 
+/// Every frame that has come, each handled.
 fn process_rx() {
-    let io_base = unsafe { NET.io_base };
-
+    let mut frame = [0u8; nic::FRAME];
     loop {
-        let cmd = inb(io_base + REG_CR);
-        if cmd & CR_BUFE != 0 { break; }
-
-        let offset = unsafe { NET.rx_offset };
-        let header = unsafe { *((RX_BUF_VADDR + offset) as *const u32) };
-        let status = (header & 0xFFFF) as u16;
-        let length = ((header >> 16) & 0xFFFF) as usize;
-
-        if status & 0x0001 == 0 || length == 0 || length > MAX_PKT + 4 {
-            // Error or invalid — skip
+        let len = card().receive(&mut frame);
+        if len == 0 {
             break;
         }
-
-        let pkt_len = length - 4; // subtract CRC
-        let pkt_start = RX_BUF_VADDR + offset + 4;
-        let pkt = unsafe { core::slice::from_raw_parts(pkt_start as *const u8, pkt_len) };
-
-        handle_packet(pkt);
-
-        // Advance (4-byte aligned): header(4) + length bytes
-        let advance = (4 + length + 3) & !3;
-        let new_offset = (offset + advance) % 8192;
-        unsafe { NET.rx_offset = new_offset; }
-        outw(io_base + REG_CAPR, new_offset.wrapping_sub(16) as u16);
+        handle_packet(&frame[..len]);
     }
+}
+
+/// Wait a little for the card to say frames have come — or for anything else
+/// the kernel says, which is seen to — and handle what has: where the stack
+/// waits for an answer from the network inside a request.
+fn poll_nic_once() {
+    let mut msg = Message::empty();
+    if syscall::sys_recv_timeout(0, &mut msg, syscall::ns(10_000_000)).is_ok() {
+        if let Some(dead) = death_notice(&msg) {
+            client_gone(dead);
+        }
+    }
+    process_rx();
 }
 
 // ---------------------------------------------------------------------------
@@ -2039,7 +1862,6 @@ fn dns_send_query(name: &[u8]) -> bool {
             unsafe { NET.gateway }
         };
         for _ in 0..200 {
-            syscall::sys_yield();
             poll_nic_once();
             if arp_lookup(&next_hop).is_some() {
                 sent = send_udp_packet(&dns_server, DNS_CLIENT_PORT, DNS_SERVER_PORT, &query_buf[..query_len]);
@@ -2145,17 +1967,6 @@ fn dns_handle_response(data: &[u8]) {
     }
 }
 
-fn poll_nic_once() {
-    let io_base = unsafe { NET.io_base };
-    let isr = inw(io_base + REG_ISR);
-    if isr != 0 {
-        outw(io_base + REG_ISR, isr);
-        if isr & ISR_ROK != 0 {
-            process_rx();
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Packet dispatch
 // ---------------------------------------------------------------------------
@@ -2182,16 +1993,30 @@ fn handle_packet(pkt: &[u8]) {
 pub extern "C" fn _start() -> ! {
     println!("[net] Started.");
 
-    if !rtl8139_init() {
-        println!("[net] No NIC. Exiting.");
-        syscall::sys_exit();
+    // The first card, once its driver has said it is there.
+    let mut waited = 0;
+    let (link, mac) = loop {
+        if let Some(found) = nic::Link::claim(b"eth0") {
+            break found;
+        }
+        if waited >= CARD_WAIT_MS {
+            println!("[net] No network card. Exiting.");
+            syscall::sys_exit();
+        }
+        // Often: the whole of the rest of the boot can take less than a
+        // tenth of a second, and the network is up before anybody is asked
+        // to log in only if it starts as soon as the card is there.
+        syscall::sleep_ms(10);
+        waited += 10;
+    };
+    unsafe {
+        NET.card = link.tid;
+        NET.mac = mac;
     }
-
-    let irq = unsafe { NET.irq };
-    if syscall::sys_irq_register(irq).is_err() {
-        println!("[net] Failed to register IRQ {}!", irq);
-        syscall::sys_exit();
-    }
+    println!(
+        "[net] eth0, address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
 
     // Try DHCP before falling back to static config
     dhcp_discover();
@@ -2202,7 +2027,6 @@ pub extern "C" fn _start() -> ! {
             break;
         }
         poll_nic_once();
-        syscall::sys_yield();
     }
 
     if nameserver::register(b"net").is_ok() {
@@ -2242,15 +2066,9 @@ pub extern "C" fn _start() -> ! {
         }
 
         if msg.sender == 0 {
-            // IRQ or kernel notification
-            let io_base = unsafe { NET.io_base };
-            let isr = inw(io_base + REG_ISR);
-            if isr != 0 {
-                outw(io_base + REG_ISR, isr); // acknowledge
-                if isr & ISR_ROK != 0 {
-                    process_rx();
-                }
-            }
+            // The card saying frames have come, or the kernel anything else:
+            // look either way.
+            process_rx();
             // Check ICMP ping timeout (300 ticks = 3 seconds at 100 Hz)
             unsafe {
                 if let Some(ref pending) = NET.pending_icmp {
@@ -2282,7 +2100,6 @@ pub extern "C" fn _start() -> ! {
             // Check TCP timers
             tcp_check_timers();
             expire_udp_reader();
-            syscall::sys_irq_ack(irq);
             continue;
         }
 
@@ -2357,21 +2174,13 @@ pub extern "C" fn _start() -> ! {
                 // before we give up.
                 let mut sent = send_icmp_echo_request(&dst_ip, id, seq);
                 if !sent {
-                    let io_base = unsafe { NET.io_base };
                     let next_hop = if is_same_subnet(&dst_ip) {
                         dst_ip
                     } else {
                         unsafe { NET.gateway }
                     };
                     for _ in 0..200 {
-                        syscall::sys_yield();
-                        let isr = inw(io_base + REG_ISR);
-                        if isr != 0 {
-                            outw(io_base + REG_ISR, isr);
-                            if isr & ISR_ROK != 0 {
-                                process_rx();
-                            }
-                        }
+                        poll_nic_once();
                         if arp_lookup(&next_hop).is_some() {
                             sent = send_icmp_echo_request(&dst_ip, id, seq);
                             break;
@@ -2512,21 +2321,13 @@ pub extern "C" fn _start() -> ! {
                     iss, 0, TCP_SYN, TCP_BUF_SIZE as u16, &[],
                 );
                 if !sent {
-                    let io_base = unsafe { NET.io_base };
                     let next_hop = if is_same_subnet(&dst_ip) {
                         dst_ip
                     } else {
                         unsafe { NET.gateway }
                     };
                     for _ in 0..200 {
-                        syscall::sys_yield();
-                        let isr = inw(io_base + REG_ISR);
-                        if isr != 0 {
-                            outw(io_base + REG_ISR, isr);
-                            if isr & ISR_ROK != 0 {
-                                process_rx();
-                            }
-                        }
+                        poll_nic_once();
                         if arp_lookup(&next_hop).is_some() {
                             sent = send_tcp_segment(
                                 &dst_ip, src_port, dst_port,

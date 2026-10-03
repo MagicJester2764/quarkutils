@@ -318,8 +318,8 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   reach, at the same addresses — a ring in anonymous memory, or a page of
   somebody else's, is a write that never arrives, and a line on the serial
   console saying so — and a device nobody has claimed reaches nothing at
-  all. `net` and `edu` claim theirs. A driver can claim only the device it
-  holds, and there is one driver for each.
+  all. `rtl8139`, `virtnet`, `virtblk` and `edu` claim theirs. A driver
+  can claim only the device it holds, and there is one driver for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init` — and so does
@@ -877,6 +877,37 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   (the service manager will).
 - **What is in the machine is a question** (`lspci`, `lspci -v`): the
   device manager answers it, and holds nothing back but the devices.
+- **A virtio device is a PCI device like any other** (`quark_rt::virtio`):
+  its structures are named by capabilities of the vendor's kind and mapped
+  from its BARs, its queues are pages of the driver's own memory, and its
+  interrupt is one MSI-X message — the kernel allocates it and the driver
+  writes it into the device's table — or its line. `virtblk` and `virtnet`
+  are its block and network devices; QEMU's are transitional, and only
+  their modern half is driven.
+
+## The network
+
+`net` is the stack — Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, a resolver —
+and holds no device. Under it is a card's driver, which serves
+`quark_rt::nic`: `rtl8139` and `virtnet` so far, each registered as the
+first of `eth0` to `eth7` nobody has. The stack claims `eth0` when it has
+been registered. The cards' drivers are in the boot image, as the disks'
+are, though the root is not on them: started from `/usr/lib/drivers` they
+came up after the root, and the network said it was ready over the login
+prompt.
+
+- **A card answers its claimant and nobody else.** A program that could send
+  a frame, or read what comes, would be the network; `qfuzz` checks the
+  card refuses it.
+- **Frames are pulled, never pushed.** The stack lends a frame to send and
+  a buffer to receive into; when frames come, the driver *notifies* the
+  stack (`nic::ARRIVED`), which asks for them until there are none.
+  Neither ever waits on the other: the driver would be stopping its card for
+  one client, and the stack every client for one card.
+- **Where the stack waits for the network inside a request** — an address
+  being resolved — it waits for the card's notice (`poll_nic_once`), and
+  sees to anything else the kernel says meanwhile: a client's death taken
+  there and dropped would leave its connections for ever.
 
 ## Disks
 
@@ -885,7 +916,9 @@ device and volume N its Nth partition, read from the GPT, or an MBR if
 there is no GPT. A request names a volume, and its sector numbers count
 from that volume's start; the driver refuses what is past its end. So a
 client given a partition cannot reach outside it and does not know where it
-is. `disk`, the ATA driver, registers as `disk0`.
+is. Each disk's driver registers as the first of `disk0` to `disk3` that
+nobody has (`block::register_disk`): `disk` for an IDE controller's first
+channel, `virtblk` for a virtio disk.
 
 - **The protocol is one module, for both ends.** `block::serve` is the
   driver's half — volumes, claims, the partition table — and a driver

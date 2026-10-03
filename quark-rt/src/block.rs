@@ -289,6 +289,12 @@ fn status(tag: u64, word: u64) -> Message {
 /// through it on its way to or from what a client lent. The driver is lent
 /// the client's buffer by the kernel for the length of the call and never
 /// learns where it is.
+/// Register a disk's driver under the first of `disk0` to `disk3` that
+/// nobody has: the name, or `None` when all four are taken.
+pub fn register_disk() -> Option<[u8; 5]> {
+    (0..4u8).map(|n| [b'd', b'i', b's', b'k', b'0' + n]).find(|name| crate::nameserver::register(name).is_ok())
+}
+
 pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
     let buf = unsafe { core::slice::from_raw_parts_mut(page as *mut u8, MAX_SECTORS as usize * SECTOR) };
     let mut volumes = [NO_VOLUME; MAX_VOLUMES];

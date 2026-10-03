@@ -5832,12 +5832,12 @@ fn test_devices() {
         n >= 2 && syscall::sys_pci_device(0, &mut record).is_none(),
     );
     check("and reads none of their configuration", n >= 2 && syscall::sys_pci_read(0, 0, 4).is_err());
-    let card = found(&|d| d.header.vendor == 0x10EC && d.header.device == 0x8139);
+    let card = found(&|d| d.header.class >> 8 == 0x0200);
     match card {
         None => println!("        no network card here: whose it is, is not checked"),
         Some(card) => check(
-            "and which driver drives which: the network card is the network driver's",
-            card.driver != 0 && card.driver_name() == b"net" && nameserver::lookup(b"net") == Some(card.driver),
+            "and which driver drives which: the network card is the driver serving it as eth0",
+            card.driver != 0 && nameserver::lookup(b"eth0") == Some(card.driver),
         ),
     }
 

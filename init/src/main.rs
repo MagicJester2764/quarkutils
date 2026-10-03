@@ -431,12 +431,14 @@ fn fat_name_to_buf(name: &[u8; 11], buf: &mut [u8; 16]) -> usize {
     pos
 }
 
-/// Check if a FAT 8.3 name is an essential boot service (loaded from boot image).
+/// Check if a FAT 8.3 name is an essential boot service (loaded from boot
+/// image). A device's driver is not on the list: whichever of them are in
+/// the boot image are the device manager's to start.
 fn is_essential_elf(name: &[u8; 11]) -> bool {
     if &name[8..11] != b"ELF" { return false; }
     let base = &name[0..8];
     base == b"NAMESRVR" || base == b"QTTY    " || base == b"KEYBOARD"
-        || base == b"DISK    " || base == b"INPUT   " || base == b"VFS     "
+        || base == b"INPUT   " || base == b"VFS     "
         || base == b"NET     " || base == b"AUTH    "
 }
 
@@ -741,7 +743,8 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    // Pass 3: spawn essential ELFs (KEYBOARD, DISK) — skip INPUT and non-essentials
+    // Pass 3: spawn the essential ELFs (KEYBOARD, AUTH) — not INPUT or VFS,
+    // which come later — and offer every driver to the device manager.
     let mut spawned_tids = [0usize; 32];
     let mut spawned_count = 0usize;
     for i in 0..count {
@@ -759,11 +762,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         if &e.name[8..11] != b"ELF" {
             continue;
         }
-        // Skip non-essential ELFs — they will be loaded from disk later
-        if !is_essential_elf(&e.name) {
-            continue;
-        }
-
         let mut namebuf = [0u8; 16];
         let namelen = fat_name_to_buf(&e.name, &mut namebuf);
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
@@ -781,6 +779,11 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                     Some(n) => println!("[init] The device manager started {} for {} device(s)", name, n),
                     None => println!("[init] No device manager to start {}", name),
                 }
+                continue;
+            }
+            // Of the rest, only what is needed before there are files: the
+            // others are read from the root.
+            if !is_essential_elf(&e.name) {
                 continue;
             }
             match spawn::load(data, &SPAWN_SCRATCH) {

@@ -5,7 +5,6 @@
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use quark_rt::block::{self, Device};
-use quark_rt::nameserver;
 use quark_rt::pci;
 use quark_rt::{println, syscall};
 
@@ -384,12 +383,11 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit();
     }
 
-    // The first disk. There is one channel here and one drive on it; a
-    // second driver would be `disk1`.
-    if nameserver::register(b"disk0").is_ok() {
-        println!("[disk] Registered with nameserver as disk0.");
-    } else {
-        println!("[disk] Failed to register with nameserver.");
+    // The first disk nobody has named: there is one channel here and one
+    // drive on it, and a disk another driver drives may be named first.
+    match block::register_disk() {
+        Some(name) => println!("[disk] Registered as {}.", core::str::from_utf8(&name).unwrap_or("a disk")),
+        None => println!("[disk] disk0 to disk3 are all taken."),
     }
 
     block::serve(&mut Ata, DRIVE_BUF)

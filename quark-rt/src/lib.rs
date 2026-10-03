@@ -26,10 +26,12 @@ pub mod wl;
 pub mod syscall;
 pub mod nameserver;
 pub mod net;
+pub mod nic;
 pub mod pci;
 pub mod socket;
 pub mod random;
 pub mod vfs;
+pub mod virtio;
 pub mod wm;
 
 pub mod allocator;

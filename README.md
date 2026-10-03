@@ -14,7 +14,8 @@ which it carries a copy of and checks against what the kernel installed.
 ```
 quark-rt/           The Rust runtime: system calls, IPC, the allocator, stdio,
                     threads and locks, the spawner, the VFS and net clients,
-                    and what a driver does with its PCI device.
+                    what a driver does with its PCI device, virtio, and the
+                    protocols between a disk or a card and what is above it.
                     The std fork's PAL for x86_64-unknown-quark is built on it.
 
 init/               The first program. Loads the services from the boot image,
@@ -28,11 +29,14 @@ devmgr/             What is in the machine: holds every PCI device and starts
 keyboard/           The i8042: keyboard and PS/2 mouse, one driver for both.
 disk/               ATA PIO, for an IDE controller: `disk0`, the whole disk and
                     each partition as a volume.
+virtblk/            A virtio disk, the same way.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
 mount/  umount/     A filesystem put at a directory, by starting a file server for it.
-net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
+net/                The network stack: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP and
+                    a resolver, above whatever card is `eth0`.
+rtl8139/  virtnet/  Network cards: the RTL8139, and virtio's.
 edu/                QEMU's teaching device: the smallest driver there is for
                     a device whose registers are memory and whose interrupt
                     is a message. Installed in /usr/lib/drivers, where the

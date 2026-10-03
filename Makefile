@@ -44,7 +44,8 @@ REQUIRE_ABI ?=
 # directory is also the crate and the binary.
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
-                 auth:AUTH devmgr:DEVMGR
+                 auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK rtl8139:RTL8139 \
+                 virtnet:VIRTNET
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
@@ -57,9 +58,11 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  gpasswd:GPASSWD id:ID date:DATE swapd:SWAPD \
                  free:FREE lspci:LSPCI
 
-# Drivers for devices nothing needs before the root is up: the device manager
-# reads them from /usr/lib/drivers and starts each for the devices it says it
-# drives. A device's driver that the root itself is on goes in BOOT_SERVICES.
+# Drivers for devices nothing needs while the system starts: the device
+# manager reads them from /usr/lib/drivers and starts each for the devices it
+# says it drives. A device's driver that the root is on goes in BOOT_SERVICES,
+# and so does a network card's, so that the network is up — and has said so
+# on the console — before anybody is asked to log in.
 DRIVERS       := edu:EDU
 
 # Programs written in C, built against libc/.

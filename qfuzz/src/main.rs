@@ -71,6 +71,7 @@ enum Kind {
     Keyboard,
     Auth,
     Devices,
+    Card,
 }
 
 struct Target {
@@ -115,6 +116,10 @@ const TARGETS: &[Target] = &[
     // being up — it takes from its parent alone, so every one of those here
     // is refused, and afterwards no device has a driver it did not have.
     Target { name: b"devices", kind: Kind::Devices, tags: &[1, 2, 3, 4] },
+    // The network card. It answers the stack, which has claimed it, and
+    // nobody else: a program that could send frames, or read what comes,
+    // would be the network.
+    Target { name: b"eth0", kind: Kind::Card, tags: &[0, 1, 2, 3] },
 ];
 
 /// How many devices the device manager said had a driver, before it was
@@ -524,6 +529,7 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
             fail("knows of no device", known == 0)?;
             fail("started or lost a driver", driven != unsafe { DRIVEN_BEFORE })
         }
+        Kind::Card => fail("answers a program that has not claimed it", !refused(tid, quark_rt::nic::TAG_RECEIVE)),
     }
 }
 
@@ -625,6 +631,7 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     let probe = match t.kind {
         Kind::Disk => refused(tid, 2),
         Kind::Keyboard => refused(tid, 5),
+        Kind::Card => refused(tid, quark_rt::nic::TAG_RECEIVE),
         _ => true,
     };
     if !probe {

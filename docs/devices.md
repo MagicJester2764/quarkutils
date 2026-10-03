@@ -56,7 +56,9 @@ so a driver started some other way holds no device, and says so.
   running before there is a filesystem to read one from. `init` reads each
   program in the boot image, and one whose manifest says it drives something
   is offered to the device manager rather than started: lent with the call
-  (`TAG_OFFER`). `DISK` and `NET` are.
+  (`TAG_OFFER`). The disks' drivers are, `DISK` and `VIRTBLK`, since a
+  root can be on either; and the network cards', `RTL8139` and `VIRTNET`,
+  so that the network is up before anybody is asked to log in.
 - **`/usr/lib/drivers`**, for everything else. When `init` has a root it
   tells the device manager so (`TAG_FILES`), before anything in
   `/etc/init.conf` runs, and the device manager reads every file there. A
@@ -88,6 +90,19 @@ Everything through `quark_rt::pci`, by the address it was given:
   and the MSI capability are the kernel's, and a write to one is refused
   (`Refused::NotAllowed`): where a device is, and where its message goes,
   are not its driver's to change.
+
+## virtio
+
+A virtio device (`quark_rt::virtio`) is driven through the same capability:
+its structures — common configuration, where a queue is told it has work,
+the interrupt's status, its own configuration — are named by capabilities of
+the vendor's kind in its configuration space, each a BAR and an offset, and
+mapped from its BARs. A queue is a page of the driver's own memory, so on a
+machine with an IOMMU it is among what the device reaches. Its interrupt is
+one MSI-X message: the kernel allocates it (`SYS_MSI_ALLOC` for the device)
+and the driver writes it into entry 0 of the device's table, which is in
+one of its BARs — or, with no MSI-X, its line. Only the modern half of a
+transitional device is driven.
 
 ## Asking what is there
 
