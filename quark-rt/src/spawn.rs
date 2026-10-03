@@ -372,7 +372,9 @@ fn give_stack(cr3: usize, at: usize, top: usize) -> Result<(), ()> {
 }
 
 /// Map `pages` of fresh, zeroed memory at `at`, or nothing.
-fn map_fresh(at: usize, pages: usize) -> Result<(), ()> {
+/// Map `pages` pages of fresh memory at `at`, a chunk at a time: where a
+/// spawner reads an image to load.
+pub fn map_fresh(at: usize, pages: usize) -> Result<(), ()> {
     let mut done = 0;
     while done < pages {
         let n = (pages - done).min(CHUNK);
@@ -403,7 +405,7 @@ fn give(cr3: usize, virt: usize, from: usize, pages: usize, writable: bool) -> R
 }
 
 /// Unmap and free whatever is still mapped of `pages` pages at `at`.
-fn release(at: usize, pages: usize) {
+pub fn release(at: usize, pages: usize) {
     let mut done = 0;
     while done < pages {
         let n = (pages - done).min(CHUNK);

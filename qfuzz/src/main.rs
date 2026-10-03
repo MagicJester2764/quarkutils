@@ -70,6 +70,7 @@ enum Kind {
     Disk,
     Keyboard,
     Auth,
+    Devices,
 }
 
 struct Target {
@@ -110,7 +111,29 @@ const TARGETS: &[Target] = &[
     // `NO_ACCOUNT` — so every one of them is to be refused, and afterwards
     // this program is who it was and the passwords are what they were.
     Target { name: b"auth", kind: Kind::Auth, tags: &[1, 2, 3] },
+    // The device manager. What starts a driver — an offer, and the root
+    // being up — it takes from its parent alone, so every one of those here
+    // is refused, and afterwards no device has a driver it did not have.
+    Target { name: b"devices", kind: Kind::Devices, tags: &[1, 2, 3, 4] },
 ];
+
+/// How many devices the device manager said had a driver, before it was
+/// sent anything.
+static mut DRIVEN_BEFORE: usize = 0;
+
+/// How many devices the device manager knows of, and how many of them have
+/// a driver.
+fn devices(tid: usize) -> (usize, usize) {
+    let (mut known, mut driven) = (0, 0);
+    while let Some(device) = quark_rt::devices::entry(tid, known) {
+        known += 1;
+        driven += (device.driver != 0) as usize;
+        if known == 256 {
+            break;
+        }
+    }
+    (known, driven)
+}
 
 /// What every name lent to `auth` begins with: no account's name does.
 const NO_ACCOUNT: u8 = b'~';
@@ -496,6 +519,11 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
             fail("changed the passwords", shadow_sum() != shadow)?;
             fail("no longer says whether a password is needed", quark_rt::auth::needs(b"~nobody") != Ok(true))
         }
+        Kind::Devices => {
+            let (known, driven) = devices(tid);
+            fail("knows of no device", known == 0)?;
+            fail("started or lost a driver", driven != unsafe { DRIVEN_BEFORE })
+        }
     }
 }
 
@@ -622,6 +650,9 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
             WHO_BEFORE = syscall::sys_get_uid();
             SHADOW_BEFORE = shadow_sum();
         }
+    }
+    if t.kind == Kind::Devices {
+        unsafe { DRIVEN_BEFORE = devices(tid).1 };
     }
     if t.kind == Kind::Net && !net_before.pinged {
         println!("  note  net: 10.0.2.2 does not answer pings here, so that is not checked");

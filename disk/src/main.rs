@@ -2,39 +2,62 @@
 #![no_main]
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use quark_rt::block::{self, Device};
 use quark_rt::nameserver;
+use quark_rt::pci;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// ATA primary channel: command block, control port, and IRQ 14 — and no
-// physical memory at all. A client lends the buffer a sector goes into or
-// comes out of with its call, and the driver copies through the kernel rather
-// than mapping a page the client named. It used to hold all four gigabytes for
-// that, and would read a sector over any of them a client asked it to.
+// An IDE controller, whose first channel this drives: the device manager
+// starts it for one, holding that device, and the channel's ports are the
+// ones its BARs say — and no physical memory at all. A client lends the
+// buffer a sector goes into or comes out of with its call, and the driver
+// copies through the kernel rather than mapping a page the client named. It
+// used to hold all four gigabytes for that, and would read a sector over any
+// of them a client asked it to.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
-    CapReq::ioport(0x1F0, 0x1F7),
-    CapReq::ioport(0x3F6, 0x3F6),
-    CapReq::irq(14),
+    CapReq::drives_class(0x01, 0x01),
 ]);
 
 // What a client asks, and who may ask it, is `quark_rt::block`: volumes,
 // claims and the partition table are the same for every kind of disk. This
 // file is where the sectors are.
 
-// ATA PIO ports (primary channel)
-const ATA_DATA: u16 = 0x1F0;
-const ATA_ERROR: u16 = 0x1F1;
-const ATA_SECTOR_COUNT: u16 = 0x1F2;
-const ATA_LBA_LO: u16 = 0x1F3;
-const ATA_LBA_MID: u16 = 0x1F4;
-const ATA_LBA_HI: u16 = 0x1F5;
-const ATA_DRIVE_HEAD: u16 = 0x1F6;
-const ATA_STATUS: u16 = 0x1F7;
-const ATA_COMMAND: u16 = 0x1F7;
-const ATA_ALT_STATUS: u16 = 0x3F6;
+// The channel's registers, from its command block: where that is, and its
+// control register, are its device's BARs' to say ([`BASE`], [`CONTROL`]) —
+// 0x1F0 and 0x3F6 for the first channel of a controller in compatibility
+// mode, as every IDE controller once was.
+const ATA_DATA: u16 = 0;
+const ATA_ERROR: u16 = 1;
+const ATA_SECTOR_COUNT: u16 = 2;
+const ATA_LBA_LO: u16 = 3;
+const ATA_LBA_MID: u16 = 4;
+const ATA_LBA_HI: u16 = 5;
+const ATA_DRIVE_HEAD: u16 = 6;
+const ATA_STATUS: u16 = 7;
+const ATA_COMMAND: u16 = 7;
+
+/// Where the command block is, and the control register.
+static BASE: AtomicU16 = AtomicU16::new(0);
+static CONTROL: AtomicU16 = AtomicU16::new(0);
+
+/// A register of the command block, as a port.
+fn reg(offset: u16) -> u16 {
+    BASE.load(Ordering::Relaxed) + offset
+}
+
+/// The control block's register: the status, read without acknowledging.
+fn alt_status() -> u16 {
+    CONTROL.load(Ordering::Relaxed)
+}
+
+/// Where this program mints its two ranges of ports.
+const COMMAND_SLOT: usize = 10;
+const CONTROL_SLOT: usize = 11;
 
 // ATA status bits
 const ATA_SR_BSY: u8 = 0x80;
@@ -70,7 +93,7 @@ static mut DRIVE: DriveInfo = DriveInfo {
 };
 
 fn ata_read_status() -> u8 {
-    syscall::sys_ioport_read(ATA_ALT_STATUS) as u8
+    syscall::sys_ioport_read(alt_status()) as u8
 }
 
 fn ata_wait_not_busy() {
@@ -99,7 +122,7 @@ fn ata_wait_drq() -> bool {
 fn ata_400ns_delay() {
     // Read alt status 4 times (~400ns delay)
     for _ in 0..4 {
-        syscall::sys_ioport_read(ATA_ALT_STATUS);
+        syscall::sys_ioport_read(alt_status());
     }
 }
 
@@ -107,10 +130,10 @@ fn ata_400ns_delay() {
 /// MULTIPLE. Whether it agreed.
 fn ata_set_multiple(sectors: u32) -> bool {
     ata_wait_not_busy();
-    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0);
+    syscall::sys_ioport_write(reg(ATA_DRIVE_HEAD), 0xE0);
     ata_400ns_delay();
-    syscall::sys_ioport_write(ATA_SECTOR_COUNT, sectors as u8);
-    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_SET_MULTIPLE);
+    syscall::sys_ioport_write(reg(ATA_SECTOR_COUNT), sectors as u8);
+    syscall::sys_ioport_write(reg(ATA_COMMAND), ATA_CMD_SET_MULTIPLE);
     ata_400ns_delay();
     ata_wait_not_busy();
     ata_read_status() & ATA_SR_ERR == 0
@@ -118,17 +141,17 @@ fn ata_set_multiple(sectors: u32) -> bool {
 
 fn ata_identify() -> bool {
     // Select drive 0 (master)
-    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xA0);
+    syscall::sys_ioport_write(reg(ATA_DRIVE_HEAD), 0xA0);
     ata_400ns_delay();
 
     // Zero out sector count and LBA registers
-    syscall::sys_ioport_write(ATA_SECTOR_COUNT, 0);
-    syscall::sys_ioport_write(ATA_LBA_LO, 0);
-    syscall::sys_ioport_write(ATA_LBA_MID, 0);
-    syscall::sys_ioport_write(ATA_LBA_HI, 0);
+    syscall::sys_ioport_write(reg(ATA_SECTOR_COUNT), 0);
+    syscall::sys_ioport_write(reg(ATA_LBA_LO), 0);
+    syscall::sys_ioport_write(reg(ATA_LBA_MID), 0);
+    syscall::sys_ioport_write(reg(ATA_LBA_HI), 0);
 
     // Send IDENTIFY command
-    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_IDENTIFY);
+    syscall::sys_ioport_write(reg(ATA_COMMAND), ATA_CMD_IDENTIFY);
     ata_400ns_delay();
 
     // Check if drive exists. Nothing at all answers 0xFF: no controller
@@ -149,8 +172,8 @@ fn ata_identify() -> bool {
     ata_wait_not_busy();
 
     // Check for non-ATA devices (ATAPI, SATA, etc.)
-    let lba_mid = syscall::sys_ioport_read(ATA_LBA_MID) as u8;
-    let lba_hi = syscall::sys_ioport_read(ATA_LBA_HI) as u8;
+    let lba_mid = syscall::sys_ioport_read(reg(ATA_LBA_MID)) as u8;
+    let lba_hi = syscall::sys_ioport_read(reg(ATA_LBA_HI)) as u8;
     if lba_mid != 0 || lba_hi != 0 {
         println!("[disk] Non-ATA device detected (mid={:#x}, hi={:#x}).", lba_mid, lba_hi);
         return false;
@@ -164,7 +187,7 @@ fn ata_identify() -> bool {
 
     // Read 256 words of identify data
     let mut identify = [0u16; 256];
-    let _ = syscall::sys_ioport_rep_insw(ATA_DATA, &mut identify);
+    let _ = syscall::sys_ioport_rep_insw(reg(ATA_DATA), &mut identify);
 
     // Extract model string (words 27-46, swapped byte pairs)
     let mut model = [0u8; 40];
@@ -210,15 +233,15 @@ fn ata_read_sectors(lba: u32, count: u32, buf: *mut u8) -> bool {
 
     ata_wait_not_busy();
 
-    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    syscall::sys_ioport_write(reg(ATA_DRIVE_HEAD), 0xE0 | ((lba >> 24) & 0x0F) as u8);
     ata_400ns_delay();
 
-    syscall::sys_ioport_write(ATA_SECTOR_COUNT, count as u8);
-    syscall::sys_ioport_write(ATA_LBA_LO, lba as u8);
-    syscall::sys_ioport_write(ATA_LBA_MID, (lba >> 8) as u8);
-    syscall::sys_ioport_write(ATA_LBA_HI, (lba >> 16) as u8);
+    syscall::sys_ioport_write(reg(ATA_SECTOR_COUNT), count as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_LO), lba as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_MID), (lba >> 8) as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_HI), (lba >> 16) as u8);
 
-    syscall::sys_ioport_write(ATA_COMMAND, ATA_CMD_READ_PIO);
+    syscall::sys_ioport_write(reg(ATA_COMMAND), ATA_CMD_READ_PIO);
     ata_400ns_delay();
 
     for i in 0..count {
@@ -227,7 +250,7 @@ fn ata_read_sectors(lba: u32, count: u32, buf: *mut u8) -> bool {
         }
         let offset = (i as usize) * 512;
         let words = unsafe { core::slice::from_raw_parts_mut(buf.add(offset) as *mut u16, 256) };
-        let _ = syscall::sys_ioport_rep_insw(ATA_DATA, words);
+        let _ = syscall::sys_ioport_rep_insw(reg(ATA_DATA), words);
     }
 
     true
@@ -259,15 +282,15 @@ fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
     ata_wait_not_busy();
 
     // Select drive 0, LBA mode, top 4 bits of LBA
-    syscall::sys_ioport_write(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    syscall::sys_ioport_write(reg(ATA_DRIVE_HEAD), 0xE0 | ((lba >> 24) & 0x0F) as u8);
     ata_400ns_delay();
 
-    syscall::sys_ioport_write(ATA_SECTOR_COUNT, count as u8);
+    syscall::sys_ioport_write(reg(ATA_SECTOR_COUNT), count as u8);
 
     // Set LBA
-    syscall::sys_ioport_write(ATA_LBA_LO, lba as u8);
-    syscall::sys_ioport_write(ATA_LBA_MID, (lba >> 8) as u8);
-    syscall::sys_ioport_write(ATA_LBA_HI, (lba >> 16) as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_LO), lba as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_MID), (lba >> 8) as u8);
+    syscall::sys_ioport_write(reg(ATA_LBA_HI), (lba >> 16) as u8);
 
     // The drive asks for each block when it has taken the last: the whole
     // request at once, or a sector at a time.
@@ -276,7 +299,7 @@ fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
     } else {
         (ATA_CMD_WRITE_PIO, 1)
     };
-    syscall::sys_ioport_write(ATA_COMMAND, command);
+    syscall::sys_ioport_write(reg(ATA_COMMAND), command);
     ata_400ns_delay();
 
     for i in 0..count {
@@ -293,7 +316,7 @@ fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
         // ones that did not are older than the firmware this boots from.
         for w in 0..128usize {
             let at = unsafe { buf.add(i as usize * 512 + w * 4) as *const u32 };
-            syscall::sys_ioport_write32(ATA_DATA, unsafe { core::ptr::read_unaligned(at) });
+            syscall::sys_ioport_write32(reg(ATA_DATA), unsafe { core::ptr::read_unaligned(at) });
         }
     }
 
@@ -333,6 +356,22 @@ impl Device for Ata {
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     println!("[disk] Started.");
+
+    // The channel: the command block is BAR 0, and the control block BAR 1
+    // — four ports with the register at the third, or, where the kernel
+    // describes a channel in compatibility mode, the register alone.
+    let Some(device) = pci::this_device() else {
+        println!("[disk] started without a device: the device manager starts this, for an IDE controller.");
+        syscall::sys_exit_code(1);
+    };
+    let (Some((base, _)), Some((control, ports))) =
+        (pci::ports(device, 0, COMMAND_SLOT), pci::ports(device, 1, CONTROL_SLOT))
+    else {
+        println!("[disk] the controller's first channel has no ports this was given.");
+        syscall::sys_exit_code(1);
+    };
+    BASE.store(base, Ordering::Relaxed);
+    CONTROL.store(if ports >= 4 { control + 2 } else { control }, Ordering::Relaxed);
 
     if syscall::sys_mmap(DRIVE_BUF, 1).is_err() {
         println!("[disk] No memory for a sector buffer. Exiting.");

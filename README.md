@@ -13,16 +13,21 @@ which it carries a copy of and checks against what the kernel installed.
 
 ```
 quark-rt/           The Rust runtime: system calls, IPC, the allocator, stdio,
-                    threads and locks, the spawner, the VFS and net clients.
+                    threads and locks, the spawner, the VFS and net clients,
+                    and what a driver does with its PCI device.
                     The std fork's PAL for x86_64-unknown-quark is built on it.
 
 init/               The first program. Loads the services from the boot image,
                     grants each what its manifest asks for, and starts a
                     session: `login`, or what `/etc/init.conf` names.
 nameserver/         Register a name, look one up, be granted the endpoint.
+devmgr/             What is in the machine: holds every PCI device and starts
+                    the driver for each, holding that device and no other —
+                    from the boot image, or `/usr/lib/drivers`. `lspci` asks.
 
 keyboard/           The i8042: keyboard and PS/2 mouse, one driver for both.
-disk/               ATA PIO: `disk0`, the whole disk and each partition as a volume.
+disk/               ATA PIO, for an IDE controller: `disk0`, the whole disk and
+                    each partition as a volume.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
@@ -30,10 +35,12 @@ mount/  umount/     A filesystem put at a directory, by starting a file server f
 net/                RTL8139, and Ethernet/ARP/IPv4/ICMP/UDP/TCP above it.
 edu/                QEMU's teaching device: the smallest driver there is for
                     a device whose registers are memory and whose interrupt
-                    is a message. Started by a `start` line in init.conf.
+                    is a message. Installed in /usr/lib/drivers, where the
+                    device manager finds it.
 swapd/              Where memory goes when there is not enough of it: the
                     pager the kernel writes programs' unused pages out to,
-                    and a file to keep them in. Started the same way.
+                    and a file to keep them in. Started by a `start` line in
+                    init.conf.
 
 fb/                 The framebuffer device: owns the display, decides who draws.
 qtty/               The text console. What the machine boots into, and to
@@ -56,11 +63,11 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
                     holds anything: they ask `auth`.
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
-ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/
+ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     821 checks of the kernel, made through the ABI; seven
+dtest/  dchild/     828 checks of the kernel, made through the ABI; twelve
                     more on a machine with a device to ask `edu` about,
                     eight where an IOMMU guards it, and twenty-three where
                     `swapd` is running.
@@ -77,7 +84,7 @@ rust-std-patches/   The std fork's port to Quark, mirrored: the commit it left
                     upstream at, a patch for the files upstream has, and the
                     files it adds. Generated; see its README.
 docs/               C on Quark, and where it is not Linux; the VFS
-                    protocol; the compositor; users.
+                    protocol; the compositor; users; devices.
 tools/check-abi.sh  The numbers here agree with each other and with the kernel.
 tools/std-patches.sh  The mirror above agrees with the fork.
 ```

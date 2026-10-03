@@ -5626,8 +5626,9 @@ fn test_smp() {
 
 /// A device that interrupts by sending a message, and the driver it takes:
 /// what a driver is given to reach a device with. The driver is `edu`, for
-/// the device of that name QEMU has; a distribution starts it, and on a
-/// machine with no such device there is nothing here to check.
+/// the device of that name QEMU has; the device manager starts it where a
+/// distribution has put it, and on a machine with no such device there is
+/// nothing here to check.
 /// Where one run of a program put its stack, its heap and a thread's stack,
 /// as it says (`dchild where`).
 fn where_it_was() -> Option<[u64; 3]> {
@@ -5705,10 +5706,11 @@ fn test_iommu() {
         "a program that may not configure devices claims none",
         syscall::sys_device_claim(syscall::pci_device(0, 0, 0)) == Err(syscall::Refused::NotAllowed),
     );
-    match ask(7, [0x10EC, 0x8139, 0, 0, 0, 0]).map(|d| d[0]) {
-        Some(3) => println!("        no network card here to be another driver's: not checked"),
-        answer => check("and a device another driver has claimed is not another's to claim", answer == Some(2)),
-    }
+    // The host bridge, which every machine has and no driver drives.
+    check(
+        "and a driver may claim no device but its own",
+        ask(7, [0, 0, 0, 0, 0, 0]).map(|d| d[0]) == Some(2),
+    );
     // A driver that could write to the IOMMU's registers could turn it off.
     // They are where devices are, and are kept out of the right to map
     // what is there — at the address QEMU gives its IOMMU.
@@ -5767,13 +5769,13 @@ fn test_msi() {
     let ask = |tag: u64, with: u64| ask2(tag, with, 0);
     let who = ask(1, 0);
     check(
-        "a driver with the right to device memory maps its device's registers, and they answer",
+        "a driver holding its device maps the device's registers, and they answer",
         matches!(who, Some(d) if d[0] & 0xFF == 0xED && d[1] == 1),
     );
-    // That right reaches where devices are and nowhere else. The driver is
-    // asked to try: memory, where the kernel is; a processor's interrupt
-    // controller, which is among the devices' addresses and is nobody's to
-    // map; and a range that begins among devices and ends in that.
+    // That reaches the device and nothing else. The driver is asked to try:
+    // memory, where the kernel is; a processor's interrupt controller, which
+    // is among the devices' addresses and is nobody's to map; and a range
+    // that begins among devices and ends in that.
     let may = |from: u64, to: u64| ask2(3, from, to).map(|d| d[0] == 1);
     check("which is not a right to memory: the kernel's is refused", may(0x10_0000, 0x10_1000) == Some(false));
     check(
@@ -5796,6 +5798,137 @@ fn test_msi() {
     );
     let again = (2..5u64).filter(|&n| matches!(ask(2, 1 << n), Some(d) if d[0] == 1 && d[1] == 1 << n)).count();
     check("and every time it sends one", again == 3);
+}
+
+/// What is in the machine, who holds which device, and what a driver may do
+/// with its own: the device manager's list, every program's capabilities,
+/// and `edu`, the driver for QEMU's test device, asked to try.
+fn test_devices() {
+    use quark_rt::devices;
+    use quark_rt::ipc::Message;
+    use quark_rt::pci::Address;
+    println!("devices:");
+    let Some(manager) = nameserver::lookup_retry(devices::NAME, 2) else {
+        check("the device manager says what is in the machine", false);
+        return;
+    };
+    let mut list = [None; 64];
+    let mut n = 0;
+    while n < list.len() {
+        let Some(device) = devices::entry(manager, n) else { break };
+        list[n] = Some(device);
+        n += 1;
+    }
+    let list = &list[..n];
+    let found = |what: &dyn Fn(&devices::Device) -> bool| list.iter().flatten().find(|d| what(d)).copied();
+    check(
+        "the device manager says what is in the machine, the host bridge first",
+        n >= 2 && list[0].is_some_and(|d| d.header.address == 0 && d.header.class >> 8 == 0x0600),
+    );
+    // A program that holds no device is told of none, and reads none.
+    let mut record = [0u64; syscall::PCI_RECORD];
+    check(
+        "a program holding no device is told of none of them",
+        n >= 2 && syscall::sys_pci_device(0, &mut record).is_none(),
+    );
+    check("and reads none of their configuration", n >= 2 && syscall::sys_pci_read(0, 0, 4).is_err());
+    let card = found(&|d| d.header.vendor == 0x10EC && d.header.device == 0x8139);
+    match card {
+        None => println!("        no network card here: whose it is, is not checked"),
+        Some(card) => check(
+            "and which driver drives which: the network card is the network driver's",
+            card.driver != 0 && card.driver_name() == b"net" && nameserver::lookup(b"net") == Some(card.driver),
+        ),
+    }
+
+    // Who holds devices: every one of them, init and the device manager; one
+    // each, a driver; and nobody but init, the ports they were all reached
+    // through. init holds every port there is, and the kernel refuses it
+    // those as it refuses everybody: which nothing out here can show.
+    let mut everything = 0;
+    let mut held = [(0u64, 0u64); 32];
+    let mut nheld = 0;
+    let mut two = false;
+    let mut ports = 0;
+    for tid in 1..64 {
+        let Ok((_, parent, _)) = syscall::sys_task_info(tid) else {
+            continue;
+        };
+        let first = parent == 0;
+        let space = syscall::sys_task_space(tid).unwrap_or(0);
+        for slot in 0.. {
+            let Ok(cap) = syscall::sys_cap_read(tid, slot) else { break };
+            if !cap.valid {
+                continue;
+            }
+            if cap.cap_type == syscall::CAP_TYPE_IOPORT
+                && !first
+                && [0xCF8u64, 0xCFC].iter().any(|&p| cap.param0 <= p && p <= cap.param1)
+            {
+                ports += 1;
+            }
+            if cap.cap_type != syscall::CAP_TYPE_PCI_DEVICE {
+                continue;
+            }
+            if cap.param0 == syscall::PCI_ANY {
+                everything += 1;
+                continue;
+            }
+            // By program: a program's threads share what it holds.
+            match held[..nheld].iter().find(|&&(s, _)| s == space) {
+                Some(&(_, device)) => two |= device != cap.param0,
+                None if nheld < held.len() => {
+                    two |= held[..nheld].iter().any(|&(_, device)| device == cap.param0);
+                    held[nheld] = (space, cap.param0);
+                    nheld += 1;
+                }
+                None => {}
+            }
+        }
+    }
+    check("only init and the device manager hold every device", everything == 2);
+    check("a driver holds its own device, and no device is two programs'", nheld >= 1 && !two);
+    check("no program but init holds the ports devices were configured through", ports == 0);
+
+    // What a driver may do with its own device: edu's.
+    let Some(edu) = nameserver::lookup_retry(b"edu", 2) else {
+        println!("        no driver for QEMU's test device is running: what a driver may do is not checked");
+        return;
+    };
+    let ask = |tag: u64, data: [u64; 6]| {
+        let mut reply = Message::empty();
+        let msg = Message { sender: 0, tag, data };
+        (syscall::sys_call(edu, &msg, &mut reply).is_ok() && reply.tag == 0).then_some(reply.data)
+    };
+    let may = |from: u64| ask(3, [from, from + 0x1000, 0, 0, 0, 0]).map(|d| d[0] == 1);
+    let own = found(&|d| d.header.vendor == 0x1234 && d.header.device == 0x11E8);
+    let own_bar = own.and_then(|d| devices::bar(manager, d.header.address(), 0));
+    check(
+        "a driver maps its own device's registers",
+        own_bar.is_some_and(|bar| bar.present() && may(bar.base & !0xFFF) == Some(true)),
+    );
+    // The display's, which every machine here has: the BAR its registers or
+    // its pixels are in.
+    let display = found(&|d| d.header.class >> 16 == 0x03).and_then(|d| {
+        (0..6).filter_map(|i| devices::bar(manager, d.header.address(), i)).find(|b| b.present() && !b.is_ports())
+    });
+    match display {
+        None => println!("        no display device here: another device's registers are not tried"),
+        Some(bar) => check("and not another device's", may(bar.base & !0xFFF) == Some(false)),
+    }
+    // Where it is, and where its message goes, are not the driver's to say.
+    let write = |offset: u64, value: u64| ask(8, [offset, 4, value, 0, 0, 0]).map(|d| d[0]);
+    check("a driver may not move its device's registers", write(0x10, 0xE000_0000) == Some(1));
+    match own.map(|d| d.header.msi as u64) {
+        Some(msi) if msi != 0 => {
+            check("nor aim its device's message somewhere else", write(msi + 4, 0xFEE0_0000) == Some(1))
+        }
+        _ => println!("        the test device has no MSI capability: where its message goes is not tried"),
+    }
+    check(
+        "nor claim a device that is not its own",
+        ask(7, [Address::new(0, 0, 0).raw(), 0, 0, 0, 0, 0]).map(|d| d[0]) == Some(2),
+    );
 }
 
 /// Where a frame of ordinary memory is mapped to be written to and read.
@@ -7996,6 +8129,7 @@ pub extern "C" fn _start() -> ! {
         ("threads", test_threads),
         ("msi", test_msi),
         ("iommu", test_iommu),
+        ("devices", test_devices),
         ("layout", test_layout),
         ("clock", test_clock),
         ("power", test_power),

@@ -4,19 +4,21 @@
 
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::nameserver;
+use quark_rt::pci;
 use quark_rt::{println, syscall};
 
 use quark_rt::manifest::CapReq;
 
-// The RTL8139's I/O window is assigned by PCI, so the port range cannot be
-// narrowed here; likewise its interrupt line. Frames for the card's own
-// receive and transmit buffers, which it reaches by DMA — but no physical
-// range: a client lends its data with the call rather than naming a page for
-// this driver to map, which it once could do anywhere in memory.
+// The RTL8139: the device manager starts this for one, holding that card,
+// whose ports this mints from it and whose line it is given. Frames for the
+// card's own receive and transmit buffers, which it reaches by DMA — but no
+// physical range: a client lends its data with the call rather than naming a
+// page for this driver to map, which it once could do anywhere in memory. It
+// held every port on the machine and every interrupt line once, because
+// which of them were the card's was not known until it looked.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
-    CapReq::ioport(0, 0xFFFF),
-    CapReq::irq(0xFF),
+    CapReq::drives(0x10EC, 0x8139),
     CapReq::phys_alloc(64),
 ]);
 
@@ -53,63 +55,30 @@ const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
 
 // ---------------------------------------------------------------------------
-// PCI config space
+// The card
 // ---------------------------------------------------------------------------
 
-const PCI_CONFIG_ADDR: u16 = 0xCF8;
-const PCI_CONFIG_DATA: u16 = 0xCFC;
-const RTL8139_VENDOR: u16 = 0x10EC;
-const RTL8139_DEVICE: u16 = 0x8139;
+/// Where this program mints the card's ports.
+const PORTS_SLOT: usize = 10;
 
-fn pci_read32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
-    let addr = 0x8000_0000u32
-        | ((bus as u32) << 16)
-        | ((device as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-    syscall::sys_ioport_write32(PCI_CONFIG_ADDR, addr);
-    syscall::sys_ioport_read32(PCI_CONFIG_DATA)
-}
-
-fn pci_write32(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
-    let addr = 0x8000_0000u32
-        | ((bus as u32) << 16)
-        | ((device as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-    syscall::sys_ioport_write32(PCI_CONFIG_ADDR, addr);
-    syscall::sys_ioport_write32(PCI_CONFIG_DATA, value);
-}
-
-/// The card, if the machine has one: its ports and its line. It is this
-/// program's from here on (`sys_device_claim`), and on a machine with an
-/// IOMMU it reaches the rings and buffers this asks the kernel for and
-/// nothing else.
-fn pci_find_rtl8139() -> Option<(u16, u8)> {
-    for bus in 0..8u8 {
-        for device in 0..32u8 {
-            let id = pci_read32(bus, device, 0, 0);
-            let vendor = (id & 0xFFFF) as u16;
-            let dev_id = ((id >> 16) & 0xFFFF) as u16;
-            if vendor == RTL8139_VENDOR && dev_id == RTL8139_DEVICE {
-                let bar0 = pci_read32(bus, device, 0, 0x10);
-                let irq_reg = pci_read32(bus, device, 0, 0x3C);
-                let irq_line = (irq_reg & 0xFF) as u8;
-                let io_base = (bar0 & 0xFFFC) as u16;
-                if syscall::sys_device_claim(syscall::pci_device(bus, device, 0)).is_err() {
-                    println!("[net] the card is another program's.");
-                    return None;
-                }
-
-                // Enable bus mastering (PCI command register bit 2)
-                let cmd = pci_read32(bus, device, 0, 0x04);
-                pci_write32(bus, device, 0, 0x04, cmd | 0x0005); // I/O + bus master
-
-                return Some((io_base, irq_line));
-            }
-        }
+/// The card this was started for: its ports and its line. It is this
+/// program's from here on (`pci::claim`), and on a machine with an IOMMU it
+/// reaches the rings and buffers this asks the kernel for and nothing else.
+fn the_card() -> Option<(u16, u8)> {
+    let device = pci::this_device()?;
+    let info = pci::info(device)?;
+    let (io_base, _) = pci::ports(device, 0, PORTS_SLOT)?;
+    if pci::claim(device).is_err() {
+        println!("[net] the card is another program's.");
+        return None;
     }
-    None
+    // Its ports, and copying memory itself: the second only now that it is
+    // this program's.
+    if pci::enable(device, pci::COMMAND_PORTS | pci::COMMAND_MASTER).is_err() {
+        println!("[net] the card may not be turned on.");
+        return None;
+    }
+    Some((io_base, info.header.line))
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +401,7 @@ fn alloc_dma_pages(count: usize, vaddr: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 fn rtl8139_init() -> bool {
-    let (io_base, irq) = match pci_find_rtl8139() {
+    let (io_base, irq) = match the_card() {
         Some(x) => x,
         None => {
             println!("[net] RTL8139 not found on PCI bus.");

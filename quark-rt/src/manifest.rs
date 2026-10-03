@@ -34,6 +34,12 @@ pub const MANIFEST_VERSION: u64 = 1;
 /// values so a spawner can tell it apart from something to mint.
 pub const PRIORITY_REQ: u64 = 0x100;
 
+/// A device a driver drives, rather than a capability: what the device
+/// manager starts it for, giving it that device ([`CapReq::drives`] and
+/// the like). Matched as `key & mask == value` over a device's
+/// `pci::Header::key`; param0 is the value and param1 the mask.
+pub const MATCH_REQ: u64 = 0x101;
+
 /// One capability a program is asking for.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -121,6 +127,48 @@ impl CapReq {
     pub const fn swap() -> Self {
         CapReq { cap_type: syscall::CAP_TYPE_SWAP, param0: 0, param1: 0 }
     }
+
+    /// Every PCI device: the device manager's, which hands each driver its
+    /// own. Only `init` is started holding it.
+    pub const fn pci_devices() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_PCI_DEVICE, param0: syscall::PCI_ANY, param1: 0 }
+    }
+
+    /// The program is the driver for a PCI device that is `vendor`'s
+    /// `device`. Not something to mint: the device manager starts the
+    /// program for each such device in the machine that has no driver,
+    /// holding that device — and no spawner but the device manager gives a
+    /// device.
+    pub const fn drives(vendor: u16, device: u16) -> Self {
+        CapReq { cap_type: MATCH_REQ, param0: (vendor as u64) << 48 | (device as u64) << 32, param1: 0xFFFF_FFFF << 32 }
+    }
+
+    /// The same, for a kind of device: any of class `class`, subclass
+    /// `subclass`.
+    pub const fn drives_class(class: u8, subclass: u8) -> Self {
+        CapReq { cap_type: MATCH_REQ, param0: ((class as u64) << 16 | (subclass as u64) << 8) << 8, param1: 0xFFFF00 << 8 }
+    }
+
+    /// And for one programming interface of a kind of device.
+    pub const fn drives_interface(class: u8, subclass: u8, interface: u8) -> Self {
+        CapReq {
+            cap_type: MATCH_REQ,
+            param0: ((class as u64) << 16 | (subclass as u64) << 8 | interface as u64) << 8,
+            param1: 0xFFFFFF << 8,
+        }
+    }
+}
+
+/// Whether the program in `image` drives devices: whether its manifest
+/// says which.
+pub fn drives_any(image: &[u8]) -> bool {
+    blocks(image).any(|reqs| reqs.iter().any(|r| r.cap_type == MATCH_REQ))
+}
+
+/// Whether the program in `image` drives a device whose key
+/// (`pci::Header::key`) is `key`.
+pub fn drives(image: &[u8], key: u64) -> bool {
+    blocks(image).any(|reqs| reqs.iter().any(|r| r.cap_type == MATCH_REQ && key & r.param1 == r.param0))
 }
 
 /// A manifest as it sits in the image: a header the scanner can recognise,
@@ -246,6 +294,11 @@ pub fn grant_image(child: usize, image: &[u8], scratch_slot: usize) -> usize {
                 if syscall::sys_task_priority(child, req.param0 as u8).is_ok() {
                     granted += 1;
                 }
+                continue;
+            }
+            if req.cap_type == MATCH_REQ {
+                // Nor here: which device a driver has is the device
+                // manager's to say, and it gives that one itself.
                 continue;
             }
             // Slots at and above the scratch one are the spawner's own

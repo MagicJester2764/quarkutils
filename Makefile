@@ -22,6 +22,9 @@ QUARK_RUST_STD_PATH ?= $(CURDIR)/../rust/library
 #   $(DESTDIR)/drivers/init.elf   loaded by the bootloader beside the kernel
 #   $(DESTDIR)/boot/         essential services, staged into boot.img
 #   $(DESTDIR)/usr/bin/      everything else, staged into the root filesystem
+#   $(DESTDIR)/usr/lib/drivers/  drivers the device manager reads once the
+#                            root is up: a device's driver that is not
+#                            needed before there is a filesystem
 #   $(DESTDIR)/etc/
 #
 # The kernel installs into the same directory, from its own repository, and
@@ -41,7 +44,7 @@ REQUIRE_ABI ?=
 # directory is also the crate and the binary.
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
-                 auth:AUTH
+                 auth:AUTH devmgr:DEVMGR
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
@@ -51,8 +54,13 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  setfont:SETFONT ramdisk:RAMDISK disks:DISKS parts:PARTS \
                  vfs:VFS mount:MOUNT umount:UMOUNT su:SU passwd:PASSWD \
                  useradd:USERADD userdel:USERDEL groupadd:GROUPADD \
-                 gpasswd:GPASSWD id:ID edu:EDU date:DATE swapd:SWAPD \
-                 free:FREE
+                 gpasswd:GPASSWD id:ID date:DATE swapd:SWAPD \
+                 free:FREE lspci:LSPCI
+
+# Drivers for devices nothing needs before the root is up: the device manager
+# reads them from /usr/lib/drivers and starts each for the devices it says it
+# drives. A device's driver that the root itself is on goes in BOOT_SERVICES.
+DRIVERS       := edu:EDU
 
 # Programs written in C, built against libc/.
 C_PROGRAMS    := cwc:CWC envtest:ENVTEST
@@ -63,7 +71,7 @@ HOSTED_PROGRAMS := hello httpget
 
 names = $(foreach p,$(1),$(firstword $(subst :, ,$(p))))
 
-RUST_PROGRAMS := init $(call names,$(BOOT_SERVICES) $(USR_PROGRAMS))
+RUST_PROGRAMS := init $(call names,$(BOOT_SERVICES) $(USR_PROGRAMS) $(DRIVERS))
 RUST_ELFS     := $(foreach p,$(RUST_PROGRAMS),$(p)/target/$(TARGET)/release/$(p))
 C_ELFS        := $(foreach p,$(call names,$(C_PROGRAMS)),$(p)/$(p))
 
@@ -173,13 +181,13 @@ rootfs:
 	@echo 'root::0::::::' > rootfs/etc/shadow
 
 install: all
-	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/etc
+	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/usr/lib/drivers $(DESTDIR)/etc
 	@# Take back what a previous install put there, so that a program renamed
 	@# or removed here does not linger in a staging directory for ever. Only
 	@# `.ELF` is cleared, which is exactly the set this target owns: coreutils
 	@# and the Wayland clients are staged by ExplOSion afterwards, under their
 	@# own names, and must survive this.
-	@rm -f $(DESTDIR)/boot/*.ELF $(DESTDIR)/usr/bin/*.ELF
+	@rm -f $(DESTDIR)/boot/*.ELF $(DESTDIR)/usr/bin/*.ELF $(DESTDIR)/usr/lib/drivers/*.ELF
 	@# init is the one program the bootloader hands the kernel, so it sits
 	@# beside the kernel's own modules rather than in the boot image.
 	@cp init/target/$(TARGET)/release/init $(DESTDIR)/drivers/init.elf
@@ -190,6 +198,10 @@ install: all
 	@for p in $(USR_PROGRAMS); do \
 		src=$${p%%:*}; dst=$${p##*:}; \
 		cp $$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/bin/$$dst.ELF; \
+	done
+	@for p in $(DRIVERS); do \
+		src=$${p%%:*}; dst=$${p##*:}; \
+		cp $$src/target/$(TARGET)/release/$$src $(DESTDIR)/usr/lib/drivers/$$dst.ELF; \
 	done
 	@# C programs are not cargo crates, so their binaries sit beside their
 	@# sources rather than under a target directory.

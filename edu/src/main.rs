@@ -10,19 +10,19 @@
 //! three things every device newer than the ISA bus does and nothing in
 //! this system did before it:
 //!
-//! - **Its registers are memory, at an address the firmware chose.** A
-//!   driver asks, in its manifest, for the right to map where devices are
-//!   (`DeviceMemory`, which `init` holds from the kernel); reads the
-//!   address out of the device's configuration; mints a range of physical
-//!   memory for exactly that; and maps it.
+//! - **Its registers are memory, at an address the firmware chose.** The
+//!   driver holds its device (the device manager started it holding that
+//!   one), is told by the kernel where its BARs are, mints a range of
+//!   physical memory inside one, and maps it. Another device's is refused.
 //! - **It has no interrupt line of its own.** On a PC it would share one of
 //!   four with whatever else is plugged in. Asked to, it sends its
 //!   interrupt as a message to a processor instead (MSI), and the kernel
-//!   gives the driver a number that is only this device's
-//!   (`SYS_MSI_ALLOC`).
-//! - **Nothing in the tree knows it is there.** A distribution starts it
-//!   with a `start` line in `/etc/init.conf`; on a machine with no such
-//!   device it says so and ends.
+//!   gives the driver a number that is only this device's and aims the
+//!   device at it (`SYS_MSI_ALLOC`).
+//! - **Nothing in the tree knows it is there.** The device manager starts
+//!   it for a device its manifest says it drives, from `/usr/lib/drivers`
+//!   where a distribution puts it; on a machine with no such device it is
+//!   not started at all.
 //! - **It copies memory itself (DMA)**, by physical address. The device is
 //!   this program's (`SYS_DEVICE_CLAIM`), and on a machine with an IOMMU it
 //!   reaches the two pages this asked the kernel for and nothing else.
@@ -41,23 +41,24 @@
 //! | 4 | copy `data[2]` bytes from `data[0]` to `data[1]` through the device: physical addresses, 0 for this driver's own source and destination | `[1 if both copies finished, the first eight bytes of its own destination, its own source, its own destination, 1 if the device reaches only this driver's memory, 1 if the device can address its pages]` |
 //! | 5 | how often has the device reached for what it may not | `[the count]` |
 //! | 6 | give your destination page back, have the device copy to where it was, and take a page again | `[1 if the copy finished, the count before, the count after, 1 if a page was had again]` |
-//! | 7 | claim the first device that is vendor `data[0]`'s device `data[1]` | `[0 or 1 claimed (as the call answers), 2 refused, 3 no such device]` |
+//! | 7 | claim the device at address `data[0]` | `[0 or 1 claimed (as the call answers), 2 refused]` |
+//! | 8 | write `data[1]` bytes of `data[2]` at offset `data[0]` of the device's configuration | `[0 written, 1 refused as the kernel's, 2 failed]` |
 //!
 //! The third is the other half of the first: what this driver is given
-//! reaches where devices are and nowhere else, and saying so takes somebody
-//! who holds it to ask.
+//! reaches its own device and nothing else, and saying so takes somebody
+//! who holds it to ask. The seventh and eighth are the same for the rest of
+//! what a device is: another's claim, and where its own is and where its
+//! message goes.
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::manifest::CapReq;
-use quark_rt::{nameserver, println, syscall};
+use quark_rt::{nameserver, pci, println, syscall};
 
-// A driver's band; the two ports every PCI device is configured through;
-// an interrupt, whichever it turns out to be; and where devices are.
+// A driver's band; QEMU's test device, which the device manager starts this
+// for, holding it; and two frames for it to copy between.
 quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
-    CapReq::ioport(0xCF8, 0xCFF),
-    CapReq::irq(0xFF),
-    CapReq::device_memory(),
+    CapReq::drives(0x1234, 0x11E8),
     CapReq::phys_alloc(2),
 ]);
 
@@ -68,23 +69,7 @@ const TAG_COPY: u64 = 4;
 const TAG_STOPPED: u64 = 5;
 const TAG_GIVE_BACK: u64 = 6;
 const TAG_CLAIM: u64 = 7;
-
-const VENDOR: u16 = 0x1234;
-const DEVICE: u16 = 0x11E8;
-
-const PCI_ADDRESS: u16 = 0xCF8;
-const PCI_DATA: u16 = 0xCFC;
-const PCI_COMMAND: u8 = 0x04;
-const PCI_BAR0: u8 = 0x10;
-const PCI_CAPABILITIES: u8 = 0x34;
-const PCI_INTERRUPT_LINE: u8 = 0x3C;
-const COMMAND_MEMORY: u32 = 1 << 1;
-const COMMAND_MASTER: u32 = 1 << 2;
-const COMMAND_NO_LINE: u32 = 1 << 10;
-const STATUS_HAS_CAPABILITIES: u32 = 1 << (16 + 4);
-const CAPABILITY_MSI: u8 = 0x05;
-const MSI_ENABLE: u32 = 1 << 16;
-const MSI_64BIT: u32 = 1 << (16 + 7);
+const TAG_CONFIG: u64 = 8;
 
 /// Where the device's registers are mapped, and the slot the capability
 /// for them is kept in: above what a manifest's grants fill.
@@ -113,36 +98,6 @@ const DEVICE_REACH: u64 = 1 << 28;
 const OWN_SOURCE: usize = REGISTERS + 0x1000;
 const OWN_DESTINATION: usize = REGISTERS + 0x2000;
 const OWN_PATTERN: &[u8; 8] = b"edu-own.";
-
-fn config_read(at: (u8, u8), offset: u8) -> u32 {
-    let address = 0x8000_0000u32 | (at.0 as u32) << 16 | (at.1 as u32) << 11 | (offset as u32 & 0xFC);
-    syscall::sys_ioport_write32(PCI_ADDRESS, address);
-    syscall::sys_ioport_read32(PCI_DATA)
-}
-
-fn config_write(at: (u8, u8), offset: u8, value: u32) {
-    let address = 0x8000_0000u32 | (at.0 as u32) << 16 | (at.1 as u32) << 11 | (offset as u32 & 0xFC);
-    syscall::sys_ioport_write32(PCI_ADDRESS, address);
-    syscall::sys_ioport_write32(PCI_DATA, value);
-}
-
-/// The bus and slot the device is in, if the machine has one.
-fn find() -> Option<(u8, u8)> {
-    find_device(VENDOR, DEVICE)
-}
-
-/// The bus and slot of the first device that is `vendor`'s `device`.
-fn find_device(vendor: u16, device: u16) -> Option<(u8, u8)> {
-    for bus in 0..8u8 {
-        for slot in 0..32u8 {
-            let id = config_read((bus, slot), 0);
-            if id as u16 == vendor && (id >> 16) as u16 == device {
-                return Some((bus, slot));
-            }
-        }
-    }
-    None
-}
 
 fn register(reg: usize) -> u32 {
     unsafe { core::ptr::read_volatile((REGISTERS + reg) as *const u32) }
@@ -185,53 +140,15 @@ fn page_for_device(at: usize) -> Option<u64> {
     Some(frame as u64)
 }
 
-/// Where the device's MSI capability is in its configuration, if it has
-/// one: a list, each entry naming its kind and the next.
-fn msi_capability(at: (u8, u8)) -> Option<u8> {
-    if config_read(at, PCI_COMMAND) & STATUS_HAS_CAPABILITIES == 0 {
-        return None;
+/// Its interrupt: a message of its own, which the kernel aims the device
+/// at; or the line it was wired to, as a device on the ISA bus would be,
+/// which the device manager gave this.
+fn interrupt(device: pci::Address, info: &pci::Info) -> Option<(u8, bool)> {
+    if let Some(irq) = pci::message(device) {
+        return Some((irq, true));
     }
-    let mut offset = (config_read(at, PCI_CAPABILITIES) & 0xFC) as u8;
-    // A list in a device's own memory is not trusted to end.
-    for _ in 0..48 {
-        if offset < 0x40 {
-            return None;
-        }
-        let entry = config_read(at, offset);
-        if entry as u8 == CAPABILITY_MSI {
-            return Some(offset);
-        }
-        offset = ((entry >> 8) & 0xFC) as u8;
-    }
-    None
-}
-
-/// Have the device send its interrupts as messages: ask the kernel for an
-/// interrupt of this driver's own, and tell the device where to send and
-/// what.
-fn by_message(at: (u8, u8)) -> Option<u8> {
-    let capability = msi_capability(at)?;
-    let msi = syscall::sys_msi_alloc().ok()?;
-    let control = config_read(at, capability);
-    config_write(at, capability + 4, msi.address);
-    if control & MSI_64BIT != 0 {
-        config_write(at, capability + 8, 0);
-        config_write(at, capability + 12, msi.data as u32);
-    } else {
-        config_write(at, capability + 8, msi.data as u32);
-    }
-    // One message, enabled; and its line, which it would otherwise go on
-    // raising as well, turned off.
-    config_write(at, capability, (control & !(0x7 << (16 + 4))) | MSI_ENABLE);
-    let command = config_read(at, PCI_COMMAND) & 0xFFFF;
-    config_write(at, PCI_COMMAND, command | COMMAND_NO_LINE);
-    Some(msi.irq)
-}
-
-/// Or by the line it was wired to, as a device on the ISA bus would.
-fn by_line(at: (u8, u8)) -> Option<u8> {
-    let line = config_read(at, PCI_INTERRUPT_LINE) as u8;
-    (line < 16 && syscall::sys_irq_register(line).is_ok()).then_some(line)
+    let line = info.header.line;
+    (line < 16 && syscall::sys_irq_register(line).is_ok()).then_some((line, false))
 }
 
 /// Raise an interrupt for `value` and wait for it: whether it arrived, and
@@ -260,35 +177,35 @@ fn raise(irq: u8, value: u32) -> (bool, u32) {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let Some(at) = find() else {
-        println!("[edu] no such device on this machine.");
-        syscall::sys_exit_code(0);
+    let Some((device, info)) = pci::this_device().and_then(|d| Some((d, pci::info(d)?))) else {
+        println!("[edu] started without a device: the device manager starts this, for QEMU's test device.");
+        syscall::sys_exit_code(1);
     };
-    let bar = config_read(at, PCI_BAR0);
-    // Memory, and below four gigabytes: bit 0 says ports, bits 1 and 2 how
-    // wide the address is.
-    if bar & 0x7 != 0 || bar & !0xFFF == 0 {
+    let bar = info.bars[0];
+    // Memory, and somewhere: where the registers this uses are.
+    if !bar.present() || bar.is_ports() || bar.base == 0 {
         println!("[edu] the device's registers are not where this can map them.");
         syscall::sys_exit_code(1);
     }
     // The device is this program's, and copies to and from what it is given.
-    let device = syscall::pci_device(at.0, at.1, 0);
-    let guarded = match syscall::sys_device_claim(device) {
+    let guarded = match pci::claim(device) {
         Ok(guarded) => guarded,
         Err(_) => {
             println!("[edu] the device is another program's.");
             syscall::sys_exit_code(1);
         }
     };
-    let command = config_read(at, PCI_COMMAND) & 0xFFFF;
-    config_write(at, PCI_COMMAND, command | COMMAND_MEMORY | COMMAND_MASTER);
+    if pci::enable(device, pci::COMMAND_MEMORY | pci::COMMAND_MASTER).is_err() {
+        println!("[edu] the device may not be turned on.");
+        syscall::sys_exit_code(1);
+    }
     // The registers this uses are in the first page of the megabyte: a
-    // range for that page and no more, from the right to device memory.
-    let page = (bar & !0xFFF) as u64;
+    // range for that page and no more, from the device.
+    let page = bar.base & !0xFFF;
     if syscall::sys_cap_mint(REGISTERS_SLOT, syscall::CAP_TYPE_PHYS_RANGE, page, page + 0x1000).is_err()
         || syscall::sys_map_phys(page as usize, REGISTERS, 1).is_err()
     {
-        println!("[edu] may not map the device's registers: this was not started with the right to device memory.");
+        println!("[edu] may not map the device's registers.");
         syscall::sys_exit_code(1);
     }
 
@@ -300,19 +217,13 @@ pub extern "C" fn _start() -> ! {
     unsafe { core::ptr::copy_nonoverlapping(OWN_PATTERN.as_ptr(), OWN_SOURCE as *mut u8, 8) };
     let reachable = own_source < DEVICE_REACH && own_destination < DEVICE_REACH;
 
-    let (irq, message) = match by_message(at) {
-        Some(irq) => (irq, true),
-        None => match by_line(at) {
-            Some(irq) => (irq, false),
-            None => {
-                println!("[edu] no interrupt to be had for the device.");
-                syscall::sys_exit_code(1);
-            }
-        },
+    let Some((irq, message)) = interrupt(device, &info) else {
+        println!("[edu] no interrupt to be had for the device.");
+        syscall::sys_exit_code(1);
     };
     println!(
         "[edu] registers at {:#x}, interrupt {} ({}).",
-        bar & !0xFFF,
+        page,
         irq,
         if message { "a message of its own" } else { "its line" }
     );
@@ -360,7 +271,7 @@ pub extern "C" fn _start() -> ! {
                 }
             }
             TAG_STOPPED => {
-                let stopped = syscall::sys_device_stopped(device).unwrap_or(u64::MAX);
+                let stopped = syscall::sys_device_stopped(device.raw()).unwrap_or(u64::MAX);
                 Message { sender: 0, tag: 0, data: [stopped, 0, 0, 0, 0, 0] }
             }
             TAG_GIVE_BACK => {
@@ -368,7 +279,7 @@ pub extern "C" fn _start() -> ! {
                 // count, either side of the copy.
                 let count = || {
                     syscall::sleep_ticks(3);
-                    syscall::sys_device_stopped(device).unwrap_or(u64::MAX)
+                    syscall::sys_device_stopped(device.raw()).unwrap_or(u64::MAX)
                 };
                 let given_back = own_destination;
                 let _ = syscall::sys_munmap(OWN_DESTINATION, 1);
@@ -383,12 +294,17 @@ pub extern "C" fn _start() -> ! {
                 Message { sender: 0, tag: 0, data: [done as u64, before, after, again.is_some() as u64, 0, 0] }
             }
             TAG_CLAIM => {
-                let answer = match find_device(msg.data[0] as u16, msg.data[1] as u16) {
-                    None => 3,
-                    Some((bus, slot)) => match syscall::sys_device_claim(syscall::pci_device(bus, slot, 0)) {
-                        Ok(guarded) => guarded as u64,
-                        Err(_) => 2,
-                    },
+                let answer = match syscall::sys_device_claim(msg.data[0]) {
+                    Ok(guarded) => guarded as u64,
+                    Err(_) => 2,
+                };
+                Message { sender: 0, tag: 0, data: [answer, 0, 0, 0, 0, 0] }
+            }
+            TAG_CONFIG => {
+                let answer = match syscall::sys_pci_write(device.raw(), msg.data[0], msg.data[1], msg.data[2] as u32) {
+                    Ok(()) => 0,
+                    Err(syscall::Refused::NotAllowed) => 1,
+                    Err(_) => 2,
                 };
                 Message { sender: 0, tag: 0, data: [answer, 0, 0, 0, 0, 0] }
             }

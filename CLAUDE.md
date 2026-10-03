@@ -169,7 +169,7 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 821 checks made from
+`dtest` is the kernel's test suite as much as this tree's: 828 checks made from
 user space through the ABI — four of them of registers only some processors
 have, and not made where there are none — with a recap of what failed before
 the count. A
@@ -210,9 +210,14 @@ not.
 `dtest
 msi` is about a device that interrupts by message, and needs one: QEMU's
 `edu` (`-device edu`, which a distribution that ships `dtest` gives the
-machines it tests on) and its driver running (`start /usr/bin/edu` in
-`/etc/init.conf`): seven checks more. Without them it says so and checks
-nothing. `dtest iommu` is about where that device may copy memory, and
+machines it tests on) and its driver, which the device manager starts where
+the image has it in `/usr/lib/drivers`: seven checks more. Without them it
+says so and checks nothing. `dtest devices` is about who holds which device:
+that the device manager knows the machine, that a program holding no device
+reaches none, that only `init` and the device manager hold every device and
+a driver its own — and, with `edu` running, that a driver maps its device's
+registers and not another's, and may not move its device, aim its message or
+claim another driver's: five checks more. `dtest iommu` is about where that device may copy memory, and
 needs an IOMMU between it and memory as well (QEMU's `intel-iommu`, on its
 q35 chipset): eight checks more — that it copies between its driver's pages
 and not to or from a page of `dtest`'s, that what its driver gives back it
@@ -279,12 +284,13 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   the framebuffer and its boot modules, `fb` holds the framebuffer and lends it
   on, and a driver holds the registers of its own device and nothing else.
   `dtest physical` walks every CSpace and fails otherwise. A driver's range
-  is one it minted for itself, from the right to *device memory*
-  (`CapReq::device_memory()`, the kernel's `DeviceMemory`): the firmware
-  chooses where a device is, so only its driver, reading the device's
-  configuration, knows what to ask for. That right is one for every device
-  — as the I/O ports are — and reaches no memory: `dtest msi` has a driver
-  ask for the kernel's and for an interrupt controller's, and be refused.
+  is one it minted for itself, inside its own device's BARs, from the
+  capability for that device (`pci::map_bar`; see *Devices*): the firmware
+  chooses where a device is and the kernel says where, and nothing else can
+  be minted from it. `dtest devices` has a driver ask for another device's
+  registers, and `dtest msi` for the kernel's and an interrupt controller's,
+  and each is refused. The right to *device memory* (`DeviceMemory`) was the
+  way before, and was every device's at once; nothing asks for it now.
 - **A frame a device is told the address of is asked for below four
   gigabytes** (`sys_phys_alloc_low`). Ordinary memory comes from the top of
   what the machine has, and on a machine with more than four gigabytes that
@@ -306,17 +312,19 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   same program. `dtest layout` and `layouttest` run a program twice and
   look.
 - **A driver whose device copies memory claims the device first**
-  (`sys_device_claim`), before it lets the device master the bus, and
-  gives it only memory from `sys_phys_alloc`. On a machine with an IOMMU
-  that is all the device can reach, at the same addresses — a ring in
-  anonymous memory, or a page of somebody else's, is a write that never
-  arrives, and a line on the serial console saying so — and a device
-  nobody has claimed reaches nothing at all. `net` and `edu` claim theirs.
-  The claim is refused for another driver's device: there is one driver
-  for each.
+  (`pci::claim`), before it lets the device master the bus — the kernel
+  refuses to turn that on before — and gives it only memory from
+  `sys_phys_alloc`. On a machine with an IOMMU that is all the device can
+  reach, at the same addresses — a ring in anonymous memory, or a page of
+  somebody else's, is a write that never arrives, and a line on the serial
+  console saying so — and a device nobody has claimed reaches nothing at
+  all. `net` and `edu` claim theirs. A driver can claim only the device it
+  holds, and there is one driver for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
-  scanning for its magic, not from a table of names in `init`. A spawner mints
+  scanning for its magic, not from a table of names in `init` — and so does
+  which devices a driver drives (`CapReq::drives`), which the device manager
+  reads to start it. A spawner mints
   each request from a capability it already holds, so it can never hand out more
   than it has — the shell holds no `PhysRange` and therefore cannot give one
   away. The framebuffer is the one exception: its address comes from the
@@ -429,10 +437,12 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   manifest (`CapReq::swap()`), which a distribution starts with a `start`
   line; a session does not hold it and cannot hand it on.
 
-`init` spawns `FB`, `CONSOLE`, `INPUT` and `VFS` in passes of their own. If a
-program misbehaves for lack of a capability, check that its pass actually calls
-`grant_caps_from_manifest` — there is no shared path that does it for them, and
-INPUT's pass once granted nothing at all, which the UID bypass hid.
+`init` spawns `FB`, `CONSOLE`, `DEVMGR`, `INPUT` and `VFS` in passes of their
+own. If a program misbehaves for lack of a capability, check that its pass
+actually calls `grant_caps_from_manifest` — there is no shared path that does
+it for them, and INPUT's pass once granted nothing at all, which the UID
+bypass hid. A boot-image program that drives a device is not started by `init`
+at all: it is offered to the device manager (see *Devices*).
 
 ## Starting programs
 
@@ -819,6 +829,55 @@ Some things to know before changing any of it:
   server, and one that is itself calling the server would deadlock with it. A
   reply needs no capability, so every other hop here is the client asking.
 
+## Devices
+
+The kernel finds every PCI device at boot and keeps what it found: ids,
+class, interrupt line, BARs sized. A program reaches a device with the
+capability for it (`CAP_TYPE_PCI_DEVICE`), and nothing else reaches one —
+the ports devices were configured through are the kernel's now. `devmgr`,
+the device manager, holds every device (`CapReq::pci_devices()`, which only
+`init` can give) and is the one program that starts a driver for one.
+`quark_rt::devices` is its protocol and `docs/devices.md` says it whole;
+`quark_rt::pci` is what a driver uses.
+
+- **A driver says what it drives, in its manifest**: `CapReq::drives(vendor,
+  device)`, `drives_class(class, subclass)`, `drives_interface(…)`. The
+  device manager starts it once for each such device that has no driver,
+  holding that device and no other, with the device's address as its first
+  argument (`pci::this_device()`), the interrupt line the firmware wired the
+  device to where it has one, its standard output, and what else its
+  manifest asks for — granted as any spawner grants, so a driver may ask for
+  nothing the device manager does not hold: a driver's band, frames
+  (`phys_alloc`), and nothing wider. No spawner but the device manager gives
+  a device: `grant_image` skips a match request, and a driver started some
+  other way finds it holds nothing and says so.
+- **A driver never scans.** It is told which device is its own, and
+  everything about the device goes through that one capability: its
+  configuration (`pci::read32`, `write16`), its BARs (`pci::map_bar`,
+  `pci::ports` mint inside them and nowhere else), its claim
+  (`pci::claim`), and its interrupt by message (`pci::message`, which the
+  kernel aims). `net` held every port on the machine and every interrupt
+  line once, and `edu` every device's registers, because which were theirs
+  was not known until they looked.
+- **Where a device is and where its message goes are not a driver's to
+  change.** The kernel refuses a write to a BAR or to the MSI capability,
+  and refuses to let a device master the bus before its program has claimed
+  it (`pci::enable` with `COMMAND_MASTER` fails until `pci::claim`).
+- **Drivers come from the boot image or from `/usr/lib/drivers`.** One the
+  root is on has to be running before there is a filesystem, so it is a
+  boot service: `init` offers each boot-image program whose manifest says it
+  drives something to the device manager, lent with the call, instead of
+  starting it. The rest are installed in `/usr/lib/drivers` (`DRIVERS` in
+  the Makefile), which the device manager reads when `init` says the root is
+  up — before anything in `/etc/init.conf` runs. It takes either only from
+  its parent: a program that could hand it a driver would be handed a
+  device.
+- **The device manager is the drivers' parent**, watches them, and collects
+  one that ends; its device has no driver again. Nothing starts it again
+  (the service manager will).
+- **What is in the machine is a question** (`lspci`, `lspci -v`): the
+  device manager answers it, and holds nothing back but the devices.
+
 ## Disks
 
 A disk driver serves *volumes* (`quark_rt::block`): volume 0 is the whole
@@ -1175,6 +1234,11 @@ removed.
   spawner does. A shell that execs is as trusted as everything it runs.
   Which is why a user's session has to *begin* holding nothing: there is no
   later point at which it is taken away.
+- **The device manager starts sixteen drivers at most**, as any program
+  without `TaskMgmt` may have sixteen children, and starts none twice: a
+  driver that ends leaves its device without one until the machine starts
+  again. A device's driver is one program, so a second card of a kind has
+  a second driver that cannot register the first one's name.
 - **A seat is nobody's.** `input` and `fb` give the keyboard and the display
   to whoever claims them, which is how `wm` runs; nothing ties a claim to
   the session at the console, so a user's program can take the keyboard out

@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use quark_rt::devices;
 use quark_rt::ipc::Message;
 use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
@@ -445,6 +446,9 @@ const NS_SLOT: usize = syscall::SLOT_ENDPOINT;
 /// Where init keeps its capability to the framebuffer device, which it has to
 /// call before the device has registered anywhere.
 const FB_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
+/// And to the device manager, which it offers drivers to before anybody is
+/// let call it.
+const DEVMGR_SLOT: usize = 11;
 
 /// Give `tid` the right to call the nameserver.
 ///
@@ -549,6 +553,31 @@ struct BootContext {
     console_pipe: usize, // pipe handle for stdout/stderr
     input_tid: usize,
     vfs_spawn: Option<Spawned>,
+    /// The device manager, if the boot image had one.
+    devmgr_tid: usize,
+}
+
+/// Offer the driver in `image`, called `name`, to the device manager, which
+/// starts it for each device it drives: how many.
+fn offer_driver(devmgr_tid: usize, image: &[u8], name: &[u8]) -> Option<u64> {
+    let mut words = [0u8; 16];
+    let n = name.len().min(16);
+    words[..n].copy_from_slice(&name[..n]);
+    let msg = Message {
+        sender: 0,
+        tag: devices::TAG_OFFER,
+        data: [
+            image.len() as u64,
+            u64::from_le_bytes(words[..8].try_into().unwrap_or([0; 8])),
+            u64::from_le_bytes(words[8..].try_into().unwrap_or([0; 8])),
+            0,
+            0,
+            0,
+        ],
+    };
+    let mut reply = Message::empty();
+    syscall::sys_call_lend(devmgr_tid, &msg, &mut reply, image).ok()?;
+    (reply.tag == 0).then_some(reply.data[0])
 }
 
 fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> BootContext {
@@ -558,7 +587,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if syscall::sys_map_phys(rootfs_phys, BOOT_IMG_BASE, rootfs_pages).is_err() {
         println!("[init] Failed to map boot image");
-        return BootContext { console_pipe: 0, input_tid: 0, vfs_spawn: None };
+        return BootContext { console_pipe: 0, input_tid: 0, vfs_spawn: None, devmgr_tid: 0 };
     }
 
     let rootfs = unsafe { core::slice::from_raw_parts(BOOT_IMG_BASE as *const u8, rootfs_size) };
@@ -680,6 +709,38 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
+    // Pass 2b: spawn DEVMGR.ELF, the device manager, which holds every
+    // device and starts their drivers: the ones below that say which
+    // devices they drive are offered to it rather than started here.
+    let mut devmgr_tid: usize = 0;
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] == b"DEVMGR  " && &e.name[8..11] == b"ELF" {
+            if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+                match spawn::load(data, &SPAWN_SCRATCH) {
+                    Ok(info) => {
+                        grant_caps_from_manifest(data, info.tid);
+                        if console_pipe != 0 {
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
+                        }
+                        let _ = spawn::set_args(&info, &[b"devmgr"], &SPAWN_SCRATCH);
+                        // init made it, so init may call it before it has
+                        // a name — and nobody else can.
+                        if syscall::sys_cap_mint(DEVMGR_SLOT, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0).is_ok()
+                            && info.start().is_ok()
+                        {
+                            devmgr_tid = info.tid;
+                            println!("[init] Spawned devmgr (TID {})", info.tid);
+                        }
+                    }
+                    Err(()) => println!("[init] FAILED to spawn devmgr"),
+                }
+            }
+            break;
+        }
+    }
+
     // Pass 3: spawn essential ELFs (KEYBOARD, DISK) — skip INPUT and non-essentials
     let mut spawned_tids = [0usize; 32];
     let mut spawned_count = 0usize;
@@ -706,6 +767,22 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         let mut namebuf = [0u8; 16];
         let namelen = fat_name_to_buf(&e.name, &mut namebuf);
         if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+            // A driver for a device is the device manager's to start, for
+            // each device it drives, holding that one.
+            if quark_rt::manifest::drives_any(data) {
+                let base_len = e.name[0..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+                let mut lbuf = [0u8; 8];
+                for j in 0..base_len {
+                    lbuf[j] = e.name[j].to_ascii_lowercase();
+                }
+                let name = core::str::from_utf8(&lbuf[..base_len]).unwrap_or("a driver");
+                match (devmgr_tid != 0).then(|| offer_driver(devmgr_tid, data, &lbuf[..base_len])).flatten() {
+                    Some(0) => println!("[init] Nothing here for {} to drive", name),
+                    Some(n) => println!("[init] The device manager started {} for {} device(s)", name, n),
+                    None => println!("[init] No device manager to start {}", name),
+                }
+                continue;
+            }
             match spawn::load(data, &SPAWN_SCRATCH) {
                 Ok(info) => {
                     let tid = info.tid;
@@ -869,7 +946,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    BootContext { console_pipe, input_tid, vfs_spawn }
+    BootContext { console_pipe, input_tid, vfs_spawn, devmgr_tid }
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,6 +1289,17 @@ pub extern "C" fn _start() -> ! {
             } else {
                 None
             };
+
+            // The device manager's drivers that are not in the boot image,
+            // now there are files to read them from: before anything
+            // `/etc/init.conf` asks for, which may need them.
+            if vfs_tid.is_some() && ctx.devmgr_tid != 0 {
+                let msg = Message { sender: 0, tag: devices::TAG_FILES, data: [0; 6] };
+                let mut reply = Message::empty();
+                if syscall::sys_call(ctx.devmgr_tid, &msg, &mut reply).is_ok() && reply.tag == 0 && reply.data[0] > 0 {
+                    println!("[init] The device manager started {} more driver(s)", reply.data[0]);
+                }
+            }
 
             // Phase 3: Load remaining programs from VFS (loaded but not started)
             let mut deferred = if let Some(vfs) = vfs_tid {

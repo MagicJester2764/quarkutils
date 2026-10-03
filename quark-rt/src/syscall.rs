@@ -177,6 +177,38 @@ pub fn sys_device_claim(bdf: u64) -> Result<bool, Refused> {
     }
 }
 
+/// How many words [`sys_pci_device`] writes: see `quark_rt::pci::Info`.
+pub const PCI_RECORD: usize = 21;
+
+/// What the kernel found of the first PCI device at or after `from` that
+/// this program holds (`CAP_TYPE_PCI_DEVICE`), written into `record`: its
+/// address, or `None` when there is none.
+pub fn sys_pci_device(from: u64, record: &mut [u64; PCI_RECORD]) -> Option<u64> {
+    match unsafe { syscall2(SYS_PCI_DEVICE, from, record.as_mut_ptr() as u64) } {
+        u64::MAX => None,
+        at => Some(at),
+    }
+}
+
+/// Read `width` bytes (1, 2 or 4) of device `bdf`'s configuration at
+/// `offset`, a multiple of `width`.
+pub fn sys_pci_read(bdf: u64, offset: u64, width: u64) -> Result<u32, ()> {
+    match unsafe { syscall3(SYS_PCI_READ, bdf, offset, width) } {
+        u64::MAX => Err(()),
+        value => Ok(value as u32),
+    }
+}
+
+/// Write them. What the kernel keeps — a BAR, the MSI capability, turning
+/// bus mastering on before the device is claimed — is
+/// [`Refused::NotAllowed`].
+pub fn sys_pci_write(bdf: u64, offset: u64, width: u64, value: u32) -> Result<(), Refused> {
+    match unsafe { syscall4(SYS_PCI_WRITE, bdf, offset, width, value as u64) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
 /// How many times device `bdf`, this program's, has reached for memory it
 /// may not.
 pub fn sys_device_stopped(bdf: u64) -> Result<u64, Refused> {
@@ -316,6 +348,10 @@ pub const SYS_SOCK_INFO: u64 = 177;
 // --- 0xA0  kernel debug console ---
 pub const SYS_WRITE: u64 = 160;
 pub const SYS_CONSOLE_POS: u64 = 161;
+// 0xA8: devices, where block 0x70 had no room left.
+pub const SYS_PCI_DEVICE: u64 = 168;
+pub const SYS_PCI_READ: u64 = 169;
+pub const SYS_PCI_WRITE: u64 = 170;
 
 // --- 0xE0  descriptors, continued ---
 pub const SYS_FD_SERVE: u64 = 224;
@@ -1070,7 +1106,19 @@ pub struct Msi {
 /// have local APICs — a message is sent to one. `Err` otherwise, or when
 /// the thirty-two there are have all been given out.
 pub fn sys_msi_alloc() -> Result<Msi, ()> {
-    let ret = unsafe { syscall0(SYS_MSI_ALLOC) };
+    msi(unsafe { syscall2(SYS_MSI_ALLOC, 0, 0) })
+}
+
+/// The same, for PCI device `bdf`, which this program holds — and the
+/// kernel aims the device's message itself, where it has an MSI
+/// capability: one message, enabled, its line off. A device with MSI-X
+/// alone has its messages in a table in its registers, which its driver
+/// writes with what this answers.
+pub fn sys_msi_alloc_for(bdf: u64) -> Result<Msi, ()> {
+    msi(unsafe { syscall2(SYS_MSI_ALLOC, bdf, 1) })
+}
+
+fn msi(ret: u64) -> Result<Msi, ()> {
     if ret == u64::MAX {
         return Err(());
     }
@@ -2379,6 +2427,13 @@ pub const CAP_TYPE_POWER: u64 = 12;
 /// The right to be where memory is written out to: to hold every program's
 /// unused pages, and hand them back (`OBJECT_SWAP`).
 pub const CAP_TYPE_SWAP: u64 = 13;
+/// A PCI device, by its address ([`pci_device`]), or every one of them
+/// ([`PCI_ANY`]): its configuration, its BARs, its claim and an interrupt
+/// for it by message. The device manager holds every device and gives each
+/// driver its own.
+pub const CAP_TYPE_PCI_DEVICE: u64 = 14;
+/// `PciDevice`'s param0 for every device.
+pub const PCI_ANY: u64 = 0xFFFF_FFFF;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -2506,7 +2561,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 23;
+pub const ABI_VERSION_MINOR: u32 = 24;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
