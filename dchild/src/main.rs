@@ -402,6 +402,31 @@ fn number(text: &[u8]) -> usize {
     text.iter().fold(0usize, |n, &d| n.wrapping_mul(10).wrapping_add(d.wrapping_sub(b'0') as usize % 10))
 }
 
+/// Compute until this task has run for `ns`, asking how long that has been
+/// only now and then, so that nearly all of it is the program's. Or until
+/// ten times as long has gone by on the clock, with something wrong.
+fn compute_for(ns: u64) {
+    let until = syscall::sys_clock() + 10 * ns + 2_000_000_000;
+    let mut x = 1u64;
+    loop {
+        for _ in 0..200_000 {
+            x = core::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+        }
+        let ran = syscall::sys_usage(syscall::USAGE_TASK).map_or(0, |u| u.total_ns());
+        if ran >= ns || syscall::sys_clock() > until {
+            return;
+        }
+    }
+}
+
+/// So many seconds, or none for "-".
+fn seconds(text: Option<&[u8]>) -> u64 {
+    match text {
+        Some(b"-") | None => u64::MAX,
+        Some(n) => number(n) as u64,
+    }
+}
+
 /// Ask a server who this is, and who a child of this task's is that was
 /// made and never started. A bit of the answer for each thing that is then
 /// so: the server answered; this task is user 1234 in group 5678; in groups
@@ -1066,6 +1091,68 @@ pub extern "C" fn _start() -> ! {
             let mut msg = Message::empty();
             let _ = syscall::sys_recv(TID_ANY, &mut msg);
         }
+    }
+    // Compute for so many milliseconds of this program's time, and end.
+    if quark_rt::args::argv(1) == Some(&b"compute"[..]) {
+        compute_for(number(quark_rt::args::argv(2).unwrap_or(b"100")) as u64 * 1_000_000);
+        syscall::sys_exit_code(0);
+    }
+    // As nice as it is told, and then compute for ever, never asking the
+    // kernel anything.
+    if quark_rt::args::argv(1) == Some(&b"busy"[..]) {
+        let nice = number(quark_rt::args::argv(2).unwrap_or(b"0")) as i64;
+        if syscall::sys_nice(0, Some(nice)).is_err() {
+            syscall::sys_exit_code(9);
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    // What it may say about how nice it is, a bit for each that is so: it
+    // may be nicer, it may not be less nice again, and asked, it says what
+    // it was made. Above them, 20 and how nice it was to begin with.
+    if quark_rt::args::argv(1) == Some(&b"nice"[..]) {
+        let was = syscall::sys_nice(0, None).unwrap_or(-20);
+        let mut bits = 0;
+        if syscall::sys_nice(0, Some(was + 5)) == Ok(was) {
+            bits |= 1;
+        }
+        if syscall::sys_nice(0, Some(was)).is_err() {
+            bits |= 2;
+        }
+        if syscall::sys_nice(0, None) == Ok(was + 5) {
+            bits |= 4;
+        }
+        syscall::sys_exit_code((((was + 20) as i32) << 3) | bits);
+    }
+    // And about how long it may run: it may lower its limit, it may not
+    // raise it again, the soft limit may go up to the hard one, and asked,
+    // it says what they are.
+    if quark_rt::args::argv(1) == Some(&b"limit"[..]) {
+        let mut bits = 0;
+        if syscall::sys_cpu_limit(50, 100).is_ok() {
+            bits |= 1;
+        }
+        if syscall::sys_cpu_limit(50, 200).is_err() {
+            bits |= 2;
+        }
+        if syscall::sys_cpu_limit(100, 100).is_ok() {
+            bits |= 4;
+        }
+        if syscall::sys_cpu_limit_get() == (100, 100) {
+            bits |= 8;
+        }
+        syscall::sys_exit_code(bits);
+    }
+    // Limited to so many seconds of processor time, soft and hard, and then
+    // computing for four: 0 if nothing ended it.
+    if quark_rt::args::argv(1) == Some(&b"cpu"[..]) {
+        let (soft, hard) = (seconds(quark_rt::args::argv(2)), seconds(quark_rt::args::argv(3)));
+        if syscall::sys_cpu_limit(soft, hard).is_err() {
+            syscall::sys_exit_code(9);
+        }
+        compute_for(4_000_000_000);
+        syscall::sys_exit_code(0);
     }
     if quark_rt::args::argv(1) == Some(&b"crashed"[..]) {
         crashed(

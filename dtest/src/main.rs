@@ -7196,6 +7196,264 @@ fn timed(tries: usize, soon: u64, wait: impl Fn()) -> (u64, usize) {
 /// was asked to. The clock is the processor's counter where the kernel can
 /// keep time by it, and the count of ticks where it cannot; what is asked of
 /// the first is not asked of the second.
+/// What each of `test_usage`'s threads found it had used, and how long by
+/// the clock it took to.
+static mut PROBED: [syscall::Usage; 3] = [syscall::Usage { user_ns: 0, system_ns: 0, voluntary: 0, involuntary: 0 }; 3];
+static PROBE_WALL: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+const PROBE_FOR: u64 = 200_000_000;
+
+fn probed(which: usize, began: u64) -> ! {
+    let used = syscall::sys_usage(syscall::USAGE_TASK).unwrap_or_default();
+    PROBE_WALL[which].store(syscall::sys_clock() - began, core::sync::atomic::Ordering::Relaxed);
+    unsafe { PROBED[which] = used };
+    syscall::sys_exit_code(0);
+}
+
+/// Compute for a while, looking at the clock only now and then.
+extern "C" fn probe_computes() -> ! {
+    let began = syscall::sys_clock();
+    let mut x = 1u64;
+    while syscall::sys_clock() < began + PROBE_FOR {
+        for _ in 0..100_000 {
+            x = core::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+        }
+    }
+    probed(0, began)
+}
+
+/// Look at the clock for a while, and do nothing else.
+extern "C" fn probe_calls() -> ! {
+    let began = syscall::sys_clock();
+    while syscall::sys_clock() < began + PROBE_FOR {}
+    probed(1, began)
+}
+
+/// Compute, then look at the clock, twenty times over, asking what this
+/// task has used after each: whether either part ever went back. Each turn
+/// is a tick and a half long, so that some catch two ticks and some one —
+/// the noise in counting by ticks that dividing the time by them, alone,
+/// turns into a part that shrinks.
+static PROBE_WENT_BACK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn probe_alternates() -> ! {
+    let mut last = syscall::Usage::default();
+    for round in 0..40 {
+        let began = syscall::sys_clock();
+        if round % 2 == 0 {
+            let mut x = 1u64;
+            while syscall::sys_clock() < began + 15_000_000 {
+                for _ in 0..20_000 {
+                    x = core::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+                }
+            }
+        } else {
+            while syscall::sys_clock() < began + 15_000_000 {}
+        }
+        let now = syscall::sys_usage(syscall::USAGE_TASK).unwrap_or_default();
+        if now.user_ns < last.user_ns || now.system_ns < last.system_ns {
+            PROBE_WENT_BACK.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        last = now;
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// What `probe_hogs` has counted to, and when it is to stop.
+static HOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HOG_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Count, as fast as it can, until told to stop.
+extern "C" fn probe_hogs() -> ! {
+    use core::sync::atomic::Ordering;
+    while !HOG_STOP.load(Ordering::Relaxed) {
+        HOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// Sleep twenty times.
+extern "C" fn probe_sleeps() -> ! {
+    let began = syscall::sys_clock();
+    for _ in 0..20 {
+        syscall::sleep_ns(1_000_000);
+    }
+    probed(2, began)
+}
+
+fn test_usage() {
+    use core::sync::atomic::Ordering;
+    const MS: u64 = 1_000_000;
+    println!("what a program uses:");
+    let run = |child: Option<spawn::Spawned>| {
+        child.and_then(|c| {
+            let tid = c.tid;
+            c.start().ok()?;
+            wait_for(tid)
+        })
+    };
+
+    let before = syscall::sys_usage(syscall::USAGE_PROGRAM).unwrap_or_default();
+    for probe in [probe_computes as extern "C" fn() -> !, probe_calls, probe_sleeps] {
+        if let Ok(t) = thread::spawn_with_stack(probe, 8) {
+            t.join();
+        }
+    }
+    let after = syscall::sys_usage(syscall::USAGE_PROGRAM).unwrap_or_default();
+    let [computes, calls, sleeps] = unsafe { PROBED };
+    let wall = |which: usize| PROBE_WALL[which].load(Ordering::Relaxed);
+    println!(
+        "        computing: {} ms in the program, {} in the kernel; calling: {} and {}",
+        computes.user_ns / MS,
+        computes.system_ns / MS,
+        calls.user_ns / MS,
+        calls.system_ns / MS
+    );
+    check(
+        "a thread that computes is said to have, and for no longer than it took",
+        computes.total_ns() >= PROBE_FOR / 2 && computes.total_ns() <= wall(0) + MS,
+    );
+    check("nearly all of it in the program", computes.user_ns >= 4 * computes.system_ns);
+    check(
+        "one that makes calls is said to spend time in the kernel",
+        calls.total_ns() >= PROBE_FOR / 2 && calls.system_ns * 5 >= calls.total_ns(),
+    );
+    check(
+        "one that sleeps gives the processor up, and uses little of it",
+        sleeps.voluntary >= 10 && sleeps.total_ns() < wall(2) / 2,
+    );
+    check(
+        "what its threads used is the program's, and neither part went back",
+        after.total_ns() - before.total_ns() >= computes.total_ns() + calls.total_ns() + sleeps.total_ns()
+            && after.user_ns >= before.user_ns
+            && after.system_ns >= before.system_ns,
+    );
+    let alternated = thread::spawn_with_stack(probe_alternates, 8).map(|t| t.join()).is_ok();
+    check(
+        "a task that computes and calls by turns is never said to have done less of either",
+        alternated && !PROBE_WENT_BACK.load(Ordering::Relaxed),
+    );
+
+    // A thread that has had a while to run against one that has been asleep:
+    // the one that slept has run less, and is chosen whenever both are
+    // ready, but when it yields the other goes first. On one processor that
+    // is the only way the other runs at all.
+    HOG_STOP.store(false, Ordering::Relaxed);
+    let hog = thread::spawn_with_stack(probe_hogs, 8);
+    syscall::sleep_ns(100 * MS);
+    let counted = HOG_COUNT.load(Ordering::Relaxed);
+    syscall::sys_yield();
+    let passed = HOG_COUNT.load(Ordering::Relaxed) > counted;
+    HOG_STOP.store(true, Ordering::Relaxed);
+    let hogged = hog.map(|t| t.join()).is_ok();
+    check("a task that yields lets another of its band go first", hogged && passed);
+
+    let children = syscall::sys_usage(syscall::USAGE_CHILDREN).unwrap_or_default();
+    let ended = run(load_child(&[b"dchild", b"compute", b"300"]));
+    let grew = syscall::sys_usage(syscall::USAGE_CHILDREN)
+        .unwrap_or_default()
+        .total_ns()
+        .saturating_sub(children.total_ns());
+    check(
+        "what a child used is its parent's children's once it is collected",
+        ended == Some(0) && grew >= 300 * MS && grew < 600 * MS,
+    );
+
+    check("a program says how nice it is", syscall::sys_nice(0, None) == Ok(0));
+    check(
+        "and may be nicer",
+        syscall::sys_nice(0, Some(2)) == Ok(0) && syscall::sys_nice(0, None) == Ok(2),
+    );
+    check(
+        "what it starts is as nice, may be nicer, and without TaskMgmt no less nice again",
+        run(load_child(&[b"dchild", b"nice"])) == Some((22 << 3) | 7),
+    );
+    check("with TaskMgmt a program may be less nice", syscall::sys_nice(0, Some(0)) == Ok(2));
+
+    // As many programs that compute for ever as there are processors, and
+    // as many again that are nicer, in the same band; and a moment for all
+    // of them to be under way before the clock starts.
+    let cpus = syscall::sys_cpus().0.clamp(1, 16);
+    let mut kids = [(0usize, false, 0u64); 32];
+    let mut n = 0;
+    for i in 0..2 * cpus {
+        let nicer = i % 2 == 1;
+        if let Some(c) = load_child(&[b"dchild", b"busy", if nicer { b"10" } else { b"0" }]) {
+            if c.start().is_ok() {
+                kids[n] = (c.tid, nicer, 0);
+                n += 1;
+            }
+        }
+    }
+    syscall::sleep_ns(100 * MS);
+    let ran = |tid: usize| syscall::sys_usage_of(tid).map_or(0, |u| u.total_ns());
+    for kid in kids[..n].iter_mut() {
+        kid.2 = ran(kid.0);
+    }
+    syscall::sleep_ns(600 * MS);
+    let (mut plain, mut nicer) = (0u64, 0u64);
+    for &(tid, nice, began) in &kids[..n] {
+        let it = ran(tid).saturating_sub(began);
+        if nice {
+            nicer += it;
+        } else {
+            plain += it;
+        }
+    }
+    for &(tid, _, _) in &kids[..n] {
+        let _ = syscall::sys_task_kill(tid);
+        let _ = wait_for(tid);
+    }
+    println!("        in 600 ms on {} processors: nice 0 ran {} ms, nice 10 {} ms", cpus, plain / MS, nicer / MS);
+    check("anybody may ask what a program has used", plain > 0 && nicer > 0);
+    // By weight, as on Linux: about nine to one.
+    check("a nicer program has less of its band, on any number of processors", n == 2 * cpus && plain > 4 * nicer);
+
+    // As many programs computing as there are processors, for a second, and
+    // then one more. The newcomer has run nothing, but is not owed the
+    // second it was not there: everybody goes on having a share.
+    let mut old = [(0usize, 0u64); 16];
+    let mut m = 0;
+    for _ in 0..cpus {
+        if let Some(c) = load_child(&[b"dchild", b"busy", b"0"]) {
+            if c.start().is_ok() {
+                old[m] = (c.tid, 0);
+                m += 1;
+            }
+        }
+    }
+    syscall::sleep_ns(1000 * MS);
+    let late = load_child(&[b"dchild", b"busy", b"0"]).and_then(|c| {
+        let tid = c.tid;
+        c.start().ok().map(|_| tid)
+    });
+    for o in old[..m].iter_mut() {
+        o.1 = ran(o.0);
+    }
+    syscall::sleep_ns(500 * MS);
+    let least = old[..m].iter().map(|&(tid, began)| ran(tid).saturating_sub(began)).min().unwrap_or(0);
+    for &(tid, _) in old[..m].iter().chain(late.map(|t| (t, 0)).iter()) {
+        let _ = syscall::sys_task_kill(tid);
+        let _ = wait_for(tid);
+    }
+    check(
+        "a program just started is not owed the time it was not there",
+        m == cpus && late.is_some() && least >= 100 * MS,
+    );
+
+    check(
+        "a program may lower its limit, and without TaskMgmt not raise it again",
+        run(load_child(&[b"dchild", b"limit"])) == Some(15),
+    );
+    check(
+        "past its soft limit SIGXCPU ends a program that has said nothing",
+        run(load_child(&[b"dchild", b"cpu", b"1", b"-"])) == Some(-24),
+    );
+    check(
+        "and at its hard limit it is ended",
+        run(load_child(&[b"dchild", b"cpu", b"1", b"1"])) == Some(-9),
+    );
+}
+
 fn test_clock() {
     use core::sync::atomic::Ordering;
     use syscall::{ns, TICK_NS};
@@ -7619,6 +7877,7 @@ pub extern "C" fn _start() -> ! {
         ("fork", test_fork),
         ("pressure", test_pressure),
         ("handlers", test_handlers),
+        ("usage", test_usage),
         ("smp", test_smp),
     ];
     let only = quark_rt::args::argv(1);
