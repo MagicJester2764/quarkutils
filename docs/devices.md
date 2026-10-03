@@ -56,9 +56,10 @@ so a driver started some other way holds no device, and says so.
   running before there is a filesystem to read one from. `init` reads each
   program in the boot image, and one whose manifest says it drives something
   is offered to the device manager rather than started: lent with the call
-  (`TAG_OFFER`). The disks' drivers are, `DISK` and `VIRTBLK`, since a
-  root can be on either; and the network cards', `RTL8139` and `VIRTNET`,
-  so that the network is up before anybody is asked to log in.
+  (`TAG_OFFER`). The disks' drivers are, `DISK`, `AHCI` and `VIRTBLK`,
+  since a root can be on any of them; and the network cards', `RTL8139`
+  and `VIRTNET`, so that the network is up before anybody is asked to log
+  in.
 - **`/usr/lib/drivers`**, for everything else. When `init` has a root it
   tells the device manager so (`TAG_FILES`), before anything in
   `/etc/init.conf` runs, and the device manager reads every file there. A

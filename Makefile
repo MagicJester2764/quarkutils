@@ -44,8 +44,8 @@ REQUIRE_ABI ?=
 # directory is also the crate and the binary.
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
-                 auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK rtl8139:RTL8139 \
-                 virtnet:VIRTNET
+                 auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK ahci:AHCI \
+                 rtl8139:RTL8139 virtnet:VIRTNET
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \

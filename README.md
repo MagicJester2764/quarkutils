@@ -30,6 +30,8 @@ keyboard/           The i8042: keyboard and PS/2 mouse, one driver for both.
 disk/               ATA PIO, for an IDE controller: `disk0`, the whole disk and
                     each partition as a volume.
 virtblk/            A virtio disk, the same way.
+ahci/               A SATA disk on an AHCI controller, likewise: what the
+                    q35 machine has, and nearly every PC since SATA.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.

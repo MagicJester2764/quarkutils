@@ -318,7 +318,7 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   reach, at the same addresses — a ring in anonymous memory, or a page of
   somebody else's, is a write that never arrives, and a line on the serial
   console saying so — and a device nobody has claimed reaches nothing at
-  all. `rtl8139`, `virtnet`, `virtblk` and `edu` claim theirs. A driver
+  all. `rtl8139`, `virtnet`, `virtblk`, `ahci` and `edu` claim theirs. A driver
   can claim only the device it holds, and there is one driver for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
@@ -921,7 +921,8 @@ from that volume's start; the driver refuses what is past its end. So a
 client given a partition cannot reach outside it and does not know where it
 is. Each disk's driver registers as the first of `disk0` to `disk3` that
 nobody has (`block::register_disk`): `disk` for an IDE controller's first
-channel, `virtblk` for a virtio disk.
+channel, `ahci` for the first disk on an AHCI controller, `virtblk` for a
+virtio disk.
 
 - **The protocol is one module, for both ends.** `block::serve` is the
   driver's half — volumes, claims, the partition table — and a driver
