@@ -40,3 +40,4 @@ watchtest
 clocktest
 avxtest
 handlertest
+usagetest
