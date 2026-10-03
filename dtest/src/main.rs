@@ -2396,11 +2396,9 @@ fn test_lent_buffers() {
         return;
     };
     let t = t.tid();
-    // The thread may call this task: an Endpoint to it, from its creator.
-    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0)
-        .is_ok()
-        && syscall::sys_cap_grant_any(t, syscall::SLOT_SCRATCH).is_ok();
-    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    // The thread may call this task: an Endpoint to it, which the thread
+    // holds because its program does, and for as long as it does.
+    let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok();
     check("let the thread call us", granted);
     LEND_GO.release();
 
@@ -2435,6 +2433,7 @@ fn test_lent_buffers() {
     let _ = syscall::sys_reply(t, &Message::empty());
 
     let _ = wait_for(t);
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
     let results = LEND_RESULTS.load(core::sync::atomic::Ordering::SeqCst);
     check("both lending calls were answered", results & 3 == 3);
     check("an unwritable buffer cannot be lent for writing", results & 4 != 0);
@@ -2457,10 +2456,6 @@ const STORM_SLOT: usize = 46;
 const INIT_TID: usize = 1;
 /// The capability type that named a set of TIDs, withdrawn at ABI 2.0.
 const WITHDRAWN_ENDPOINT_SET: u64 = 7;
-/// The offering thread's own slots.
-const OFFER_SLOT: usize = 8;
-const HOLDER_SLOT: usize = 9;
-const FOREIGN_SLOT: usize = 10;
 
 fn mint_endpoint(slot: usize, tid: usize) -> bool {
     syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0).is_ok()
@@ -2492,38 +2487,6 @@ fn call_tag(tid: usize) -> Option<u64> {
     }
 }
 
-static OFFER_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static OFFER_GO: sync::Semaphore = sync::Semaphore::new(0);
-/// What the offering thread saw. Bit 0: holding a capability to main, it could
-/// mint another. 1: its offering call was answered. 2: it could not mint one
-/// to init, which it neither is, made, nor holds one for.
-static OFFER_RESULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// The client half of the offer checks: offers main a capability naming
-/// itself, with a call.
-extern "C" fn offerer() -> ! {
-    use quark_rt::ipc::Message;
-    // Not until main has given this thread the right to call it.
-    OFFER_GO.acquire();
-    let main = OFFER_TO.load(core::sync::atomic::Ordering::SeqCst);
-    let me = syscall::sys_getpid() as usize;
-    let mut results = 0;
-    if mint_endpoint(HOLDER_SLOT, main) {
-        results |= 1;
-    }
-    let ask = Message { sender: 0, tag: 1, data: [0; 6] };
-    let mut reply = Message::empty();
-    if mint_endpoint(OFFER_SLOT, me)
-        && syscall::sys_call_offer(main, &ask, &mut reply, OFFER_SLOT).is_ok()
-    {
-        results |= 2;
-    }
-    if !mint_endpoint(FOREIGN_SLOT, INIT_TID) {
-        results |= 4;
-    }
-    OFFER_RESULTS.store(results, core::sync::atomic::Ordering::SeqCst);
-    syscall::sys_exit_code(0);
-}
 
 fn test_endpoint_objects() {
     use quark_rt::ipc::Message;
@@ -2589,18 +2552,17 @@ fn test_endpoint_objects() {
     check("the fresh one reaches the child", call_tag(b.tid) == Some(42));
     let _ = wait_for(b.tid);
 
-    // Offers: a capability travels with a call, and the task called takes it.
-    OFFER_TO.store(me, core::sync::atomic::Ordering::SeqCst);
-    let Ok(t) = thread::spawn_with_stack(offerer, 8) else {
-        check("start a thread to offer us a capability", false);
+    // Offers: a capability travels with a call, and the program called takes
+    // it. From a program of its own (`dchild offer`): a thread's capabilities
+    // are its program's, and an offer between two of them is no offer.
+    let mut text = [0u8; 20];
+    let Some(offerer) = load_child(&[b"dchild", b"offer", decimal(me, &mut text)]) else {
+        check("start a child to offer us a capability", false);
         return;
     };
-    let t = t.tid();
-    check(
-        "let the thread call us",
-        syscall::sys_cap_grant_any(t, SELF_SLOT).is_ok(),
-    );
-    OFFER_GO.release();
+    let t = offerer.tid;
+    check("let the child call us", syscall::sys_cap_grant(t, SELF_SLOT, 20).is_ok());
+    let _ = offerer.start();
     let mut msg = Message::empty();
     let arrived = syscall::sys_recv_timeout(t, &mut msg, 100).is_ok() && msg.tag == 1;
     check("the offering call arrives", arrived);
@@ -2608,7 +2570,7 @@ fn test_endpoint_objects() {
         let taken = syscall::sys_cap_take_any(t);
         check("take what was offered", taken.is_ok_and(|s| s >= 16));
         let taken = taken.unwrap_or(0);
-        check("a creator may mint a capability to its thread", mint_endpoint(THREAD_SLOT, t));
+        check("a creator may mint a capability to its child", mint_endpoint(THREAD_SLOT, t));
         let number = |slot| syscall::sys_cap_read(me, slot).map(|c| (c.cap_type, c.param0));
         check(
             "and what was taken names the same task",
@@ -2622,11 +2584,10 @@ fn test_endpoint_objects() {
         let _ = syscall::sys_cap_delete(taken);
         let _ = syscall::sys_reply(t, &Message::empty());
     }
-    let _ = wait_for(t);
-    let results = OFFER_RESULTS.load(core::sync::atomic::Ordering::SeqCst);
+    let results = wait_for(t).unwrap_or(0);
     check("a holder may mint another", results & 1 != 0);
     check("the offering call was answered", results & 2 != 0);
-    check("a thread cannot mint one to a stranger", results & 4 != 0);
+    check("a program cannot mint one to a stranger", results & 4 != 0);
 
     for slot in SELF_SLOT..=EMPTY_SLOT {
         let _ = syscall::sys_cap_delete(slot);
@@ -6023,9 +5984,9 @@ fn test_fork() {
     match thread::spawn_with_stack(fork_lender, 8) {
         Ok(t) => {
             let t = t.tid();
-            let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok()
-                && syscall::sys_cap_grant_any(t, syscall::SLOT_SCRATCH).is_ok();
-            let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+            // An Endpoint to this task, which the thread holds as its program
+            // does, until the thread is done.
+            let granted = syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok();
             FORK_LEND_GO.release();
             let mut msg = Message::empty();
             let arrived = granted && syscall::sys_recv(t, &mut msg).is_ok() && msg.tag == 1;
@@ -6036,6 +5997,7 @@ fn test_fork() {
             );
             let _ = syscall::sys_reply(t, &Message::empty());
             let _ = wait_for(t);
+            let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
             check(
                 "and it is the lender's page that is written",
                 FORK_LENT.load(Ordering::SeqCst) == 1
@@ -7528,6 +7490,76 @@ fn test_threads() {
         matches!(late, Some((Err(()), waited)) if (5..18).contains(&waited)),
     );
     check("and joins it through the word like any other", word_cleared());
+
+    // One capability space for a program, as it has one descriptor table: a
+    // thread holds what its program is given after it started, and the
+    // program what a thread is given. It used to be a copy, as it stood.
+    println!("a program's threads hold its capabilities:");
+    let me = syscall::sys_getpid() as usize;
+    for slot in [SHARED_SLOT, SHARED_SLOT_2] {
+        let _ = syscall::sys_cap_delete(slot);
+    }
+    match thread::spawn_with_stack(holds_with, 4) {
+        Ok(t) => {
+            let given = mint_endpoint(SHARED_SLOT, me);
+            CAPS_GO.release();
+            CAPS_DONE.acquire();
+            check(
+                "a thread holds what its program is given after it started",
+                given && CAPS_SEEN.load(Ordering::SeqCst) == syscall::CAP_TYPE_ENDPOINT,
+            );
+            check(
+                "and the program holds what a thread is given",
+                syscall::sys_cap_read(me, SHARED_SLOT_2).is_ok_and(|c| c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.valid),
+            );
+            let _ = syscall::sys_cap_delete(SHARED_SLOT_2);
+            CAPS_GO.release();
+            CAPS_DONE.acquire();
+            check("and what one deletes is gone for the other", CAPS_SEEN.load(Ordering::SeqCst) == 0);
+            let _ = syscall::sys_wait_for(t.tid());
+        }
+        Err(()) => check("start a thread", false),
+    }
+    match syscall::sys_fork() {
+        Ok(0) => {
+            syscall::sleep_ticks(10);
+            let has = syscall::sys_cap_read(syscall::sys_getpid() as usize, SHARED_SLOT_2).map_or(0, |c| c.cap_type);
+            syscall::sys_exit_program(if has == 0 { 7 } else { 8 });
+        }
+        Ok(child) => {
+            let given = mint_endpoint(SHARED_SLOT_2, me);
+            check(
+                "a forked child holds a copy, and not what its parent is given afterwards",
+                given && wait_for(child) == Some(7),
+            );
+        }
+        Err(()) => check("fork", false),
+    }
+    for slot in [SHARED_SLOT, SHARED_SLOT_2] {
+        let _ = syscall::sys_cap_delete(slot);
+    }
+}
+
+const SHARED_SLOT: usize = 47;
+const SHARED_SLOT_2: usize = 48;
+static CAPS_GO: sync::Semaphore = sync::Semaphore::new(0);
+static CAPS_DONE: sync::Semaphore = sync::Semaphore::new(0);
+/// What the thread found in `SHARED_SLOT`, as a capability's type.
+static CAPS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Looks at a slot of its program's after it started, and puts something in
+/// another; then looks again, when told.
+extern "C" fn holds_with() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let me = syscall::sys_getpid() as usize;
+    CAPS_GO.acquire();
+    CAPS_SEEN.store(syscall::sys_cap_read(me, SHARED_SLOT).map_or(u64::MAX, |c| c.cap_type), SeqCst);
+    let _ = mint_endpoint(SHARED_SLOT_2, me);
+    CAPS_DONE.release();
+    CAPS_GO.acquire();
+    CAPS_SEEN.store(syscall::sys_cap_read(me, SHARED_SLOT_2).map_or(u64::MAX, |c| c.cap_type), SeqCst);
+    CAPS_DONE.release();
+    syscall::sys_exit_code(0);
 }
 
 #[unsafe(no_mangle)]

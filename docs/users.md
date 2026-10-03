@@ -249,8 +249,6 @@ password. The C tests `idtest` and `crypttest` are the C library's side.
 - **One id.** A task has one user, not Unix's three. The real and effective
   ids are always equal; `seteuid` changes who the task *is*, and what keeps
   the way back is the capability, not a saved id.
-- **A thread has a copy of its program's capabilities**, so a threaded C
-  program that drops `SetUid` drops it in the thread that asked.
 - **A right taken away is not taken from a session that has it.**
 - **No list of commands a user may run as another**: `become` is all or
   nothing. The server would have to load the program itself to know what it

@@ -1085,6 +1085,12 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"serve"[..]) {
         serve_once();
     }
+    if quark_rt::args::argv(1) == Some(&b"offer"[..]) {
+        let main = quark_rt::args::argv(2).map_or(0, |n| {
+            n.iter().fold(0usize, |acc, &d| acc * 10 + (d.wrapping_sub(b'0') as usize % 10))
+        });
+        syscall::sys_exit_code(offer(main) as i32);
+    }
     if quark_rt::args::argv(1) == Some(&b"register"[..]) {
         let name = quark_rt::args::argv(2).unwrap_or(b"");
         if nameserver::register(name).is_err() {
@@ -1424,4 +1430,31 @@ fn behind() -> u32 {
     }
     let _ = syscall::sys_fd_write(CONN, &[went as u8, (went >> 8) as u8]);
     went
+}
+
+/// The client half of dtest's offer checks: offers `main`, its parent, a
+/// capability naming itself, with a call. The parent put a capability to
+/// itself in slot 20 before starting this. What it saw, as bits: 1, holding
+/// one to `main` it could mint another; 2, its offering call was answered;
+/// 4, it could not mint one to init, which it neither is, made, nor holds
+/// one for.
+fn offer(main: usize) -> u32 {
+    const HOLDER: usize = 21;
+    const OFFERED: usize = 22;
+    const FOREIGN: usize = 23;
+    let mint = |slot: usize, tid: usize| syscall::sys_cap_mint(slot, syscall::CAP_TYPE_ENDPOINT, tid as u64, 0).is_ok();
+    let me = syscall::sys_getpid() as usize;
+    let mut results = 0;
+    if mint(HOLDER, main) {
+        results |= 1;
+    }
+    let ask = Message { sender: 0, tag: 1, data: [0; 6] };
+    let mut reply = Message::empty();
+    if mint(OFFERED, me) && syscall::sys_call_offer(main, &ask, &mut reply, OFFERED).is_ok() {
+        results |= 2;
+    }
+    if !mint(FOREIGN, 1) {
+        results |= 4;
+    }
+    results
 }
