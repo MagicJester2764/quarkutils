@@ -175,7 +175,8 @@ What is different:
 - **`siginfo_t` says who sent a signal by process id and nothing more**:
   `si_uid` is 0, and for `SIGCHLD` there is no `si_status`.
 - The interval timers that count time spent running (`ITIMER_VIRTUAL`,
-  `ITIMER_PROF`) are refused, since nothing measures it; `timer_create` is
+  `ITIMER_PROF`) are refused: the time is measured (`getrusage`, below) and
+  limited (`RLIMIT_CPU`), but nothing counts it down. `timer_create` is
   `ENOSYS`, and the programs that try it first fall back to `setitimer`.
 
 ## Job control
