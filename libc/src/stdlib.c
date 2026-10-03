@@ -30,7 +30,9 @@ struct header {
 int errno;
 
 static struct header *free_list;
-static unsigned long heap_top = HEAP_START;
+/* Where to look next; nought until the heap first grows, when it starts a
+   random number of pages into the first half of its range. */
+static unsigned long heap_top;
 
 #define ALIGN 16
 #define HDR sizeof(struct header)
@@ -47,6 +49,11 @@ static size_t round_up(size_t v, size_t a) {
 static int grow(size_t bytes) {
     size_t size = round_up(bytes, PAGE_SIZE);
     unsigned long pages = size / PAGE_SIZE;
+    if (heap_top == 0) {
+        unsigned long chance = 0;
+        __syscall2(SYS_GETRANDOM, (unsigned long)&chance, sizeof chance);
+        heap_top = HEAP_START + chance % ((HEAP_LIMIT - HEAP_START) / 2 / PAGE_SIZE) * PAGE_SIZE;
+    }
     unsigned long at = heap_top;
 
     while (__syscall2(SYS_MMAP, at, pages) == QUARK_ERR) {

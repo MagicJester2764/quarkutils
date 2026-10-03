@@ -62,6 +62,10 @@ void __quark_lock(int *lock);
 void __quark_unlock(int *lock);
 void __quark_locks_forked(void);
 void __quark_arena_forked(void);
+/* A number of pages from nought to `window`, at random: how far into its
+   window a place in the address space is put, so that where one run of a
+   program put a thing says nothing about where the next does. */
+unsigned long __quark_random_pages(unsigned long window);
 
 /* A terminal by its name, for a `stat` and for `ttyname`: in pty.c. */
 long __quark_pty_slave_number(long fd);

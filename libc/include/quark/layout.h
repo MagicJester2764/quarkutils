@@ -25,9 +25,11 @@
 #define QUARK_MAX_PHDRS 16
 #define QUARK_PHDR_SIZE 56
 #define QUARK_PHDRS_AT (4096 - 16 - QUARK_MAX_PHDRS * QUARK_PHDR_SIZE)
-/* The top of the user stack, which a program is started with. Mirrors
-   quark_rt::spawn::STACK_TOP: the last page of PML4[255], which is the last
-   page of user space. */
+/* The highest a program's stack may reach, which it is started below: where
+   in the two gigabytes under this its stack ends is chosen at random, by
+   whoever builds the program (quark_rt::spawn, which this mirrors, and
+   execve). The last page of PML4[255], which is the last page of user
+   space. */
 #define QUARK_STACK_TOP 0x7FFFFFFFF000UL
 /* One past the last user address: PML4[256] and above is the kernel's. */
 #define QUARK_USER_END 0x800000000000UL
@@ -40,9 +42,10 @@
 #define QUARK_STAGE_STACK 0x150000000000UL
 #define QUARK_STAGE_ARGS  0x160000000000UL
 
-/* Where malloc looks for pages. Deliberately not the Rust runtime's
-   0x90_0000_0000: a program links one or the other, and picking the same
-   address would turn a mistake into a confusing failure. */
+/* Where malloc looks for pages — a random number of pages into the first
+   half of this, chosen when it first looks. Deliberately not the Rust
+   runtime's 0x90_0000_0000: a program links one or the other, and picking the
+   same address would turn a mistake into a confusing failure. */
 #define QUARK_HEAP_START 0x9800000000UL
 #define QUARK_HEAP_LIMIT 0xA000000000UL
 

@@ -396,9 +396,11 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
         }
         given = segs[i].end;
     }
+    /* Where the new program's stack ends: a random number of pages into the
+       two gigabytes below the highest it may reach. */
+    unsigned long stack_top = QUARK_STACK_TOP - __quark_random_pages(1UL << 19) * PAGE_SIZE;
     if (ok) {
-        ok = give(cr3, QUARK_STACK_TOP - STACK_PAGES * PAGE_SIZE, STAGE_STACK,
-                  STACK_PAGES, 1);
+        ok = give(cr3, stack_top - STACK_PAGES * PAGE_SIZE, STAGE_STACK, STACK_PAGES, 1);
     }
     if (ok) {
         ok = give(cr3, QUARK_ARGS_PAGE, STAGE_ARGS, 1, 0);
@@ -413,7 +415,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* The last call this program makes. Everything above it was preparation
        that could fail and leave the caller as it was; this does not return. */
-    __syscall3(SYS_EXEC_SPACE, cr3, eh.e_entry, QUARK_STACK_TOP);
+    __syscall3(SYS_EXEC_SPACE, cr3, eh.e_entry, stack_top);
     /* Only reached if the kernel refused, which means the space is not the
        caller's or has a task in it — neither of which can be true here. */
     __syscall1(SYS_ADDRSPACE_DESTROY, cr3);

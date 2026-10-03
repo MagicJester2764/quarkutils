@@ -337,6 +337,16 @@ in the C library chooses a routine by what the processor has, musl having
 no such mechanism for a static program; a library that does its own
 choosing (pixman, zlib-ng) finds them.
 
+## Where things are
+
+A program's stack, what `malloc` gives and what `mmap` gives with no
+address asked for are each somewhere else every time the program runs: a
+random number of pages into a window of their own, chosen by `execve` for
+the stack and by the C layer, the first time it is wanted, for the rest. A
+forked child is in its parent's places. A program's code is where it was
+linked: nothing is built to be loaded anywhere (PIE), and `dlopen` has
+nothing to load.
+
 ## What is refused
 
 A call the layer has no answer for returns `ENOSYS`, on purpose: a C library
