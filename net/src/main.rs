@@ -81,6 +81,10 @@ fn pci_write32(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
     syscall::sys_ioport_write32(PCI_CONFIG_DATA, value);
 }
 
+/// The card, if the machine has one: its ports and its line. It is this
+/// program's from here on (`sys_device_claim`), and on a machine with an
+/// IOMMU it reaches the rings and buffers this asks the kernel for and
+/// nothing else.
 fn pci_find_rtl8139() -> Option<(u16, u8)> {
     for bus in 0..8u8 {
         for device in 0..32u8 {
@@ -92,6 +96,10 @@ fn pci_find_rtl8139() -> Option<(u16, u8)> {
                 let irq_reg = pci_read32(bus, device, 0, 0x3C);
                 let irq_line = (irq_reg & 0xFF) as u8;
                 let io_base = (bar0 & 0xFFFC) as u16;
+                if syscall::sys_device_claim(syscall::pci_device(bus, device, 0)).is_err() {
+                    println!("[net] the card is another program's.");
+                    return None;
+                }
 
                 // Enable bus mastering (PCI command register bit 2)
                 let cmd = pci_read32(bus, device, 0, 0x04);
