@@ -92,7 +92,10 @@ const TARGETS: &[Target] = &[
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 0xFFFF_0008, 0xFFFF_0009, 0xFFFF_000A,
         ],
     },
-    Target { name: b"fb", kind: Kind::Fb, tags: &[0, 1, 2, 3, 100, 0x100, 0x101] },
+    // 5 and 6 are a display's driver's, and refused from this. Not 7: it is
+    // asked by whoever has the display, which this may be, having claimed it
+    // — and a size it asked for would be given.
+    Target { name: b"fb", kind: Kind::Fb, tags: &[0, 1, 2, 3, 5, 6, 100, 0x100, 0x101] },
     Target { name: b"console", kind: Kind::Console, tags: &[0, 1, 2, 0x100, 0x101] },
     Target {
         name: b"input",

@@ -72,6 +72,15 @@ pub fn move_by(dx: i32, dy: i32) {
     }
 }
 
+/// The screen is another size: the pointer stays on it.
+pub fn keep_on_screen() {
+    let s = unsafe { &SCREEN };
+    unsafe {
+        X = X.min(s.width.saturating_sub(1));
+        Y = Y.min(s.height.saturating_sub(1));
+    }
+}
+
 fn clamp(v: i32, limit: usize) -> usize {
     if v < 0 {
         0

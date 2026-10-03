@@ -80,6 +80,21 @@ fn ask(manager: usize, tag: u64, data: [u64; 6]) -> Option<[u64; 6]> {
     (syscall::sys_call(manager, &msg, &mut reply).is_ok() && reply.tag == 0).then_some(reply.data)
 }
 
+/// Whether the device manager says task `tid`'s program is a driver it
+/// started: what a server asks of a caller before it takes keys or a screen
+/// from it, while the caller waits on the call that offered them. A second
+/// at most: a device manager busy starting drivers is not one that said yes.
+pub fn vouches_for(tid: usize) -> bool {
+    let Some(manager) = crate::nameserver::lookup(NAME) else { return false };
+    let space = syscall::sys_task_space(tid).unwrap_or(0);
+    let msg = Message { sender: 0, tag: TAG_IS_DRIVER, data: [space, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    space != 0
+        && matches!(syscall::sys_call_timeout(manager, &msg, &mut reply, 100), syscall::CallOutcome::Replied)
+        && reply.tag == 0
+        && reply.data[0] == 1
+}
+
 /// The device at `index` in the device manager's list, which is in order of
 /// address; `None` past the last.
 pub fn entry(manager: usize, index: usize) -> Option<Device> {

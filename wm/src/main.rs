@@ -1649,23 +1649,80 @@ fn lose_display() {
     let _ = syscall::sys_cap_delete(FB_LEASE_SLOT);
 }
 
-/// Map the framebuffer again, now that the device has lent it back.
+/// Map the framebuffer again, now that the device has lent it back — in
+/// another size, if the display's driver has changed its mode, and then the
+/// rest is made again in the new shape (`reshape`). A mode of another depth
+/// is one this does not draw in.
 fn regain_display(msg: &Message) -> bool {
+    let w = (msg.data[0] >> 32) as usize;
+    let h = (msg.data[0] & 0xFFFF_FFFF) as usize;
+    let pitch = (msg.data[1] >> 32) as usize;
+    let bpp = (msg.data[1] & 0xFF) as usize;
     let s = unsafe { &SCREEN };
-    let same = (msg.data[0] >> 32) as usize == s.width
-        && (msg.data[0] & 0xFFFF_FFFF) as usize == s.height
-        && (msg.data[1] >> 32) as usize == s.pitch;
-    // The back buffer is the shape of the old mode. The device's mode is the
-    // bootloader's and does not change, so a different one is a device that
-    // cannot be trusted with the screen.
-    if !same {
+    if w == 0 || h == 0 || bpp != s.bpp || pitch < w * (bpp / 8) {
         return false;
     }
-    let pages = (s.pitch * s.height).div_ceil(4096);
+    let pages = (pitch * h).div_ceil(4096);
     if syscall::sys_map_phys(msg.data[3] as usize, FB_VADDR, pages).is_err() {
         return false;
     }
+    if (w, h, pitch) != (s.width, s.height, s.pitch) && !reshape(w, h, pitch) {
+        return false;
+    }
     unsafe { SCREEN.fb = FB_VADDR };
+    true
+}
+
+/// The display is back, another size. The back buffer is made again in its
+/// shape; the pointer and every window are kept where they can be reached,
+/// and a window that filled the screen is asked to fill the new one; and
+/// every client that bound the output is told its new mode. Nothing is
+/// drawn here — the screen is not this program's again until it returns —
+/// and the caller repaints all of it.
+fn reshape(w: usize, h: usize, pitch: usize) -> bool {
+    const MAP_MAX: usize = 256;
+    let old = unsafe { (SCREEN.pitch * SCREEN.height).div_ceil(4096) };
+    let mut done = 0;
+    while done < old {
+        let chunk = (old - done).min(MAP_MAX);
+        let _ = syscall::sys_munmap(BACK_VADDR + done * 4096, chunk);
+        done += chunk;
+    }
+    unsafe { SCREEN.back = 0 };
+    let pages = (pitch * h).div_ceil(4096);
+    let mut done = 0;
+    while done < pages {
+        let chunk = (pages - done).min(MAP_MAX);
+        if syscall::sys_mmap(BACK_VADDR + done * 4096, chunk).is_err() {
+            println!("wm: no memory for a back buffer {}x{}", w, h);
+            return false;
+        }
+        done += chunk;
+    }
+    unsafe {
+        SCREEN.back = BACK_VADDR;
+        SCREEN.width = w;
+        SCREEN.height = h;
+        SCREEN.pitch = pitch;
+    }
+    cursor::keep_on_screen();
+    for idx in 0..MAX_WINDOWS {
+        if !unsafe { WINDOWS[idx].used } {
+            continue;
+        }
+        if unsafe { WINDOWS[idx].maximized } {
+            ask_resize(idx, w.saturating_sub(BORDER * 2), h.saturating_sub(TITLE_H + BORDER * 2), false);
+        } else {
+            let (x, y) = unsafe { (WINDOWS[idx].x, WINDOWS[idx].y) };
+            move_window(idx, x, y);
+        }
+    }
+    for i in 0..client::MAX_CLIENTS {
+        unsafe {
+            let clients = &raw mut CLIENTS;
+            (*clients)[i].output_changed();
+        }
+    }
     true
 }
 

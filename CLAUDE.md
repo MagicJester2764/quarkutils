@@ -770,6 +770,26 @@ Some things to know before changing any of it:
   right to *map*, not mappings that already exist, so the outgoing owner is
   told and answers before the new one is let in — and must empty its
   capability slot, since granting into an occupied one fails.
+- **A display can come from a driver, and then what is drawn is said.** A
+  machine whose only display draws from memory — a virtio GPU — gives the
+  bootloader no framebuffer: `fb` starts with none and the console waits,
+  keeping what is written, until the display's driver (`virtgpu`) offers
+  one. The driver is taken only if the device manager says it started it
+  (`TAG_FB_DRIVER`), and the display it offers (`TAG_FB_DISPLAY`) is a mode
+  and a `PhysRange` over the screen's memory, which the kernel gives the
+  driver (`SYS_DISPLAY_MEMORY`) and keeps for the device: it is lent as the
+  bootloader's framebuffer is. Such a display shows what its driver copies
+  to it and nothing else, so whoever draws says where — the tiles of a
+  grid eight across and seven down that it drew on
+  (`quark_rt::display::drew`), as a notification to `fb`, which passes it
+  to the driver. Seven down because a notification word's bits 16 to 18 are
+  the kernel's task signals, and a word with any of them in it is refused
+  whole: with eight rows, every repaint of the whole screen was. A notification
+  because it never waits: `fb` calls its claimants when the display changes
+  hands, and one that was in a call to `fb` at that moment could answer
+  nothing until the call timed out. `present` in the compositor and the
+  console's every write to the screen say it; something new that draws on
+  the screen says it too, or what it draws is never seen there.
 - **Guard every framebuffer write on still owning the display**, not just the
   flush. The console gated its flush and not `hide_cursor` or `scroll`, and
   carried on writing into memory it had just unmapped.
@@ -919,8 +939,9 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   its structures are named by capabilities of the vendor's kind and mapped
   from its BARs, its queues are pages of the driver's own memory, and its
   interrupt is one MSI-X message, which each queue is told to send, or its
-  line. `virtblk` and `virtnet` are its block and network devices; QEMU's
-  are transitional, and only their modern half is driven.
+  line. `virtblk`, `virtnet` and `virtgpu` are its block device, network
+  card and display; QEMU's first two are transitional, and only their
+  modern half is driven.
 - **A USB controller is one program, and so is everything plugged into
   it** (`usb`, for an xHCI controller). Its first thread has the
   controller: commands, the event ring, giving each device plugged in an
@@ -1331,6 +1352,12 @@ removed.
   USB 3 hub is not driven, and what is behind one is not seen. A keyboard's
   lights are not lit. One program drives a controller and all of it, so a
   fault in one device's handling takes every device on the controller.
+- **A virtio GPU has no cursor plane here.** The compositor draws its
+  pointer into the picture, which works on every display, and on one a
+  driver copies, each move is a region copied. The device could move a
+  cursor of its own, if it were given the image and the positions in a way
+  that never waits — which the damage notification, a word of tile bits,
+  cannot carry.
 - **A seat is nobody's.** `input` and `fb` give the keyboard and the display
   to whoever claims them, which is how `wm` runs; nothing ties a claim to
   the session at the console, so a user's program can take the keyboard out

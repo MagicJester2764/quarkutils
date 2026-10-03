@@ -1073,6 +1073,29 @@ impl Client {
         self.flush();
     }
 
+    /// The output is another size: its mode said again, as it was when it
+    /// was bound, and `done` where the version has it.
+    pub fn output_changed(&mut self) {
+        if self.output == 0 {
+            return;
+        }
+        let id = self.output;
+        let (w, h) = crate::screen_size();
+        if let Some(a) = self.begin(id, proto::OUTPUT_MODE) {
+            self.arg_u32(proto::OUTPUT_MODE_CURRENT | proto::OUTPUT_MODE_PREFERRED);
+            self.arg_u32(w as u32);
+            self.arg_u32(h as u32);
+            self.arg_u32(0);
+            self.end(a);
+        }
+        if self.objects.version_of(id) >= 2 {
+            if let Some(a) = self.begin(id, proto::OUTPUT_DONE) {
+                self.end(a);
+            }
+        }
+        self.flush();
+    }
+
     /// Tell this client which of its surfaces are on the output, and which
     /// have stopped being.
     ///

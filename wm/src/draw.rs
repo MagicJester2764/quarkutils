@@ -149,7 +149,25 @@ pub fn draw_text(x: usize, y: usize, text: &[u8], colour: u32) {
 ///
 /// Everything above drew into the back buffer. This is the only write to the
 /// framebuffer, which is why the cleared backdrop is never what anybody sees.
+/// And so it is the one place that says what was drawn: a display that draws
+/// from memory shows what its driver copies, and the framebuffer device
+/// passes this on to it (`quark_rt::display`).
 pub fn present(region: Rect) {
+    copy_to_screen(region);
+    let s = unsafe { &SCREEN };
+    let fb = unsafe { crate::FB_TID };
+    quark_rt::display::drew(
+        fb,
+        region.x0 as u64,
+        region.y0 as u64,
+        region.x1 as u64,
+        region.y1 as u64,
+        s.width as u64,
+        s.height as u64,
+    );
+}
+
+fn copy_to_screen(region: Rect) {
     let s = unsafe { &SCREEN };
     let bpp = s.bpp / 8;
     let bytes = (region.x1 - region.x0) * bpp;

@@ -310,6 +310,25 @@ impl Device {
         write8(self.common + DEVICE_STATUS, status | FAILED);
     }
 
+    /// Have the device say when its own configuration changes — a display
+    /// whose size the host changed — with the message its queues send:
+    /// whether it will. A device on its line raises it for that anyway.
+    /// The driver asks its configuration what changed, whatever woke it.
+    pub fn hear_changes(&self) -> bool {
+        if !self.table {
+            return true;
+        }
+        write16(self.common + CONFIG_MSIX_VECTOR, 0);
+        read16(self.common + CONFIG_MSIX_VECTOR) == 0
+    }
+
+    /// Write a 32-bit field of the device's own configuration, at `offset`.
+    pub fn set_config32(&self, offset: usize, value: u32) {
+        if self.config != 0 && offset + 4 <= self.config_len {
+            write32(self.config + offset, value);
+        }
+    }
+
     /// A byte of the device's own configuration, at `offset`.
     pub fn config8(&self, offset: usize) -> u8 {
         if self.config == 0 || offset >= self.config_len {

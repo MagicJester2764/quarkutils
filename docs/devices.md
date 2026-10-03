@@ -114,6 +114,14 @@ one MSI-X message (`pci::interrupt`), which each queue is told to send — or,
 with no MSI-X, its line. Only the modern half of a transitional device is
 driven.
 
+A virtio GPU (`virtgpu`) shows a picture the host keeps, copied from memory
+the guest gives it when the guest says. Its driver is given the screen's
+memory by the kernel (`SYS_DISPLAY_MEMORY`: nobody's, kept for the device,
+reached by it), makes the picture from it and shows it, and offers the
+display to `fb`, which lends it out as it does the bootloader's framebuffer;
+what whoever has the display draws, it says (`quark_rt::display`), and the
+driver copies that.
+
 ## USB
 
 An xHCI controller's driver, `usb`, is in the boot image and drives what is

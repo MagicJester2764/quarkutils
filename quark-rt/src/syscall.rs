@@ -209,6 +209,17 @@ pub fn sys_pci_write(bdf: u64, offset: u64, width: u64, value: u32) -> Result<()
     }
 }
 
+/// Memory for display device `bdf`'s screen, `pages` long: where it begins,
+/// with a `PhysRange` over it now in this program's empty `slot`. One run
+/// for each device, nobody's to free, the same every time it is asked for —
+/// for a driver of a device that draws from memory, which has claimed it.
+pub fn sys_display_memory(bdf: u64, pages: u64, slot: usize) -> Result<u64, ()> {
+    match unsafe { syscall3(SYS_DISPLAY_MEMORY, bdf, pages, slot as u64) } {
+        u64::MAX => Err(()),
+        base => Ok(base),
+    }
+}
+
 /// How many times device `bdf`, this program's, has reached for memory it
 /// may not.
 pub fn sys_device_stopped(bdf: u64) -> Result<u64, Refused> {
@@ -352,6 +363,7 @@ pub const SYS_CONSOLE_POS: u64 = 161;
 pub const SYS_PCI_DEVICE: u64 = 168;
 pub const SYS_PCI_READ: u64 = 169;
 pub const SYS_PCI_WRITE: u64 = 170;
+pub const SYS_DISPLAY_MEMORY: u64 = 171;
 
 // --- 0xE0  descriptors, continued ---
 pub const SYS_FD_SERVE: u64 = 224;
@@ -1675,6 +1687,13 @@ pub fn sys_pty_set_termios(fd: usize, t: &Termios) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// How big the terminal is, in characters: `(rows, columns)`.
+pub fn sys_pty_size(fd: usize) -> Option<(u16, u16)> {
+    let mut size = [0u16; 4];
+    let ret = unsafe { syscall3(SYS_PTY_CTL, fd as u64, 2, size.as_mut_ptr() as u64) };
+    (ret != u64::MAX).then_some((size[0], size[1]))
+}
+
 /// Say how big the terminal is, in characters. Stored, and handed to
 /// whichever program asks.
 pub fn sys_pty_set_size(fd: usize, rows: u16, cols: u16) -> Result<(), ()> {
@@ -2561,7 +2580,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 24;
+pub const ABI_VERSION_MINOR: u32 = 25;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

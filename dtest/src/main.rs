@@ -5853,6 +5853,96 @@ fn test_msi() {
 /// What is in the machine, who holds which device, and what a driver may do
 /// with its own: the device manager's list, every program's capabilities,
 /// and `edu`, the driver for QEMU's test device, asked to try.
+/// The display, where a driver gives it: another size, and its own again,
+/// and the console's afterwards. On the bootloader's framebuffer there is
+/// one size and nothing to ask.
+///
+/// The size is asked for by `fbmode`, as a child: whoever asks holds the
+/// display for the asking, and is lent it in the slot this program's own
+/// manifest fills.
+fn test_display() {
+    use quark_rt::display;
+    println!("display:");
+    let Some(mode) = display::mode() else {
+        println!("  (no framebuffer device here; nothing to ask)");
+        return;
+    };
+    check("there is a display, and a mode it is in", mode.phys != 0 && mode.width > 0 && mode.height > 0);
+    // What a full repaint says: every tile, in one notification, which the
+    // kernel takes. A word with the bits of its task signals in it, it
+    // refuses whole, and the driver copies nothing.
+    let (w, h) = (mode.width, mode.height);
+    check(
+        "the whole screen can be said to have been drawn on",
+        quark_rt::nameserver::lookup(b"fb").is_some_and(|fb| display::drew(fb, 0, 0, w, h, w, h)),
+    );
+    check(
+        "and so can each tile of it",
+        quark_rt::nameserver::lookup(b"fb").is_some_and(|fb| {
+            (0..h).step_by((h as usize / 16).max(1)).all(|y| {
+                (0..w).step_by((w as usize / 16).max(1)).all(|x| display::drew(fb, x, y, x + 1, y + 1, w, h))
+            })
+        }),
+    );
+    if !mode.driven {
+        println!("  (the bootloader's framebuffer: one size, nothing to ask)");
+        return;
+    }
+    let fbmode = |w: &[u8], h: &[u8]| {
+        load_program(b"/usr/bin/fbmode", b"/usr/bin/FBMODE.ELF", &[b"fbmode", w, h]).and_then(|child| {
+            let tid = child.tid;
+            child.start().ok()?;
+            wait_for(tid)
+        })
+    };
+    let mut width = [0u8; 8];
+    let mut height = [0u8; 8];
+    let text = |n: u64, out: &mut [u8; 8]| -> usize {
+        let mut digits = [0u8; 8];
+        let (mut len, mut v) = (0, n);
+        loop {
+            digits[len] = b'0' + (v % 10) as u8;
+            len += 1;
+            v /= 10;
+            if v == 0 || len == 8 {
+                break;
+            }
+        }
+        for i in 0..len {
+            out[i] = digits[len - 1 - i];
+        }
+        len
+    };
+    let (wl, hl) = (text(mode.width, &mut width), text(mode.height, &mut height));
+    // The console's terminal, if this is on it, is told its new size: eight
+    // by sixteen a character.
+    let grid = |w: u64, h: u64| ((h / 16) as u16, (w / 8) as u16);
+    let on_console = syscall::sys_pty_size(1) == Some(grid(mode.width, mode.height));
+    check(
+        "a display a driver gives can be had another size",
+        fbmode(b"1024", b"768") == Some(0)
+            && display::mode().is_some_and(|m| m.width == 1024 && m.height == 768 && m.pitch >= 1024 * 4),
+    );
+    if on_console {
+        check("and the console's terminal is that size", syscall::sys_pty_size(1) == Some(grid(1024, 768)));
+    }
+    check(
+        "and its own again, the console's in that size",
+        fbmode(&width[..wl], &height[..hl]) == Some(0)
+            && display::mode().is_some_and(|m| m.width == mode.width && m.height == mode.height),
+    );
+    if on_console {
+        check(
+            "and the console's terminal is its own size again",
+            syscall::sys_pty_size(1) == Some(grid(mode.width, mode.height)),
+        );
+    }
+    check(
+        "a size larger than the screen's memory is refused",
+        fbmode(b"16384", b"16384") == Some(1) && display::mode().is_some_and(|m| m.width == mode.width),
+    );
+}
+
 /// A USB controller and what is plugged into it, on a machine with one.
 ///
 /// The machine the acceptance gives one has a keyboard, a mouse and a disk
@@ -8261,6 +8351,7 @@ pub extern "C" fn _start() -> ! {
         ("iommu", test_iommu),
         ("devices", test_devices),
         ("usb", test_usb),
+        ("display", test_display),
         ("layout", test_layout),
         ("clock", test_clock),
         ("power", test_power),

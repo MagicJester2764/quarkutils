@@ -70,6 +70,18 @@ static mut INITIALIZED: bool = false;
 static mut FB_TID: usize = 0;
 static mut HAVE_DISPLAY: bool = false;
 
+/// What has been drawn since it was last said (`report_damage`), a box in
+/// pixels: for a display that draws from memory, which shows what its driver
+/// copies and nothing else.
+const NO_DAMAGE: (usize, usize, usize, usize) = (usize::MAX, usize::MAX, 0, 0);
+static mut DAMAGE: (usize, usize, usize, usize) = NO_DAMAGE;
+
+/// The grid text is kept in while there is no display to draw it on — a
+/// machine whose display's driver has not offered it yet: what is written
+/// before then is drawn when it comes.
+const WAITING_COLS: usize = 160;
+const WAITING_ROWS: usize = 50;
+
 /// Where the framebuffer is mapped.
 const FB_VADDR: usize = 0x81_0000_0000;
 /// The slot the framebuffer device grants the display into. Fixed by that
@@ -215,6 +227,9 @@ pub extern "C" fn _start() -> ! {
         println!("[console] No display; nothing to draw on.");
         syscall::sys_exit_code(1);
     }
+    if !unsafe { HAVE_DISPLAY } {
+        println!("[console] No display yet; what is written is kept until there is one.");
+    }
 
     // Register with nameserver
     if nameserver::register(b"console").is_ok() {
@@ -282,6 +297,7 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
+        report_damage();
         if busy {
             // Still look for word from the framebuffer device, and for
             // somebody asking for the terminal: a program printing without
@@ -450,16 +466,28 @@ fn claim_display() -> bool {
         println!("[console] the framebuffer would not give up the display");
         return false;
     }
-    adopt_mode(&reply)
+    if !adopt_mode(&reply) {
+        // Claimed, with no display yet: it comes as TAG_FB_GAINED.
+        unsafe {
+            COLS = WAITING_COLS;
+            ROWS = WAITING_ROWS;
+            INITIALIZED = true;
+        }
+    }
+    true
 }
 
-/// Map the framebuffer and lay the text grid out on it.
+/// Map the framebuffer and lay the text grid out on it. False for a mode
+/// with no display in it.
 fn adopt_mode(reply: &Message) -> bool {
     let w = (reply.data[0] >> 32) as usize;
     let h = (reply.data[0] & 0xFFFF_FFFF) as usize;
     let pitch = (reply.data[1] >> 32) as usize;
     let bpp = (reply.data[1] & 0xFF) as usize;
     let phys = reply.data[3] as usize;
+    if w == 0 || h == 0 || phys == 0 {
+        return false;
+    }
 
     let pages = (pitch * h + 4095) / 4096;
     if syscall::sys_map_phys(phys, FB_VADDR, pages).is_err() {
@@ -477,12 +505,28 @@ fn adopt_mode(reply: &Message) -> bool {
         G_POS = ((reply.data[2] >> 8) & 0xFF) as u8;
         B_POS = (reply.data[2] & 0xFF) as u8;
         COLS = (w / GLYPH_W).min(MAX_CELL_COLS);
-        ROWS = (h / GLYPH_H).min(MAX_CELL_ROWS);
+        let rows = (h / GLYPH_H).min(MAX_CELL_ROWS);
+        // Fewer rows than the text was kept in: the last of it stays, with
+        // the cursor's row on the screen.
+        if INITIALIZED && rows > 0 && ROW >= rows {
+            let drop = ROW + 1 - rows;
+            let stride = MAX_CELL_COLS;
+            CELL_CH.copy_within(drop * stride..(drop + rows) * stride, 0);
+            CELL_FG.copy_within(drop * stride..(drop + rows) * stride, 0);
+            CELL_BG.copy_within(drop * stride..(drop + rows) * stride, 0);
+            ROW -= drop;
+        }
+        ROWS = rows;
         // The pixel layout may have changed with the mode; the attributes
         // have not.
         recolor();
         HAVE_DISPLAY = true;
         INITIALIZED = true;
+        // And the terminal is told its size: whoever is in front of it is
+        // told in turn (SIGWINCH), and a line editor lays itself out again.
+        if TTY_MASTER != usize::MAX {
+            let _ = syscall::sys_pty_set_size(TTY_MASTER, ROWS as u16, COLS as u16);
+        }
     }
     true
 }
@@ -512,10 +556,31 @@ fn redraw_all() {
     }
     unsafe {
         core::ptr::write_bytes(FB as *mut u8, 0, PITCH * HEIGHT);
+        damaged(0, 0, WIDTH, HEIGHT);
         DIRTY_MIN = 0;
         DIRTY_MAX = ROWS.saturating_sub(1);
     }
     flush_dirty();
+}
+
+/// Note that `[x0, x1) × [y0, y1)` was drawn on.
+fn damaged(x0: usize, y0: usize, x1: usize, y1: usize) {
+    unsafe {
+        DAMAGE = (DAMAGE.0.min(x0), DAMAGE.1.min(y0), DAMAGE.2.max(x1), DAMAGE.3.max(y1));
+    }
+}
+
+/// Say what was drawn since it was last said: to the framebuffer device,
+/// which passes it to the display's driver, if it has one. A notification,
+/// so it never waits.
+fn report_damage() {
+    unsafe {
+        let (x0, y0, x1, y1) = DAMAGE;
+        DAMAGE = NO_DAMAGE;
+        if HAVE_DISPLAY && x0 < x1 && y0 < y1 {
+            quark_rt::display::drew(FB_TID, x0 as u64, y0 as u64, x1 as u64, y1 as u64, WIDTH as u64, HEIGHT as u64);
+        }
+    }
 }
 
 /// One step of loading a font: begin, a piece of the file, or end. Returns
@@ -594,6 +659,7 @@ fn serve(ticks: u64) {
             let _ = syscall::sys_reply(msg.sender, &ack);
             if ok {
                 redraw_all();
+                report_damage();
             }
         }
         TAG_TTY_OPEN => {
@@ -875,6 +941,7 @@ fn draw_glyph(col: usize, row: usize, ch: u32, fg: u32, bg: u32) {
     // blank: the cells are what the program was told, and the font may
     // disagree with them.
     let across = if wide_cell { 2 * GLYPH_W } else { GLYPH_W };
+    damaged(pixel_x, pixel_y, pixel_x + across, pixel_y + GLYPH_H);
 
     unsafe {
         let bytes_per_pixel = BPP / 8;
@@ -1186,6 +1253,7 @@ fn scroll() {
         // Scroll framebuffer pixels up by one text row instead of a full
         // redraw, so pre-existing content (e.g. kernel boot text) is preserved.
         if HAVE_DISPLAY {
+            damaged(0, 0, WIDTH, ROWS * GLYPH_H);
             let shift = GLYPH_H * PITCH;
             let total = ROWS * GLYPH_H * PITCH;
             core::ptr::copy(
@@ -1260,6 +1328,7 @@ unsafe fn draw_cursor_block(color: u32) {
     let pixel_x = COL * GLYPH_W;
     let pixel_y = ROW * GLYPH_H;
     let bytes_per_pixel = BPP / 8;
+    damaged(pixel_x, pixel_y + GLYPH_H - 2, pixel_x + GLYPH_W, pixel_y + GLYPH_H);
 
     // Draw bottom 2 pixel rows as a solid underline
     for gy in (GLYPH_H - 2)..GLYPH_H {

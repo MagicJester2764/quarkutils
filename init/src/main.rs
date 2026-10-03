@@ -701,8 +701,13 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // one grant a manifest cannot express. It goes into
                         // slot 0 and stays there: everything the device lends
                         // out is derived from it.
+                        // A machine whose display draws from memory gave the
+                        // bootloader none, and has nothing here: the
+                        // display's driver gives the device one later.
                         let (fb_base, fb_end) = framebuffer_range();
-                        mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
+                        if fb_end > fb_base && fb_base != 0 {
+                            mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, fb_base, fb_end);
+                        }
                         grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"fb"], &SPAWN_SCRATCH);
                         fb_tid = info.tid;

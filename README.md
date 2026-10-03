@@ -36,6 +36,8 @@ nvme/               An NVMe disk: queues in memory, a namespace, a message
                     for an interrupt.
 usb/                A USB controller (xHCI) and what is plugged into it:
                     hubs, keyboards and mice into `input`, disks as diskN.
+virtgpu/            A virtio GPU's display, for `fb` to lend: the screen in
+                    memory, and what is drawn on it copied to the host.
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
@@ -74,7 +76,7 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/ lsusb/
-                    Programs, in Rust without std.
+fbmode/             Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
 dtest/  dchild/     828 checks of the kernel, made through the ABI; twelve

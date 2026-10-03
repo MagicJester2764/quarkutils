@@ -45,7 +45,8 @@ REQUIRE_ABI ?=
 BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
                  auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK ahci:AHCI \
-                 nvme:NVME usb:USB rtl8139:RTL8139 virtnet:VIRTNET
+                 nvme:NVME usb:USB rtl8139:RTL8139 virtnet:VIRTNET \
+                 virtgpu:VIRTGPU
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
@@ -56,7 +57,7 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  vfs:VFS mount:MOUNT umount:UMOUNT su:SU passwd:PASSWD \
                  useradd:USERADD userdel:USERDEL groupadd:GROUPADD \
                  gpasswd:GPASSWD id:ID date:DATE swapd:SWAPD \
-                 free:FREE lspci:LSPCI lsusb:LSUSB
+                 free:FREE lspci:LSPCI lsusb:LSUSB fbmode:FBMODE
 
 # Drivers for devices nothing needs while the system starts: the device
 # manager reads them from /usr/lib/drivers and starts each for the devices it

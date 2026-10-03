@@ -11,6 +11,7 @@ pub mod calendar;
 pub mod console;
 pub mod crypt;
 pub mod devices;
+pub mod display;
 pub mod font;
 pub mod ipc;
 pub mod keys;

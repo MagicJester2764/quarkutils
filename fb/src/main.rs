@@ -37,6 +37,23 @@
 //! which gets the display back when everything above it has let go — a
 //! console under a compositor under another compositor unwinds in that order.
 //! A claimant below the top that lets go or dies just leaves the line.
+//!
+//! **A display can come from a driver.** A machine whose only display draws
+//! from memory — a virtio GPU — gives the bootloader no framebuffer, and this
+//! starts with none: a claim is taken, and the claimant waits for the
+//! display. The display's driver offers itself (`TAG_FB_DRIVER`), which is
+//! taken if the device manager says it is a driver it started, and then the
+//! display (`TAG_FB_DISPLAY`): the mode, and a `PhysRange` over the screen's
+//! memory, from which the leases are minted as they are from `init`'s. A
+//! new mode is the display changing hands: the owner is told it has lost it
+//! and given it back with the mode.
+//!
+//! **What is drawn is said, where a driver has to be told.** A display that
+//! draws from memory shows what its driver copies to it, and a claimant says
+//! which parts of the screen it drew on by notifying this server — a bit for
+//! each of an eight by eight grid of tiles (`quark_rt::display`), which never
+//! waits — and this passes the bits on to the driver. With the bootloader's
+//! framebuffer nothing is told, and nothing needs to be.
 
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
 use quark_rt::{nameserver, println, syscall};
@@ -59,7 +76,9 @@ const TAG_FB_INIT: u64 = 100;
 /// Replies `data[0] = (width << 32) | height`,
 /// `data[1] = (pitch << 32) | bpp`,
 /// `data[2] = (red << 16) | (green << 8) | blue` bit positions,
-/// `data[3] = physical address`.
+/// `data[3] = physical address` (0 for no display yet),
+/// `data[4] = 1` where a driver gives the display, which may then be had in
+/// another size (`TAG_FB_SET_MODE`).
 const TAG_FB_INFO: u64 = 1;
 /// Take the display. Replies as [`TAG_FB_INFO`] does, and the caller may now
 /// map the framebuffer.
@@ -75,6 +94,17 @@ const TAG_FB_RELEASE: u64 = 3;
 const TAG_FB_LOST: u64 = 0x100;
 /// Sent to the previous owner when the display comes back, with the mode.
 const TAG_FB_GAINED: u64 = 0x101;
+/// A display's driver offers itself, with the right to notify it.
+const TAG_FB_DRIVER: u64 = 5;
+/// The display's driver offers the display: `data[0..4]` as [`TAG_FB_INIT`],
+/// with a `PhysRange` over its memory on offer.
+const TAG_FB_DISPLAY: u64 = 6;
+/// Whoever has the display asks for another size of it: `data[0]` is
+/// `width << 32 | height`. Only a display with a driver has others; the
+/// driver answers whether it can, and then offers the display in that mode.
+const TAG_FB_SET_MODE: u64 = 7;
+/// What the driver is asked, the same way.
+const TAG_GPU_MODE: u64 = 1;
 
 const TAG_OK: u64 = 0;
 const TAG_ERROR: u64 = u64::MAX;
@@ -100,6 +130,13 @@ struct Mode {
     g_pos: u64,
     b_pos: u64,
 }
+
+/// The display's driver, or 0 for none — the bootloader's framebuffer, or
+/// no display at all — and where the capability to notify it is.
+static mut DRIVER: usize = 0;
+static mut DRIVER_SLOT: usize = 0;
+/// Where the `PhysRange` over the driver's screen is.
+static mut SCREEN_SLOT: usize = 0;
 
 static mut MODE: Mode = Mode {
     phys: 0,
@@ -180,7 +217,7 @@ fn mode_reply() -> Message {
             (m.pitch << 32) | m.bpp,
             (m.r_pos << 16) | (m.g_pos << 8) | m.b_pos,
             m.phys,
-            0,
+            (unsafe { DRIVER } != 0) as u64,
             0,
         ],
     }
@@ -240,16 +277,26 @@ fn claim(sender: usize) -> Message {
     mode_reply()
 }
 
+/// Whether there is a display to give.
+fn have_display() -> bool {
+    unsafe { MODE.width != 0 && MODE.height != 0 && MODE.phys != 0 }
+}
+
 /// Hand the right to map the framebuffer to `tid`.
 ///
 /// Revoke first, always: the previous lease is derived from this slot, so
 /// bumping its generation is what stops the last holder mapping it again.
+/// With no display yet there is nothing to lend, and the claimant waits for
+/// it.
 fn lease_to(tid: usize) -> bool {
     let m = unsafe { &MODE };
     let end = m.phys + m.pitch * m.height;
 
     let _ = syscall::sys_cap_revoke(LEASE_SLOT);
     let _ = syscall::sys_cap_delete(LEASE_SLOT);
+    if !have_display() {
+        return true;
+    }
     if syscall::sys_cap_mint(LEASE_SLOT, syscall::CAP_TYPE_PHYS_RANGE, m.phys, end).is_err() {
         println!("[fb] could not mint a lease");
         return false;
@@ -273,6 +320,100 @@ fn take_back() {
     let _ = syscall::sys_cap_revoke(LEASE_SLOT);
 }
 
+/// A display's driver offers itself: kept if the device manager says it is
+/// a driver, and there is no other.
+fn driver(sender: usize) -> Message {
+    let Ok(slot) = syscall::sys_cap_take_any(sender) else {
+        return error();
+    };
+    let alive = |tid: usize| tid != 0 && syscall::sys_task_info(tid).is_ok_and(|(state, _, _)| state != 3);
+    if unsafe { DRIVER } != sender && alive(unsafe { DRIVER }) || !quark_rt::devices::vouches_for(sender) {
+        let _ = syscall::sys_cap_delete(slot);
+        return error();
+    }
+    let new = unsafe { DRIVER } != sender;
+    unsafe {
+        if DRIVER_SLOT != 0 && DRIVER_SLOT != slot {
+            let _ = syscall::sys_cap_delete(DRIVER_SLOT);
+        }
+        DRIVER = sender;
+        DRIVER_SLOT = slot;
+    }
+    let _ = syscall::sys_task_watch(sender);
+    // Said once: a driver offers itself again with every new mode, and the
+    // console it would be said on is the program that has the display.
+    if new {
+        println!("[fb] tid {} drives the display", sender);
+    }
+    ok()
+}
+
+/// The display's driver offers the display, or a new mode of it: the mode
+/// in `msg`, the screen's memory on offer. Whoever has the display loses it
+/// and is given it back with the mode.
+fn display(sender: usize, msg: &Message) -> Message {
+    let Ok(slot) = syscall::sys_cap_take_any(sender) else {
+        return error();
+    };
+    let mode = mode_of(msg);
+    let end = mode.phys + mode.pitch * mode.height;
+    let me = syscall::sys_getpid() as usize;
+    let covers = syscall::sys_cap_read(me, slot).is_ok_and(|c| {
+        c.cap_type == syscall::CAP_TYPE_PHYS_RANGE && c.valid && c.param0 <= mode.phys && end <= c.param1
+    });
+    if unsafe { DRIVER } != sender || !covers || mode.width == 0 || mode.height == 0 {
+        let _ = syscall::sys_cap_delete(slot);
+        return error();
+    }
+    // Answered first: telling the owner is a call of its own, and the
+    // driver is waiting on this one.
+    let _ = syscall::sys_reply(sender, &ok());
+    take_back();
+    let first = !have_display();
+    unsafe {
+        if SCREEN_SLOT != 0 && SCREEN_SLOT != slot {
+            let _ = syscall::sys_cap_delete(SCREEN_SLOT);
+        }
+        SCREEN_SLOT = slot;
+        MODE = mode;
+        if first {
+            println!("[fb] {}x{} at {} bpp, from the display's driver.", MODE.width, MODE.height, MODE.bpp);
+        }
+    }
+    hand_back();
+    Message { sender: u64::MAX as usize, tag: TAG_OK, data: [0; 6] }
+}
+
+/// Whoever has the display asks for `data[0]`'s size: passed to the driver,
+/// which says whether it can. What comes of it comes as the display handed
+/// back with the mode.
+fn set_mode(sender: usize, msg: &Message) -> Message {
+    let driver = unsafe { DRIVER };
+    if sender != owner() || driver == 0 {
+        return error();
+    }
+    let ask = Message { sender: 0, tag: TAG_GPU_MODE, data: [msg.data[0], 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    match syscall::sys_call_timeout(driver, &ask, &mut reply, HANDOVER_TICKS) {
+        syscall::CallOutcome::Replied if reply.tag == TAG_OK => ok(),
+        _ => error(),
+    }
+}
+
+/// A mode as `TAG_FB_INIT` and `TAG_FB_DISPLAY` say it.
+fn mode_of(msg: &Message) -> Mode {
+    Mode {
+        phys: msg.data[0],
+        width: msg.data[1] >> 32,
+        height: msg.data[1] & 0xFFFF_FFFF,
+        pitch: msg.data[2] >> 32,
+        bpp: msg.data[2] & 0xFF,
+        r_pos: (msg.data[3] >> 16) & 0xFF,
+        g_pos: (msg.data[3] >> 8) & 0xFF,
+        b_pos: msg.data[3] & 0xFF,
+    }
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -289,22 +430,13 @@ pub extern "C" fn _start() -> ! {
         }
         let _ = syscall::sys_reply(msg.sender, &error());
     }
-    unsafe {
-        MODE = Mode {
-            phys: msg.data[0],
-            width: msg.data[1] >> 32,
-            height: msg.data[1] & 0xFFFF_FFFF,
-            pitch: msg.data[2] >> 32,
-            bpp: msg.data[2] & 0xFF,
-            r_pos: (msg.data[3] >> 16) & 0xFF,
-            g_pos: (msg.data[3] >> 8) & 0xFF,
-            b_pos: msg.data[3] & 0xFF,
-        };
-    }
+    unsafe { MODE = mode_of(&msg) };
     let _ = syscall::sys_reply(msg.sender, &ok());
 
-    unsafe {
-        println!("[fb] {}x{} at {} bpp.", MODE.width, MODE.height, MODE.bpp);
+    if have_display() {
+        unsafe { println!("[fb] {}x{} at {} bpp.", MODE.width, MODE.height, MODE.bpp) };
+    } else {
+        println!("[fb] No framebuffer from the bootloader; a display's driver may give one.");
     }
     if nameserver::register(b"fb").is_ok() {
         println!("[fb] Registered with nameserver.");
@@ -325,6 +457,25 @@ pub extern "C" fn _start() -> ! {
                 let _ = syscall::sys_cap_revoke(LEASE_SLOT);
                 hand_back();
             }
+            if dead == unsafe { DRIVER } {
+                // The screen stays what it was; nothing copies it any more.
+                println!("[fb] the display's driver has gone");
+                unsafe {
+                    let _ = syscall::sys_cap_delete(DRIVER_SLOT);
+                    DRIVER = 0;
+                    DRIVER_SLOT = 0;
+                }
+            }
+            continue;
+        }
+        // What a claimant drew, as tiles: for the driver to copy, if the
+        // display has one. From the kernel, so from nobody in particular —
+        // which costs a spurious copy at worst.
+        if sender == 0 && msg.tag == syscall::TAG_NOTIFICATION {
+            let driver = unsafe { DRIVER };
+            if driver != 0 && msg.data[0] != 0 {
+                let _ = syscall::sys_notify(driver, msg.data[0]);
+            }
             continue;
         }
 
@@ -332,6 +483,18 @@ pub extern "C" fn _start() -> ! {
             TAG_FB_INFO => mode_reply(),
 
             TAG_FB_CLAIM => claim(sender),
+
+            TAG_FB_DRIVER => driver(sender),
+
+            TAG_FB_SET_MODE => set_mode(sender, &msg),
+
+            TAG_FB_DISPLAY => {
+                let answer = display(sender, &msg);
+                if answer.sender == u64::MAX as usize {
+                    continue; // already answered
+                }
+                answer
+            }
 
             TAG_FB_RELEASE => match remove(sender) {
                 None => error(),
