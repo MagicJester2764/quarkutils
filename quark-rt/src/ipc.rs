@@ -32,6 +32,46 @@ impl Message {
 /// pipe on fd 0 and has no dispatch to answer from, so it never replies.
 pub const TAG_PING: u64 = 0xFFFF_FFFF_FFFF_FF01;
 
+/// What the kernel said to a task that was waiting for something else — a
+/// death, to a driver waiting for its device — kept for the loop that
+/// answers it. A driver waits for its interrupt by receiving from the
+/// kernel, and the kernel says everything else there too: a death notice
+/// taken by that wait and dropped was a claim nobody ever let go. Kept by
+/// task, so that a thread answers only what it was told.
+static KEPT: crate::sync::Mutex<([(u64, Message); KEPT_MAX], usize)> =
+    crate::sync::Mutex::new(([(0, Message::empty()); KEPT_MAX], 0));
+const KEPT_MAX: usize = 16;
+
+/// Keep `msg`, which a wait for something else received, for [`kept`]:
+/// whether there was room.
+pub fn keep(msg: &Message) -> bool {
+    let me = crate::syscall::sys_getpid();
+    let mut kept = KEPT.lock();
+    let n = kept.1;
+    if n == KEPT_MAX {
+        return false;
+    }
+    kept.0[n] = (me, *msg);
+    kept.1 = n + 1;
+    true
+}
+
+/// The oldest message [`keep`] kept for this task, if there is one: what a
+/// server's loop answers before it receives again.
+pub fn kept() -> Option<Message> {
+    let mut kept = KEPT.lock();
+    let n = kept.1;
+    if n == 0 {
+        return None;
+    }
+    let me = crate::syscall::sys_getpid();
+    let at = kept.0[..n].iter().position(|&(task, _)| task == me)?;
+    let (_, msg) = kept.0[at];
+    kept.0.copy_within(at + 1..n, at);
+    kept.1 = n - 1;
+    Some(msg)
+}
+
 /// Kernel notification word, delivered with sender 0.
 pub const TAG_NOTIFICATION: u64 = 0xFFFF_0002;
 

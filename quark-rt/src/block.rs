@@ -302,8 +302,11 @@ pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
     let mut count = scan(dev, &mut volumes, &mut buf[..]);
 
     loop {
+        // What the driver's wait for its device heard first.
         let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+        if let Some(earlier) = crate::ipc::kept() {
+            msg = earlier;
+        } else if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
             continue;
         }
         if let Some(dead) = death_notice(&msg) {

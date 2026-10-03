@@ -27,7 +27,6 @@ use crate::syscall;
 pub const VENDOR: u16 = 0x1AF4;
 
 const CAPABILITY_VENDOR: u8 = 0x09;
-const CAPABILITY_MSIX: u8 = 0x11;
 const COMMON: u8 = 1;
 const NOTIFY: u8 = 2;
 const ISR: u8 = 3;
@@ -61,8 +60,6 @@ const FAILED: u8 = 128;
 pub const VERSION_1: u64 = 1 << 32;
 
 const NO_VECTOR: u16 = 0xFFFF;
-const MSIX_ENABLE: u16 = 1 << 15;
-const MSIX_MASK_ALL: u16 = 1 << 14;
 
 /// The most buffers a queue here holds: a page of them.
 pub const MAX_QUEUE: u16 = 128;
@@ -115,6 +112,9 @@ pub struct Device {
     pub irq: u8,
     /// Whether that is a message of the device's own, or its line.
     pub by_message: bool,
+    /// Whether it is entry 0 of the device's MSI-X table, which each queue
+    /// is told to send.
+    table: bool,
     /// Where each BAR is mapped, once it is.
     bars: [usize; 6],
     at: usize,
@@ -132,7 +132,6 @@ impl Device {
         let info = pci::info(address).ok_or("this program does not hold the device")?;
         let mut places = [Place::default(); 5];
         let mut multiplier = 0;
-        let mut msix = 0u8;
         if pci::read16(address, 0x06).unwrap_or(0) & (1 << 4) != 0 {
             let mut cap = pci::read8(address, 0x34).unwrap_or(0) & 0xFC;
             for _ in 0..48 {
@@ -140,9 +139,6 @@ impl Device {
                     break;
                 }
                 let id = pci::read8(address, cap as u16).unwrap_or(0);
-                if id == CAPABILITY_MSIX && msix == 0 {
-                    msix = cap;
-                }
                 if id == CAPABILITY_VENDOR {
                     let kind = pci::read8(address, cap as u16 + 3).unwrap_or(0);
                     let place = Place {
@@ -176,6 +172,7 @@ impl Device {
             config_len: places[CONFIG as usize].length as usize,
             irq: 0,
             by_message: false,
+            table: false,
             bars: [0; 6],
             at,
             slots,
@@ -216,33 +213,16 @@ impl Device {
         write8(device.common + DEVICE_STATUS, ACKNOWLEDGE);
         write8(device.common + DEVICE_STATUS, ACKNOWLEDGE | DRIVER);
 
-        // Its interrupt: a message, where it has MSI-X — written into
-        // entry 0 of its table, in its own registers — else its line.
-        device.irq = match msix {
-            0 => {
-                let line = info.header.line;
-                if line == 0 || line >= 16 || syscall::sys_irq_register(line).is_err() {
-                    return Err("no interrupt to be had for the device");
-                }
-                line
-            }
-            msix => {
-                let table = pci::read32(address, msix as u16 + 4).ok_or("cannot read the device")?;
-                let bar = (table & 7) as usize;
-                let entry = device.map(bar)? + (table & !7) as usize;
-                let message = syscall::sys_msi_alloc_for(address.raw()).map_err(|_| "no message to be had")?;
-                write32(entry, message.address);
-                write32(entry + 4, 0);
-                write32(entry + 8, message.data as u32);
-                write32(entry + 12, 0);
-                let control = pci::read16(address, msix as u16 + 2).ok_or("cannot read the device")?;
-                pci::write16(address, msix as u16 + 2, (control | MSIX_ENABLE) & !MSIX_MASK_ALL)
-                    .map_err(|_| "may not turn its messages on")?;
-                write16(device.common + CONFIG_MSIX_VECTOR, NO_VECTOR);
-                device.by_message = true;
-                message.irq
-            }
-        };
+        // Its interrupt: a message, where it has MSI-X — entry 0 of its
+        // table, in its own registers — else its line.
+        let interrupt = pci::interrupt(address, |bar| device.map(bar).ok())
+            .ok_or("no interrupt to be had for the device")?;
+        device.irq = interrupt.number();
+        device.by_message = !interrupt.is_line();
+        device.table = matches!(interrupt, pci::Interrupt::Table(_));
+        if device.table {
+            write16(device.common + CONFIG_MSIX_VECTOR, NO_VECTOR);
+        }
         Ok(device)
     }
 
@@ -304,7 +284,7 @@ impl Device {
         write64(c + QUEUE_DESC, frame as u64);
         write64(c + QUEUE_DRIVER, (frame + Queue::AVAIL) as u64);
         write64(c + QUEUE_DEVICE, (frame + used) as u64);
-        if self.by_message {
+        if self.table {
             write16(c + QUEUE_MSIX_VECTOR, 0);
             if read16(c + QUEUE_MSIX_VECTOR) != 0 {
                 return Err("the device would not send that queue's message");
@@ -376,6 +356,8 @@ impl Device {
     /// Wait for the device's interrupt, `span` at most (see
     /// `syscall::sys_recv_timeout`): whether it came. A line is said to be
     /// dealt with before this returns; a message needs nothing said.
+    /// Anything else the kernel says meanwhile is kept for the driver's
+    /// loop (`ipc::keep`).
     pub fn wait(&self, span: u64) -> bool {
         let mut msg = Message::empty();
         loop {
@@ -386,6 +368,7 @@ impl Device {
                 self.settle();
                 return true;
             }
+            crate::ipc::keep(&msg);
         }
     }
 }

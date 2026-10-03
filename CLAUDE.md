@@ -318,8 +318,9 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   reach, at the same addresses — a ring in anonymous memory, or a page of
   somebody else's, is a write that never arrives, and a line on the serial
   console saying so — and a device nobody has claimed reaches nothing at
-  all. `rtl8139`, `virtnet`, `virtblk`, `ahci` and `edu` claim theirs. A driver
-  can claim only the device it holds, and there is one driver for each.
+  all. `rtl8139`, `virtnet`, `virtblk`, `ahci`, `nvme` and `edu` claim
+  theirs. A driver can claim only the device it holds, and there is one
+  driver for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
   scanning for its magic, not from a table of names in `init` — and so does
@@ -855,14 +856,30 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   everything about the device goes through that one capability: its
   configuration (`pci::read32`, `write16`), its BARs (`pci::map_bar`,
   `pci::ports` mint inside them and nowhere else), its claim
-  (`pci::claim`), and its interrupt by message (`pci::message`, which the
-  kernel aims). `net` held every port on the machine and every interrupt
-  line once, and `edu` every device's registers, because which were theirs
-  was not known until they looked.
+  (`pci::claim`), and its interrupt (`pci::interrupt`). `net` held every
+  port on the machine and every interrupt line once, and `edu` every
+  device's registers, because which were theirs was not known until they
+  looked.
 - **Where a device is and where its message goes are not a driver's to
   change.** The kernel refuses a write to a BAR or to the MSI capability,
   and refuses to let a device master the bus before its program has claimed
   it (`pci::enable` with `COMMAND_MASTER` fails until `pci::claim`).
+- **A device's interrupt is the best it has, and one kind of it.** A
+  message the kernel aims it at where it has MSI; else entry 0 of its MSI-X
+  table, the kernel's message written in by the driver; else its line
+  (`pci::interrupt`, for every driver). Never MSI-X on a device with MSI:
+  the kernel turns MSI on as it aims it, and a device with both on does as
+  it likes. And no message for a device that cannot send one —
+  `pci::message` gave one once, the kernel aimed nothing, and a driver
+  would have waited on it for good.
+- **A wait for a device keeps what else the kernel says.** A driver waits
+  for its interrupt by receiving from the kernel, and the kernel says
+  everything else there too, a claimant's death among it. The wait keeps
+  it (`ipc::keep`) and `block::serve` answers what was kept before it
+  receives again. Dropped, a death left a claim with a task that had gone
+  — and with its task id, which the next task made is given and a write is
+  judged by. `dtest disks` ends a claimant in the middle of its reads,
+  eight times over.
 - **Drivers come from the boot image or from `/usr/lib/drivers`.** One the
   root is on has to be running before there is a filesystem, so it is a
   boot service: `init` offers each boot-image program whose manifest says it
@@ -883,8 +900,8 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
 - **A virtio device is a PCI device like any other** (`quark_rt::virtio`):
   its structures are named by capabilities of the vendor's kind and mapped
   from its BARs, its queues are pages of the driver's own memory, and its
-  interrupt is one MSI-X message — the kernel allocates it and the driver
-  writes it into the device's table — or its line. `virtblk` and `virtnet`
+  interrupt is one MSI-X message, which each queue is told to send, or its
+  line. `virtblk` and `virtnet`
   are its block and network devices; QEMU's are transitional, and only
   their modern half is driven.
 
@@ -921,8 +938,8 @@ from that volume's start; the driver refuses what is past its end. So a
 client given a partition cannot reach outside it and does not know where it
 is. Each disk's driver registers as the first of `disk0` to `disk3` that
 nobody has (`block::register_disk`): `disk` for an IDE controller's first
-channel, `ahci` for the first disk on an AHCI controller, `virtblk` for a
-virtio disk.
+channel, `ahci` for the first disk on an AHCI controller, `nvme` for the
+first namespace of an NVMe controller, `virtblk` for a virtio disk.
 
 - **The protocol is one module, for both ends.** `block::serve` is the
   driver's half — volumes, claims, the partition table — and a driver

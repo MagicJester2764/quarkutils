@@ -280,9 +280,85 @@ pub fn claim(at: Address) -> Result<bool, syscall::Refused> {
 }
 
 /// An interrupt of the device's own, sent as a message: its number. The
-/// kernel aims the device at it, where it has an MSI capability.
+/// kernel aims the device at it; a device with no MSI capability has none
+/// to be aimed, and is not given one.
 pub fn message(at: Address) -> Option<u8> {
+    if info(at)?.header.msi == 0 {
+        return None;
+    }
     syscall::sys_msi_alloc_for(at.raw()).ok().map(|m| m.irq)
+}
+
+/// How a device's interrupt comes, and its number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interrupt {
+    /// A message the kernel aimed the device at (MSI).
+    Message(u8),
+    /// A message written into entry 0 of the device's own table (MSI-X).
+    Table(u8),
+    /// Its line, which is acknowledged after each (`sys_irq_ack`).
+    Line(u8),
+}
+
+impl Interrupt {
+    pub fn number(self) -> u8 {
+        match self {
+            Interrupt::Message(n) | Interrupt::Table(n) | Interrupt::Line(n) => n,
+        }
+    }
+
+    pub fn is_line(self) -> bool {
+        matches!(self, Interrupt::Line(_))
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Interrupt::Message(_) => "a message of its own",
+            Interrupt::Table(_) => "a message of its own, from its table",
+            Interrupt::Line(_) => "its line",
+        }
+    }
+}
+
+const MSIX_ENABLE: u16 = 1 << 15;
+const MSIX_MASK_ALL: u16 = 1 << 14;
+
+/// The device's interrupt, the best it has. A message the kernel aims it
+/// at, where it has MSI. Else entry 0 of its MSI-X table, which is in one
+/// of its memory BARs — `map` is told which, and answers where that BAR
+/// begins in this program — with a message from the kernel written into
+/// it and MSI-X turned on. Else its line, registered; the device manager
+/// gave the capability for it.
+///
+/// A device with MSI is never given MSI-X as well: the kernel turns MSI on
+/// as it aims it, and a device with both on does what it likes.
+pub fn interrupt(at: Address, map: impl FnOnce(usize) -> Option<usize>) -> Option<Interrupt> {
+    let header = info(at)?.header;
+    if header.msi != 0 {
+        if let Some(irq) = message(at) {
+            return Some(Interrupt::Message(irq));
+        }
+    } else if header.msix != 0 {
+        if let Some(irq) = table_entry(at, header.msix as u16, map) {
+            return Some(Interrupt::Table(irq));
+        }
+    }
+    let line = header.line;
+    (line != 0 && line < 16 && syscall::sys_irq_register(line).is_ok()).then_some(Interrupt::Line(line))
+}
+
+/// Entry 0 of the MSI-X table of the device whose capability is at `cap`.
+fn table_entry(at: Address, cap: u16, map: impl FnOnce(usize) -> Option<usize>) -> Option<u8> {
+    let table = read32(at, cap + 4)?;
+    let entry = map((table & 7) as usize)? + (table & !7) as usize;
+    let message = syscall::sys_msi_alloc_for(at.raw()).ok()?;
+    let words = [message.address, 0, message.data as u32, 0];
+    for (i, word) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((entry + 4 * i) as *mut u32, *word) };
+    }
+    let control = read16(at, cap + 2)?;
+    write16(at, cap + 2, (control | MSIX_ENABLE) & !MSIX_MASK_ALL).ok()?;
+    Some(message.irq)
 }
 
 /// Map memory BAR `n` of the device at `virt`, minting the range in this

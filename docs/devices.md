@@ -40,7 +40,7 @@ quark_rt::manifest!([
     CapReq::priority(quark_rt::syscall::PRIO_DRIVER),
     CapReq::drives(0x10EC, 0x8139),          // a vendor's device
     // CapReq::drives_class(0x01, 0x01),     // any IDE controller
-    // CapReq::drives_interface(0x01, 0x08, 0x02),  // NVMe
+    // CapReq::drives_interface(0x01, 0x08, 0x02),  // an NVMe controller
     CapReq::phys_alloc(64),
 ]);
 ```
@@ -56,10 +56,10 @@ so a driver started some other way holds no device, and says so.
   running before there is a filesystem to read one from. `init` reads each
   program in the boot image, and one whose manifest says it drives something
   is offered to the device manager rather than started: lent with the call
-  (`TAG_OFFER`). The disks' drivers are, `DISK`, `AHCI` and `VIRTBLK`,
-  since a root can be on any of them; and the network cards', `RTL8139`
-  and `VIRTNET`, so that the network is up before anybody is asked to log
-  in.
+  (`TAG_OFFER`). The disks' drivers are, `DISK`, `AHCI`, `NVME` and
+  `VIRTBLK`, since a root can be on any of them; and the network cards',
+  `RTL8139` and `VIRTNET`, so that the network is up before anybody is
+  asked to log in.
 - **`/usr/lib/drivers`**, for everything else. When `init` has a root it
   tells the device manager so (`TAG_FILES`), before anything in
   `/etc/init.conf` runs, and the device manager reads every file there. A
@@ -87,9 +87,14 @@ Everything through `quark_rt::pci`, by the address it was given:
   IOMMU reaches the frames this program asked for (`sys_phys_alloc`) and
   nothing else. Before it copies any memory: `pci::enable(at,
   COMMAND_MASTER)` is refused until then.
-- `pci::message(at)` — an interrupt of the device's own, which the kernel
-  aims the device at. Or the line the device manager gave, with
-  `sys_irq_register`.
+- `pci::interrupt(at, map)` — the device's interrupt, the best it has: a
+  message the kernel aims it at, where it has MSI (`pci::message` alone);
+  else entry 0 of its MSI-X table, which `map` maps from the BAR it is in,
+  with a message from the kernel written into it; else the line the device
+  manager gave, registered. Never MSI-X on a device that has MSI: the
+  kernel turns MSI on as it aims it, and a device with both on does what it
+  likes. A line is acknowledged after each interrupt (`sys_irq_ack`); a
+  message is not.
 - `pci::read32`, `write16` and the rest — the device's configuration. A BAR
   and the MSI capability are the kernel's, and a write to one is refused
   (`Refused::NotAllowed`): where a device is, and where its message goes,
@@ -103,10 +108,9 @@ the interrupt's status, its own configuration — are named by capabilities of
 the vendor's kind in its configuration space, each a BAR and an offset, and
 mapped from its BARs. A queue is a page of the driver's own memory, so on a
 machine with an IOMMU it is among what the device reaches. Its interrupt is
-one MSI-X message: the kernel allocates it (`SYS_MSI_ALLOC` for the device)
-and the driver writes it into entry 0 of the device's table, which is in
-one of its BARs — or, with no MSI-X, its line. Only the modern half of a
-transitional device is driven.
+one MSI-X message (`pci::interrupt`), which each queue is told to send — or,
+with no MSI-X, its line. Only the modern half of a transitional device is
+driven.
 
 ## Asking what is there
 

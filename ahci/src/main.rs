@@ -30,10 +30,13 @@ quark_rt::manifest!([
     CapReq::phys_alloc(4),
 ]);
 
-/// Where the controller's registers (BAR 5) are mapped, and the slot the
-/// range is minted in.
+/// Where the controller's registers (BAR 5) are mapped, its MSI-X table's
+/// BAR when it has one and that is another, and the slots their ranges are
+/// minted in.
 const ABAR_AT: usize = 0xA0_0000_0000;
+const TABLE_AT: usize = 0xA1_0000_0000;
 const ABAR_SLOT: usize = 10;
+const TABLE_SLOT: usize = 11;
 /// The page `block::serve` keeps sectors in, and the port's page: its
 /// command list, the FISes it receives, a command table and room to
 /// identify the disk into.
@@ -118,8 +121,7 @@ struct Ahci {
     page: u64,
     data: u64,
     sectors: u64,
-    irq: u8,
-    by_message: bool,
+    interrupt: pci::Interrupt,
     /// What the port has said since the command was issued, cleared or
     /// not: an interrupt is answered by clearing what the port says, and
     /// an error must not be answered away before the command looks.
@@ -135,11 +137,13 @@ impl Ahci {
                 return true;
             }
             let mut msg = Message::empty();
-            if syscall::sys_recv_timeout(0, &mut msg, syscall::ns(10_000_000)).is_ok()
-                && msg.sender == 0
-                && msg.tag == self.irq as u64
-            {
-                self.settle();
+            if syscall::sys_recv_timeout(0, &mut msg, syscall::ns(10_000_000)).is_ok() {
+                if msg.sender == 0 && msg.tag == self.interrupt.number() as u64 {
+                    self.settle();
+                } else {
+                    // A death, most likely: block::serve's to hear.
+                    quark_rt::ipc::keep(&msg);
+                }
             }
         }
         done()
@@ -153,8 +157,8 @@ impl Ahci {
         self.seen.set(self.seen.get() | port_is);
         let n = (self.port - self.hba - 0x100) / 0x80;
         write32(self.hba + IS, 1 << n);
-        if !self.by_message {
-            syscall::sys_irq_ack(self.irq);
+        if self.interrupt.is_line() {
+            syscall::sys_irq_ack(self.interrupt.number());
         }
     }
 
@@ -286,7 +290,7 @@ fn until(ms: u64, done: impl Fn() -> bool) -> bool {
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let Some((device, info)) = pci::this_device().and_then(|d| Some((d, pci::info(d)?))) else {
+    let Some(device) = pci::this_device().filter(|&d| pci::info(d).is_some()) else {
         stop("started without a controller: the device manager starts this, for an AHCI controller.");
     };
     let Some(hba) = pci::map_bar(device, 5, ABAR_AT, ABAR_SLOT) else {
@@ -361,23 +365,16 @@ pub extern "C" fn _start() -> ! {
     };
     write32(hba + IS, u32::MAX);
 
-    // Its interrupt: a message of its own, which the kernel aims; or its
-    // line.
-    let (irq, by_message) = match pci::message(device) {
-        Some(irq) => (irq, true),
-        None => {
-            let line = info.header.line;
-            if line == 0 || line >= 16 || syscall::sys_irq_register(line).is_err() {
-                stop("no interrupt to be had for the controller");
-            }
-            (line, false)
-        }
-    };
+    // Its interrupt: the best it has.
+    let interrupt = pci::interrupt(device, |bar| {
+        if bar == 5 { Some(hba) } else { pci::map_bar(device, bar, TABLE_AT, TABLE_SLOT) }
+    })
+    .unwrap_or_else(|| stop("no interrupt to be had for the controller"));
     write32(port + P_IE, IE_WANTED);
     write32(hba + GHC, read32(hba + GHC) | GHC_INTERRUPTS);
     write32(port + P_CMD, read32(port + P_CMD) | CMD_START);
 
-    let mut ahci = Ahci { hba, port, page: port_page, data, sectors: 0, irq, by_message, seen: core::cell::Cell::new(0) };
+    let mut ahci = Ahci { hba, port, page: port_page, data, sectors: 0, interrupt, seen: core::cell::Cell::new(0) };
     if !ahci.run(IDENTIFY, 0, 0, port_page + IDENTIFY_AT as u64, 512, false) {
         stop("the disk does not say what it is");
     }
@@ -400,8 +397,8 @@ pub extern "C" fn _start() -> ! {
         core::str::from_utf8(&model[..model_len]).unwrap_or("a disk"),
         ahci.sectors,
         ahci.sectors / 2048,
-        irq,
-        if by_message { "a message of its own" } else { "its line" }
+        interrupt.number(),
+        interrupt.describe()
     );
     match block::register_disk() {
         Some(name) => println!("[ahci] Registered as {}.", core::str::from_utf8(&name).unwrap_or("a disk")),

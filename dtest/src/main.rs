@@ -3236,6 +3236,41 @@ fn test_disks() {
     );
     check("it is let go", block::release(disk, 1).is_ok());
     check("and is then nobody's again", block::info(disk, 1).is_ok_and(|v| v.claimant == 0));
+
+    // A claim goes with its claimant, however busy the driver was when it
+    // went. A driver waiting for its device hears from the kernel, and a
+    // death taken there was lost: the claim stayed with a task id that the
+    // next task made is given, and a write is judged by that id.
+    const ROUNDS: u64 = 8;
+    let mut gone = 0;
+    for round in 0..ROUNDS {
+        let Some(child) = load_child(&[b"dchild", b"diskread", b"disk0", b"1"]) else { break };
+        let tid = child.tid;
+        if child.start().is_err() {
+            break;
+        }
+        let pid = syscall::sys_pid(tid).unwrap_or(0);
+        for _ in 0..200 {
+            if block::info(disk, 1).is_ok_and(|v| v.claimant == pid && pid != 0) {
+                break;
+            }
+            syscall::sleep_ms(5);
+        }
+        syscall::sleep_ms(1 + round * 3);
+        let _ = syscall::sys_task_kill(tid);
+        let _ = wait_for(tid);
+        // Asked by claiming it: a dead claimant's pid is not to be had, so
+        // the volume would be said to be nobody's either way.
+        for _ in 0..100 {
+            if block::claim(disk, 1).is_ok() {
+                let _ = block::release(disk, 1);
+                gone += 1;
+                break;
+            }
+            syscall::sleep_ms(10);
+        }
+    }
+    check("a claim goes with its claimant, ended in the middle of a read", gone == ROUNDS);
 }
 
 /// The RAM disk `ramdisk 4` has just made: the one of `ram0`..`ram7` that is

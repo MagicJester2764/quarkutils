@@ -33,7 +33,10 @@
 //! if every one holds what was written to it, 3 if one does not. `outgo`
 //! writes to sixteen pages, gives them up to be written out, and ends with
 //! however many were: a program that goes with pages of its own out.
-//! `fault` writes through a null pointer; `sleep` sleeps ten seconds; `late`
+//! `diskread NAME VOLUME` claims that volume of the disk NAME and reads it,
+//! a sector at a time, until it is ended: a claimant that goes with a
+//! command in flight. `fault` writes through a null pointer; `sleep` sleeps
+//! ten seconds; `late`
 //! sleeps a fifth of one and ends with status 3, having answered nobody.
 //! `leave` starts a thread that never ends and then ends the program with
 //! status 5: descriptor 3, which the thread never closes, has to close.
@@ -1010,6 +1013,22 @@ pub extern "C" fn _start() -> ! {
     if quark_rt::args::argv(1) == Some(&b"sleep"[..]) {
         syscall::sleep_ticks(1000);
         syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"diskread"[..]) {
+        use quark_rt::block;
+        let volume = number(quark_rt::args::argv(3).unwrap_or(b"1")) as u64;
+        let Some(disk) = nameserver::lookup(quark_rt::args::argv(2).unwrap_or(b"disk0")) else {
+            syscall::sys_exit_code(1);
+        };
+        if block::claim(disk, volume).is_err() {
+            syscall::sys_exit_code(2);
+        }
+        let mut sector = [0u8; 512];
+        for lba in (0..64).cycle() {
+            if block::read(disk, volume, lba, &mut sector).is_err() {
+                syscall::sys_exit_code(3);
+            }
+        }
     }
     if quark_rt::args::argv(1) == Some(&b"beat"[..]) {
         for _ in 0..80 {
