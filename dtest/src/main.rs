@@ -258,6 +258,74 @@ fn test_services() {
         "and says what for",
         said.is_some_and(|(n, _)| text[..n].windows(17).any(|w| w == b"(no such service)")),
     );
+    test_restarts(init);
+}
+
+/// How a service is doing once `done` says so, or `ms` have passed.
+fn service_when(init: usize, name: &[u8], ms: u64, done: impl Fn(&quark_rt::services::Status) -> bool) -> Option<quark_rt::services::Status> {
+    let mut last = None;
+    for _ in 0..ms / 100 {
+        last = quark_rt::services::state(init, name).ok();
+        if last.as_ref().is_some_and(&done) {
+            break;
+        }
+        syscall::sleep_ms(100);
+    }
+    last
+}
+
+/// What fails is started again, later each time, until it has failed five
+/// times in a row within a minute of starting; what ends by itself with 0 is
+/// done. And the network stack, ended, comes back and works.
+fn test_restarts(init: usize) {
+    use quark_rt::services::State;
+    if quark_rt::services::state(init, b"svc-crash").is_ok() {
+        // Dead 0.2 s after each start: started again 1, 2, 4 and 8 seconds
+        // later, so failed about sixteen seconds after the first.
+        let crash = service_when(init, b"svc-crash", 40_000, |s| s.state == State::Failed);
+        check("a service that keeps failing is failed in the end", crash.is_some_and(|s| s.state == State::Failed));
+        check("having been started five times", crash.is_some_and(|s| s.starts == 5));
+        check("and the status it last ended with is its own", crash.is_some_and(|s| s.ended == Some(3)));
+        let done = quark_rt::services::state(init, b"svc-done");
+        check(
+            "one that ended by itself with 0 is done, and not started again",
+            done.is_ok_and(|s| s.state == State::Done && s.starts == 1 && s.ended == Some(0)),
+        );
+    }
+    let Ok(before) = quark_rt::services::state(init, b"net") else { return };
+    if before.state != State::Up {
+        return;
+    }
+    let _ = syscall::sys_task_kill(before.tid);
+    let after = service_when(init, b"net", 30_000, |s| s.state == State::Up && s.starts > before.starts);
+    check(
+        "the network stack, ended, is started again and is up",
+        // Its task id may well be the one it had; its process id is not.
+        after.is_some_and(|s| s.state == State::Up && s.starts == before.starts + 1 && s.pid != before.pid),
+    );
+    check("and a stream over it works", stream_over_loopback());
+}
+
+/// A connection to a listener of this program's, on 127.0.0.1, and four
+/// bytes across it.
+fn stream_over_loopback() -> bool {
+    use quark_rt::socket::{TcpListener, TcpStream};
+    const PORT: u16 = 47_913;
+    let Ok(listener) = TcpListener::bind(PORT) else { return false };
+    let Ok(client) = TcpStream::connect([127, 0, 0, 1], PORT) else { return false };
+    let Ok((server, _, _)) = listener.accept() else { return false };
+    if client.write_all(b"ping").is_err() {
+        return false;
+    }
+    let mut got = [0u8; 4];
+    let mut have = 0;
+    while have < 4 {
+        match server.read(&mut got[have..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => have += n,
+        }
+    }
+    have == 4 && &got == b"ping"
 }
 
 static SHARE_GO: sync::Semaphore = sync::Semaphore::new(0);

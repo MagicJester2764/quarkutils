@@ -8,7 +8,9 @@ This document is the one they are checked against.
 A client finds the server by looking up `net` with the nameserver, which
 also gives it the right to call it — which it needs to make a socket, and
 for nothing else: once a socket is a descriptor, the descriptor is the
-permission, as it is for a pipe or a file.
+permission, as it is for a pipe or a file. The stack is started again if it
+fails (`docs/services.md`), so a client that remembers which task it is
+asks again when a call to it fails; its sockets went with the old one.
 
 ## A socket is a descriptor
 

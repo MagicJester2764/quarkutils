@@ -374,7 +374,12 @@ long __quark_inet_socket(long domain, long type, long protocol) {
     msg.data[2] = (unsigned long)type & 0xF;
     msg.data[3] = (unsigned long)protocol;
     if (quark_call(net, &msg, &reply) != 0) {
-        return -LX_ENETDOWN;
+        /* The stack may have been started again since it was looked up,
+           and the old one is gone: who it is, once more. */
+        net = __quark_net(1);
+        if (!net || quark_call(net, &msg, &reply) != 0) {
+            return -LX_ENETDOWN;
+        }
     }
     if (reply.tag == ~0UL) {
         return -(long)reply.data[0];

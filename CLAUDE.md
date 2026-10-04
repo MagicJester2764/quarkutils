@@ -616,6 +616,36 @@ it. Three things follow:
   ignoring it: a group with nobody to continue it is not stopped from a
   terminal. Nothing here needs to say what it does about signal 20.
 
+## Services
+
+`init` is the service manager (`init/src/services.rs`, `docs/services.md`):
+the boot image's programs and `/etc/init.conf`'s `service` lines are
+services, each with what it needs, the name it is up once it has
+registered, and what is done when it ends. `svc` asks it, as `init`
+(`quark_rt::services`).
+
+- **Up is registered, by the task a service began as.** init asks the
+  nameserver which name a task holds (`TAG_LOOKUP_TID`), which grants
+  nothing; a lookup by name, every twentieth of a second, would have filled
+  init's capabilities. A service that registers from another thread is
+  never seen to be up.
+- **What is started again is what nobody else holds a part of.** `auth`,
+  `net` and `sound` are looked up by whoever wants them, each time; the
+  nameserver, the console, the device manager, `input` and the file server
+  are named in other programs' descriptors and capabilities, and a new one
+  would be a stranger to all of them. A new service that is to be started
+  again is one its clients find by asking — and `quark_rt` asks each time;
+  the C library asks again when a call to the stack it remembered fails.
+  init keeps a copy of each boot program it starts again: GNU/Quark's root
+  has no `/boot` to read one from.
+- **init stays in the drivers' band**, because it starts `net` again and a
+  spawner gives no better band than its own.
+- **The session waits for services still starting, five seconds at most.**
+  A line printed after the login prompt pushes the prompt off the line it is
+  waited for on, and `net` said it was ready a moment after the prompt on a
+  machine whose card's driver came up late. And `net` says it is ready
+  before it registers, not after.
+
 ## Users
 
 `docs/users.md` is the whole of it: read that before touching `auth`,

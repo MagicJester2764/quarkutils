@@ -12,6 +12,10 @@
 //! child, collects one that ends, starts what has become startable, runs the
 //! `run` lines one after another and then the session, answers `svc`
 //! (`quark_rt::services`), and sleeps until the next thing is due.
+//!
+//! What ends is started again as its policy says: a second later, and twice
+//! as long each time it ends within a minute of starting, up to a minute;
+//! the fifth such end in a row leaves it failed.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -34,6 +38,13 @@ const LOOK_NS: u64 = 20_000_000;
 const SESSION_WAIT_NS: u64 = 5_000_000_000;
 /// The arguments a configured program may be given.
 const MAX_ARGS: usize = 6;
+/// An end this soon after a start is one in a row.
+const QUICK_NS: u64 = 60_000_000_000;
+/// How many in a row leave a service failed.
+const GIVE_UP: u32 = 5;
+/// How long after the first of them it is started again, and the longest.
+const FIRST_DELAY_NS: u64 = 1_000_000_000;
+const MAX_DELAY_NS: u64 = 60_000_000_000;
 
 /// Where a service's program comes from.
 pub enum Program {
@@ -84,6 +95,10 @@ pub struct Service {
     /// When it was last started, in nanoseconds since boot.
     started: u64,
     ended: Option<i32>,
+    /// How many times in a row it has ended within a minute of starting.
+    quick: u32,
+    /// When it is started again, if it is `Restarting`.
+    due: u64,
     said_slow: bool,
     /// Why it is failed, or anything else worth saying about it.
     note: Option<&'static str>,
@@ -106,6 +121,8 @@ impl Service {
             starts: 0,
             started: 0,
             ended: None,
+            quick: 0,
+            due: 0,
             said_slow: false,
             note: None,
         }
@@ -392,14 +409,38 @@ impl Manager {
             return;
         }
         let Some(i) = self.services.iter().position(|s| s.tid == tid && tid != 0) else { return };
+        let t = now();
         let s = &mut self.services[i];
         s.tid = 0;
         s.pid = 0;
         s.ended = Some(status);
-        s.state = if status == 0 { State::Done } else { State::Failed };
-        if status != 0 {
-            println!("[init] {} ended with status {}", s.show(), status);
+        let again = match s.policy {
+            Policy::Always => true,
+            Policy::OnFailure => status != 0,
+            Policy::Never => false,
+        };
+        if !again {
+            s.state = if status == 0 { State::Done } else { State::Failed };
+            if status != 0 {
+                println!("[init] {} ended with status {}", s.show(), status);
+            }
+            return;
         }
+        s.quick = if t.saturating_sub(s.started) < QUICK_NS { s.quick + 1 } else { 1 };
+        if s.quick >= GIVE_UP {
+            s.state = State::Failed;
+            s.note = Some("ended five times in a row, each within a minute of starting: not started again");
+            println!(
+                "[init] {} ended with status {}, the fifth time in a row within a minute of starting; it is not started again",
+                s.show(),
+                status
+            );
+            return;
+        }
+        let delay = (FIRST_DELAY_NS << (s.quick - 1)).min(MAX_DELAY_NS);
+        s.state = State::Restarting;
+        s.due = t + delay;
+        println!("[init] {} ended with status {}; starting it again in {} s", s.show(), status, delay / 1_000_000_000);
     }
 
     fn up(&self, name: &[u8]) -> bool {
@@ -419,9 +460,14 @@ impl Manager {
                 println!("[init] {} has not registered as {} after {} seconds", s.show(), text(want), SLOW_NS / 1_000_000_000);
             }
         }
+        // What is due to be started again waits, like anything not started,
+        // for what it needs.
+        for s in self.services.iter_mut().filter(|s| s.state == State::Restarting && s.due <= t) {
+            s.state = State::Waiting;
+        }
         for i in 0..self.services.len() {
             let s = &self.services[i];
-            if s.state != State::Waiting || s.session {
+            if s.state != State::Waiting || (s.session && s.starts == 0) {
                 continue;
             }
             if s.needs.iter().all(|n| self.up(n)) {
@@ -452,6 +498,9 @@ impl Manager {
         let mut sooner = |ns: u64| wait = Some(wait.map_or(ns, |w| w.min(ns)));
         if self.services.iter().any(|s| s.state == State::Starting) {
             sooner(LOOK_NS);
+        }
+        for s in self.services.iter().filter(|s| s.state == State::Restarting) {
+            sooner(s.due.saturating_sub(t).max(1));
         }
         if self.running == 0 && self.runs.is_empty() && self.services.iter().any(|s| s.session && s.state == State::Waiting) {
             sooner((self.session_ready + SESSION_WAIT_NS).saturating_sub(t).max(1));
@@ -592,6 +641,10 @@ impl Manager {
             }
             State::Starting => {
                 let _ = write!(out, "starting, not yet {}", text(s.register.as_deref().unwrap_or(b"")));
+            }
+            State::Restarting => {
+                let secs = s.due.saturating_sub(now()).div_ceil(1_000_000_000);
+                let _ = write!(out, "restarting in {} s", secs);
             }
             State::Failed | State::Done => {
                 out.push_str(s.state.word());

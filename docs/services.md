@@ -18,6 +18,7 @@ state is one of:
 | `up` | running, and registered if it registers |
 | `starting` | running, and not yet registered under the name it is waited for by |
 | `waiting` | not started: something it needs is not up |
+| `restarting` | ended, and to be started again in a moment |
 | `failed` | ended with a status that is not 0, and not started again |
 | `done` | ended by itself with status 0, and not started again |
 
@@ -28,21 +29,45 @@ after thirty seconds is said to be slow on the console, and is still waited
 for. A service that registers from a thread other than the one it began as
 is never seen to: it stays `starting`.
 
+## When one ends
+
+What is done is its policy: `always` started again, `on-failure` started
+again if it ended with a status that is not 0 — a fault, a signal, a
+failure it said — and `never`. It is started again a second after it
+ended, and twice as long after each time it ends within a minute of
+starting, up to a minute; the fifth such end in a row leaves it `failed`,
+which `svc status` says. One that ran for a minute or more starts the count
+again. Started again, it waits as anything not started does for what it
+needs.
+
+A client finds a service again by asking for it again. `quark_rt` looks a
+service up each time it makes something of it; the C library keeps the
+network stack's task and asks again when a call to it fails. What a client
+had of the old one — a socket, a stream — went with it.
+
 ## The boot image's
 
-| Service | Up once it has registered |
-|---|---|
-| `nameserver` | (at once) |
-| `fb` | `fb` |
-| `console` | `console` |
-| `devmgr` | `devices` |
-| `keyboard` | `keyboard` |
-| `auth` | `auth` |
-| `net` | `net` |
-| `sound` | `sound` |
-| `ramdisk` | (at once) |
-| `input` | `input` |
-| `vfs` | `vfs` |
+| Service | Up once it has registered | Started again |
+|---|---|---|
+| `nameserver` | (at once) | never |
+| `fb` | `fb` | never |
+| `console` | `console` | never |
+| `devmgr` | `devices` | never |
+| `keyboard` | `keyboard` | never |
+| `auth` | `auth` | on failure |
+| `net` | `net` | on failure |
+| `sound` | `sound` | on failure |
+| `ramdisk` | (at once) | never |
+| `input` | `input` | never |
+| `vfs` | `vfs` | never |
+
+What is never started again is what other programs hold a part of that a
+new one would not have: the nameserver's capabilities, the console's pipe,
+the devices, every session's standard input, every open file. `auth`, `net`
+and `sound` are looked up by whoever wants them, each time; init keeps a
+copy of their programs before it frees the boot image, since a root need
+not carry one. init stays in the drivers' band to start them: a spawner can
+give no better band than it is in, and `net` asks for the drivers'.
 
 ## `/etc/init.conf`
 
@@ -63,8 +88,9 @@ session PATH
 - `run` lines are run one after another, each to its end, before the
   session.
 - `session` is what everybody logs in through: `getty`, for a system whose
-  users are on terminals. Without one it is `login` from `/usr/bin`, or the
-  shell. It is started once the `run` lines have run and every service that
+  users are on terminals, which is started again if it fails. Without one
+  it is `login` from `/usr/bin`, or the shell, which is not: on a console
+  with no terminal, the end of the login is the end of the session. It is started once the `run` lines have run and every service that
   is starting has registered — or five seconds have passed: a line a service
   prints after the login prompt pushes the prompt off its line, and a
   network that never comes does not keep anybody from logging in for long.
