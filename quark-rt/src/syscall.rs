@@ -372,6 +372,9 @@ pub const SYS_ROBUST_LIST: u64 = 132;
 // --- 0x88  signals, continued again ---
 pub const SYS_SIG_QUEUE: u64 = 136;
 pub const SYS_SIGNAL_FD: u64 = 137;
+/// Where the caller's program makes its system calls from: one made from
+/// anywhere else raises SIGSYS. Linux's syscall user dispatch.
+pub const SYS_SYSCALL_TRAP: u64 = 138;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
@@ -2311,6 +2314,17 @@ pub fn sys_signal_fd_change(fd: usize, mask: u64) -> Result<(), ()> {
     }
 }
 
+/// The caller's program makes its system calls from the `len` bytes at
+/// `from`, and one made from anywhere else is not made: signal 31 is raised
+/// at once, with every register as it was in the handler's record. `len`
+/// 0 for calls from anywhere, as a program begins.
+pub fn sys_syscall_trap(from: usize, len: usize) -> Result<(), ()> {
+    match unsafe { syscall2(SYS_SYSCALL_TRAP, from as u64, len as u64) } {
+        0 => Ok(()),
+        _ => Err(()),
+    }
+}
+
 /// [`sys_sig_wait_for`], answering with everything that came with the
 /// signal.
 pub fn sys_sig_wait_info(set: u64, span: u64) -> Result<Option<(u64, SigInfo)>, ()> {
@@ -3033,7 +3047,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 36;
+pub const ABI_VERSION_MINOR: u32 = 37;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

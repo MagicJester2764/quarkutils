@@ -1488,6 +1488,35 @@ Static is still the default, and everything else here is static. A program
 built before any of this reads its arguments from the argument page, which
 every loader still maps.
 
+**A program linked to be put anywhere is put somewhere at random.** A PIE
+(`ET_DYN`, as a program built for Linux usually is, and `-dynamic -fPIE
+-pie` here) is loaded a random number of pages into a terabyte of its own
+(`spawn::PIE_BASE`, `QUARK_PIE_BASE`), and its loader is told where: its
+entry moved (`AT_ENTRY`), and the copy of its headers' `PT_PHDR` written as
+the table's address less the distance moved, so that musl computes the
+base as where it was put. `ctests/pietest.c` checks what depends on that.
+
+**A program built for Linux runs here, its own system calls answered.**
+One linked for Linux's musl asks for its loader by Linux's name,
+`/lib/ld-musl-x86_64.so.1` (`QUARK_LINUX_INTERP`, `spawn::LINUX_INTERP`),
+where a distribution keeps the same `libc.so`; both loaders tell such a
+program so in its auxiliary vector (`QUARK_AT_LINUX`, 0x5155 — Quark's
+own key). Its code may make Linux's calls itself — rustix does, in every
+Rust program, and tempfile's rename and `terminal_size` among them — and
+those would reach the kernel with Linux's numbers. So the C layer, before
+main (`quark_start`, `__quark_linux_start`), tells the kernel that this
+program's calls are made from libc.so's own code (`SYS_SYSCALL_TRAP`, over
+its executable segment, found from its `__ehdr_start`), and a call from
+anywhere else comes back as SIGSYS with every register as it was, which
+`__quark_sig_run` answers through `__quark_syscall` as it answers musl's
+own — the answer in RAX, the rest left alone. SIGSYS stays the layer's in
+such a program: a `sigaction` for it to the default or to ignore changes
+what a SIGSYS that is not a call does, not that calls are answered. A
+static program built for Linux carries its own C library and cannot be
+run; one built here asks for `/usr/lib/...` and is never trapped.
+`ctests/linuxtest.c`, linked with Linux's loader name, checks the raw calls,
+the registers, six arguments, a thread, a fork and an exec.
+
 ## Mounts
 
 **A mount is a server.** `mount /dev/disk0p2 /mnt` starts a second file

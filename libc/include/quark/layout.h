@@ -50,6 +50,22 @@
 #define QUARK_INTERP_BASE  0x20000000000UL
 #define QUARK_INTERP_PAGES (1UL << 28)
 
+/* Where a program linked to be put anywhere (a PIE, as a program built for
+   Linux usually is) is put: a random number of pages into the terabyte above
+   the interpreter's. Mirrors quark_rt::spawn::PIE_BASE. */
+#define QUARK_PIE_BASE  0x30000000000UL
+#define QUARK_PIE_PAGES (1UL << 28)
+
+/* The loader a program linked for Linux's musl asks for, by Linux's name.
+   Quark's own programs ask for /usr/lib/ld-musl-x86_64.so.1, and a system
+   that runs Linux's keeps the same file at this name too. A program that
+   asks for it was built for Linux, and its own code may make Linux's system
+   calls: its loader says so in its auxiliary vector, under QUARK_AT_LINUX —
+   Quark's own key, far above Linux's — and the C library answers them.
+   Mirrors quark_rt::spawn::LINUX_INTERP and AT_QUARK_LINUX. */
+#define QUARK_LINUX_INTERP "/lib/ld-musl-x86_64.so.1"
+#define QUARK_AT_LINUX     0x5155UL
+
 /* Where malloc looks for pages — a random number of pages into the first
    half of this, chosen when it first looks. Deliberately not the Rust
    runtime's 0x90_0000_0000: a program links one or the other, and picking the
@@ -67,5 +83,8 @@ _Static_assert(QUARK_STAGE_ELF >= QUARK_USER_MIN && QUARK_STAGE_INTERP < QUARK_U
 _Static_assert(QUARK_INTERP_BASE >= QUARK_USER_MIN &&
                QUARK_INTERP_BASE + QUARK_INTERP_PAGES * 4096 <= QUARK_STAGE_ELF,
                "the interpreter's window is not clear of exec staging");
+_Static_assert(QUARK_PIE_BASE >= QUARK_INTERP_BASE + QUARK_INTERP_PAGES * 4096 &&
+               QUARK_PIE_BASE + QUARK_PIE_PAGES * 4096 + (1UL << 30) <= 0x93000000000UL,
+               "a PIE's window is not clear of the interpreter's and the layer's arena");
 
 #endif

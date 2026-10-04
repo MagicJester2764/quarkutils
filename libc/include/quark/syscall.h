@@ -156,6 +156,9 @@
 #define SYS_SIG_QUEUE       136
 /* A descriptor read for signals: signalfd. */
 #define SYS_SIGNAL_FD       137
+/* Where the caller's program makes its system calls from: one made from
+   anywhere else raises SIGSYS. Linux's syscall user dispatch. */
+#define SYS_SYSCALL_TRAP    138
 
 /* 0x90  time
  *

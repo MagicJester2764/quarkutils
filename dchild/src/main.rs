@@ -841,6 +841,23 @@ pub extern "C" fn _start() -> ! {
         }
         syscall::sys_exit_code(seat_refused() as i32);
     }
+    // Its calls said to be made from where it has none — its argument
+    // page — so the next one is not made, and with no handler for 31 that
+    // is the end of it; or from the gigabyte its code is linked in, and
+    // they are made as ever.
+    if quark_rt::args::argv(1) == Some(&b"trap"[..]) {
+        if syscall::sys_syscall_trap(quark_rt::spawn::ARGS_PAGE_ADDR, 4096).is_err() {
+            syscall::sys_exit_code(255);
+        }
+        syscall::sys_exit_code(0);
+    }
+    if quark_rt::args::argv(1) == Some(&b"trapok"[..]) {
+        if syscall::sys_syscall_trap(0x80_0000_0000, 1 << 30).is_err() {
+            syscall::sys_exit_code(255);
+        }
+        let me = syscall::sys_getpid();
+        syscall::sys_exit_code(if me == 0 { 254 } else { 0 });
+    }
     // Asked only to run: the parent is counting how many programs it can
     // start, not talking to this one.
     if quark_rt::args::argv(1) == Some(&b"quit"[..]) {

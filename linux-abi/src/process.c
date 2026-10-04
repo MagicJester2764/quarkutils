@@ -169,9 +169,9 @@ static int give(unsigned long cr3, unsigned long there, unsigned long here,
 
 /* Read the loadable segments, checked the way `quark_rt::spawn` checks them:
    in address order, apart, inside the file, and not spanning more than a
-   gigabyte. Each is where the file says plus `bias`: nought for a program,
-   which is not moved, and where this put an interpreter for that. Returns
-   how many, or -1. */
+   gigabyte. Each is where the file says plus `bias`: nought for a program
+   linked to be somewhere, and where this put it for one linked to be put
+   anywhere (a PIE) or for an interpreter. Returns how many, or -1. */
 static int read_segments(const struct phdr *ph, int phnum, unsigned long file_size,
                          struct segment *out, unsigned long bias) {
     int n = 0;
@@ -217,7 +217,7 @@ static int read_segments(const struct phdr *ph, int phnum, unsigned long file_si
  * thread-local in a C program lands outside its block. The end of the page
  * belongs to them however long the command line is. */
 static void build_args(unsigned char *page, char *const argv[], char *const envp[],
-                       const struct phdr *ph, int phnum) {
+                       const struct phdr *ph, int phnum, unsigned long moved) {
     unsigned long off = 0;
     for (int section = 0; section < 2; section++) {
         char *const *list = section == 0 ? argv : envp;
@@ -254,10 +254,11 @@ static void build_args(unsigned char *page, char *const argv[], char *const envp
         if (dst->p_type == PT_PHDR) {
             /* A C library takes the difference between AT_PHDR and this entry
                as the load base, and for a program that is not relocated it has
-               to come out zero. Left as it was, every address derived from the
-               headers would be off by the distance to this page. */
-            dst->p_vaddr = table;
-            dst->p_paddr = table;
+               to come out zero — for a PIE, where it was put. Left as it was,
+               every address derived from the headers would be off by the
+               distance to this page. */
+            dst->p_vaddr = table - moved;
+            dst->p_paddr = table - moved;
         }
     }
 }
@@ -275,6 +276,15 @@ static void drop_stage(const struct segment *segs, int n, unsigned long base,
     if (mapped_args) {
         unmap_stage(STAGE_ARGS, 1);
     }
+}
+
+/* Whether two strings are the same. */
+static int same(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
 }
 
 /* Unmap what of an image was staged at `stage`. */
@@ -383,7 +393,7 @@ static unsigned long length(const char *s) {
    end, as on the argument page; whatever that page holds fits here. */
 static void build_stack_top(unsigned char *page, unsigned long there, char *const argv[],
                             char *const envp[], unsigned long phnum, unsigned long entry,
-                            unsigned long interp_base) {
+                            unsigned long interp_base, unsigned long linux) {
     unsigned long random_at = PAGE_SIZE - 16;
     __syscall3(SYS_GETRANDOM, (unsigned long)(page + random_at), 16, 0);
     unsigned long ids = __syscall0(SYS_GET_UID);
@@ -405,6 +415,7 @@ static void build_stack_top(unsigned char *page, unsigned long there, char *cons
         {AT_SECURE, 0},
         {AT_HWCAP, d},
         {AT_RANDOM, there + random_at},
+        {QUARK_AT_LINUX, linux},
     };
     unsigned long naux = sizeof aux / sizeof aux[0];
 
@@ -522,13 +533,27 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
         }
     }
 
+    /* A program linked to be put anywhere (a PIE) is put somewhere of its
+       own, at random, as an interpreter is; one linked to be somewhere is
+       put there. */
+    unsigned long moved = 0;
+    if (eh.e_type == ET_DYN) {
+        unsigned long first = ~0UL;
+        for (int i = 0; i < eh.e_phnum && first == ~0UL; i++) {
+            if (ph[i].p_type == PT_LOAD && ph[i].p_memsz != 0) {
+                first = ph[i].p_vaddr & ~(PAGE_SIZE - 1);
+            }
+        }
+        moved = QUARK_PIE_BASE + __quark_random_pages(QUARK_PIE_PAGES) * PAGE_SIZE - first;
+    }
     struct segment segs[MAX_SEGMENTS];
-    int n = read_segments(ph, eh.e_phnum, file_size, segs, 0);
+    int n = read_segments(ph, eh.e_phnum, file_size, segs, moved);
     if (n < 0) {
         __quark_close(fd);
         return -LX_ENOEXEC;
     }
     unsigned long base = segs[0].first;
+    unsigned long entry = eh.e_entry + moved;
 
     /* A program built to use shared libraries names the loader that finds
        them, and is started in it: a shared object, put at a random base in a
@@ -538,7 +563,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     struct segment isegs[MAX_SEGMENTS];
     int in = 0;
     long ifd = -1;
-    unsigned long interp_base = 0, ibase = 0, start_at = eh.e_entry;
+    unsigned long interp_base = 0, ibase = 0, start_at = entry, linux = 0;
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_INTERP) {
             continue;
@@ -550,6 +575,11 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
             return -LX_ENOEXEC;
         }
         name[ph[i].p_filesz] = 0;
+        /* A program that asks for musl's loader by Linux's name was linked
+           for Linux, and its own code may make Linux's calls: it is told
+           so (QUARK_AT_LINUX), for its C library — this one, as libc.so —
+           to answer them. */
+        linux = same(name, QUARK_LINUX_INTERP);
         ifd = __quark_open(name, 0 /* O_RDONLY */, 0);
         if (ifd < 0) {
             __quark_close(fd);
@@ -615,10 +645,10 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
         drop_stage(segs, n, base, 1, 0);
         return -LX_ENOMEM;
     }
-    build_args((unsigned char *)STAGE_ARGS, argv, envp, ph, eh.e_phnum);
+    build_args((unsigned char *)STAGE_ARGS, argv, envp, ph, eh.e_phnum, moved);
     build_stack_top((unsigned char *)(STAGE_STACK + (STACK_PAGES - 1) * PAGE_SIZE),
-                    stack_top - PAGE_SIZE, argv, envp, (unsigned long)eh.e_phnum, eh.e_entry,
-                    interp_base);
+                    stack_top - PAGE_SIZE, argv, envp, (unsigned long)eh.e_phnum, entry,
+                    interp_base, linux);
 
     unsigned long cr3 = __syscall0(SYS_ADDRSPACE_CREATE);
     if (cr3 == QUARK_ERR) {

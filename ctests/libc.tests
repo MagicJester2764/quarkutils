@@ -5,6 +5,8 @@ ctortest
 mmaptest
 fixedtest
 dltest
+pietest
+linuxtest
 filetest
 dirtest
 threadfile

@@ -2295,6 +2295,19 @@ fn test_signals() {
     }
     let _ = syscall::sys_sig_take(None);
 
+    // A call made from where its program said none is made is not made:
+    // SIGSYS, which a program with no handler for it is ended by. One made
+    // from where it said is made.
+    check(
+        "a call from where its program makes none is SIGSYS, and the end of it",
+        run(b"dchild", &[b"trap"]) == Some(-31),
+    );
+    check("a call from where its program makes them is made", run(b"dchild", &[b"trapok"]) == Some(0));
+    check(
+        "the calls are said to be made from the program's own half",
+        syscall::sys_syscall_trap(0x1000, 4096).is_err(),
+    );
+
     // What a descriptor is, and whether anybody is at the other end.
     check(
         "a terminal's two ends say which they are",

@@ -64,6 +64,26 @@ pub const STACK_PAGES: usize = 256;
 pub const INTERP_BASE: usize = 0x200_0000_0000;
 const INTERP_WINDOW_PAGES: usize = 1 << 28;
 
+/// Where a program linked to be put anywhere is put — a PIE, `ET_DYN`, as a
+/// program built for Linux usually is: a random number of pages into the
+/// terabyte above the interpreter's, as everything a program has is chosen.
+/// Mirrored as `QUARK_PIE_BASE` in `quark/layout.h`.
+pub const PIE_BASE: usize = 0x300_0000_0000;
+const PIE_WINDOW_PAGES: usize = 1 << 28;
+
+/// The loader a program linked for Linux's musl asks for, by Linux's name.
+/// Quark's own programs ask for `/usr/lib/ld-musl-x86_64.so.1`; a system
+/// that runs Linux's keeps the same file at this name too. Mirrored as
+/// `QUARK_LINUX_INTERP` in `quark/layout.h`.
+pub const LINUX_INTERP: &[u8] = b"/lib/ld-musl-x86_64.so.1";
+
+/// The key in the auxiliary vector that says a program asked for
+/// [`LINUX_INTERP`]: it was built for Linux, and its own code may make
+/// Linux's system calls, which the C library it runs on then answers
+/// (`SYS_SYSCALL_TRAP`). Quark's own number, far above Linux's. Mirrored
+/// as `QUARK_AT_LINUX` in `quark/layout.h`.
+pub const AT_QUARK_LINUX: u64 = 0x5155;
+
 /// The most address space a program may span, from its first loaded page to
 /// its last: a gigabyte. The image is built laid out as the child will see it,
 /// so this is what a spawner must leave free at `Scratch::elf`.
@@ -106,6 +126,11 @@ pub struct Spawned {
     program_entry: u64,
     /// Where the interpreter was put, or nought (`AT_BASE`).
     interp_base: u64,
+    /// How far the program was moved from where it was linked: nought, but
+    /// for a PIE.
+    program_base: u64,
+    /// It asked for [`LINUX_INTERP`] ([`AT_QUARK_LINUX`]).
+    linux: bool,
 }
 
 impl Spawned {
@@ -120,6 +145,8 @@ impl Spawned {
         phnum: 0,
         program_entry: 0,
         interp_base: 0,
+        program_base: 0,
+        linux: false,
     };
 
     /// Run it. Nothing happens until this is called, which is what lets a
@@ -260,6 +287,22 @@ pub fn load_with(elf: &[u8], interp: Option<&[u8]>, scratch: &Scratch) -> Result
 
     let mut segs = [Segment::EMPTY; MAX_SEGMENTS];
     let n = segments(elf, phoff, phentsize, phnum, &mut segs).ok_or(())?;
+    // A program linked to be put anywhere is put somewhere of its own, at
+    // random; one linked to be somewhere is put there.
+    let moved = if hdr.e_type == ET_DYN {
+        let at = PIE_BASE + crate::layout::random_pages(PIE_WINDOW_PAGES) * PAGE_SIZE;
+        let by = at.wrapping_sub(segs[0].first);
+        for s in &mut segs[..n] {
+            s.first = s.first.wrapping_add(by);
+            s.end = s.end.wrapping_add(by);
+            s.vaddr = s.vaddr.wrapping_add(by);
+            s.vend = s.vend.wrapping_add(by);
+        }
+        by
+    } else {
+        0
+    };
+    let entry = entry.wrapping_add(moved as u64);
     let segs = &segs[..n];
     let base = segs[0].first;
 
@@ -339,6 +382,8 @@ pub fn load_with(elf: &[u8], interp: Option<&[u8]>, scratch: &Scratch) -> Result
         phnum: kept,
         program_entry: entry,
         interp_base: interp_base as u64,
+        program_base: moved as u64,
+        linux: interpreter(elf) == Some(LINUX_INTERP),
     })
 }
 
@@ -729,6 +774,7 @@ fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) 
         (AT_SECURE, 0),
         (AT_HWCAP, core::arch::x86_64::__cpuid(1).edx as u64),
         (AT_RANDOM, (there + random_at) as u64),
+        (AT_QUARK_LINUX, info.linux as u64),
     ];
     // A program with too many headers to copy is told of none.
     if info.phnum == 0 {
@@ -784,12 +830,13 @@ fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) 
 
 /// Put the program header table at the end of the argument page.
 ///
-/// A `PT_PHDR` entry is rewritten to say the table is where this copy is. A C
-/// library takes the difference between `AT_PHDR` and that entry's address as
-/// the load base, and for a program that is not relocated the base has to come
-/// out as zero; left as it was, every address derived from the headers —
-/// the thread-local template among them — would be off by the distance to
-/// this page.
+/// A `PT_PHDR` entry is rewritten to say the table is where this copy is,
+/// less how far the program was moved. A C library takes the difference
+/// between `AT_PHDR` and that entry's address as the load base, and for a
+/// program that is not relocated the base has to come out as zero — for a
+/// PIE, as where it was put; left as it was, every address derived from the
+/// headers — the thread-local template among them — would be off by the
+/// distance to this page.
 unsafe fn write_phdrs(base: *mut u8, info: &Spawned) {
     let at = PHDRS_AT;
     let table = ARGS_PAGE_ADDR + at + 16;
@@ -805,8 +852,8 @@ unsafe fn write_phdrs(base: *mut u8, info: &Spawned) {
             );
             let ph = &mut *(dst as *mut Elf64Phdr);
             if ph.p_type == PT_PHDR {
-                ph.p_vaddr = table as u64;
-                ph.p_paddr = table as u64;
+                ph.p_vaddr = (table as u64).wrapping_sub(info.program_base);
+                ph.p_paddr = ph.p_vaddr;
             }
         }
     }

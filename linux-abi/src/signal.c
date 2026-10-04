@@ -30,6 +30,13 @@
  * Two signals the kernel raises of its own accord, and both arrive here like
  * any other: SIGALRM, when the alarm `setitimer` set is due, and SIGCHLD,
  * when a child of this program ends.
+ *
+ * And a third, in a program built for Linux (`__quark_linux_start`): SIGSYS,
+ * for a system call the program's own code made rather than asking this
+ * library to. The kernel makes no such call — its numbers are Linux's — and
+ * hands it here instead, as a fault, with every register as it was; this
+ * answers it as it answers its own calls, and the program goes on after it
+ * as if the kernel had.
  */
 
 #include <quark/syscall.h>
@@ -46,6 +53,9 @@
 #define LX_SIGSEGV 11
 #define LX_SIGPIPE 13
 #define LX_SIGSTOP 19
+#define LX_SIGSYS  31
+/* A SIGSYS for a call the kernel turned aside (Linux's SYS_USER_DISPATCH). */
+#define LX_SYS_USER_DISPATCH 2
 /* musl's own, for pthread_cancel. */
 #define LX_SIGCANCEL 33
 
@@ -251,10 +261,28 @@ static void fill_info(struct lx_siginfo *si, int sig, long code, unsigned long w
     }
 }
 
+long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
+
+/* This is a program built for Linux, whose own calls this library answers
+   (`__quark_linux_start`). */
+static int linux_calls;
+
 /* Call the handler the frame names, and put back what it changed of where
    the thread was and what it holds back. */
 void __quark_sig_run(struct quark_sigframe *f, void *fp) {
     int sig = (int)f->signo;
+    /* A system call the program's own code made: the number is in the low
+       half of what came with it, the arguments where Linux passes them —
+       RDI, RSI, RDX, R10, R8, R9, at their places in the record — and the
+       answer goes in RAX, which is all a call changes but RCX and R11, and
+       those the record has as the instruction left them. */
+    if (sig == LX_SIGSYS && f->info_code == LX_SYS_USER_DISPATCH) {
+        f->regs[0] = (unsigned long)__quark_syscall((long)(unsigned int)f->info_value,
+                                                    (long)f->regs[5], (long)f->regs[4],
+                                                    (long)f->regs[3], (long)f->regs[9],
+                                                    (long)f->regs[7], (long)f->regs[8]);
+        return;
+    }
     if (!(f->flags & Q_SIGINFO)) {
         ((void (*)(int))f->cookie)(sig);
         return;
@@ -292,6 +320,68 @@ void __quark_sig_start(void) {
         }
     }
     __syscall5(SYS_SIG_ACTION, 0, QUARK_SIG_RUN, 0, QUARK_SIG_UNIX, (unsigned long)__quark_sig_entry);
+}
+
+/* SIGSYS that was not a call, in a program that has said nothing about it
+   or asked for what it does by default: what it does by default — the end
+   of the program — once this handler is left. */
+static void sigsys_default(int sig) {
+    __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_DEFAULT);
+    __syscall2(SYS_SIG_RAISE, __syscall0(SYS_GETPID), (unsigned long)sig);
+}
+
+/* And one the program asked to have ignored. */
+static void sigsys_ignored(int sig) {
+    (void)sig;
+}
+
+/* The ELF header this library was loaded with — libc.so's, for a program
+   linked to it; nothing in a program linked to this statically, whose
+   headers are not loaded. */
+extern const unsigned char __ehdr_start[] __attribute__((weak, visibility("hidden")));
+
+/* A program built for Linux — it asked for musl's loader by Linux's name,
+   and its loader said so (QUARK_AT_LINUX) — is running on this library as
+   libc.so, and its own code may make Linux's system calls itself rather
+   than ask: rustix does, in every Rust program.
+   So the kernel is told that this program's calls are made from this
+   library's code (SYS_SYSCALL_TRAP), and one made from anywhere else comes
+   here as SIGSYS, answered by `__quark_sig_run`. A program linked to this
+   statically has nowhere to say that from: one built for Linux is not
+   linked to this, and one built for Quark makes its calls itself. */
+void __quark_linux_start(void) {
+    const unsigned char *self = __ehdr_start;
+    if (!self) {
+        return;
+    }
+    unsigned long phoff = *(const unsigned long *)(self + 32);
+    unsigned short phentsize = *(const unsigned short *)(self + 54);
+    unsigned short phnum = *(const unsigned short *)(self + 56);
+    unsigned long from = ~0UL, to = 0;
+    for (unsigned short i = 0; i < phnum; i++) {
+        const unsigned char *ph = self + phoff + (unsigned long)i * phentsize;
+        unsigned int type = *(const unsigned int *)ph;
+        unsigned int flags = *(const unsigned int *)(ph + 4);
+        unsigned long vaddr = *(const unsigned long *)(ph + 16);
+        unsigned long memsz = *(const unsigned long *)(ph + 40);
+        if (type != 1 /* PT_LOAD */ || !(flags & 1) /* PF_X */ || memsz == 0) {
+            continue;
+        }
+        unsigned long start = (unsigned long)self + vaddr;
+        if (start < from) {
+            from = start;
+        }
+        if (start + memsz > to) {
+            to = start + memsz;
+        }
+    }
+    if (from >= to) {
+        return;
+    }
+    linux_calls = 1;
+    __syscall5(SYS_SIG_ACTION, LX_SIGSYS, QUARK_SIG_RUN, 0, Q_SIGINFO,
+               (unsigned long)sigsys_default);
+    __syscall2(SYS_SYSCALL_TRAP, from, to - from);
 }
 
 /* What this thread holds back. */
@@ -349,7 +439,15 @@ long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksig
     struct lx_ksigaction was = action_of(sig);
     if (act) {
         unsigned long r;
-        if (act->handler == LX_SIG_DFL) {
+        if (linux_calls && sig == LX_SIGSYS &&
+            (act->handler == LX_SIG_DFL || act->handler == LX_SIG_IGN)) {
+            /* The calls this library answers come as SIGSYS: the kernel has
+               to go on running a handler for it, whatever else the program
+               wants done with one that is not a call. */
+            r = __syscall5(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_RUN, 0, Q_SIGINFO,
+                           act->handler == LX_SIG_DFL ? (unsigned long)sigsys_default
+                                                      : (unsigned long)sigsys_ignored);
+        } else if (act->handler == LX_SIG_DFL) {
             r = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_DEFAULT);
         } else if (act->handler == LX_SIG_IGN) {
             r = __syscall2(SYS_SIG_ACTION, (unsigned long)sig, QUARK_SIG_IGNORE);

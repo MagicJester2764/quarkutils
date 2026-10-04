@@ -1063,6 +1063,23 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 void __quark_sig_start(void);
+void __quark_linux_start(void);
+
+/* What a program's loader said of it under `key`, from the auxiliary vector
+   that follows its environment on the stack it began with — before main, so
+   before anything could have moved the environment. 0 if it said nothing. */
+static unsigned long told(unsigned long key) {
+    char **e = __environ;
+    while (e && *e) {
+        e++;
+    }
+    for (const unsigned long *aux = (const unsigned long *)(e + 1); e && aux[0] != 0; aux += 2) {
+        if (aux[0] == key) {
+            return aux[1];
+        }
+    }
+    return 0;
+}
 
 /* Where the kernel enters this program to run a signal's handler, and how a
    call a signal cuts short is to be answered — before main, and before any
@@ -1075,6 +1092,11 @@ void __quark_sig_start(void);
 __attribute__((constructor(101))) static void quark_start(void) {
     __quark_sig_start();
     first_stack_top = ((unsigned long)__environ + 4095UL) & ~4095UL;
+    /* And a program built for Linux: the calls its own code makes are
+       answered here too. */
+    if (told(QUARK_AT_LINUX)) {
+        __quark_linux_start();
+    }
 }
 
 /* Every call musl makes arrives here. A handler runs wherever the kernel
