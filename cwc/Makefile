@@ -20,7 +20,7 @@ CC      ?= gcc
 CFLAGS  := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
            -fno-pic -no-pie -mcmodel=large -mno-red-zone \
            -std=c11 -O2 -Wall -Wextra -I$(LIBC)/include
-LDFLAGS := -nostdlib -no-pie -Wl,-T,../linker.ld -Wl,--build-id=none
+LDFLAGS := -nostdlib -no-pie -T ../linker.ld -Wl,--build-id=none
 LIBS    := $(LIBC)/src/start.o $(LIBC)/libquark.a
 DEPS    := $(LIBC)/libquark.a $(LIBC)/src/start.o
 endif

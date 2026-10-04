@@ -111,11 +111,18 @@ check-abi:
 # nothing checks goes stale: this one had, by ten files of sixteen. So when the
 # fork is here to compare against, it is compared — and the compiler with it,
 # which has to be the one built from the commit the fork is based on.
+#
+# On a system building itself the fork is a copy of its library and not its
+# checkout: there is no history there to compare against, and no git.
 check-std-patches:
 ifeq ($(HAVE_STD_FORK),)
 	@echo "std-patches: no std fork at $(QUARK_RUST_STD_PATH) — the mirror was not checked"
 else
-	@./tools/std-patches.sh check $(QUARK_RUST_STD_PATH)/..
+	@if [ -e $(QUARK_RUST_STD_PATH)/../.git ]; then \
+		./tools/std-patches.sh check $(QUARK_RUST_STD_PATH)/..; \
+	else \
+		echo "std-patches: $(QUARK_RUST_STD_PATH) is not a checkout — the mirror was not checked"; \
+	fi
 endif
 
 all: check-abi check-std-patches $(RUST_ELFS) $(HOSTED_ELFS) $(C_ELFS) $(LINUX_ABI_A) rootfs
