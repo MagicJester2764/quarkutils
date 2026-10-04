@@ -97,6 +97,7 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
                           unsigned long size);
 long __quark_kill(long pid, long sig);
 long __quark_tkill(long tid, long sig);
+long __quark_sigqueue(long pid, long tid, long sig, const void *info);
 long __quark_sigaltstack(const void *ss, void *old);
 /* As the program starts: where the kernel enters it to run a handler. */
 void __quark_sig_start(void);

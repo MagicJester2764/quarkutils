@@ -1449,8 +1449,8 @@ mounts`):
   no focus stealing prevention.
 - **A call to a server is not cut short by a signal**: a C program's read
   of a file, or its wait for a lock, runs its handler when the server has
-  answered. Nothing is queued, real-time signals included, and a handler is
-  told who sent a signal by process id alone. `alarm` and `setitimer` are
+  answered. A real-time signal queues, as on Linux, but in a queue of 64 a
+  program, and one more is refused with `EAGAIN`. `alarm` and `setitimer` are
   the kernel's one alarm for a program, in real time, to the nanosecond: the
   timers that count time spent running are refused, and so is
   `timer_create`, which every program asked falls back from.

@@ -346,6 +346,9 @@ pub const SYS_FUTEX_WAKE: u64 = 129;
 pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 pub const SYS_EVENT_CREATE: u64 = 131;
 
+// --- 0x88  signals, continued again ---
+pub const SYS_SIG_QUEUE: u64 = 136;
+
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
 pub const SYS_BOOT_TIME: u64 = 145;
@@ -1946,6 +1949,75 @@ pub fn sys_sig_pending() -> u64 {
     unsafe { syscall2(SYS_SIG_MASK, 4, 0) }
 }
 
+/// What came with a signal: Linux's `si_code`, who raised it — a process id
+/// in the low half and its user in the high (for SIGCHLD the child's) — and
+/// what it carried: the value it was queued with, a child's status, a
+/// fault's address. The end of a handler's [`crate::signal::Frame`], and
+/// what [`sys_sig_wait_info`] answers with.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SigInfo {
+    pub code: i64,
+    pub who: u64,
+    pub value: u64,
+}
+
+/// [`SigInfo::code`]: raised with `SYS_SIG_RAISE`, the same for one task,
+/// with [`sys_sig_queue`], by the kernel; and SIGCHLD's — the child exited,
+/// a signal ended it, it stopped, it was continued.
+pub const SI_USER: i64 = 0;
+pub const SI_TKILL: i64 = -6;
+pub const SI_QUEUE: i64 = -1;
+pub const SI_KERNEL: i64 = 0x80;
+pub const CLD_EXITED: i64 = 1;
+pub const CLD_KILLED: i64 = 2;
+pub const CLD_STOPPED: i64 = 5;
+pub const CLD_CONTINUED: i64 = 6;
+
+/// Why [`sys_sig_queue`] raised nothing: nobody to raise it for, or a
+/// real-time signal with as many of it waiting as can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotQueued {
+    Nobody,
+    Full,
+}
+
+fn queued(ret: u64) -> Result<(), NotQueued> {
+    match ret {
+        0 => Ok(()),
+        0xFFFF_FFFE => Err(NotQueued::Full),
+        _ => Err(NotQueued::Nobody),
+    }
+}
+
+/// Raise `signo` for the program `tid` is a task of, carrying `value`. A
+/// real-time signal (32 and up) raised while one of its number is waiting
+/// waits behind it, rather than being the same one again.
+pub fn sys_sig_queue(tid: usize, signo: u64, value: u64) -> Result<(), NotQueued> {
+    queued(unsafe { syscall4(SYS_SIG_QUEUE, tid as u64, signo, value, 0) })
+}
+
+/// The same, for the program whose process id is `pid`.
+pub fn sys_sig_queue_pid(pid: u64, signo: u64, value: u64) -> Result<(), NotQueued> {
+    queued(unsafe { syscall4(SYS_SIG_QUEUE, pid, signo, value, 1) })
+}
+
+/// The same, for task `tid` and no other.
+pub fn sys_sig_queue_thread(tid: usize, signo: u64, value: u64) -> Result<(), NotQueued> {
+    queued(unsafe { syscall4(SYS_SIG_QUEUE, tid as u64, signo, value, 4) })
+}
+
+/// [`sys_sig_wait_for`], answering with everything that came with the
+/// signal.
+pub fn sys_sig_wait_info(set: u64, span: u64) -> Result<Option<(u64, SigInfo)>, ()> {
+    let mut info = SigInfo::default();
+    match unsafe { syscall4(SYS_SIG_WAIT, set, span, &mut info as *mut SigInfo as u64, 1) } {
+        0 => Ok(None),
+        n if n <= 64 => Ok(Some((n, info))),
+        _ => Err(()),
+    }
+}
+
 /// Take one of `set` that is waiting, or that arrives within `span` (ticks,
 /// or nanoseconds with the top bit set; 0 not to wait, `u64::MAX` for ever),
 /// without its handler running: the signal and who raised it — a process id
@@ -2644,7 +2716,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 27;
+pub const ABI_VERSION_MINOR: u32 = 28;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

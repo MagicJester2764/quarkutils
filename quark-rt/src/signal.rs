@@ -59,6 +59,8 @@ pub struct Frame {
     pub cookie: u64,
     /// RAX RBX RCX RDX RSI RDI RBP R8–R15 RIP RFLAGS RSP.
     pub regs: [u64; 18],
+    /// What came with it, of which `code` and `value` say part.
+    pub info: crate::syscall::SigInfo,
 }
 
 /// Where in [`Frame::regs`] the task was, and its stack.

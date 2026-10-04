@@ -7267,6 +7267,9 @@ static HANDLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 static HANDLED_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HANDLED_BY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static HANDLED_WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// What came with it, as the end of its record says: `si_code` and the value.
+static HANDLED_CODE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static HANDLED_VALUE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDLED_WHO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDLED_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static HANDLED_ON_STACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -7310,6 +7313,8 @@ fn on_signal(frame: &mut quark_rt::signal::Frame) {
     HANDLED_BY.store(syscall::sys_getpid() as usize, SeqCst);
     HANDLED_WHY.store(frame.code, SeqCst);
     HANDLED_WHO.store(frame.value, SeqCst);
+    HANDLED_CODE.store(frame.info.code, SeqCst);
+    HANDLED_VALUE.store(frame.info.value, SeqCst);
     HANDLED.fetch_add(1, SeqCst);
     HANDLED_FLAG.store(1, SeqCst);
 }
@@ -7733,6 +7738,113 @@ fn test_handlers() {
             && syscall::sys_ticks() - before < 50,
     );
     let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+
+    // What comes with a signal, and what waits behind what. A real-time
+    // signal raised three times while held back is three, each with what it
+    // carried; one below 32 raised twice is one.
+    const RT: u64 = 40;
+    let (uid, _) = syscall::sys_get_uid();
+    let pid = syscall::sys_pid_self();
+    let mine = pid | (uid as u64) << 32;
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, sig(RT) | sig(HANDLED_USR2) | sig(17));
+    let queued = (1..=3).all(|v| syscall::sys_sig_queue(me, RT, 100 + v).is_ok());
+    let mut values = [0u64; 3];
+    let mut said = true;
+    for v in values.iter_mut() {
+        match syscall::sys_sig_wait_info(sig(RT), 0) {
+            Ok(Some((RT, info))) => {
+                *v = info.value;
+                said &= info.code == syscall::SI_QUEUE && info.who == mine;
+            }
+            _ => said = false,
+        }
+    }
+    check(
+        "a real-time signal queued three times while held back is taken three times, each with its value, in order",
+        queued && values == [101, 102, 103],
+    );
+    check("each saying it was queued, by this program and its user", said);
+    check("and then none is waiting", syscall::sys_sig_pending() & sig(RT) == 0);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    let first = syscall::sys_sig_wait_info(sig(HANDLED_USR2), 0);
+    check(
+        "one below 32 raised twice while held back is one, raised by this program",
+        matches!(first, Ok(Some((HANDLED_USR2, info))) if info.code == syscall::SI_USER && info.who == mine)
+            && syscall::sys_sig_wait_info(sig(HANDLED_USR2), 0) == Ok(None),
+    );
+    let mut room = 0;
+    while room < 200 && syscall::sys_sig_queue(me, RT, room).is_ok() {
+        room += 1;
+    }
+    check(
+        "a program has room for 65 of one real-time signal, and the next cannot wait",
+        room == 65 && syscall::sys_sig_queue(me, RT, 0) == Err(syscall::NotQueued::Full),
+    );
+    let mut taken = 0;
+    while let Ok(Some(_)) = syscall::sys_sig_wait_info(sig(RT), 0) {
+        taken += 1;
+    }
+    check("and every one of them is taken", taken == 65);
+    let mut room = 0;
+    while room < 200 && syscall::sys_sig_queue_thread(me, RT, room).is_ok() {
+        room += 1;
+    }
+    let mut taken = 0;
+    while let Ok(Some(_)) = syscall::sys_sig_wait_info(sig(RT), 0) {
+        taken += 1;
+    }
+    check("a task has room for 17 of its own, every one of them taken", room == 17 && taken == 17);
+
+    // SIGCHLD says which child, and what became of it.
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(7),
+        Ok(child) => {
+            let child_pid = syscall::sys_pid(child).unwrap_or(0);
+            let ended = wait_for(child) == Some(7);
+            let told = syscall::sys_sig_wait_info(sig(17), 100);
+            check(
+                "SIGCHLD says that a child exited, which, and with what",
+                ended
+                    && matches!(told, Ok(Some((17, info)))
+                        if info.code == syscall::CLD_EXITED && info.who == child_pid | (uid as u64) << 32 && info.value == 7),
+            );
+        }
+        Err(()) => check("fork", false),
+    }
+    match syscall::sys_fork() {
+        Ok(0) => loop {
+            syscall::sleep_ticks(100);
+        },
+        Ok(child) => {
+            let child_pid = syscall::sys_pid(child).unwrap_or(0);
+            let _ = syscall::sys_sig_raise(child, syscall::SIGKILL);
+            let ended = wait_for(child) == Some(-(syscall::SIGKILL as i32));
+            let told = syscall::sys_sig_wait_info(sig(17), 100);
+            check(
+                "and that a signal ended one, and which",
+                ended
+                    && matches!(told, Ok(Some((17, info)))
+                        if info.code == syscall::CLD_KILLED && info.who & 0xFFFF_FFFF == child_pid
+                            && info.value == syscall::SIGKILL),
+            );
+        }
+        Err(()) => check("fork", false),
+    }
+
+    // A handler the kernel runs is told the same, at the end of its record.
+    fresh();
+    let _ = signal::handle(RT, on_signal, 0, 0);
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+    let raised = syscall::sys_sig_queue(me, RT, 4242).is_ok();
+    check(
+        "a handler is told what came with its signal",
+        raised
+            && HANDLED.load(SeqCst) == 1
+            && HANDLED_CODE.load(SeqCst) == syscall::SI_QUEUE
+            && HANDLED_VALUE.load(SeqCst) == 4242,
+    );
+    let _ = syscall::sys_sig_action(RT, syscall::SIG_DEFAULT);
 
     // A terminal says when its size changes.
     fresh();

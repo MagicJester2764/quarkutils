@@ -134,8 +134,18 @@ A program has what Linux gives it: `sigaction` with `SA_SIGINFO`,
 `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `SA_ONSTACK`; a mask for
 each thread (`sigprocmask`, `pthread_sigmask`); `kill`, `raise`,
 `pthread_kill`; `sigsuspend`, `pause`, `sigpending`, `sigwait`,
-`sigwaitinfo` and `sigtimedwait`; `sigaltstack`; `alarm` and
-`setitimer(ITIMER_REAL)`; and `SIGCHLD` when a child ends.
+`sigwaitinfo` and `sigtimedwait`; `sigqueue`, and for one thread
+`rt_tgsigqueueinfo` (musl has no function for it); `sigaltstack`; `alarm` and `setitimer(ITIMER_REAL)`; and `SIGCHLD` when a
+child ends, stops or is continued.
+
+**A real-time signal queues.** One raised while one of its number is
+waiting waits behind it with its own value, and each is handled, in the
+order they were raised; a signal below `SIGRTMIN` raised again while it
+waits is the same one, as on Linux. And `siginfo_t` says what Linux's
+does: `si_code` (`SI_USER`, `SI_QUEUE`, `SI_TKILL`, `SI_KERNEL`, a fault's
+`SEGV_MAPERR` or `SEGV_ACCERR`), `si_pid` and `si_uid` of whoever raised it,
+`si_value`; for `SIGCHLD`, `CLD_EXITED`, `CLD_KILLED`, `CLD_STOPPED` or
+`CLD_CONTINUED` and the child's `si_status`; for a fault, `si_addr`.
 
 **The kernel runs the handler**, as Linux's does: a thread that does not
 block the signal is turned aside wherever it is — in a call, or computing —
@@ -170,10 +180,12 @@ What is different:
   lock: they are calls to the file server, and the handler runs when it has
   answered. On Linux a file on a disk is not interruptible either; a lock's
   wait is.
-- **Nothing is queued.** A signal raised twice before it is handled is
-  handled once — the real-time signals included, which Linux queues.
-- **`siginfo_t` says who sent a signal by process id and nothing more**:
-  `si_uid` is 0, and for `SIGCHLD` there is no `si_status`.
+- **The queue is 64 long**, for a program, and 16 more for each thread
+  (`RLIMIT_SIGPENDING`; musl's `sysconf(_SC_SIGQUEUE_MAX)` says -1, as it
+  does on Linux): a real-time signal past that is refused with `EAGAIN`, by
+  `kill` as well as by `sigqueue`. Linux's is thousands long.
+- **`SIGCHLD` says nothing of the time the child used** (`si_utime`,
+  `si_stime`); `getrusage` and `wait4` do.
 - The interval timers that count time spent running (`ITIMER_VIRTUAL`,
   `ITIMER_PROF`) are refused: the time is measured (`getrusage`, below) and
   limited (`RLIMIT_CPU`), but nothing counts it down. `timer_create` is

@@ -60,14 +60,6 @@
 #define LX_SS_DISABLE 2
 #define LX_MINSIGSTKSZ 2048
 
-/* si_code: raised by a program, by the kernel, and the four faults. */
-#define LX_SI_USER     0
-#define LX_SI_KERNEL   0x80
-#define LX_SEGV_MAPERR 1
-#define LX_BUS_ADRERR  2
-#define LX_FPE_INTDIV  1
-#define LX_ILL_ILLOPN  2
-
 /* What the kernel is told about running a handler (SYS_SIG_ACTION's flags):
    its own signal is not held back while it runs; it is run once; on the
    stack named for handlers; a call it cuts short is made again. And above
@@ -97,6 +89,13 @@ struct quark_sigframe {
     /* The handler, as it was given. */
     unsigned long cookie;
     unsigned long regs[18];
+    /* What came with it, which `code` and `value` say part of: Linux's
+       si_code, who raised it (a process id, and its user in the high half;
+       for SIGCHLD the child's), and what it carried — a queued value, a
+       child's status, a fault's address. */
+    long info_code;
+    unsigned long info_who;
+    unsigned long info_value;
 };
 
 /* musl's siginfo_t and ucontext_t on x86-64, laid out as a handler compiled
@@ -107,10 +106,13 @@ struct lx_siginfo {
     int si_code;
     int pad;
     union {
+        /* A signal a program or the kernel raised: who, and what it carried
+           — si_value, or for SIGCHLD si_status. */
         struct {
             int pid;
             unsigned int uid;
-        } kill;
+            unsigned long value;
+        } rt;
         void *addr;
         char fill[112];
     } u;
@@ -218,18 +220,20 @@ __asm__(
 void __quark_sig_entry(void);
 void __quark_sig_run(struct quark_sigframe *f, void *fp);
 
-/* Why, as siginfo says it. */
-static int code_of(const struct quark_sigframe *f) {
-    if (f->code == 2) {
-        switch (f->signo) {
-        case LX_SIGSEGV: return LX_SEGV_MAPERR;
-        case LX_SIGBUS: return LX_BUS_ADRERR;
-        case LX_SIGFPE: return LX_FPE_INTDIV;
-        case LX_SIGILL: return LX_ILL_ILLOPN;
-        default: return LX_SI_KERNEL;
-        }
+/* What came with a signal, as siginfo says it: who raised it and what it
+   carried — or, for a fault, where it was. */
+static void fill_info(struct lx_siginfo *si, int sig, long code, unsigned long who,
+                      unsigned long value, int fault) {
+    __builtin_memset(si, 0, sizeof *si);
+    si->si_signo = sig;
+    si->si_code = (int)code;
+    if (fault) {
+        si->u.addr = (void *)value;
+    } else {
+        si->u.rt.pid = (int)(who & 0xFFFFFFFFUL);
+        si->u.rt.uid = (unsigned int)(who >> 32);
+        si->u.rt.value = value;
     }
-    return f->code == 0 ? LX_SI_USER : LX_SI_KERNEL;
 }
 
 /* Call the handler the frame names, and put back what it changed of where
@@ -242,15 +246,8 @@ void __quark_sig_run(struct quark_sigframe *f, void *fp) {
     }
     struct lx_siginfo info;
     struct lx_ucontext uc;
-    __builtin_memset(&info, 0, sizeof info);
+    fill_info(&info, sig, f->info_code, f->info_who, f->info_value, f->code == 2);
     __builtin_memset(&uc, 0, sizeof uc);
-    info.si_signo = sig;
-    info.si_code = code_of(f);
-    if (f->code == 2) {
-        info.u.addr = (void *)f->value;
-    } else if (f->code == 0) {
-        info.u.kill.pid = (int)(f->value & 0x7FFFFFFFUL);
-    }
     for (int i = 0; i < 18; i++) {
         uc.gregs[greg_of[i]] = f->regs[i];
     }
@@ -439,15 +436,12 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
             unsigned long now = quark_now();
             span = now < deadline ? quark_span(deadline - now) : 0;
         }
-        unsigned long who = 0;
-        unsigned long r = __syscall3(SYS_SIG_WAIT, *set, span, (unsigned long)&who);
+        /* What came with it, as a handler's record ends. */
+        unsigned long came[3] = {0, 0, 0};
+        unsigned long r = __syscall4(SYS_SIG_WAIT, *set, span, (unsigned long)came, 1);
         if (r >= 1 && r <= NSIG) {
             if (info) {
-                struct lx_siginfo *si = info;
-                __builtin_memset(si, 0, sizeof *si);
-                si->si_signo = (int)r;
-                si->si_code = (who >> 63) ? LX_SI_USER : LX_SI_KERNEL;
-                si->u.kill.pid = (int)(who & 0x7FFFFFFFUL);
+                fill_info(info, (int)r, (long)came[0], came[1], came[2], 0);
             }
             return (long)r;
         }
@@ -522,8 +516,12 @@ long __quark_kill(long pid, long sig) {
                                      QUARK_RAISE_GROUP);
         return r == QUARK_ERR ? -LX_ESRCH : r == QUARK_NOT_ALLOWED ? -LX_EPERM : 0;
     }
-    if (__syscall3(SYS_SIG_RAISE, (unsigned long)pid, (unsigned long)sig, QUARK_RAISE_BY_PID) !=
-        QUARK_ERR) {
+    unsigned long r = __syscall3(SYS_SIG_RAISE, (unsigned long)pid, (unsigned long)sig, QUARK_RAISE_BY_PID);
+    if (r == QUARK_WOULD_BLOCK) {
+        /* A real-time signal with as many of it waiting as can. */
+        return -LX_EAGAIN;
+    }
+    if (r != QUARK_ERR) {
         return 0;
     }
     /* The kernel says no one way, for a process that is not there and for
@@ -541,10 +539,39 @@ long __quark_tkill(long tid, long sig) {
     if (sig < 0 || sig > NSIG || tid <= 0) {
         return -LX_EINVAL;
     }
-    return __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig, QUARK_RAISE_THREAD) ==
-                   QUARK_ERR
-               ? -LX_ESRCH
-               : 0;
+    unsigned long r = __syscall3(SYS_SIG_RAISE, (unsigned long)tid, (unsigned long)sig, QUARK_RAISE_THREAD);
+    return r == QUARK_ERR ? -LX_ESRCH : r == QUARK_WOULD_BLOCK ? -LX_EAGAIN : 0;
+}
+
+/* rt_sigqueueinfo, and with a thread rt_tgsigqueueinfo: a signal carrying
+   the value in the record the program filled — the record's alone. Who
+   raised it, and as what, are the kernel's to say. A real-time signal waits
+   behind one of its number, and EAGAIN is the kernel saying it cannot. */
+long __quark_sigqueue(long pid, long tid, long sig, const void *info) {
+    if (sig < 0 || sig > NSIG || !info) {
+        return -LX_EINVAL;
+    }
+    unsigned long value = ((const struct lx_siginfo *)info)->u.rt.value;
+    unsigned long r;
+    if (tid >= 0) {
+        if (tid == 0) {
+            return -LX_EINVAL;
+        }
+        r = __syscall4(SYS_SIG_QUEUE, (unsigned long)tid, (unsigned long)sig, value, QUARK_RAISE_THREAD);
+        return r == QUARK_ERR ? -LX_ESRCH : r == QUARK_WOULD_BLOCK ? -LX_EAGAIN : 0;
+    }
+    if (pid <= 0) {
+        return -LX_ESRCH;
+    }
+    r = __syscall4(SYS_SIG_QUEUE, (unsigned long)pid, (unsigned long)sig, value, QUARK_RAISE_BY_PID);
+    if (r == QUARK_WOULD_BLOCK) {
+        return -LX_EAGAIN;
+    }
+    if (r != QUARK_ERR) {
+        return 0;
+    }
+    return __syscall2(SYS_PGROUP, QUARK_PGROUP_GET, (unsigned long)pid) == QUARK_ERR ? -LX_ESRCH
+                                                                                     : -LX_EPERM;
 }
 
 /* A write found nobody at the other end. */

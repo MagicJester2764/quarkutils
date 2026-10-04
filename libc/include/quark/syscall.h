@@ -152,6 +152,8 @@
 #define SYS_FUTEX_WAKE      129
 #define SYS_FUTEX_WAIT_TIMEOUT 130
 #define SYS_EVENT_CREATE    131
+/* A signal that carries a value: a real-time one queues. */
+#define SYS_SIG_QUEUE       136
 
 /* 0x90  time
  *

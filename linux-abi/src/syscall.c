@@ -103,6 +103,8 @@ typedef unsigned long size_t;
 #define LX_rt_sigsuspend   130
 #define LX_tkill           200
 #define LX_tgkill          234
+#define LX_rt_sigqueueinfo 129
+#define LX_rt_tgsigqueueinfo 297
 #define LX_epoll_pwait     281
 #define LX_ioctl            16
 #define LX_readv            19
@@ -644,6 +646,7 @@ static long do_uname(char *u) {
 #define LX_RLIMIT_CPU    0
 #define LX_RLIMIT_STACK  3
 #define LX_RLIMIT_NOFILE 7
+#define LX_RLIMIT_SIGPENDING 11
 #define LX_RLIM_INFINITY (~0UL)
 
 static long do_getrlimit(long what, unsigned long *lim) {
@@ -660,6 +663,9 @@ static long do_getrlimit(long what, unsigned long *lim) {
     switch (what) {
     case LX_RLIMIT_NOFILE: v = 64; break;           /* the kernel's table */
     case LX_RLIMIT_STACK:  v = 256 * 4096UL; break; /* what a spawner gives */
+    /* How many signals may wait behind their first, which is what sysconf
+       answers _SC_SIGQUEUE_MAX with: the kernel's room for a program. */
+    case LX_RLIMIT_SIGPENDING: v = 64; break;
     default:               v = LX_RLIM_INFINITY; break;
     }
     lim[0] = v; /* soft */
@@ -1600,6 +1606,10 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_tkill(a1, a2);
     case LX_tgkill:
         return __quark_tkill(a2, a3);
+    case LX_rt_sigqueueinfo:
+        return __quark_sigqueue(a1, -1, a2, (const void *)a3);
+    case LX_rt_tgsigqueueinfo:
+        return __quark_sigqueue(a1, a2, a3, (const void *)a4);
     case LX_rt_sigreturn:
         /* Returning from a handler is returning from a function here. */
         return 0;

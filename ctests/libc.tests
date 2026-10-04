@@ -44,3 +44,4 @@ avxtest
 handlertest
 usagetest
 layouttest
+sigqueuetest
