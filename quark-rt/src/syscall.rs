@@ -726,21 +726,42 @@ pub fn sys_call_offer(
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// Mint a capability into a slot of this program's for the length of a call:
+/// which slot. The highest empty one, taken by minting into it, which the
+/// kernel refuses for a slot that is not empty — so that two threads of one
+/// program, which share its capabilities, never take the same one. One slot
+/// for everybody (`SLOT_SCRATCH`) was a slot one thread's offer took from
+/// under another's: a USB disk's thread, offering itself for its name while
+/// the driver's other thread was in a call with its own offer there, was
+/// refused all four names a disk may have.
+pub fn mint_scratch(cap_type: u64, param0: u64, param1: u64) -> Result<usize, ()> {
+    let me = sys_getpid() as usize;
+    for slot in (SLOT_SCRATCH + 2..64).rev().chain([SLOT_SCRATCH]) {
+        if sys_cap_read(me, slot).is_ok_and(|c| c.cap_type != 0) {
+            continue;
+        }
+        if sys_cap_mint(slot, cap_type, param0, param1).is_ok() {
+            return Ok(slot);
+        }
+    }
+    Err(())
+}
+
 /// [`sys_call`], offering `dest` the right to call this task back.
 ///
 /// A server that only ever answers needs nothing of the kind. One that has to
 /// tell a client something unprompted — the display is going, Ctrl-C was
 /// pressed — does, and this is the only way it gets it: the capability is
-/// minted into [`SLOT_SCRATCH`] for the length of the call.
+/// minted into a slot of its own (`mint_scratch`) for the length of the call.
 pub fn sys_call_offer_self(
     dest: usize,
     msg: &crate::ipc::Message,
     reply: &mut crate::ipc::Message,
 ) -> Result<(), ()> {
     let me = sys_getpid();
-    sys_cap_mint(SLOT_SCRATCH, CAP_TYPE_ENDPOINT, me, 0)?;
-    let called = sys_call_offer(dest, msg, reply, SLOT_SCRATCH);
-    let _ = sys_cap_delete(SLOT_SCRATCH);
+    let slot = mint_scratch(CAP_TYPE_ENDPOINT, me, 0)?;
+    let called = sys_call_offer(dest, msg, reply, slot);
+    let _ = sys_cap_delete(slot);
     called
 }
 

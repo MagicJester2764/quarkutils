@@ -765,17 +765,16 @@ pub fn mount(vfs_tid: usize, server: usize, source: &[u8], target: &[u8]) -> Res
     };
     // The capability for the server goes with the request, for the length
     // of the call.
-    syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, server as u64, 0)
-        .map_err(|()| ERR_PERMISSION)?;
+    let slot = syscall::mint_scratch(syscall::CAP_TYPE_ENDPOINT, server as u64, 0).map_err(|()| ERR_PERMISSION)?;
     let with = syscall::CallWith {
         buf: lent.as_ptr() as u64,
         len_access: len as u64 | syscall::LEND_READ,
-        offer: syscall::SLOT_SCRATCH as u64,
+        offer: slot as u64,
         ticks: 0,
     };
     let mut reply = Message::empty();
     let outcome = syscall::sys_call_with(vfs_tid, &msg, &mut reply, &with);
-    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    let _ = syscall::sys_cap_delete(slot);
     if outcome != syscall::CallOutcome::Replied {
         return Err(ERR_IO);
     }
