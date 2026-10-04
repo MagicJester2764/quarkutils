@@ -1131,14 +1131,26 @@ sent out to be answered by nobody.
   stack, which keeps account of what is queued where; a socket that sends
   nothing for three seconds has its queue let go of, and the address at its
   head is given up for thirty — what is sent there meanwhile is dropped where
-  it is sent. A new place that queues a datagram on the card goes through it
+  it is sent. A way out is never given up: what holds one up is more often
+  the card's one question a second being spent on somebody else. A new place that queues a datagram on the card goes through it
   too, and one that takes a datagram socket out uses `remove_datagram`. The
   old protocol's ports and pings are bounded the same way: an echo has a
   socket of its own, and no more than sixty-four ports are kept.
-- **A stream let go of says goodbye before it goes** (`Stack::retire`): its
+- **A stream let go of says goodbye before it goes** (`Stack::let_go`): its
   FIN, or the reset for one closed with something unread, as Linux does,
   and then it is taken out of its set — after a minute whether it has
-  finished or not, so a peer that never answers keeps nothing.
+  finished or not, so a peer that never answers keeps nothing. One still
+  connecting goes at once, and a reset not sent in three seconds is given
+  up: a reset for an address nothing answers for waited the minute, asking
+  "who has it?" every second, and after a fuzzer's connections to
+  10.0.2.99 the gateway's answer expired and could not be asked for again —
+  nothing beyond the machine answered a ping until they had gone. The card
+  asks about one address a second, IPv6's neighbours included.
+- **The session waits for the network to say it is ready** — init's
+  service manager waits for every service still starting, five seconds at
+  most (*Services*) — and `net` says so before it registers and nothing
+  after: on the IOMMU machine, whose card's driver comes up late, the ready
+  line came after the login prompt and pushed it off its line, every run.
 
 ## Sound
 

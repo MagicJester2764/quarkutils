@@ -125,6 +125,20 @@ fn nowhere(net_tid: usize) {
         }
     }
     check("a datagram for nobody holds up the next from its socket for no more than a moment", back);
+    // Connections to it, given up on while they are still being made, are
+    // gone: a reset for somebody who never answered went on asking "who has
+    // it?", every second, for a minute.
+    for port in 0..4u16 {
+        let _ = TcpStream::connect_timeout(Endpoint::v4(NOWHERE, 4_000 + port), 200_000_000);
+    }
+    syscall::sleep_ms(500);
+    static mut STATUS: [u8; 32768] = [0; 32768];
+    let text = unsafe { &mut *core::ptr::addr_of_mut!(STATUS) };
+    let n = net::status(net_tid, text).map_or(0, |(n, _)| n);
+    let lingering = text[..n].split(|&b| b == b'\n').any(|l| {
+        l.windows(7).any(|w| w == b"goodbye") && l.windows(9).any(|w| w == b"10.0.2.99")
+    });
+    check("connections to it given up on while being made leave nothing behind", n > 0 && !lingering);
 }
 
 /// The old protocol keeps a socket on each port it has sent from — and no

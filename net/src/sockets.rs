@@ -1140,13 +1140,8 @@ impl Sockets {
         }
         match (s.kind, s.socket) {
             (Kind::Stream, Some((side, h))) => {
-                let t = stream(net, side, h);
-                if t.can_recv() {
-                    t.abort();
-                } else {
-                    t.close();
-                }
-                net.retire(side, h);
+                let unread = stream(net, side, h).can_recv();
+                net.let_go(side, h, unread);
             }
             (Kind::Datagram, Some((side, h))) => {
                 net.remove_datagram(side, h);

@@ -102,7 +102,10 @@ one call: one that asks something else, or dies, is waiting for nothing.
   given up for thirty, everything sent there dropped where it is sent. A
   socket sends its datagrams in order, so before this one for nobody held up
   everything behind it, to anybody, for good. `netctl` says how many were
-  dropped, and for whom.
+  dropped, and for whom. A router is never given up.
+- A stream closed while it is still connecting goes at once, with no reset:
+  there is nobody to say goodbye to. `netctl` lists the streams still
+  saying goodbye.
 
 ## Limits
 
