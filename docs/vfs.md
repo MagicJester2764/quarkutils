@@ -51,7 +51,7 @@ and each directory on the way to a file has to let the caller through
 (execute). User 0 is not checked. A caller that has gone by the time it is
 asked about is nobody (65534), not user 0.
 
-FAT32 has no owners and no modes to check anything against. It is anybody's
+FAT has no owners and no modes to check anything against. It is anybody's
 to read and user 0's alone to change — `PERMISSION` to anybody else for
 every request that writes, makes, removes or renames — which is the least
 that keeps a user off the partition a machine starts from.
@@ -68,7 +68,7 @@ naming a path carries in `data[5]`: 0 is the calling program's working
 directory, and `h + 1` is the directory open as handle `h`. `RENAME` and
 `LINK` carry their second path's base in `data[4]`. A base that is not an
 open directory of the caller's program is `INVALID_HANDLE` or `NOT_DIR`; an
-absolute path ignores it. FAT32 has no inodes to start from: a base that is
+absolute path ignores it. FAT has no inodes to start from: a base that is
 an open directory there is turned back into its path, by its `..` entries,
 and the lookup starts from the root.
 
@@ -186,7 +186,7 @@ permission bits in `data[2]` if that word has bit 16 (`0x10000`) set, and
 mode 0644 if the word is 0.
 The reply's `mode` includes the file-type bits (`0o170000`), `access` is what
 this caller may do (4 read, 2 write, 1 execute), and `id` is the inode number
-(FAT32: the first cluster), stable for as long as the file exists.
+(FAT: the first cluster), stable for as long as the file exists.
 
 A handle that is not a descriptor's is one its program reads through, so
 opening one needs the right to read the file — unless it is opened with
@@ -311,10 +311,13 @@ second name at the second. A link at the first path gets the name itself,
 unless `data[2]` has bit 0 set, which follows it. A directory is refused (`IS_DIR`), and so is a name
 that is taken (`EXISTS`) and a file with as many names as the filesystem
 allows (`TOO_MANY_LINKS`: 32000 on ext2, 65000 on ext4). The new name's
-directory needs write permission, as for `UNLINK`. FAT32 has one name to a
+directory needs write permission, as for `UNLINK`. FAT has one name to a
 file and no links: `UNLINK` and `RMDIR` remove a name and give back what it
 held — `BUSY` if the file is open, since there would be nowhere for it to go
-on being — and the other three are `NOT_SUPPORTED`.
+on being — `RENAME` moves a name, and a directory's `..` with it, and what
+is open goes on being open by the new name; `LINK` and `SYMLINK` are
+`NOT_SUPPORTED`. A name on FAT is kept as a long name (VFAT) with an 8.3
+one beside it, and a file is found by either, without regard to case.
 
 Two paths that lead into two filesystems — one mounted in the other, or two
 mounts — are `CROSS_DEVICE`, for `RENAME` and for `LINK`.
@@ -349,7 +352,7 @@ reply's `next`. Each record is:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 8 | `id` — the entry's inode number, or FAT32 first cluster |
+| 0 | 8 | `id` — the entry's inode number, or FAT first cluster |
 | 8 | 8 | `next` — the `start` that continues after this entry |
 | 16 | 8 | `size` in bytes |
 | 24 | 2 | `reclen` — this record's length, a multiple of 8 |
@@ -387,7 +390,7 @@ The server holds the directory by inode, as Linux does, so a rename above it
 changes what `GETCWD` says and nothing else, and a directory removed while a
 program is in it lasts until the last program in it leaves or goes.
 
-FAT32 has no directory handles to make a descriptor of, so there the server
+FAT has no directory handles to make a descriptor of, so there the server
 keeps each program's directory itself, as a path, by address space. That
 record does not follow a `fork` or an `exec`. `GIVE_CWD` is for it: it puts a
 program being made in the caller's directory. The child must be a task the
@@ -427,7 +430,7 @@ handle it was made through answers it `INVALID_HANDLE`. Before a program
 waits, the server follows the programs holding what it wants, and the
 requests they are waiting on in turn; if that leads back to the program
 asking, the answer is `DEADLOCK`. Locks live in the server's memory, 256 at
-once (`NO_SPACE` beyond), and are keyed by inode — on FAT32 by first cluster,
+once (`NO_SPACE` beyond), and are keyed by inode — on FAT by first cluster,
 or for an empty file by its directory and name.
 
 ### MAP
@@ -438,7 +441,7 @@ the caller's CSpace: `MemObject` access 1 (read), and 2 (write) as well if
 handle — and, of a descriptor's, one opened to write (`PERMISSION`
 otherwise). A descriptor not opened to read cannot be mapped at all. The caller maps it with `SYS_OBJECT_MAP` and
 may delete the capability after: the mapping keeps the object. Directories,
-links, devices and FAT32 files are `NOT_SUPPORTED`.
+links, devices and FAT files are `NOT_SUPPORTED`.
 
 The server is the object's pager (the kernel's `docs/abi.md`, "Memory
 objects"): it answers
@@ -479,7 +482,7 @@ user 0's alone; an owner may move a file to their own group or to any group
 they are in besides, or say what is already so. A time set to a value is the owner's to set; a time set to now is
 also anybody's who may write the file. Every change sets the change time.
 Owners and groups are sixteen bits (`INVALID_PATH` beyond). `/dev` and what
-is in it are the server's and stay as they are (`PERMISSION`); FAT32 has
+is in it are the server's and stay as they are (`PERMISSION`); FAT has
 none of this (`NOT_SUPPORTED`).
 
 ### MKNOD and named pipes
@@ -488,7 +491,7 @@ none of this (`NOT_SUPPORTED`).
 a mode with its type bits, and the only type there is is a named pipe
 (`0o010000`): anything else is `PERMISSION`, a device because the ones there
 are are the server's own, and a regular file because that is made by opening
-it. `EXISTS` if the name is taken; `NOT_SUPPORTED` on FAT32.
+it. `EXISTS` if the name is taken; `NOT_SUPPORTED` on FAT.
 
 A named pipe is an inode and nothing else: a name, an owner, a mode and
 times, and no blocks. The pipe is the kernel's, made when the name is first
@@ -524,7 +527,7 @@ finds it empty.
 `/dev` is the server's own, whatever the root filesystem holds there: the
 lookup answers for its names itself, so a path reaches the devices however it
 is spelled and whatever links it passes through. (A root with no `/dev`
-directory, and FAT32, match the path as written instead.) It holds five character devices, mode `0666`,
+directory, and FAT, match the path as written instead.) It holds five character devices, mode `0666`,
 with ids from `0xFFFF_FF00` in this order:
 
 | Name | Read | Write |
@@ -578,9 +581,9 @@ Only root opens one (`PERMISSION`).
 ### STATFS
 
 The lent buffer is filled with eight little-endian 64-bit words: the
-filesystem's magic (`0xEF53` for ext2 and ext4, `0x4d44` for FAT32), block
+filesystem's magic (`0xEF53` for ext2 and ext4, `0x4d44` for FAT), block
 size, block count, free blocks, blocks free to anyone (less those reserved
-for user 0), inodes, free inodes, and the longest name. FAT32 reports its
+for user 0), inodes, free inodes, and the longest name. FAT reports its
 cluster size and zeroes for the counts.
 
 `data[0]` is 0 for the server's own filesystem, or an open file's handle and

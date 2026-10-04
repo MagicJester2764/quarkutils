@@ -7,6 +7,7 @@ pub mod ext2;
 pub mod ext2_alloc;
 pub mod ext2_dir;
 pub mod ext4;
+pub mod fat;
 pub mod csum;
 pub mod cwd;
 pub mod devices;
@@ -260,32 +261,74 @@ pub static mut SECTOR_CACHE: SectorCache = SectorCache::new();
 // FAT32 structures
 // ---------------------------------------------------------------------------
 
+/// Which FAT a volume is: how wide an entry of its table is, and where its
+/// root directory is kept. Decided by how many clusters it has, as the
+/// specification says and every system agrees, and by nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatKind {
+    /// Twelve bits an entry, packed two to three bytes; the root directory
+    /// a region of its own, before the clusters.
+    Fat12,
+    /// Sixteen bits an entry; the root directory a region of its own.
+    Fat16,
+    /// Twenty-eight bits an entry; the root directory a chain of clusters
+    /// like any other.
+    Fat32,
+}
+
 struct Bpb {
     bytes_per_sector: u32,
     sectors_per_cluster: u32,
     reserved_sectors: u32,
     num_fats: u32,
-    fat_size_32: u32,
+    /// Sectors in one copy of the table.
+    fat_size: u32,
+    /// The root directory's first cluster on FAT32; nought on FAT12 and
+    /// FAT16, where it is the region `root_sectors` long after the tables.
     root_cluster: u32,
+    root_sectors: u32,
     /// How many sectors the volume has, and which of them holds the counts
     /// kept for whoever mounts it next (0 if none does).
     total_sectors: u32,
     fs_info: u32,
+    kind: FatKind,
 }
 
 fn parse_bpb(data: &[u8]) -> Bpb {
+    let bytes_per_sector = read_u16(data, 11) as u32;
+    let sectors_per_cluster = data[13] as u32;
+    let reserved_sectors = read_u16(data, 14) as u32;
+    let num_fats = data[16] as u32;
+    let root_entries = read_u16(data, 17) as u32;
+    let fat_size = match read_u16(data, 22) {
+        0 => read_u32(data, 36),
+        n => n as u32,
+    };
+    let total_sectors = match read_u16(data, 19) {
+        0 => read_u32(data, 32),
+        n => n as u32,
+    };
+    let root_sectors = (root_entries * 32).div_ceil(512);
+    let data_start = reserved_sectors + num_fats * fat_size + root_sectors;
+    let clusters = total_sectors.saturating_sub(data_start) / sectors_per_cluster.max(1);
+    let kind = if clusters < 4085 {
+        FatKind::Fat12
+    } else if clusters < 65525 {
+        FatKind::Fat16
+    } else {
+        FatKind::Fat32
+    };
     Bpb {
-        bytes_per_sector: read_u16(data, 11) as u32,
-        sectors_per_cluster: data[13] as u32,
-        reserved_sectors: read_u16(data, 14) as u32,
-        num_fats: data[16] as u32,
-        fat_size_32: read_u32(data, 36),
-        root_cluster: read_u32(data, 44),
-        total_sectors: match read_u32(data, 32) {
-            0 => read_u16(data, 19) as u32,
-            n => n,
-        },
-        fs_info: read_u16(data, 48) as u32,
+        bytes_per_sector,
+        sectors_per_cluster,
+        reserved_sectors,
+        num_fats,
+        fat_size,
+        root_cluster: if kind == FatKind::Fat32 { read_u32(data, 44) } else { 0 },
+        root_sectors,
+        total_sectors,
+        fs_info: if kind == FatKind::Fat32 { read_u16(data, 48) as u32 } else { 0 },
+        kind,
     }
 }
 
@@ -379,19 +422,59 @@ impl DiskState {
         unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) }
     }
 
+    /// Byte `at` of the first copy of the table.
+    fn fat_byte(&self, at: usize) -> Option<u8> {
+        let data = self.cached_read_sector(self.bpb.reserved_sectors + (at / 512) as u32).ok()?;
+        Some(data[at % 512])
+    }
+
+    /// The table's entry for `cluster`, as wide as the kind says.
+    fn fat_get(&self, cluster: u32) -> Option<u32> {
+        let c = cluster as usize;
+        match self.bpb.kind {
+            FatKind::Fat12 => {
+                // Two entries in three bytes, and one of them may begin in
+                // one sector and end in the next.
+                let at = c + c / 2;
+                let word = self.fat_byte(at)? as u32 | (self.fat_byte(at + 1)? as u32) << 8;
+                Some(if c % 2 == 0 { word & 0xFFF } else { word >> 4 })
+            }
+            FatKind::Fat16 => Some(self.fat_byte(2 * c)? as u32 | (self.fat_byte(2 * c + 1)? as u32) << 8),
+            FatKind::Fat32 => {
+                let data = self.cached_read_sector(self.bpb.reserved_sectors + (4 * c / 512) as u32).ok()?;
+                Some(read_u32(data, 4 * c % 512) & 0x0FFF_FFFF)
+            }
+        }
+    }
+
+    /// The value at which an entry says a chain has ended, and the one
+    /// written to end one.
+    fn fat_end(&self) -> (u32, u32) {
+        match self.bpb.kind {
+            FatKind::Fat12 => (0xFF8, 0xFFF),
+            FatKind::Fat16 => (0xFFF8, 0xFFFF),
+            FatKind::Fat32 => (0x0FFF_FFF8, 0x0FFF_FFFF),
+        }
+    }
+
     fn fat_next(&self, cluster: u32) -> Option<u32> {
-        let fat_byte_off = (cluster as usize) * 4;
-        let sector_in_fat = fat_byte_off / 512;
-        let offset_in_sector = fat_byte_off % 512;
-        let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
-        let data = self.cached_read_sector(lba).ok()?;
-        let next = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
-        if next >= 0x0FFF_FFF8 { None } else { Some(next) }
+        let next = self.fat_get(cluster)?;
+        if next >= self.fat_end().0 { None } else { Some(next) }
+    }
+
+    /// Where the clusters begin: after the tables, and the root
+    /// directory's region where it has one.
+    fn data_start(&self) -> u32 {
+        self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size + self.bpb.root_sectors
+    }
+
+    /// Where FAT12's and FAT16's root directory region begins.
+    fn root_region(&self) -> u32 {
+        self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size
     }
 
     fn cluster_start_lba(&self, cluster: u32) -> u32 {
-        let data_start = self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size_32;
-        data_start + (cluster - 2) * self.bpb.sectors_per_cluster
+        self.data_start() + (cluster - 2) * self.bpb.sectors_per_cluster
     }
 
     fn write_sector(&self, lba: u32) -> Result<(), ()> {
@@ -402,43 +485,56 @@ impl DiskState {
         unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) }
     }
 
+    /// Change the bits `mask` of the table's bytes from `at` (two or four
+    /// of them, little-endian) to `value`'s, in every copy of the table. A
+    /// FAT12 entry can be in two sectors, and each is read, changed and
+    /// written in turn.
+    fn fat_put(&self, at: usize, width: usize, mask: u32, value: u32) -> Result<(), ()> {
+        let mut done = 0;
+        while done < width {
+            let sector = ((at + done) / 512) as u32;
+            let lba = self.bpb.reserved_sectors + sector;
+            self.read_sector(lba)?;
+            let data = self.sector_data_mut();
+            while done < width && (at + done) / 512 == sector as usize {
+                let shift = 8 * done;
+                let m = (mask >> shift) as u8;
+                let v = (value >> shift) as u8;
+                let b = &mut data[(at + done) % 512];
+                *b = (*b & !m) | (v & m);
+                done += 1;
+            }
+            for copy in 0..self.bpb.num_fats {
+                let lba = lba + copy * self.bpb.fat_size;
+                self.write_sector(lba)?;
+                unsafe { SECTOR_CACHE.invalidate(self.part_lba + lba) };
+            }
+        }
+        Ok(())
+    }
+
     /// Write a FAT entry: set fat[cluster] = value.
     fn fat_set(&self, cluster: u32, value: u32) -> Result<(), ()> {
-        let fat_byte_off = (cluster as usize) * 4;
-        let sector_in_fat = fat_byte_off / 512;
-        let offset_in_sector = fat_byte_off % 512;
-        let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
-
-        // Read the FAT sector
-        self.read_sector(lba).map_err(|_| ())?;
-
-        // Modify the entry (preserve top 4 bits)
-        let data = self.sector_data_mut();
-        let old = read_u32(data, offset_in_sector);
-        let new_val = (old & 0xF000_0000) | (value & 0x0FFF_FFFF);
-        let bytes = new_val.to_le_bytes();
-        data[offset_in_sector..offset_in_sector + 4].copy_from_slice(&bytes);
-
-        // Write back
-        self.write_sector(lba).map_err(|_| ())?;
-        unsafe { SECTOR_CACHE.invalidate(self.part_lba + lba); }
-
-        // Update second FAT copy if present (buffer still has modified sector)
-        if self.bpb.num_fats > 1 {
-            let lba2 = lba + self.bpb.fat_size_32;
-            self.write_sector(lba2).map_err(|_| ())?;
-            unsafe { SECTOR_CACHE.invalidate(self.part_lba + lba2); }
+        let c = cluster as usize;
+        match self.bpb.kind {
+            FatKind::Fat12 if c % 2 == 0 => self.fat_put(c + c / 2, 2, 0x0FFF, value & 0xFFF),
+            FatKind::Fat12 => self.fat_put(c + c / 2, 2, 0xFFF0, (value & 0xFFF) << 4),
+            FatKind::Fat16 => self.fat_put(2 * c, 2, 0xFFFF, value & 0xFFFF),
+            // The top four bits are kept as they are.
+            FatKind::Fat32 => self.fat_put(4 * c, 4, 0x0FFF_FFFF, value & 0x0FFF_FFFF),
         }
-
-        Ok(())
     }
 
     /// How many clusters the volume has. They are numbered from 2, and the
     /// table may have room for more than there are.
     fn cluster_count(&self) -> u32 {
-        let data_start = self.bpb.reserved_sectors + self.bpb.num_fats * self.bpb.fat_size_32;
-        let on_disk = self.bpb.total_sectors.saturating_sub(data_start) / self.bpb.sectors_per_cluster.max(1);
-        on_disk.min((self.bpb.fat_size_32 * 512 / 4).saturating_sub(2))
+        let on_disk = self.bpb.total_sectors.saturating_sub(self.data_start()) / self.bpb.sectors_per_cluster.max(1);
+        let entries = match self.bpb.kind {
+            FatKind::Fat12 => self.bpb.fat_size * 512 * 2 / 3,
+            FatKind::Fat16 => self.bpb.fat_size * 512 / 2,
+            FatKind::Fat32 => self.bpb.fat_size * 512 / 4,
+        };
+        on_disk.min(entries.saturating_sub(2))
     }
 
     /// Allocate a free cluster. Marks it as EOF in the FAT.
@@ -451,19 +547,9 @@ impl DiskState {
         // Scan FAT for a free entry (value == 0), once round from the hint.
         for step in 0..count {
             let cluster = 2 + (from + step) % count;
-            let fat_byte_off = (cluster as usize) * 4;
-            let sector_in_fat = fat_byte_off / 512;
-            let offset_in_sector = fat_byte_off % 512;
-            let lba = self.bpb.reserved_sectors + sector_in_fat as u32;
-
-            let data = match self.cached_read_sector(lba) {
-                Ok(d) => d,
-                Err(()) => continue,
-            };
-            let val = read_u32(data, offset_in_sector) & 0x0FFF_FFFF;
-            if val == 0 {
-                // Mark as EOF
-                self.fat_set(cluster, 0x0FFF_FFFF)?;
+            if self.fat_get(cluster) == Some(0) {
+                // The end of a chain, of one.
+                self.fat_set(cluster, self.fat_end().1)?;
                 unsafe {
                     FAT_HINT = cluster + 1;
                     FAT_FREED -= 1;
@@ -689,145 +775,59 @@ pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]
 // Path resolution
 // ---------------------------------------------------------------------------
 
-/// Convert a path component to FAT 8.3 name.
-/// Input: "HELLO.ELF" or "USR" (uppercase, no long names)
-/// Output: "HELLO   ELF" or "USR        "
-fn to_fat83(component: &[u8], out: &mut [u8; 11]) {
-    *out = [b' '; 11];
+/// What a path's resolution says of the root: it has no parent, and no
+/// name in one.
+const NO_PARENT: u32 = u32::MAX;
 
-    // Find dot separator
-    let dot_pos = component.iter().position(|&b| b == b'.');
-
-    let (base, ext) = match dot_pos {
-        Some(pos) => (&component[..pos], &component[pos + 1..]),
-        None => (component, &[] as &[u8]),
-    };
-
-    // Copy base name (up to 8 chars), uppercase
-    let base_len = base.len().min(8);
-    for i in 0..base_len {
-        out[i] = base[i].to_ascii_uppercase();
-    }
-
-    // Copy extension (up to 3 chars), uppercase
-    let ext_len = ext.len().min(3);
-    for i in 0..ext_len {
-        out[8 + i] = ext[i].to_ascii_uppercase();
-    }
-}
-
-/// Resolve a path like "/USR/BIN/HELLO.ELF" to (cluster, size, is_dir, parent_cluster, fat_name).
-/// Paths use "/" separators. Leading "/" is optional.
+/// Resolve a path like "/usr/bin/hello" to (cluster, size, is_dir,
+/// parent_cluster, 8.3 name): each component by its long name or its 8.3
+/// one, as `fat::lookup` finds it. Paths use "/" separators; a leading "/"
+/// is optional. The root has [`NO_PARENT`].
 fn resolve_path(
     disk: &DiskState,
     path: &[u8],
 ) -> Result<(u32, u32, bool, u32, [u8; 11]), u64> {
-    let path = if !path.is_empty() && path[0] == b'/' {
-        &path[1..]
-    } else {
-        path
-    };
-
-    if path.is_empty() {
-        // Root directory
-        let root_name = [b' '; 11];
-        return Ok((disk.bpb.root_cluster, 0, true, 0, root_name));
-    }
-
-    let mut current_cluster = disk.bpb.root_cluster;
-
-    // Split path into components
+    let root = disk.bpb.root_cluster;
+    let mut current_cluster = root;
     let mut remaining = path;
     loop {
-        // Find next "/" or end
         let (component, rest) = match remaining.iter().position(|&b| b == b'/') {
             Some(pos) => (&remaining[..pos], &remaining[pos + 1..]),
             None => (remaining, &[] as &[u8]),
         };
-
         if component.is_empty() {
-            remaining = rest;
-            if remaining.is_empty() {
-                let root_name = [b' '; 11];
-                return Ok((current_cluster, 0, true, 0, root_name));
+            if rest.is_empty() {
+                // The directory got to, with nothing after it but slashes.
+                return Ok((current_cluster, 0, true, NO_PARENT, [b' '; 11]));
             }
+            remaining = rest;
             continue;
         }
-
-        let mut target = [0u8; 11];
-        to_fat83(component, &mut target);
-
-        let is_last = rest.is_empty();
-
-        // Search directory for this component
-        match find_entry(disk, current_cluster, &target)? {
-            Some((cluster, size, is_dir)) => {
-                if is_last {
-                    return Ok((cluster, size, is_dir, current_cluster, target));
-                }
-                // Intermediate component must be a directory
-                if !is_dir {
-                    return Err(ERR_NOT_DIR);
-                }
-                current_cluster = cluster;
-                remaining = rest;
+        let entry = fat::lookup(disk, current_cluster, component)?.ok_or(ERR_NOT_FOUND)?;
+        // A `..` that leads to the root says so with no cluster at all.
+        let cluster = if entry.cluster == 0 && entry.is_dir() { root } else { entry.cluster };
+        if rest.iter().all(|&b| b == b'/') {
+            if rest.is_empty() || entry.is_dir() {
+                return Ok((cluster, entry.size, entry.is_dir(), current_cluster, entry.short));
             }
-            None => return Err(ERR_NOT_FOUND),
+            return Err(ERR_NOT_DIR);
         }
+        if !entry.is_dir() {
+            return Err(ERR_NOT_DIR);
+        }
+        current_cluster = cluster;
+        remaining = rest;
     }
 }
 
-/// Search a directory for an entry matching the given FAT 8.3 name.
+/// Search a directory for the entry whose 8.3 name is `name`.
 /// Returns (cluster, size, is_dir) or None.
 fn find_entry(
     disk: &DiskState,
     dir_cluster: u32,
     name: &[u8; 11],
 ) -> Result<Option<(u32, u32, bool)>, u64> {
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-
-    loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        disk.prefetch_sectors(start_lba, spc);
-        for s in 0..spc {
-            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(sec_data);
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 {
-                    return Ok(None); // end of directory
-                }
-                if first_byte == 0xE5 {
-                    continue;
-                }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F {
-                    continue; // LFN
-                }
-                if attr & 0x08 != 0 {
-                    continue; // volume label
-                }
-
-                if &sec_buf[off..off + 11] == name {
-                    let hi = read_u16(&sec_buf, off + 20) as u32;
-                    let lo = read_u16(&sec_buf, off + 26) as u32;
-                    let cluster = (hi << 16) | lo;
-                    let size = read_u32(&sec_buf, off + 28);
-                    let is_dir = attr & 0x10 != 0;
-                    return Ok(Some((cluster, size, is_dir)));
-                }
-            }
-        }
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => break,
-        }
-    }
-    Ok(None)
+    Ok(fat::by_short(disk, dir_cluster, name)?.map(|e| (e.cluster, e.size, e.is_dir())))
 }
 
 // ---------------------------------------------------------------------------
@@ -963,72 +963,6 @@ fn read_file_data(
 }
 
 // ---------------------------------------------------------------------------
-// Read directory entries
-// ---------------------------------------------------------------------------
-
-/// Read directory entry at `index` from a directory.
-/// Returns entry info packed into IPC message data words:
-///   data[0] = handle (echo back)
-///   data[1..2] = 8.3 name (11 bytes in 2 words)
-///   data[3] = file_size
-///   data[4] = (is_dir << 32) | first_cluster
-///   data[5] = attr
-fn read_dir_entry(
-    disk: &DiskState,
-    dir_cluster: u32,
-    index: u32,
-) -> Result<Option<(u32, [u8; 11], u32, bool, u8)>, u64> {
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-    let mut current_idx: u32 = 0;
-
-    loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        disk.prefetch_sectors(start_lba, spc);
-        for s in 0..spc {
-            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(sec_data);
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 {
-                    return Ok(None);
-                }
-                if first_byte == 0xE5 {
-                    continue;
-                }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F {
-                    continue; // LFN
-                }
-                if attr & 0x08 != 0 {
-                    continue; // volume label
-                }
-
-                if current_idx == index {
-                    let mut name = [0u8; 11];
-                    name.copy_from_slice(&sec_buf[off..off + 11]);
-                    let hi = read_u16(&sec_buf, off + 20) as u32;
-                    let lo = read_u16(&sec_buf, off + 26) as u32;
-                    let size = read_u32(&sec_buf, off + 28);
-                    let is_dir = attr & 0x10 != 0;
-                    let _cluster = (hi << 16) | lo;
-                    return Ok(Some((_cluster, name, size, is_dir, attr)));
-                }
-                current_idx += 1;
-            }
-        }
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => break,
-        }
-    }
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------------
 // Create a new directory entry
 // ---------------------------------------------------------------------------
 
@@ -1059,128 +993,71 @@ fn fat_now() -> (u16, u16) {
     (date, time)
 }
 
-/// Create a new file entry in a directory. Returns the first cluster of the new file.
+/// An 8.3 entry to make an entry from: `attr`, made and written now, its
+/// first cluster and its length.
+fn fat_template(attr: u8, cluster: u32, size: u32) -> [u8; 32] {
+    let mut e = [0u8; 32];
+    e[11] = attr;
+    let (date, time) = fat_now();
+    e[14..16].copy_from_slice(&time.to_le_bytes());
+    e[16..18].copy_from_slice(&date.to_le_bytes());
+    e[18..20].copy_from_slice(&date.to_le_bytes());
+    e[22..24].copy_from_slice(&time.to_le_bytes());
+    e[24..26].copy_from_slice(&date.to_le_bytes());
+    e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    e[28..32].copy_from_slice(&size.to_le_bytes());
+    e
+}
+
+/// Make a file, or a directory, called `name` in a directory: its first
+/// cluster (none for a file, which has none until it is written to) and its
+/// 8.3 name, the long name kept before it where `name` is not one.
 fn create_dir_entry(
     disk: &DiskState,
     dir_cluster: u32,
-    name: &[u8; 11],
+    name: &[u8],
     is_dir: bool,
-) -> Result<u32, u64> {
-    // Check if name already exists
-    if let Ok(Some(_)) = find_entry(disk, dir_cluster, name) {
-        return Err(ERR_INVALID_PATH); // already exists
+) -> Result<(u32, [u8; 11]), u64> {
+    fat::valid_name(name)?;
+    if fat::lookup(disk, dir_cluster, name)?.is_some() {
+        return Err(ERR_EXISTS);
     }
-
     // A directory has a cluster from the start, for `.` and `..`. A file has
     // none until something is written to it: an empty file with a cluster is
     // a file whose length and whose chain disagree, and a checker says so.
     let new_cluster = if is_dir {
         let cluster = disk.fat_alloc().map_err(|_| ERR_NO_SPACE)?;
         disk.zero_cluster(cluster).map_err(|_| ERR_IO)?;
+        let start_lba = disk.cluster_start_lba(cluster);
+        if disk.read_sector(start_lba).is_err() {
+            let _ = disk.fat_free_chain(cluster);
+            return Err(ERR_IO);
+        }
+        let sec = disk.sector_data_mut();
+        // `.`, itself, and `..`, its parent — nought for the root, as every
+        // system writes it.
+        let parent = if dir_cluster == disk.bpb.root_cluster { 0 } else { dir_cluster };
+        let mut dot = fat_template(fat::ATTR_DIR, cluster, 0);
+        dot[..11].copy_from_slice(b".          ");
+        let mut dotdot = fat_template(fat::ATTR_DIR, parent, 0);
+        dotdot[..11].copy_from_slice(b"..         ");
+        sec[..32].copy_from_slice(&dot);
+        sec[32..64].copy_from_slice(&dotdot);
+        disk.write_sector(start_lba).map_err(|_| ERR_IO)?;
+        unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba); }
         cluster
     } else {
         0
     };
-
-    // If creating a directory, write "." and ".." entries
-    if is_dir {
-        let start_lba = disk.cluster_start_lba(new_cluster);
-        if disk.read_sector(start_lba).is_err() {
-            return Err(ERR_IO);
-        }
-        let sec = disk.sector_data_mut();
-
-        // "." entry — points to self
-        sec[0..11].copy_from_slice(b".          ");
-        sec[11] = 0x10; // directory attribute
-        let cl_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
-        let cl_lo = (new_cluster & 0xFFFF) as u16;
-        sec[20..22].copy_from_slice(&cl_hi.to_le_bytes());
-        sec[26..28].copy_from_slice(&cl_lo.to_le_bytes());
-
-        // ".." entry — points to parent
-        sec[32..43].copy_from_slice(b"..         ");
-        sec[43] = 0x10;
-        let (date, time) = fat_now();
-        for at in [0usize, 32] {
-            sec[at + 14..at + 16].copy_from_slice(&time.to_le_bytes());
-            sec[at + 16..at + 18].copy_from_slice(&date.to_le_bytes());
-            sec[at + 18..at + 20].copy_from_slice(&date.to_le_bytes());
-            sec[at + 22..at + 24].copy_from_slice(&time.to_le_bytes());
-            sec[at + 24..at + 26].copy_from_slice(&date.to_le_bytes());
-        }
-        let parent_cl = if dir_cluster == disk.bpb.root_cluster { 0 } else { dir_cluster };
-        let p_hi = ((parent_cl >> 16) & 0xFFFF) as u16;
-        let p_lo = (parent_cl & 0xFFFF) as u16;
-        sec[52..54].copy_from_slice(&p_hi.to_le_bytes());
-        sec[58..60].copy_from_slice(&p_lo.to_le_bytes());
-
-        disk.write_sector(start_lba).map_err(|_| ERR_IO)?;
-        unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba); }
-    }
-
-    // Find a free slot in the parent directory
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-
-    loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        disk.prefetch_sectors(start_lba, spc);
-        for s in 0..spc {
-            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(sec_data);
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                // Free slot: 0x00 (end of dir) or 0xE5 (deleted)
-                if first_byte == 0x00 || first_byte == 0xE5 {
-                    // Write the new entry
-                    sec_buf[off..off + 11].copy_from_slice(name);
-                    sec_buf[off + 11] = if is_dir { 0x10 } else { 0x20 }; // dir or archive
-                    // Zero out remaining fields, and say when it was made.
-                    for i in 12..32 {
-                        sec_buf[off + i] = 0;
-                    }
-                    let (date, time) = fat_now();
-                    sec_buf[off + 14..off + 16].copy_from_slice(&time.to_le_bytes());
-                    sec_buf[off + 16..off + 18].copy_from_slice(&date.to_le_bytes());
-                    sec_buf[off + 18..off + 20].copy_from_slice(&date.to_le_bytes());
-                    sec_buf[off + 22..off + 24].copy_from_slice(&time.to_le_bytes());
-                    sec_buf[off + 24..off + 26].copy_from_slice(&date.to_le_bytes());
-                    // Set first cluster
-                    let cl_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
-                    let cl_lo = (new_cluster & 0xFFFF) as u16;
-                    sec_buf[off + 20..off + 22].copy_from_slice(&cl_hi.to_le_bytes());
-                    sec_buf[off + 26..off + 28].copy_from_slice(&cl_lo.to_le_bytes());
-                    // Size = 0 initially
-                    sec_buf[off + 28..off + 32].copy_from_slice(&0u32.to_le_bytes());
-
-                    // If this was end-of-dir (0x00), mark next slot as end if room
-                    if first_byte == 0x00 && e + 1 < 16 {
-                        sec_buf[(e + 1) * 32] = 0x00;
-                    }
-
-                    // Write sector back
-                    let data = disk.sector_data_mut();
-                    data.copy_from_slice(&sec_buf);
-                    disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
-                    unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba + s); }
-
-                    return Ok(new_cluster);
-                }
+    let attr = if is_dir { fat::ATTR_DIR } else { fat::ATTR_ARCHIVE };
+    match fat::create(disk, dir_cluster, name, &fat_template(attr, new_cluster, 0)) {
+        Ok(short) => Ok((new_cluster, short)),
+        Err(code) => {
+            if new_cluster != 0 {
+                let _ = disk.fat_free_chain(new_cluster);
             }
-        }
-        // Extend the directory with a new cluster
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => {
-                let new_dir_cluster = disk.fat_extend(cluster).map_err(|_| ERR_IO)?;
-                disk.zero_cluster(new_dir_cluster).map_err(|_| ERR_IO)?;
-                cluster = new_dir_cluster;
-                // Loop again — the zeroed cluster will have 0x00 entries
-            }
+            Err(code)
         }
     }
 }
@@ -1201,71 +1078,33 @@ enum Change {
     Size(u32),
     /// Where the file's first cluster is, and how long the file is.
     Start(u32, u32),
-    /// The name is free again.
+    /// The name is free again, and its long name with it.
     Remove,
 }
 
-/// Change the entry called `name` in a directory.
+/// Change the entry whose 8.3 name is `name` in a directory.
 fn update_dir_entry(
     disk: &DiskState,
     dir_cluster: u32,
     name: &[u8; 11],
     change: Change,
 ) -> Result<(), u64> {
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
-
-    loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        disk.prefetch_sectors(start_lba, spc);
-        for s in 0..spc {
-            let sec_data = disk.cached_read_sector(start_lba + s).map_err(|_| ERR_IO)?;
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(sec_data);
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 {
-                    return Err(ERR_NOT_FOUND);
-                }
-                if first_byte == 0xE5 {
-                    continue;
-                }
-                let attr = sec_buf[off + 11];
-                if attr & 0x0F == 0x0F || attr & 0x08 != 0 {
-                    continue;
-                }
-                if &sec_buf[off..off + 11] == name {
-                    match change {
-                        Change::Size(size) => sec_buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes()),
-                        Change::Start(cluster, size) => {
-                            sec_buf[off + 20..off + 22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
-                            sec_buf[off + 26..off + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
-                            sec_buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-                        }
-                        Change::Remove => sec_buf[off] = 0xE5,
-                    }
-                    // Written to: when.
-                    if !matches!(change, Change::Remove) {
-                        let (date, time) = fat_now();
-                        sec_buf[off + 22..off + 24].copy_from_slice(&time.to_le_bytes());
-                        sec_buf[off + 24..off + 26].copy_from_slice(&date.to_le_bytes());
-                    }
-                    let data = disk.sector_data_mut();
-                    data.copy_from_slice(&sec_buf);
-                    disk.write_sector(start_lba + s).map_err(|_| ERR_IO)?;
-                    unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start_lba + s); }
-                    return Ok(());
-                }
-            }
-        }
-        match disk.fat_next(cluster) {
-            Some(next) => cluster = next,
-            None => break,
+    let entry = fat::by_short(disk, dir_cluster, name)?.ok_or(ERR_NOT_FOUND)?;
+    let mut raw = entry.raw;
+    match change {
+        Change::Remove => return fat::remove(disk, &entry),
+        Change::Size(size) => raw[28..32].copy_from_slice(&size.to_le_bytes()),
+        Change::Start(cluster, size) => {
+            raw[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+            raw[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+            raw[28..32].copy_from_slice(&size.to_le_bytes());
         }
     }
-    Err(ERR_NOT_FOUND)
+    // Written to: when.
+    let (date, time) = fat_now();
+    raw[22..24].copy_from_slice(&time.to_le_bytes());
+    raw[24..26].copy_from_slice(&date.to_le_bytes());
+    fat::rewrite(disk, &entry, &raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,7 +1262,7 @@ pub(crate) fn error_reply(sender: usize, err_code: u64) {
 /// This eliminates cold-miss IPC round-trips on the first readdir/ls.
 fn warm_cache(disk: &DiskState) {
     let fat_start = disk.bpb.reserved_sectors;
-    let fat_sectors = disk.bpb.fat_size_32.min(64); // cap at 64 sectors (32 KiB of FAT)
+    let fat_sectors = disk.bpb.fat_size.min(64); // cap at 64 sectors (32 KiB of FAT)
 
     // Prefetch FAT in 8-sector batches
     let mut lba = 0u32;
@@ -1433,9 +1272,14 @@ fn warm_cache(disk: &DiskState) {
         lba += batch;
     }
 
-    // Prefetch root directory's first cluster
-    let root_lba = disk.cluster_start_lba(disk.bpb.root_cluster);
-    disk.prefetch_sectors(root_lba, disk.bpb.sectors_per_cluster.min(8));
+    // Prefetch the root directory's first sectors: its region, or its first
+    // cluster.
+    if disk.bpb.root_cluster == 0 {
+        disk.prefetch_sectors(disk.root_region(), disk.bpb.root_sectors.min(8));
+    } else {
+        let root_lba = disk.cluster_start_lba(disk.bpb.root_cluster);
+        disk.prefetch_sectors(root_lba, disk.bpb.sectors_per_cluster.min(8));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,29 +1426,35 @@ pub extern "C" fn _start() -> ! {
         }
         let data = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };
         let bpb = parse_bpb(data);
-        // Anything that is not ext2 was taken for FAT32, and a volume with
+        // Anything that is not ext2 was taken for FAT, and a volume with
         // nothing on it is neither: its first sector describes a filesystem
-        // of no sectors in clusters of none. Nor is FAT12 or FAT16, which
-        // keep the root directory in a place of its own and say how big it
-        // is and how long one table is in two fields FAT32 leaves at nothing
-        // — and keep other things where FAT32 keeps the two this reads, so a
-        // FAT16 volume used to be mounted and then fail every read.
+        // of no sectors in clusters of none. Which FAT it is is said by how
+        // many clusters it has (`parse_bpb`), and each keeps what it keeps
+        // where it keeps it: FAT32 its root in a cluster, the others in a
+        // region of their own — and where a FAT32 volume's fields say one
+        // thing the other two leave nought, and the reverse. Read as FAT32, a
+        // FAT16 volume was mounted and then failed every read.
+        let fat32 = bpb.kind == FatKind::Fat32;
         let plausible = data[510] == 0x55
             && data[511] == 0xAA
             && bpb.bytes_per_sector == 512
             && bpb.sectors_per_cluster.is_power_of_two()
             && bpb.num_fats >= 1
-            && read_u16(data, 17) == 0
-            && read_u16(data, 22) == 0
-            && bpb.fat_size_32 != 0
-            && bpb.root_cluster >= 2;
+            && bpb.fat_size != 0
+            && bpb.total_sectors > 0
+            && if fat32 {
+                read_u16(data, 17) == 0 && read_u16(data, 22) == 0 && bpb.root_cluster >= 2
+            } else {
+                bpb.root_sectors != 0
+            };
         if !plausible {
             println!("[vfs] No filesystem this knows on the volume. Exiting.");
             let _ = quark_rt::block::release(disk_tid, volume);
             syscall::sys_exit();
         }
         say!(
-            "[vfs] FAT32: bps={} spc={} reserved={} root={}",
+            "[vfs] {}: bps={} spc={} reserved={} root={}",
+            match bpb.kind { FatKind::Fat12 => "FAT12", FatKind::Fat16 => "FAT16", FatKind::Fat32 => "FAT32" },
             bpb.bytes_per_sector, bpb.sectors_per_cluster,
             bpb.reserved_sectors, bpb.root_cluster
         );
@@ -1625,10 +1475,12 @@ pub extern "C" fn _start() -> ! {
                 sectors_per_cluster: 1,
                 reserved_sectors: 0,
                 num_fats: 0,
-                fat_size_32: 0,
+                fat_size: 0,
                 root_cluster: 0,
+                root_sectors: 0,
                 total_sectors: 0,
                 fs_info: 0,
+                kind: FatKind::Fat32,
             },
         }
     };
@@ -2169,23 +2021,14 @@ pub(crate) fn fat_dir_path(disk: &DiskState, cluster: u32) -> Result<&'static [u
             Some((parent, _, true)) => parent,
             _ => return Err(ERR_NOT_FOUND),
         };
-        let mut name = [0u8; 12];
-        let mut len = 0;
-        for index in 0.. {
-            match read_dir_entry(disk, parent, index)? {
-                Some((entry, raw, _, true, _)) if entry == cur && raw[0] != b'.' => {
-                    len = fat_display_name(&raw, &mut name);
-                    break;
-                }
-                Some(_) => {}
-                None => return Err(ERR_NOT_FOUND),
-            }
-        }
+        let entry = fat::walk(disk, parent, |e| e.is_dir() && e.cluster == cur && !e.is_dot())?.ok_or(ERR_NOT_FOUND)?;
+        let name = entry.name();
+        let len = name.len();
         if len + 1 > start {
             return Err(ERR_NAME_TOO_LONG);
         }
         start -= len;
-        out[start..start + len].copy_from_slice(&name[..len]);
+        out[start..start + len].copy_from_slice(name);
         start -= 1;
         out[start] = b'/';
         cur = parent;
@@ -2336,34 +2179,19 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
     ]);
 }
 
-/// Whether `name` is a FAT short name: at most eight characters, a dot and
-/// three more. Anything longer would be squeezed into one by `to_fat83` and
-/// name a different file.
-fn fits_fat83(name: &[u8]) -> bool {
-    let (base, ext) = match name.iter().position(|&b| b == b'.') {
-        Some(dot) => (&name[..dot], &name[dot + 1..]),
-        None => (name, &[][..]),
-    };
-    !base.is_empty() && base.len() <= 8 && ext.len() <= 3 && !ext.contains(&b'.')
-}
-
-/// Split a FAT32 path into its parent directory's cluster and the new name.
-fn fat32_parent(disk: &DiskState, path: &[u8]) -> Result<(u32, [u8; 11]), u64> {
+/// Split a FAT path into its parent directory's cluster and the new name.
+fn fat32_parent<'a>(disk: &DiskState, path: &'a [u8]) -> Result<(u32, &'a [u8]), u64> {
     let (parent, name) = ext2_ops::split_path(path)?;
-    if !fits_fat83(name) {
-        return Err(ERR_NAME_TOO_LONG);
-    }
+    fat::valid_name(name)?;
     let (cluster, _, is_dir, _, _) = resolve_path(disk, parent)?;
     if !is_dir {
         return Err(ERR_NOT_DIR);
     }
-    let mut fat_name = [0u8; 11];
-    to_fat83(name, &mut fat_name);
-    Ok((cluster, fat_name))
+    Ok((cluster, name))
 }
 
-/// Make a FAT32 file `size` bytes long, which is no longer than it is: the
-/// clusters past the new end are given back, and an empty file keeps none.
+/// Make a FAT file `size` bytes long: shorter, the clusters past the new end
+/// given back, and an empty file keeps none; longer, noughts to the new end.
 fn fat32_truncate(disk: &DiskState, file: &mut OpenFile, size: u32) -> Result<(), u64> {
     if file.is_dir {
         return Err(ERR_IS_DIR);
@@ -2377,11 +2205,18 @@ fn fat32_truncate(disk: &DiskState, file: &mut OpenFile, size: u32) -> Result<()
         Some((cluster, len, false)) => (cluster, len),
         _ => return Err(ERR_NOT_FOUND),
     };
-    // Longer would be clusters of zeroes to write, and nothing here asks.
-    if size > current {
-        return Err(ERR_NOT_SUPPORTED);
-    }
     let cluster_bytes = disk.bpb.sectors_per_cluster * disk.bpb.bytes_per_sector;
+    if size > current {
+        let first = fat_lengthen(disk, first, current, size, cluster_bytes)?;
+        update_dir_entry(disk, dir_cluster, &fat_name, Change::Start(first, size))?;
+        file.file_size = size;
+        if let FsFileData::Fat32 { first_cluster, cur_cluster, cur_cluster_offset, .. } = &mut file.fs {
+            *first_cluster = first;
+            *cur_cluster = first;
+            *cur_cluster_offset = 0;
+        }
+        return Ok(());
+    }
     let keep = size.div_ceil(cluster_bytes);
     let mut start = first;
     if size < current {
@@ -2400,7 +2235,7 @@ fn fat32_truncate(disk: &DiskState, file: &mut OpenFile, size: u32) -> Result<()
             }
             update_dir_entry(disk, dir_cluster, &fat_name, Change::Size(size))?;
             if let Some(rest) = disk.fat_next(last) {
-                disk.fat_set(last, 0x0FFF_FFFF).map_err(|_| ERR_IO)?;
+                disk.fat_set(last, disk.fat_end().1).map_err(|_| ERR_IO)?;
                 disk.fat_free_chain(rest).map_err(|_| ERR_IO)?;
             }
         }
@@ -2414,16 +2249,47 @@ fn fat32_truncate(disk: &DiskState, file: &mut OpenFile, size: u32) -> Result<()
     Ok(())
 }
 
-/// Whether a FAT32 directory holds nothing but `.` and `..`.
-fn fat32_dir_empty(disk: &DiskState, cluster: u32) -> Result<bool, u64> {
-    for index in 0.. {
-        match read_dir_entry(disk, cluster, index)? {
-            Some((_, name, _, _, _)) if name[0] == b'.' => {}
-            Some(_) => return Ok(false),
-            None => break,
+/// Noughts from byte `current` of a file whose first cluster is `first` to
+/// byte `size`: what is left of its last cluster made nought, and clusters
+/// of noughts after it. Its first cluster, which an empty file is given.
+fn fat_lengthen(disk: &DiskState, first: u32, current: u32, size: u32, cluster_bytes: u32) -> Result<u32, u64> {
+    let have = current.div_ceil(cluster_bytes);
+    let need = size.div_ceil(cluster_bytes);
+    let mut last = 0;
+    if have > 0 {
+        last = first;
+        for _ in 1..have {
+            last = disk.fat_next(last).ok_or(ERR_IO)?;
+        }
+        // Whatever the cluster held past the old end is the file's now, and
+        // has to read as noughts.
+        let within = current % cluster_bytes;
+        if within != 0 {
+            let start = disk.cluster_start_lba(last);
+            for s in within / 512..disk.bpb.sectors_per_cluster {
+                disk.read_sector(start + s).map_err(|_| ERR_IO)?;
+                let from = if s == within / 512 { (within % 512) as usize } else { 0 };
+                disk.sector_data_mut()[from..].fill(0);
+                disk.write_sector(start + s).map_err(|_| ERR_IO)?;
+                unsafe { SECTOR_CACHE.invalidate(disk.part_lba + start + s) };
+            }
         }
     }
-    Ok(true)
+    let mut first = first;
+    for _ in have..need {
+        let added = if last == 0 { disk.fat_alloc() } else { disk.fat_extend(last) }.map_err(|_| ERR_NO_SPACE)?;
+        disk.zero_cluster(added).map_err(|_| ERR_IO)?;
+        if first == 0 {
+            first = added;
+        }
+        last = added;
+    }
+    Ok(first)
+}
+
+/// Whether a FAT directory holds nothing but `.` and `..`.
+fn fat32_dir_empty(disk: &DiskState, cluster: u32) -> Result<bool, u64> {
+    Ok(fat::walk(disk, cluster, |e| !e.is_dot())?.is_none())
 }
 
 /// Remove a FAT32 file's name, or an empty directory's, and give back what
@@ -2431,7 +2297,7 @@ fn fat32_dir_empty(disk: &DiskState, cluster: u32) -> Result<bool, u64> {
 /// why one that is open is refused: there is nowhere for it to go on being.
 fn fat32_remove(disk: &DiskState, path: &[u8], dir: bool) -> Result<(), u64> {
     let (cluster, _, is_dir, parent, name) = resolve_path(disk, path)?;
-    if parent == 0 {
+    if parent == NO_PARENT {
         // The root has no name to remove.
         return Err(ERR_BUSY);
     }
@@ -2453,6 +2319,89 @@ fn fat32_remove(disk: &DiskState, path: &[u8], dir: bool) -> Result<(), u64> {
     Ok(())
 }
 
+/// Give a FAT file or directory another name, or another directory: the
+/// new entry made first, with everything of the old — attributes, times,
+/// first cluster, length — and the old taken out after, so that a machine
+/// stopped between the two has the file twice rather than not at all. What
+/// had the new name is replaced, as `rename` replaces it: a file by a file,
+/// an empty directory by a directory. A directory that moves is told its
+/// new parent (its `..`), and a handle open on what moved follows it.
+fn fat32_rename(disk: &DiskState, from: &[u8], to: &[u8]) -> Result<(), u64> {
+    let (cluster, _, is_dir, parent, short) = resolve_path(disk, from)?;
+    if parent == NO_PARENT {
+        return Err(ERR_BUSY);
+    }
+    let source = fat::by_short(disk, parent, &short)?.ok_or(ERR_NOT_FOUND)?;
+    let (to_parent, to_name) = fat32_parent(disk, to)?;
+    // Not into itself, nor anywhere below itself.
+    if is_dir {
+        let root = disk.bpb.root_cluster;
+        let mut cur = to_parent;
+        for _ in 0..MAX_PATH / 2 {
+            if cur == cluster {
+                return Err(ERR_INVALID_PATH);
+            }
+            if cur == root || cur == 0 {
+                break;
+            }
+            cur = match find_entry(disk, cur, b"..         ")? {
+                Some((0, _, true)) => root,
+                Some((up, _, true)) => up,
+                _ => break,
+            };
+        }
+    }
+    match fat::lookup(disk, to_parent, to_name)? {
+        // The same entry: a name that differs in case, or not at all.
+        Some(e) if to_parent == parent && e.short == short => {
+            if e.name() == to_name {
+                return Ok(());
+            }
+            fat::remove(disk, &source)?;
+            let made = fat::create(disk, to_parent, to_name, &source.raw);
+            let new_short = match made {
+                Ok(new_short) => new_short,
+                Err(code) => {
+                    // Put back as it was, as near as can be.
+                    let _ = fat::create(disk, parent, source.name(), &source.raw);
+                    return Err(code);
+                }
+            };
+            handles::fat_renamed(parent, &short, to_parent, &new_short);
+            return Ok(());
+        }
+        Some(e) => {
+            match (is_dir, e.is_dir()) {
+                (false, true) => return Err(ERR_IS_DIR),
+                (true, false) => return Err(ERR_NOT_DIR),
+                (true, true) if !fat32_dir_empty(disk, e.cluster)? => return Err(ERR_NOT_EMPTY),
+                _ => {}
+            }
+            if handles::fat_is_open(to_parent, &e.short) {
+                return Err(ERR_BUSY);
+            }
+            fat::remove(disk, &e)?;
+            if e.cluster != 0 {
+                disk.fat_free_chain(e.cluster).map_err(|_| ERR_IO)?;
+            }
+        }
+        None => {}
+    }
+    let new_short = fat::create(disk, to_parent, to_name, &source.raw)?;
+    fat::remove(disk, &source)?;
+    if is_dir && to_parent != parent {
+        let up = if to_parent == disk.bpb.root_cluster { 0 } else { to_parent };
+        if let Some(dotdot) = fat::by_short(disk, cluster, b"..         ")? {
+            let mut raw = dotdot.raw;
+            raw[20..22].copy_from_slice(&((up >> 16) as u16).to_le_bytes());
+            raw[26..28].copy_from_slice(&(up as u16).to_le_bytes());
+            fat::rewrite(disk, &dotdot, &raw)?;
+        }
+    }
+    handles::fat_renamed(parent, &short, to_parent, &new_short);
+    Ok(())
+}
+
 fn open_fat32(disk: &DiskState, sender: usize, path: &[u8], flags: u64) {
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
     let wants_dir = flags & OPEN_DIRECTORY != 0 || trailing;
@@ -2464,12 +2413,12 @@ fn open_fat32(disk: &DiskState, sender: usize, path: &[u8], flags: u64) {
             found
         }
         Err(ERR_NOT_FOUND) if flags & OPEN_CREATE != 0 && !trailing => {
-            let (parent, fat_name) = match fat32_parent(disk, path) {
+            let (parent, name) = match fat32_parent(disk, path) {
                 Ok(p) => p,
                 Err(code) => return error_reply(sender, code),
             };
-            match create_dir_entry(disk, parent, &fat_name, false) {
-                Ok(cluster) => (cluster, 0, false, parent, fat_name),
+            match create_dir_entry(disk, parent, name, false) {
+                Ok((cluster, short)) => (cluster, 0, false, parent, short),
                 Err(code) => return error_reply(sender, code),
             }
         }
@@ -2560,7 +2509,7 @@ fn fat32_mkdir(disk: &DiskState, path: &[u8]) -> Result<(), u64> {
         match resolve_path(disk, path) {
             Ok(_) => Err(ERR_EXISTS),
             Err(ERR_NOT_FOUND) => fat32_parent(disk, path)
-                .and_then(|(parent, name)| create_dir_entry(disk, parent, &name, true))
+                .and_then(|(parent, name)| create_dir_entry(disk, parent, name, true))
                 .map(|_| ()),
             Err(code) => Err(code),
         }
@@ -2790,14 +2739,37 @@ fn settle(inodes: &[u32]) {
     }
 }
 
+/// A FAT rename's two paths, each made whole from where its caller is —
+/// the first copied out before the second is made, which uses the same
+/// buffer.
+fn fat_rename_request(disk: &DiskState, sender: usize, msg: &Message) -> Result<(), u64> {
+    static mut FROM: [u8; MAX_PATH] = [0; MAX_PATH];
+    let from = protocol::lent_path(sender, 0, msg.data[0] as usize, 0).and_then(|p| fat_path(disk, sender, msg.data[5], p))?;
+    if devices::refuses(from) {
+        return Err(ERR_PERMISSION);
+    }
+    let kept = unsafe { &mut *core::ptr::addr_of_mut!(FROM) };
+    if from.len() > kept.len() {
+        return Err(ERR_NAME_TOO_LONG);
+    }
+    kept[..from.len()].copy_from_slice(from);
+    let from = &kept[..from.len()];
+    let to = protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096)
+        .and_then(|p| fat_path(disk, sender, msg.data[4], p))?;
+    if devices::refuses(to) {
+        return Err(ERR_PERMISSION);
+    }
+    fat32_rename(disk, from, to)
+}
+
 /// TAG_UNLINK and TAG_RMDIR lend a path, `data[0]` long. TAG_RENAME and
 /// TAG_LINK lend two, end to end, `data[0]` and `data[1]` long (LINK's
 /// `data[2]` may ask to follow a link at the source); TAG_SYMLINK lends the
 /// target, then the new path.
 fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } != FsType::Ext2 {
-        // FAT32 has one name to a file and no links: a name can be removed,
-        // and that is all.
+        // FAT has one name to a file and no links: a name can be removed,
+        // or changed, and that is all.
         let done = match msg.tag {
             TAG_UNLINK | TAG_RMDIR => protocol::lent_path(sender, 0, msg.data[0] as usize, 0)
                 .and_then(|path| fat_path(disk, sender, msg.data[5], path))
@@ -2805,6 +2777,7 @@ fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
                     true => Err(ERR_PERMISSION),
                     false => fat32_remove(disk, path, msg.tag == TAG_RMDIR),
                 }),
+            TAG_RENAME => fat_rename_request(disk, sender, msg),
             _ => Err(ERR_NOT_SUPPORTED),
         };
         return match done {
@@ -3174,85 +3147,36 @@ fn handle_readdir_bulk(disk: &DiskState, sender: usize, msg: &Message) {
     };
 
     let buf = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, PAGE_SIZE) };
-    let spc = disk.bpb.sectors_per_cluster;
-    let mut cluster = dir_cluster;
     let mut index = 0u64;
     let mut used = 0usize;
     let mut next = start;
-    let mut end = true;
-
-    'outer: loop {
-        let start_lba = disk.cluster_start_lba(cluster);
-        disk.prefetch_sectors(start_lba, spc);
-        for sector in 0..spc {
-            let sec_data = match disk.cached_read_sector(start_lba + sector) {
-                Ok(d) => d,
-                // What was read so far is still good; the next request
-                // starts at the sector that failed and reports it.
-                Err(_) if used > 0 => {
-                    end = false;
-                    break 'outer;
-                }
-                Err(_) => return error_reply(sender, ERR_IO),
-            };
-            let mut sec_buf = [0u8; 512];
-            sec_buf.copy_from_slice(sec_data);
-
-            for e in 0..16 {
-                let off = e * 32;
-                let first_byte = sec_buf[off];
-                if first_byte == 0x00 {
-                    break 'outer;
-                }
-                let attr = sec_buf[off + 11];
-                // Deleted, long-name pieces and the volume label are not entries.
-                if first_byte == 0xE5 || attr & 0x0F == 0x0F || attr & 0x08 != 0 {
-                    continue;
-                }
-                if index < start {
-                    index += 1;
-                    continue;
-                }
-                let mut name = [0u8; 12];
-                let name_len = fat_display_name(&sec_buf[off..off + 11], &mut name);
-                let hi = read_u16(&sec_buf, off + 20) as u64;
-                let lo = read_u16(&sec_buf, off + 26) as u64;
-                let size = read_u32(&sec_buf, off + 28) as u64;
-                let kind = if attr & 0x10 != 0 { DT_DIR } else { DT_REG };
-                match put_dirent(&mut buf[..room], used, (hi << 16) | lo, index + 1, size, kind, &name[..name_len]) {
-                    Some(len) => {
-                        used += len;
-                        next = index + 1;
-                        index += 1;
-                    }
-                    None => {
-                        end = false;
-                        break 'outer;
-                    }
-                }
+    let mut full = false;
+    let walked = fat::walk(disk, dir_cluster, |e| {
+        if index < start {
+            index += 1;
+            return false;
+        }
+        let kind = if e.is_dir() { DT_DIR } else { DT_REG };
+        match put_dirent(&mut buf[..room], used, e.cluster as u64, index + 1, e.size as u64, kind, e.name()) {
+            Some(len) => {
+                used += len;
+                index += 1;
+                next = index;
+                false
+            }
+            None => {
+                full = true;
+                true
             }
         }
-        match disk.fat_next(cluster) {
-            Some(n) => cluster = n,
-            None => break,
-        }
+    });
+    match walked {
+        Ok(_) => reply_dirents(sender, used, next, !full),
+        // What was read so far is still good; the next request starts where
+        // this one stopped and reports it.
+        Err(_) if used > 0 => reply_dirents(sender, used, next, false),
+        Err(code) => error_reply(sender, code),
     }
-
-    reply_dirents(sender, used, next, end);
-}
-
-/// A FAT short name as a name: `HELLO   ELF` is `HELLO.ELF`, `USR        `
-/// is `USR`.
-fn fat_display_name(raw: &[u8], out: &mut [u8; 12]) -> usize {
-    let base = raw[..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
-    let ext = raw[8..11].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
-    out[..base].copy_from_slice(&raw[..base]);
-    if ext == 0 {
-        return base;
-    }
-    out[base] = b'.';
-    out[base + 1..base + 1 + ext].copy_from_slice(&raw[8..8 + ext]);
-    base + 1 + ext
 }
 
 /// Reply to a bulk readdir: `used` bytes of records from `CLIENT_BUF` into

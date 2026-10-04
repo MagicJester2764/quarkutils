@@ -4307,8 +4307,111 @@ fn test_mounts() {
             run_as_user(&[b"dchild", b"userfat", b"/tmp/dtest-mnt/EFI", b"BOOT.BIN"]) == Some(3),
         );
     }
+    // Names as people give them — long, in both cases, with spaces — kept
+    // as VFAT keeps them, beside an 8.3 name made for each.
+    let listed = |dir: &[u8], name: &[u8]| -> bool {
+        let Ok((h, _, true)) = vfs::open(vfs_tid, dir) else { return false };
+        let mut entries = [vfs::DirEntry::empty(); 16];
+        let mut start = 0;
+        let mut found = false;
+        while let Ok(page) = vfs::readdir_bulk(vfs_tid, h, start, &mut entries) {
+            found |= entries[..page.count].iter().any(|e| &e.name[..e.name_len] == name);
+            if page.end || page.count == 0 {
+                break;
+            }
+            start = page.next;
+        }
+        let _ = vfs::close(vfs_tid, h);
+        found
+    };
+    check(
+        "a long name is kept, and found whatever its case",
+        spill(vfs_tid, b"/tmp/dtest-mnt/A Long File Name.txt", &pattern[..100]).is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/a long file name.TXT", &mut back) == Ok(100)
+            && back[..100] == pattern[..100],
+    );
+    check("and listed as it was given", listed(b"/tmp/dtest-mnt", b"A Long File Name.txt"));
+    check(
+        "an 8.3 name is kept as it was given too",
+        spill(vfs_tid, b"/tmp/dtest-mnt/readme.md", b"lower case").is_ok() && listed(b"/tmp/dtest-mnt", b"readme.md"),
+    );
+    check(
+        "a file is renamed, and moved",
+        vfs::rename(vfs_tid, b"/tmp/dtest-mnt/A Long File Name.txt", b"/tmp/dtest-mnt/EFI/Renamed, and moved.dat").is_ok()
+            && vfs::open(vfs_tid, b"/tmp/dtest-mnt/A Long File Name.txt").err() == Some(vfs::ERR_NOT_FOUND)
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/EFI/Renamed, and moved.dat", &mut back) == Ok(100)
+            && back[..100] == pattern[..100],
+    );
+    check(
+        "a directory is moved, and knows where it is",
+        vfs::mkdir(vfs_tid, b"/tmp/dtest-mnt/Second directory").is_ok()
+            && vfs::rename(vfs_tid, b"/tmp/dtest-mnt/EFI", b"/tmp/dtest-mnt/Second directory/Moved").is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/Second directory/Moved/BOOT.BIN", &mut back) == Ok(700)
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/Second directory/Moved/../Moved/BOOT.BIN", &mut back) == Ok(700)
+            && {
+                let there = vfs::chdir(vfs_tid, b"/tmp/dtest-mnt/Second directory/Moved").is_ok()
+                    && vfs::getcwd(vfs_tid, &mut cwd).is_ok_and(|n| &cwd[..n] == b"/tmp/dtest-mnt/Second directory/Moved");
+                let _ = vfs::chdir(vfs_tid, b"/");
+                there
+            },
+    );
+    check(
+        "a rename replaces what had the name",
+        spill(vfs_tid, b"/tmp/dtest-mnt/old.txt", &pattern[..300]).is_ok()
+            && spill(vfs_tid, b"/tmp/dtest-mnt/new.txt", b"replaced").is_ok()
+            && vfs::rename(vfs_tid, b"/tmp/dtest-mnt/old.txt", b"/tmp/dtest-mnt/new.txt").is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/new.txt", &mut back) == Ok(300)
+            && vfs::rename(vfs_tid, b"/tmp/dtest-mnt/new.txt", b"/tmp/dtest-mnt/Second directory") == Err(vfs::ERR_IS_DIR),
+    );
+    check("and a name differs in case alone", {
+        vfs::rename(vfs_tid, b"/tmp/dtest-mnt/new.txt", b"/tmp/dtest-mnt/NEW.txt").is_ok()
+            && listed(b"/tmp/dtest-mnt", b"NEW.txt")
+            && !listed(b"/tmp/dtest-mnt", b"new.txt")
+    });
+    check("a file is made longer, with noughts", {
+        let path = b"/tmp/dtest-mnt/Second directory/Moved/BOOT.BIN";
+        vfs::open(vfs_tid, path).is_ok_and(|(h, _, _)| {
+            let longer = vfs::truncate(vfs_tid, h, 9000).is_ok();
+            let _ = vfs::close(vfs_tid, h);
+            longer
+        }) && slurp(vfs_tid, path, &mut back) == Ok(9000)
+            && back[..700] == pattern[..700]
+            && back[700..9000].iter().all(|&b| b == 0)
+    });
     check("it is unmounted", run(b"umount", &[at]) == Some(0));
     check("and its checker finds nothing wrong", run(b"fsck.fat", &[b"-n", dev]) == Some(0));
+
+    // FAT16 and FAT12, which keep their root directory in a region of its
+    // own, as long as it was made — what `mformat` and `mkfs.fat` make of
+    // a small disk, a camera's card, a small USB stick.
+    for (bits, cluster_sectors) in [(&b"16"[..], &b"4"[..]), (&b"12"[..], &b"64"[..])] {
+        let kind = if bits == b"16" { "FAT16" } else { "FAT12" };
+        check(
+            if bits == b"16" { "a FAT16 filesystem is made and mounted" } else { "a FAT12 filesystem is made and mounted" },
+            run(b"mkfs.fat", &[b"-F", bits, b"-s", cluster_sectors, dev]) == Some(0) && run(b"mount", &[dev, at]) == Some(0),
+        );
+        let mut ok = vfs::mkdir(vfs_tid, b"/tmp/dtest-mnt/Photos from the trip").is_ok();
+        for n in 0..20u8 {
+            let mut name = *b"/tmp/dtest-mnt/A long name for a file, number 00.txt";
+            name[46] = b'0' + n / 10;
+            name[47] = b'0' + n % 10;
+            ok &= spill(vfs_tid, &name, &pattern[..(n as usize + 1) * 100]).is_ok();
+        }
+        ok &= spill(vfs_tid, b"/tmp/dtest-mnt/Photos from the trip/IMG 0001.jpeg", &pattern[..5000]).is_ok()
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/A long name for a file, number 19.txt", &mut back) == Ok(2000)
+            && slurp(vfs_tid, b"/tmp/dtest-mnt/photos from the trip/img 0001.JPEG", &mut back) == Ok(5000)
+            && listed(b"/tmp/dtest-mnt", b"A long name for a file, number 07.txt")
+            && vfs::rename(vfs_tid, b"/tmp/dtest-mnt/A long name for a file, number 07.txt", b"/tmp/dtest-mnt/Photos from the trip/seven").is_ok()
+            && vfs::unlink(vfs_tid, b"/tmp/dtest-mnt/A long name for a file, number 08.txt").is_ok();
+        if !ok {
+            println!("  ({} did not take what was written)", kind);
+        }
+        check("and holds long names in its root, and a directory", ok);
+        check(
+            "and is unmounted, and its checker finds nothing wrong",
+            run(b"umount", &[at]) == Some(0) && run(b"fsck.fat", &[b"-n", dev]) == Some(0),
+        );
+    }
 
     // A server that goes.
     check("a filesystem is mounted", {

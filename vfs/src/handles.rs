@@ -225,6 +225,19 @@ pub fn fat_is_open(dir: u32, name: &[u8; 11]) -> bool {
     })
 }
 
+/// A FAT file has been given another name, or moved: every handle that
+/// named it by its old one names it by the new.
+pub fn fat_renamed(dir: u32, name: &[u8; 11], to_dir: u32, to_name: &[u8; 11]) {
+    for f in table().iter_mut().filter(|f| f.in_use) {
+        if let FsFileData::Fat32 { dir_cluster, fat_name, .. } = &mut f.fs {
+            if *dir_cluster == dir && fat_name == name {
+                *dir_cluster = to_dir;
+                *fat_name = *to_name;
+            }
+        }
+    }
+}
+
 /// Whether any handle is in use.
 pub fn any() -> bool {
     table().iter().any(|f| f.in_use)

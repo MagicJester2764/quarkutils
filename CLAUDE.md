@@ -1318,21 +1318,39 @@ mounted ext4 — a file of root's, one of a group the user is in besides its
 own, a sticky directory, a directory of root's — and against a FAT
 filesystem, which is anybody's to read and root's to change.
 
-**FAT12 and FAT16 are not FAT32**, and are refused at mount: they keep the
-root directory in a place of its own, and other things where FAT32 keeps the
-two fields this reads. For a long time one was mounted and then failed every
-read — and `mformat` makes anything under half a gigabyte FAT16 unless told
-otherwise, so an image's own EFI partition was one.
+**FAT is three filesystems**, told apart by how many clusters there are
+and nothing else (`parse_bpb`): FAT12 and FAT16 keep the root directory in
+a region of its own, outside every cluster — written here as cluster 0 —
+and their entries are twelve and sixteen bits, where FAT32 keeps its root
+in clusters and its entries in thirty-two. `mformat` makes anything under
+half a gigabyte FAT16 unless told otherwise, so an image's own EFI
+partition is one. For a long time all three were read as FAT32, and the
+other two mounted and then failed every read.
 
-FAT32, which had only ever been a root nobody wrote much to, is what an EFI
-system partition is, so it had to be right enough to mount one and have
-`fsck.fat` find nothing: a file with nothing in it has no cluster (one with
-a cluster and no length is an error to a checker), the count of free
-clusters the filesystem keeps is brought up to date after every request
-that changes it, the search for a free cluster starts where the last one
-ended and stops at the last cluster the volume has rather than the last
-the table has room for, and a file can be shortened, written over and
-removed.
+FAT, which had only ever been a root nobody wrote much to, is what an EFI
+system partition is, so it has to be right enough to be written by
+anything and have `fsck.fat` find nothing (`vfs/src/fat.rs`, and `dtest
+mounts`):
+
+- **A name is a long name.** Every name is kept as VFAT keeps it: the long
+  one in entries of thirteen UTF-16 units before the short one, each with
+  the short one's checksum, and a short one made to match (`BASIS~N`, the
+  first free). A name that fits eight and three in one case is the short
+  one alone, with the case in the byte Windows keeps it in. A long name
+  read back is the long name, and a file is found by either, without
+  regard to case, as Windows finds one.
+- **A file with nothing in it has no cluster**: one with a cluster and no
+  length is an error to a checker.
+- **The count of free clusters is brought up to date after every request
+  that changes it**, and the search for a free cluster starts where the
+  last one ended and stops at the last cluster the volume has, not the last
+  the table has room for.
+- **A rename moves the entry and keeps the cluster**, a directory's `..`
+  is pointed at its new parent, and what is open by its old name is open
+  by its new one: a handle knows a file by its directory and its short
+  name, and that is two things a rename changes.
+- **A file is made longer by being cut longer**, with clusters of noughts
+  — which is what `truncate` and `ftruncate` past the end mean.
 
 ## Known gaps
 
