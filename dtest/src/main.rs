@@ -260,6 +260,65 @@ fn test_services() {
     );
     test_restarts(init);
     test_control(init);
+    test_log(init);
+}
+
+/// Whether `needle` is somewhere in `hay`.
+fn has_text(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether the last 64 KiB of the file at `path` hold `needle`.
+fn file_holds(path: &[u8], needle: &[u8]) -> bool {
+    static mut TAIL: [u8; 65536] = [0; 65536];
+    let tail = unsafe { &mut *core::ptr::addr_of_mut!(TAIL) };
+    let Some(vfs_tid) = nameserver::lookup(b"vfs") else { return false };
+    let Ok((handle, size, false)) = vfs::open(vfs_tid, path) else { return false };
+    let from = size.saturating_sub(tail.len() as u32);
+    let mut got = 0usize;
+    while got < tail.len() {
+        match vfs::read(vfs_tid, handle, &mut tail[got..], from + got as u32) {
+            Ok(n) if n > 0 => got += n as usize,
+            _ => break,
+        }
+    }
+    let _ = vfs::close(vfs_tid, handle);
+    has_text(&tail[..got], needle)
+}
+
+/// What a service prints is kept: its last lines, stamped with the date and
+/// who said them, for `svc log`; and every line in /var/log/messages.
+fn test_log(init: usize) {
+    use quark_rt::services;
+    if services::state(init, b"svc-b").is_err() {
+        return;
+    }
+    let mut text = [0u8; 8192];
+    let kept = services::log(init, b"svc-b", &mut text).ok();
+    check(
+        "what a service printed is in its log",
+        kept.is_some_and(|(n, _)| has_text(&text[..n], b"svctest: svc-b is up")),
+    );
+    check(
+        "stamped with the date and who said it",
+        kept.is_some_and(|(n, _)| {
+            n > 5 && text[..4].iter().all(u8::is_ascii_digit) && text[4] == b'-' && has_text(&text[..n], b"svc-b[")
+        }),
+    );
+    let said = services::log(init, b"init", &mut text).ok();
+    check(
+        "and so is what init said",
+        said.is_some_and(|(n, _)| has_text(&text[..n], b"[init] Started svc-b")),
+    );
+    let mut written = false;
+    for _ in 0..20 {
+        written = file_holds(b"/var/log/messages", b"svctest: svc-b is up");
+        if written {
+            break;
+        }
+        syscall::sleep_ms(100);
+    }
+    check("and in /var/log/messages, within two seconds", written);
 }
 
 /// Stopping, starting and starting again by name: for a program that may

@@ -16,6 +16,7 @@ pub mod font;
 pub mod ipc;
 pub mod keys;
 pub mod layout;
+pub mod logd;
 pub mod manifest;
 pub mod session;
 pub mod signal;

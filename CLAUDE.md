@@ -631,7 +631,7 @@ registered, and what is done when it ends. `svc` asks it, as `init`
   never seen to be up.
 - **What is started again is what nobody else holds a part of.** `auth`,
   `net` and `sound` are looked up by whoever wants them, each time; the
-  nameserver, the console, the device manager, `input` and the file server
+  nameserver, the console, the log, the device manager, `input` and the file server
   are named in other programs' descriptors and capabilities, and a new one
   would be a stranger to all of them. A new service that is to be started
   again is one its clients find by asking — and `quark_rt` asks each time;
@@ -645,6 +645,23 @@ registered, and what is done when it ends. `svc` asks it, as `init`
   capabilities. A stop is answered once the service has gone — init holds
   the answer, not itself — and a service init could not start again is not
   stopped at all.
+- **A service's output is its stream of the log** (`logd`, `quark_rt::logd`):
+  descriptors 1 and 2 are IPC descriptors to it, tagged with the stream, set
+  by init before the service starts. Not for what is part of the console:
+  `input` echoes what is typed through its standard output, and in the log
+  the echo vanished once the session had the console. A new boot program
+  that prints for the user, not about itself, is wired to the console pipe.
+- **The console is the session's once it has started** (`TAG_QUIET`): from
+  then on what services print is kept and not shown. A line after the login
+  prompt pushes the prompt off its line, and restarts print lines whenever
+  they happen.
+- **`logd` answers at once and waits on nothing.** Every service's every
+  write is a call to it, so a `logd` that blocks stops them all: its main
+  thread only receives, and the console and the file are written by threads
+  of their own. A stream is a small number — init's is 0, a service's its
+  place plus one — and what is kept is a list by number: init's was 0xFFFF
+  once, and the list grown to it, seven megabytes in one allocation, held the
+  main thread long enough for every service's first line to wait on it.
 - **The session waits for services still starting, five seconds at most.**
   A line printed after the login prompt pushes the prompt off the line it is
   waited for on, and `net` said it was ready a moment after the prompt on a

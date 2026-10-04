@@ -509,6 +509,11 @@ const FB_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
 /// And to the device manager, which it offers drivers to before anybody is
 /// let call it.
 const DEVMGR_SLOT: usize = 11;
+/// And to the log, which nobody else may call: the first empty slot from
+/// here. Every one below 16 is the kernel's or named here — the kernel
+/// starts init with its authorities in the first slots and a range of
+/// memory for each boot module after them, as many as there are.
+const LOGD_SLOTS_FROM: usize = 16;
 
 /// Give `tid` the right to call the nameserver.
 ///
@@ -676,7 +681,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         // scheduled as a server, and that arrives the same way.
                         grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"nameserver"], &SPAWN_SCRATCH);
-                        mgr.boot(b"nameserver", info.tid, Program::Boot, Policy::Never, None);
+                        mgr.boot(b"nameserver", info.tid, Program::Boot, Policy::Never, None, false);
                         let _ = info.start();
                         println!("[init] Spawned nameserver (TID {})", info.tid);
                     }
@@ -718,7 +723,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"fb"], &SPAWN_SCRATCH);
                         fb_tid = info.tid;
-                        mgr.boot(b"fb", info.tid, Program::Boot, Policy::Never, Some(b"fb"));
+                        mgr.boot(b"fb", info.tid, Program::Boot, Policy::Never, Some(b"fb"), false);
                         let _ = info.start();
                         // It learns the mode from init before it registers, so
                         // this is the one call init cannot make with a
@@ -756,7 +761,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                             let _ = syscall::sys_pipe_fd_set(my_tid, 1, pipe, true);
                             let _ = syscall::sys_pipe_fd_set(my_tid, 2, pipe, true);
                         }
-                        mgr.boot(b"console", info.tid, Program::Boot, Policy::Never, Some(b"console"));
+                        mgr.boot(b"console", info.tid, Program::Boot, Policy::Never, Some(b"console"), false);
                         let _ = info.start();
                         println!("[init] Spawned console (TID {})", info.tid);
                         // The framebuffer device could not be given a stdout
@@ -769,12 +774,54 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                             let _ = syscall::sys_pipe_fd_set(fb_tid, 1, console_pipe, true);
                             let _ = syscall::sys_pipe_fd_set(fb_tid, 2, console_pipe, true);
                         }
+                        mgr.console(console_pipe);
                     }
                     Err(()) => println!("[init] FAILED to spawn console"),
                 }
             }
             break;
         }
+    }
+
+    // Pass 2a: LOGD.ELF, the log. What is started after it prints to it,
+    // each service by a stream of its own, and it passes everything on to
+    // the console; init's own lines go there too. Started before the device
+    // manager, which hands its drivers what it prints to.
+    for i in 0..count {
+        let e = &entries[i];
+        if &e.name[0..8] != b"LOGD    " || &e.name[8..11] != b"ELF" || console_pipe == 0 {
+            continue;
+        }
+        if let Ok(data) = read_file_to_buffer(rootfs, &bpb, e.first_cluster, e.file_size) {
+            match spawn::load(data, &SPAWN_SCRATCH) {
+                Ok(info) => {
+                    grant_caps_from_manifest(data, info.tid);
+                    let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
+                    let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
+                    let _ = spawn::set_args(&info, &[b"logd"], &SPAWN_SCRATCH);
+                    mgr.boot(b"logd", info.tid, Program::Boot, Policy::Never, None, false);
+                    // init made it, so init may call it, and nobody else can.
+                    let me = syscall::sys_getpid() as usize;
+                    let slot = (LOGD_SLOTS_FROM..64).find(|&s| syscall::sys_cap_read(me, s).is_ok_and(|c| c.cap_type == 0));
+                    let callable = slot.is_some_and(|s| {
+                        syscall::sys_cap_mint(s, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0).is_ok()
+                    });
+                    let tid = info.tid;
+                    if !callable {
+                        println!("[init] No capability to call logd (slot {:?}): nothing is logged", slot);
+                        mgr.note(b"logd", "init could not mint the right to call it");
+                    } else if info.start().is_err() {
+                        println!("[init] logd would not start: nothing is logged");
+                        mgr.note(b"logd", "it would not start");
+                    } else {
+                        println!("[init] Spawned logd (TID {})", tid);
+                        mgr.set_logd(tid);
+                    }
+                }
+                Err(()) => println!("[init] FAILED to spawn logd"),
+            }
+        }
+        break;
     }
 
     // Pass 2b: spawn DEVMGR.ELF, the device manager, which holds every
@@ -788,14 +835,10 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
                         grant_caps_from_manifest(data, info.tid);
-                        if console_pipe != 0 {
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
-                        }
                         let _ = spawn::set_args(&info, &[b"devmgr"], &SPAWN_SCRATCH);
                         // init made it, so init may call it before it has
                         // a name — and nobody else can.
-                        mgr.boot(b"devmgr", info.tid, Program::Boot, Policy::Never, Some(devices::NAME));
+                        mgr.boot(b"devmgr", info.tid, Program::Boot, Policy::Never, Some(devices::NAME), true);
                         if syscall::sys_cap_mint(DEVMGR_SLOT, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0).is_ok()
                             && info.start().is_ok()
                         {
@@ -857,10 +900,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                 Ok(info) => {
                     let tid = info.tid;
                     grant_caps_from_manifest(data, tid);
-                    if console_pipe != 0 {
-                        let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
-                        let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
-                    }
                     let _ = spawn::set_args(&info, &[&namebuf[..namelen]], &SPAWN_SCRATCH);
                     // Which of them are started again, and from a copy kept
                     // here: what nobody else holds a part of.
@@ -877,7 +916,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         b"keyboard" => (Program::Boot, Policy::Never, Some(b"keyboard")),
                         _ => (Program::Boot, Policy::Never, None),
                     };
-                    mgr.boot(lname, tid, program, policy, register);
+                    mgr.boot(lname, tid, program, policy, register, true);
                     mgr.boot_argv(lname, &[&namebuf[..namelen]], true);
                     let _ = info.start();
                     if spawned_count < 32 {
@@ -916,10 +955,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         let end = (phys + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                         mint_and_grant(info.tid, 0, syscall::CAP_TYPE_PHYS_RANGE, phys as u64, end as u64);
                         grant_caps_from_manifest(data, info.tid);
-                        if console_pipe != 0 {
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
-                        }
                         let (mut at, mut len) = ([0u8; 18], [0u8; 18]);
                         let (at_len, len_len) = (hex(phys, &mut at), hex(size, &mut len));
                         let _ = spawn::set_args(
@@ -927,7 +962,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                             &[b"ramdisk", b"module", &at[..at_len], &len[..len_len]],
                             &SPAWN_SCRATCH,
                         );
-                        mgr.boot(b"ramdisk", info.tid, Program::Boot, Policy::Never, None);
+                        mgr.boot(b"ramdisk", info.tid, Program::Boot, Policy::Never, None, true);
                         let _ = info.start();
                         // And init's own right to that memory goes. It was
                         // given it to read the module, as it is every
@@ -967,12 +1002,14 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         // every check. Each pass must grant; there is no shared
                         // path that does it for them.
                         grant_caps_from_manifest(data, info.tid);
+                        // The console's, not the log's: what it prints is
+                        // the echo of what is typed at it.
                         if console_pipe != 0 {
                             let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
                             let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
                         }
                         let _ = spawn::set_args(&info, &[b"input"], &SPAWN_SCRATCH);
-                        mgr.boot(b"input", info.tid, Program::Boot, Policy::Never, Some(b"input"));
+                        mgr.boot(b"input", info.tid, Program::Boot, Policy::Never, Some(b"input"), false);
                         let _ = info.start();
                         println!("[init] Spawned input (TID {})", info.tid);
                     }
@@ -999,10 +1036,6 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                 match spawn::load(data, &SPAWN_SCRATCH) {
                     Ok(info) => {
                         grant_caps_from_manifest(data, info.tid);
-                        if console_pipe != 0 {
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
-                            let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
-                        }
                         if input_tid != 0 {
                             let _ = syscall::sys_fd_set(info.tid, 0, input_tid, 1);
                         }
@@ -1041,6 +1074,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
 // ---------------------------------------------------------------------------
 // Phase 2: Load remaining programs from disk
 // ---------------------------------------------------------------------------
+
 
 /// `/etc/init.conf`, as text: what the distribution wants done once there
 /// are files (`services::Manager::configure` says what the lines are).
@@ -1156,7 +1190,7 @@ pub extern "C" fn _start() -> ! {
             // Phase 2: Start VFS, wait for it to register
             let vfs_tid = if let Some(vfs) = ctx.vfs_spawn {
                 println!("[init] Starting VFS (TID {})", vfs.tid);
-                mgr.boot(b"vfs", vfs.tid, Program::Boot, Policy::Never, Some(b"vfs"));
+                mgr.boot(b"vfs", vfs.tid, Program::Boot, Policy::Never, Some(b"vfs"), true);
                 let _ = vfs.start();
                 match nameserver::lookup_retry(b"vfs", 50) {
                     Some(tid) => {
@@ -1186,6 +1220,9 @@ pub extern "C" fn _start() -> ! {
             // Phase 3: what the root says to start, to run and to log in
             // through, which the service manager does from here on.
             mgr.wire(ctx.console_pipe, ctx.input_tid);
+            if vfs_tid.is_some() {
+                mgr.files();
+            }
             if let Some(vfs) = vfs_tid {
                 // What is mounted, written down where programs that were
                 // written for Unix look for it: the root, and nothing else

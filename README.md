@@ -62,6 +62,9 @@ swapd/              Where memory goes when there is not enough of it: the
                     and a file to keep them in. Started by a `start` line in
                     init.conf.
 
+logd/               The log: what every service prints, passed on to the
+                    console until the session has it, and kept — its last
+                    lines for `svc log`, and every line in /var/log/messages.
 fb/                 The framebuffer device: owns the display, decides who draws.
 qtty/               The text console. What the machine boots into, and to
                     a session a terminal; `termcap` beside it says which.

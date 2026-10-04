@@ -54,6 +54,7 @@ had of the old one — a socket, a stream — went with it.
 | `nameserver` | (at once) | never |
 | `fb` | `fb` | never |
 | `console` | `console` | never |
+| `logd` | (at once) | never |
 | `devmgr` | `devices` | never |
 | `keyboard` | `keyboard` | never |
 | `auth` | `auth` | on failure |
@@ -70,6 +71,40 @@ and `sound` are looked up by whoever wants them, each time; init keeps a
 copy of their programs before it frees the boot image, since a root need
 not carry one. init stays in the drivers' band to start them: a spawner can
 give no better band than it is in, and `net` asks for the drivers'.
+
+## The log
+
+`logd`, in the boot image, is started after the console and before
+everything else. Each service's descriptors 1 and 2 are IPC descriptors to
+it whose tag is the service's stream (`quark_rt::logd`), so whatever writes
+there — the service, a thread, a child it forked — is that service. The
+kernel makes each write a call, forty bytes at a time; `logd` answers at
+once, passes the bytes on to the console as they came, and cuts them into
+lines, each stamped with the date and who said it:
+
+```text
+2026-10-04 14:22:25 net[75]: [net] IP 10.0.2.15 - ready.
+```
+
+It keeps each stream's last sixty-four lines — `svc log NAME`, and `svc log
+init` for init's own — and once init says the root is up it appends every
+line to `/var/log/messages`, which is moved to `messages.0` when it is a
+megabyte long. What was said before the root was up is kept until then.
+
+**The console is the session's once it has started.** init tells `logd`
+before it starts the session, and from then on what the services print is
+kept and not shown: a line printed after the login prompt pushes the prompt
+off its line. `input` prints the echo of what is typed at the console, so it
+is the console's and not a service of the log's; so are `fb` and the console
+itself, which are started before there is a log.
+
+`logd` registers no name. init made it, so only init may call it, and a
+descriptor is the only other way in: a line in the log is one a service's
+descriptor wrote. Three threads, so that nothing in it waits on anything a
+service could be waiting on: one only receives, and answers at once; one
+writes to the console, which may be full; one writes the file, through the
+file server, which may itself be writing a line. It is not started again:
+what it holds is every service's descriptors, which nothing can re-point.
 
 ## `/etc/init.conf`
 
@@ -111,10 +146,11 @@ svc start NAME          start it, once what it needs is up — and what it
 svc stop NAME           SIGTERM, five seconds, then the end of it; answered
                         once it has gone, and not started again
 svc restart NAME        both
+svc log NAME            what it has printed lately, stamped; `init` for init's
 ```
 
 Anybody may ask what the services are doing (`quark_rt::services::table`,
-`state`, `describe`). Starting and stopping one is for a program holding
+`state`, `describe`) and what they have said (`svc log`). Starting and stopping one is for a program holding
 TaskMgmt over every task — what ending somebody's program takes anyway —
 which init reads out of the caller's capabilities, as it may: it holds
 TaskMgmt too. `svc` asks for it in its manifest, so a session whose account

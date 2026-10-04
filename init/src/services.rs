@@ -26,6 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
+use quark_rt::logd;
 use quark_rt::services::{self as proto, State};
 use quark_rt::{nameserver, println, spawn, syscall};
 
@@ -149,6 +150,9 @@ impl Service {
 
 pub struct Manager {
     services: Vec<Service>,
+    /// The log, once it is there: what each service prints is its stream
+    /// of it, numbered as the service is in `services`.
+    logd: usize,
     console_pipe: usize,
     input_tid: usize,
     vfs_tid: usize,
@@ -198,6 +202,7 @@ impl Manager {
     pub fn new() -> Manager {
         Manager {
             services: Vec::new(),
+            logd: 0,
             console_pipe: 0,
             input_tid: 0,
             vfs_tid: 0,
@@ -214,12 +219,78 @@ impl Manager {
     }
 
     /// A program a pass of the boot has started, as `tid`: up once it has
-    /// registered `register`, if it registers.
-    pub fn boot(&mut self, name: &[u8], tid: usize, program: Program, policy: Policy, register: Option<&[u8]>) {
+    /// registered `register`, if it registers. `output`: what it prints is
+    /// given its stream of the log, or the console where there is none.
+    pub fn boot(&mut self, name: &[u8], tid: usize, program: Program, policy: Policy, register: Option<&[u8]>, output: bool) {
         let mut s = Service::new(name, program, Vec::new(), policy);
         s.register = register.map(<[u8]>::to_vec);
         self.running_now(&mut s, tid);
         self.services.push(s);
+        if output {
+            self.output(self.services.len() - 1, tid);
+        }
+    }
+
+    /// Something to say about a service, in `svc status`.
+    pub fn note(&mut self, name: &[u8], note: &'static str) {
+        if let Some(i) = self.find(name) {
+            self.services[i].note = Some(note);
+        }
+    }
+
+    /// The console's pipe, once there is one.
+    pub fn console(&mut self, pipe: usize) {
+        self.console_pipe = pipe;
+    }
+
+    /// The log, once it is there: whatever is started from now on prints to
+    /// it, and so does init.
+    pub fn set_logd(&mut self, tid: usize) {
+        self.logd = tid;
+        let me = syscall::sys_getpid() as usize;
+        self.name_stream(logd::INIT_STREAM, b"init", syscall::sys_pid(me).unwrap_or(0));
+        let _ = syscall::sys_fd_set(me, 1, tid, logd::STREAM + logd::INIT_STREAM);
+        let _ = syscall::sys_fd_set(me, 2, tid, logd::STREAM + logd::INIT_STREAM);
+    }
+
+    /// The root is there: the log may be written to it.
+    pub fn files(&self) {
+        if self.logd != 0 {
+            let mut reply = Message::empty();
+            let msg = Message { sender: 0, tag: logd::TAG_FILES, data: [0; 6] };
+            let _ = syscall::sys_call(self.logd, &msg, &mut reply);
+        }
+    }
+
+    /// The session has the console: the log passes nothing more on to it.
+    fn quiet(&self) {
+        if self.logd != 0 {
+            let mut reply = Message::empty();
+            let msg = Message { sender: 0, tag: logd::TAG_QUIET, data: [0; 6] };
+            let _ = syscall::sys_call(self.logd, &msg, &mut reply);
+        }
+    }
+
+    fn name_stream(&self, stream: u64, name: &[u8], pid: u64) {
+        let w = proto::pack(name);
+        let msg = Message { sender: 0, tag: logd::TAG_NAME, data: [stream, w[0], w[1], w[2], w[3], pid] };
+        let mut reply = Message::empty();
+        let _ = syscall::sys_call(self.logd, &msg, &mut reply);
+    }
+
+    /// Where service `i`, as task `tid`, prints: its stream of the log — by
+    /// its name and its process — or the console where there is no log.
+    fn output(&self, i: usize, tid: usize) {
+        if self.logd != 0 {
+            let s = &self.services[i];
+            let stream = i as u64 + 1;
+            self.name_stream(stream, &s.name, syscall::sys_pid(tid).unwrap_or(0));
+            let _ = syscall::sys_fd_set(tid, 1, self.logd, logd::STREAM + stream);
+            let _ = syscall::sys_fd_set(tid, 2, self.logd, logd::STREAM + stream);
+        } else if self.console_pipe != 0 {
+            let _ = syscall::sys_pipe_fd_set(tid, 1, self.console_pipe, true);
+            let _ = syscall::sys_pipe_fd_set(tid, 2, self.console_pipe, true);
+        }
     }
 
     /// What a boot program started as `tid` was called: what it is started
@@ -518,7 +589,10 @@ impl Manager {
             }
             let starting = self.services.iter().any(|s| s.state == State::Starting);
             if !starting || t.saturating_sub(self.session_ready) >= SESSION_WAIT_NS {
-                if let Some(i) = self.services.iter().position(|s| s.session && s.state == State::Waiting) {
+                if let Some(i) = self.services.iter().position(|s| s.session && s.state == State::Waiting && s.starts == 0) {
+                    // The console is the session's from now on: what the
+                    // services print is kept, and not shown there.
+                    self.quiet();
                     self.launch(i);
                 }
             }
@@ -560,10 +634,14 @@ impl Manager {
             return false;
         };
         let tid = info.tid;
-        if console != 0 {
+        // The session is on the console; everything else in the log.
+        if s.session && console != 0 {
             let _ = syscall::sys_pipe_fd_set(tid, 1, console, true);
             let _ = syscall::sys_pipe_fd_set(tid, 2, console, true);
+        } else if !s.session {
+            self.output(i, tid);
         }
+        let s = &self.services[i];
         if s.stdin && input != 0 {
             let _ = syscall::sys_fd_set(tid, 0, input, 1);
         }
@@ -610,7 +688,7 @@ impl Manager {
         match msg.tag {
             proto::TAG_TABLE => {
                 let out = self.table();
-                self.give_text(msg, &out);
+                self.give_text(msg, out.as_bytes());
             }
             proto::TAG_STATE => match self.named(msg) {
                 Some(i) => {
@@ -633,10 +711,28 @@ impl Manager {
             proto::TAG_DESCRIBE => match self.named(msg) {
                 Some(i) => {
                     let out = self.describe(i);
-                    self.give_text(msg, &out);
+                    self.give_text(msg, out.as_bytes());
                 }
                 None => refuse(msg.sender, proto::NO_SUCH),
             },
+            proto::TAG_LOG => {
+                let (name, n) = proto::unpack(&msg.data[..4]);
+                let stream = match &name[..n] {
+                    b"init" => Some(logd::INIT_STREAM),
+                    named => self.find(named).map(|i| i as u64 + 1),
+                };
+                let Some(stream) = stream else { return refuse(msg.sender, proto::NO_SUCH) };
+                let mut kept = alloc::vec![0u8; 16384];
+                let mut n = 0;
+                if self.logd != 0 {
+                    let ask = Message { sender: 0, tag: logd::TAG_TAIL, data: [stream, kept.len() as u64, 0, 0, 0, 0] };
+                    let mut answer = Message::empty();
+                    if syscall::sys_call_lend_mut(self.logd, &ask, &mut answer, &mut kept).is_ok() && answer.tag == logd::TAG_OK {
+                        n = (answer.data[0] as usize).min(kept.len());
+                    }
+                }
+                self.give_text(msg, &kept[..n]);
+            }
             proto::TAG_START | proto::TAG_STOP | proto::TAG_RESTART => {
                 let Some(i) = self.named(msg) else { return refuse(msg.sender, proto::NO_SUCH) };
                 if !may_control(msg.sender) {
@@ -720,10 +816,10 @@ impl Manager {
     }
 
     /// Text into the buffer a request lent: `[written, how long it was]`.
-    fn give_text(&self, msg: &Message, out: &str) {
+    fn give_text(&self, msg: &Message, out: &[u8]) {
         let room = msg.data[4] as usize;
         let n = out.len().min(room);
-        if n > 0 && syscall::sys_lent_write(msg.sender, 0, &out.as_bytes()[..n]).is_err() {
+        if n > 0 && syscall::sys_lent_write(msg.sender, 0, &out[..n]).is_err() {
             return refuse(msg.sender, proto::INVALID);
         }
         reply(msg.sender, proto::TAG_OK, [n as u64, out.len() as u64, 0, 0, 0, 0]);
