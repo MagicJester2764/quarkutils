@@ -1257,11 +1257,11 @@ The rules that got it there, and that a further port should follow:
   a Unix. Teaching a package's `config.sub` the word `quark` is not a patch to
   the package; it is a patch to autoconf's idea of what operating systems
   exist.
-- **Static, and non-PIC.** There is no dynamic loader here, so
-  `-Ddefault_library=static -Db_staticpic=false` is on every meson build and
-  the compiler wrapper drops `-fPIC` whatever a build system says. A module
-  that would be `dlopen`ed has to be built in instead — gdk-pixbuf's loaders
-  are, which is also why no loader cache is needed.
+- **Static.** `-Ddefault_library=static -Db_staticpic=false` is on every
+  meson build, and a module that would be `dlopen`ed is built in instead —
+  gdk-pixbuf's loaders are, which is also why no loader cache is needed.
+  Shared libraries exist now (*Shared libraries*, below) and the toolkits
+  do not use them: moving them over is a port of its own.
 - **glib is built twice.** Three of its tools are C programs rather than Python
   — `glib-compile-resources`, `glib-compile-schemas` and `gio-querymodules` —
   and GTK's build runs two of them to turn XML into C. The copies in the target
@@ -1280,6 +1280,29 @@ The rules that got it there, and that a further port should follow:
   whole image into its own memory before giving the pages away, so it is in
   memory twice while it starts. QEMU gets a gigabyte and the root filesystem is
   128 MiB.
+
+## Shared libraries
+
+A C program linked `-dynamic` (the musl wrapper's flag, in
+`../quark-toolchain`) names an interpreter, `/usr/lib/ld-musl-x86_64.so.1`
+— a link to `libc.so`, which is musl and the C layer in one shared object
+and is its own dynamic loader, as on Linux. Both loaders here read the
+name (`spawn::interpreter`, and `execve`), load that file too, at a random
+base in a terabyte of its own (`spawn::INTERP_BASE`, `QUARK_INTERP_BASE`),
+start the task in it, and tell it where the program is (`AT_BASE`,
+`AT_ENTRY`, `AT_PHDR` — the copy on the argument page, whose `PT_PHDR` says
+it is there, so the loader computes that the program was not moved). The
+loader maps each library through `mmap`, which places a mapping exactly
+where it is told now (`MAP_FIXED`, and `MAP_FIXED_NOREPLACE`) and steps
+the arena past one it places ahead of where the arena has got to.
+`dlopen` works in such a program. `ctests/dltest.c` is the proof: linked
+to `libdltwo.so`, opening `libdlone.so` by path and by name, and finding a
+function, a datum, a constructor that ran, a thread-local that is each
+thread's own, and one errno.
+
+Static is still the default, and everything else here is static. A program
+built before any of this reads its arguments from the argument page, which
+every loader still maps.
 
 ## Mounts
 
@@ -1508,7 +1531,9 @@ mounts`):
   when it is first touched, read or write.
 - `mprotect` says yes and does nothing: a mapping is made with the protection
   it will keep, so a program that maps read-only and then asks for write gets
-  a mapping that still faults on the write. Shortening a file does not take
+  a mapping that still faults on the write — and a shared library's
+  relocated data that its loader would make read-only (RELRO) stays
+  writable. Shortening a file does not take
   away pages of it a program has already mapped past the new end; what it does
   is stop new ones being filled from beyond it.
 - `std::fs` is not implemented for this target: a hosted Rust program reads
@@ -1528,10 +1553,15 @@ mounts`):
   everybody, and 128 for any one program. A pipe, a terminal and a stream all
   say they are a character device to `fstat`: nothing tells the layer what
   kind a kernel descriptor is.
-- **No OpenGL, no D-Bus, no `dlopen`.** GTK starts without any of them and says
-  so: `g_module_symbol` complains about a NULL module twice, the session bus
-  cannot be reached, and GSK draws through cairo. Each is a real absence rather
+- **No OpenGL, no D-Bus.** GTK starts without either and says so: the
+  session bus cannot be reached, and GSK draws through cairo. GTK is static,
+  so `g_module_symbol` still complains about a NULL module twice: `dlopen`
+  works only in a program linked `-dynamic`. Each is a real absence rather
   than a stub, and each is a thing a bigger application may ask for and not get.
+- **A shared library is C's alone.** libstdc++ is static and nothing builds a
+  C++ shared object (no crtbeginS); the Rust runtime is static. A program
+  that is not on the root filesystem's `/usr/lib` names its libraries by
+  path or by `LD_LIBRARY_PATH`, and nothing caches where libraries are.
 - **Quark has no dma-buf**, and the Linux uapi headers copied wholesale into
   the sysroot said it did until `linux/dma-buf.h` was taken out of them. Every
   other header there describes something a program can ask for and be told no;

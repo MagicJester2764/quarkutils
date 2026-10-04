@@ -1,5 +1,9 @@
 /* Where a new thread begins.
  *
+ * Calls are to the PLT, which a static link makes direct and a shared
+ * library — the C library as `libc.so`, with this in it — needs: a function
+ * it might export is not one it may call directly.
+ *
  * Entered with RDI holding the thread function's argument, and RSP pointing at
  * two words the creator planted: the thread pointer, then the function. The
  * word the kernel clears when the thread ends was registered by the creator.
@@ -14,12 +18,12 @@ __quark_thread_entry:
 	and $-16,%rsp           /* a call needs RSP aligned; below here is ours */
 	test %rdi,%rdi
 	jz 1f
-	call __quark_set_fs     /* FS base, which is where thread-locals hang */
+	call __quark_set_fs@PLT /* FS base, which is where thread-locals hang */
 1:
 	mov %rbx,%rdi
 	call *%r12
 	mov %eax,%edi
-	call __quark_thread_exit
+	call __quark_thread_exit@PLT
 	hlt
 	.size __quark_thread_entry,.-__quark_thread_entry
 
@@ -42,7 +46,7 @@ __quark_thread_entry:
 	.type   __quark_unmapself,@function
 __quark_unmapself:
 	lea __quark_last_stack_top(%rip),%rsp
-	call __quark_unmap_and_exit
+	call __quark_unmap_and_exit@PLT
 	hlt
 	.size __quark_unmapself,.-__quark_unmapself
 

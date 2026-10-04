@@ -53,6 +53,33 @@ liblinux-abi.a: $(OBJS)
 src/vfs-client.o: ../libc/src/quark.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# The same objects again, position-independent, for the C library as a
+# shared object: musl's `libc.so` takes all of this archive in, since every
+# call musl makes is made through it and the dynamic loader in it is the
+# first thing to make one. Code that does not care where it is does not need
+# the large model, and is quicker without it.
+PIC_CFLAGS := $(filter-out -fno-pic -no-pie -mcmodel=large,$(CFLAGS)) -fPIC
+PIC_OBJS   := $(patsubst src/%.o,pic/%.o,$(OBJS))
+$(PIC_OBJS): $(HEADERS)
+
+liblinux-abi-pic.a: $(PIC_OBJS)
+	rm -f $@
+	$(AR) rcs $@ $(PIC_OBJS)
+
+pic/%.o: src/%.c
+	@mkdir -p pic
+	$(CC) $(PIC_CFLAGS) -c -o $@ $<
+
+pic/%.o: src/%.s
+	@mkdir -p pic
+	$(CC) $(PIC_CFLAGS) -c -o $@ $<
+
+pic/vfs-client.o: ../libc/src/quark.c
+	@mkdir -p pic
+	$(CC) $(PIC_CFLAGS) -c -o $@ $<
+
+pic: liblinux-abi-pic.a
+
 SYSROOT ?= $(HOME)/opt/cross/x86_64-quark/sys-root
 
 install-sysroot: all
@@ -61,6 +88,6 @@ install-sysroot: all
 	cp $(MANIFEST) $(SYSROOT)/usr/lib/quark-libc-manifest.o
 
 clean:
-	rm -f $(OBJS) $(MANIFEST) liblinux-abi.a
+	rm -f $(OBJS) $(PIC_OBJS) $(MANIFEST) liblinux-abi.a liblinux-abi-pic.a
 
-.PHONY: all clean install-sysroot
+.PHONY: all clean install-sysroot pic

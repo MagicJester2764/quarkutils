@@ -16,20 +16,31 @@
 # image puts the programs in /usr/bin and the lists in /etc.
 #
 # A test that needs a library of the C library's own says so on its first
-# line:
+# line, `@OUT@` standing for <outdir>:
 #     // LINK: -lutil
+#
+# A file named lib*.c is a shared library, built first: lib*.so in <outdir>,
+# for a test linked with -dynamic to be linked to or to open. A
+# distribution puts them where libraries are, /usr/lib.
 set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:?usage: build-ctests.sh <outdir>}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+for src in "$HERE"/ctests/lib*.c; do
+    [ -f "$src" ] || continue
+    name=$(basename "$src" .c)
+    echo "==> $name.so"
+    x86_64-quark-musl-gcc -O2 -fPIC -shared -Wl,--strip-debug -o "$OUT/$name.so" "$src"
+done
 for src in "$HERE"/ctests/*.c "$HERE"/ctests/*.cpp; do
     [ -f "$src" ] || continue
     case $src in
+    */lib*.c) continue ;;
     *.cpp) name=$(basename "$src" .cpp); cc=x86_64-quark-musl-g++ ;;
     *)     name=$(basename "$src" .c);   cc=x86_64-quark-musl-gcc ;;
     esac
-    flags=$(sed -n '1s|^// LINK: ||p' "$src")
+    flags=$(sed -n '1s|^// LINK: ||p' "$src" | sed "s|@OUT@|$OUT|g")
     echo "==> $name"
     # --strip-debug and not -s: the symbol table is what turns a faulting rip
     # into a function name.

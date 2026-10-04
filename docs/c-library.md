@@ -348,8 +348,10 @@ forked child is in its parent's places. A mapping smaller than two
 gigabytes never crosses a multiple of two gigabytes: pixman's stress test
 turns bit 31 of an image's address over, adds to it and turns it back,
 which is the address only while the image does not. A program's code is where it was
-linked: nothing is built to be loaded anywhere (PIE), and `dlopen` has
-nothing to load. `mmap` with an address and `MAP_FIXED` puts the mapping
+linked: nothing is built to be loaded anywhere (PIE). The libraries of a
+program linked `-dynamic` are wherever its loader maps them, out of the same
+arena, and the loader itself — `libc.so` — a random number of pages into a
+terabyte of its own. `mmap` with an address and `MAP_FIXED` puts the mapping
 there, over whatever was; `MAP_FIXED_NOREPLACE` is refused (`EEXIST`) where
 something is, and an address below where programs live (512 GiB) is refused.
 An address asked for without either is still only a hint, and ignored.
@@ -370,5 +372,9 @@ answer a program has something to do about. musl asks a name service daemon
 who a user is before it concludes nobody has the name, and takes this for
 "there is no daemon".
 
-Everything is linked statically. There is no dynamic loader, so `dlopen`
-fails, and a library that would be loaded as a plugin has to be built in.
+A program is linked statically unless it asks: `x86_64-quark-musl-gcc
+-dynamic` links it to `libc.so`, and `-fPIC -shared` makes a shared object
+it can be linked to or `dlopen`. In a static program `dlopen` fails, as
+musl's does anywhere, and a library that would be a plugin has to be built
+in. `mprotect` does nothing, so what a loader would make read-only after
+relocating it stays writable.

@@ -4,6 +4,7 @@ tlstest
 ctortest
 mmaptest
 fixedtest
+dltest
 filetest
 dirtest
 threadfile

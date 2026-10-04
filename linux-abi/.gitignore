@@ -1,2 +1,3 @@
 liblinux-abi.a
 *.o
+liblinux-abi-pic.a
