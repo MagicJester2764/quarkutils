@@ -633,6 +633,7 @@ fn crossing(sender: usize, msg: &Message) -> bool {
         TAG_CHDIR => one(true, true),
         TAG_MKDIR | TAG_MKNOD | TAG_UNLINK | TAG_RMDIR | TAG_READLINK | TAG_BIND => one(false, true),
         TAG_CONNECT => one(true, true),
+        TAG_INOTIFY_ADD => one(msg.data[1] & INOTIFY_DONT_FOLLOW == 0, true),
         TAG_SETATTR if len != 0 => one(msg.data[2] == 0, true),
         TAG_ATTACH | TAG_DETACH => one(true, false),
         TAG_RENAME | TAG_LINK => return two(sender, msg),
@@ -682,6 +683,12 @@ fn crossing(sender: usize, msg: &Message) -> bool {
         // socket's name is the same: the kernel would know the listener by
         // that server, and the connector is calling this one.
         TAG_MKNOD | TAG_BIND | TAG_CONNECT => {
+            error_reply(sender, ERR_NOT_SUPPORTED);
+            return true;
+        }
+        // What is watched is this server's, which sees every request that
+        // could change it; what is mounted here is another's.
+        TAG_INOTIFY_ADD => {
             error_reply(sender, ERR_NOT_SUPPORTED);
             return true;
         }

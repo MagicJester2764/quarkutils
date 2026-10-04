@@ -52,7 +52,7 @@ pub fn create(
     gid: u32,
     is_dir: bool,
     mode: Option<u16>,
-) -> Result<(u32, Ext2Inode), u64> {
+) -> Result<(u32, Ext2Inode, u32), u64> {
     let (parent_path, name) = split_path(path)?;
     let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
@@ -109,7 +109,8 @@ pub fn create(
     parent.i_mtime = t;
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
-    Ok((ino, inode))
+    crate::inotify::created(parent_ino, name, is_dir);
+    Ok((ino, inode, parent_ino))
 }
 
 /// Make a named pipe, or a socket's name: an inode that is a name, an owner
@@ -155,6 +156,7 @@ pub fn make_special(
     parent.i_mtime = t;
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
+    crate::inotify::created(parent_ino, name, false);
     Ok(ino)
 }
 
@@ -278,7 +280,9 @@ pub fn unlink(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) ->
     parent.i_mtime = t;
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
-    drop_link(e2, ino, &mut inode, t)
+    drop_link(e2, ino, &mut inode, t)?;
+    crate::inotify::removed(parent_ino, name, ino, false, inode.i_links_count == 0);
+    Ok(())
 }
 
 /// Remove the empty directory `path`.
@@ -303,7 +307,9 @@ pub fn rmdir(e2: &mut Ext2State, base: u32, path: &[u8], uid: u32, gid: u32) -> 
     parent.i_mtime = t;
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
-    drop_dir(e2, ino, &mut dir, t)
+    drop_dir(e2, ino, &mut dir, t)?;
+    crate::inotify::removed(parent_ino, name, ino, true, true);
+    Ok(())
 }
 
 /// Give the file at `from` the name `to`, replacing what had it.
@@ -332,6 +338,8 @@ pub fn rename(
         return Err(ERR_INVALID_PATH);
     }
     let t = ext2::now();
+    // What had the new name, and whether that was its last.
+    let mut replaced = None;
 
     if let Some((existing, _)) = ext2_dir::find_entry(e2, &tparent, to_name)? {
         if existing == ino {
@@ -362,6 +370,7 @@ pub fn rename(
             ext2::write_inode(e2, tpi, &tp)?;
             drop_link(e2, existing, &mut victim, t)?;
         }
+        replaced = Some((existing, victim.i_links_count == 0));
     }
 
     // The new name first, so that a failure part way leaves the file with two
@@ -389,7 +398,9 @@ pub fn rename(
         ext2_dir::set_dotdot(e2, ino, &inode, tpi)?;
     }
     inode.i_ctime = t;
-    ext2::write_inode(e2, ino, &inode)
+    ext2::write_inode(e2, ino, &inode)?;
+    crate::inotify::moved(fpi, from_name, tpi, to_name, ino, is_dir, replaced);
+    Ok(())
 }
 
 /// Give the file at `from` a second name, `to`.
@@ -429,7 +440,9 @@ pub fn link(
     ext2_dir::create_dir_entry(e2, tpi, &mut tp, to_name, ino, ext2::file_type_of(&inode))?;
     tp.i_mtime = t;
     tp.i_ctime = t;
-    ext2::write_inode(e2, tpi, &tp)
+    ext2::write_inode(e2, tpi, &tp)?;
+    crate::inotify::linked(tpi, to_name, ino);
+    Ok(())
 }
 
 /// Where [`read_link`] leaves a link's target.
@@ -544,7 +557,9 @@ pub fn symlink(
     }
     parent.i_mtime = t;
     parent.i_ctime = t;
-    ext2::write_inode(e2, parent_ino, &parent)
+    ext2::write_inode(e2, parent_ino, &parent)?;
+    crate::inotify::created(parent_ino, name, false);
+    Ok(())
 }
 
 /// Whether directory `dir` is `ancestor` or somewhere beneath it.

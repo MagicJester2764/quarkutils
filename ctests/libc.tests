@@ -48,3 +48,4 @@ sigqueuetest
 ptimertest
 signalfdtest
 unixtest
+inotifytest

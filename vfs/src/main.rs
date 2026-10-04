@@ -14,6 +14,7 @@ pub mod devices;
 pub mod disk;
 pub mod ext2_ops;
 pub mod handles;
+pub mod inotify;
 pub mod journal;
 pub mod locks;
 pub mod mkfs;
@@ -752,7 +753,7 @@ fn cwd_of(sender: usize) -> (cwd::Where, &'static [u8]) {
 
 /// Put `file` in the table and answer the OPEN that asked for it. For a
 /// descriptor the caller is given one, and told which.
-pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]) {
+pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]) -> Option<usize> {
     let by_fd = flags & OPEN_DESCRIPTOR != 0;
     if by_fd {
         file.by_fd = true;
@@ -761,7 +762,8 @@ pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]
         file.may_write = flags & OPEN_WRITE != 0;
     }
     let Some(handle) = handles::alloc(file) else {
-        return error_reply(sender, ERR_TOO_MANY_OPEN);
+        error_reply(sender, ERR_TOO_MANY_OPEN);
+        return None;
     };
     words[0] = handle as u64;
     if by_fd {
@@ -771,11 +773,13 @@ pub fn opened(sender: usize, flags: u64, mut file: OpenFile, mut words: [u64; 6]
                 // Its table is full, or the kernel's. Nothing names the
                 // handle, so nothing will ever say it has been closed.
                 let _ = handles::release(handle);
-                return error_reply(sender, ERR_TOO_MANY_OPEN);
+                error_reply(sender, ERR_TOO_MANY_OPEN);
+                return None;
             }
         }
     }
     reply_opened(sender, words);
+    Some(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1572,8 @@ pub extern "C" fn _start() -> ! {
     // Service loop
     loop {
         let mut msg = Message::empty();
+        // Whoever waits to read events the last request made is given them.
+        inotify::settle();
         // A mapped file nothing maps any more, which could not be let go
         // when the kernel said so.
         if pager::owed() {
@@ -1606,13 +1612,18 @@ pub extern "C" fn _start() -> ! {
         }
         if let Some(tid) = quark_rt::ipc::death_notice(&msg) {
             locks::drop_task(tid);
+            inotify::drop_task(tid);
             continue;
         }
         // The last descriptor for something has closed. One notice however
         // many there are: collect until there are none.
         if quark_rt::ipc::fd_released_notice(&msg) {
             while let Some(cookie) = syscall::sys_fd_reap() {
-                descriptor_closed(cookie as usize);
+                if inotify::is_instance(cookie) {
+                    inotify::closed(cookie);
+                } else {
+                    descriptor_closed(cookie as usize);
+                }
             }
             continue;
         }
@@ -1620,6 +1631,8 @@ pub extern "C" fn _start() -> ! {
         // for and gave up on is not a request any more, and granting it later
         // would hand a lock to a program that had stopped asking.
         locks::drop_task(sender);
+        // Nor in a read of events.
+        inotify::drop_task(sender);
         // And `/proc/self` is the caller's.
         procfs::serving(sender);
 
@@ -1628,6 +1641,13 @@ pub extern "C" fn _start() -> ! {
         // descriptor is. The same thing as a client asking for itself, and
         // checked the same way — the tag proves nothing, holding the cookie
         // does.
+        // An inotify instance is not a file, and is not read as one is.
+        if matches!(msg.tag, quark_rt::ipc::TAG_FD_READ | quark_rt::ipc::TAG_FD_WRITE)
+            && inotify::is_instance(msg.data[0])
+        {
+            inotify::io(sender, &msg);
+            continue;
+        }
         let msg = match msg.tag {
             quark_rt::ipc::TAG_FD_READ | quark_rt::ipc::TAG_FD_WRITE => Message {
                 sender,
@@ -1714,6 +1734,8 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_MKNOD => transacted(|| handle_mknod(sender, msg)),
         TAG_BIND => transacted(|| handle_bind(sender, msg)),
         TAG_CONNECT => handle_connect(sender, msg),
+        TAG_INOTIFY_ADD => inotify::add(sender, msg),
+        TAG_INOTIFY => inotify::request(sender, msg),
         TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
             transacted(|| handle_namespace(disk, sender, msg))
         }
@@ -1918,10 +1940,13 @@ fn handle_setattr(sender: usize, msg: &Message) {
     }
     let len = msg.data[0] as usize;
     let (uid, gid) = get_sender_uid_gid(sender);
+    // The inode, and the handle it was named by or the directory it was
+    // found in, for inotify to say whose attributes changed.
     let ino = if len == 0 {
-        match get_handle(msg.data[5].wrapping_sub(1) as usize, sender) {
+        let handle = msg.data[5].wrapping_sub(1) as usize;
+        match get_handle(handle, sender) {
             Some(file) => match file.fs {
-                FsFileData::Ext2 { inode_num } => Ok(inode_num),
+                FsFileData::Ext2 { inode_num } => Ok((inode_num, Some(handle), 0)),
                 // The devices are the server's, and are what they are; so is
                 // what /proc says.
                 FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir | FsFileData::Proc(_) => {
@@ -1940,8 +1965,8 @@ fn handle_setattr(sender: usize, msg: &Message) {
                 return Err(ERR_PERMISSION);
             }
             match ext2_dir::resolve(ext2_state(), base, path, uid, gid, msg.data[2] == 0)? {
-                ext2_dir::Found::Inode(ino, _, _) if ino != ext2_dir::dev_dir() && ino != ext2_dir::proc_dir() => {
-                    Ok(ino)
+                ext2_dir::Found::Inode(ino, _, holder) if ino != ext2_dir::dev_dir() && ino != ext2_dir::proc_dir() => {
+                    Ok((ino, None, holder))
                 }
                 _ => Err(ERR_PERMISSION),
             }
@@ -1960,8 +1985,14 @@ fn handle_setattr(sender: usize, msg: &Message) {
         atime: word(3),
         mtime: word(4),
     };
-    match ino.and_then(|ino| ext2_ops::setattr(ext2_state_mut(), ino, &attrs, uid, gid)) {
-        Ok(()) => reply_opened(sender, [0; 6]),
+    match ino.and_then(|named| ext2_ops::setattr(ext2_state_mut(), named.0, &attrs, uid, gid).map(|()| named)) {
+        Ok((ino, handle, dir)) => {
+            reply_opened(sender, [0; 6]);
+            match handle {
+                Some(handle) => inotify::touched(handle, ino, inotify::IN_ATTRIB),
+                None => inotify::attrib(ino, dir),
+            }
+        }
         Err(code) => error_reply(sender, code),
     }
 }
@@ -2157,12 +2188,13 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
         Ok(ext2_dir::Found::Inode(ino, inode, holder)) => Ok((ino, inode, holder)),
         Err(code) => Err(code),
     };
-    let (ino, inode) = match found {
-        Ok((ino, inode, _)) => {
+    // And the directory it was found in, or made in.
+    let (ino, inode, dir) = match found {
+        Ok((ino, inode, holder)) => {
             if flags & OPEN_CREATE != 0 && flags & OPEN_EXCLUSIVE != 0 {
                 return error_reply(sender, ERR_EXISTS);
             }
-            (ino, inode)
+            (ino, inode, holder)
         }
         Err(ERR_NOT_FOUND) if flags & OPEN_CREATE != 0 => {
             if trailing {
@@ -2252,6 +2284,7 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
             return error_reply(sender, code);
         }
         pager::resized(ino, 0);
+        inotify::changed(ino, dir, false, inotify::IN_MODIFY);
         size = 0;
     }
     let file = OpenFile {
@@ -2263,7 +2296,7 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
         fs: FsFileData::Ext2 { inode_num: ino },
         ..OpenFile::empty()
     };
-    opened(sender, flags, file, [
+    let made = opened(sender, flags, file, [
         0,
         size,
         inode.is_dir() as u64,
@@ -2271,6 +2304,10 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
         access_bits(&inode, uid, gid),
         ino as u64,
     ]);
+    // What is opened only to be asked about is not opened, to inotify.
+    if let (Some(handle), false) = (made, link) {
+        inotify::opened(handle, ino, dir, inode.is_dir(), flags & OPEN_WRITE != 0);
+    }
 }
 
 /// Split a FAT path into its parent directory's cluster and the new name.
@@ -3220,7 +3257,8 @@ fn handle_truncate(disk: &DiskState, sender: usize, msg: &Message) {
     match ext2_ops::truncate(ext2_state_mut(), ino, msg.data[1]) {
         Ok(()) => {
             pager::resized(ino, msg.data[1]);
-            reply_opened(sender, [0; 6])
+            reply_opened(sender, [0; 6]);
+            inotify::touched(msg.data[0] as usize, ino, inotify::IN_MODIFY);
         }
         Err(code) => error_reply(sender, code),
     }
@@ -3456,6 +3494,9 @@ fn handle_read_ext2(sender: usize, msg: &Message) {
             // A shared mapping's writes are in the cache before the file.
             if let Ok(n) = read {
                 pager::read_through(ino, offset as u64, n as usize);
+                if n > 0 {
+                    inotify::touched(handle, ino, inotify::IN_ACCESS);
+                }
             }
             reply_read(sender, read);
         }
@@ -3574,6 +3615,9 @@ fn handle_write_ext2(sender: usize, msg: &Message) {
                     pager::wrote(inode_num, offset as u64, bytes_written as usize);
                     pager::resized(inode_num, inode.size64());
                     reply_count(sender, bytes_written as u64);
+                    if bytes_written > 0 {
+                        inotify::touched(handle, inode_num, inotify::IN_MODIFY);
+                    }
                 }
                 Err(code) => error_reply(sender, code),
             }

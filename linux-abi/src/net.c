@@ -622,13 +622,13 @@ long __quark_accept(long fd, void *addr, unsigned int *len, long flags) {
         }
         return why;
     }
+    __quark_fd_forget((long)r);
     if (flags & LX_SOCK_NONBLOCK) {
         __quark_fd_set_nonblock((long)r, 1);
     }
     if (flags & LX_SOCK_CLOEXEC) {
         __syscall3(SYS_FD_FLAGS, r, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
     }
-    __quark_fd_forget((long)r);
     if (r < MAX_FDS) {
         remember(named_as[r], fd >= 0 && fd < MAX_FDS ? named_as[fd] : "");
         connected_to[r][0] = 0;

@@ -595,6 +595,87 @@ int quark_vfs_connect(unsigned long base, const char *path, long fd) {
     return vfs_path_call(QUARK_VFS_TAG_CONNECT, base, path, &msg, &reply);
 }
 
+/* The cookie an inotify descriptor names, which has QUARK_VFS_NOT_A_FILE. */
+static int inotify_cookie(long fd, unsigned long *cookie) {
+    unsigned long named[2];
+
+    if (fd < 0 || __syscall2(SYS_FD_SERVED, (unsigned long)fd, (unsigned long)named) == QUARK_ERR ||
+        named[0] != quark_vfs() || !(named[1] & QUARK_VFS_NOT_A_FILE)) {
+        return QUARK_VFS_INVALID_HANDLE;
+    }
+    *cookie = named[1];
+    return 0;
+}
+
+int quark_vfs_inotify_is(long fd) {
+    unsigned long cookie;
+    return inotify_cookie(fd, &cookie) == 0;
+}
+
+int quark_vfs_inotify_init(long *fd) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_INOTIFY;
+    msg.data[0] = QUARK_VFS_INOTIFY_INIT;
+    int err = vfs_call(&msg, &reply);
+    if (!err) {
+        *fd = (long)reply.data[0];
+    }
+    return err;
+}
+
+int quark_vfs_inotify_add(long fd, unsigned long base, const char *path, unsigned int mask, long *wd) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+    unsigned long cookie;
+
+    int err = inotify_cookie(fd, &cookie);
+    if (err) {
+        return err;
+    }
+    zero(&msg, sizeof msg);
+    msg.data[1] = mask;
+    msg.data[2] = cookie;
+    err = vfs_path_call(QUARK_VFS_TAG_INOTIFY_ADD, base, path, &msg, &reply);
+    if (!err) {
+        *wd = (long)reply.data[0];
+    }
+    return err;
+}
+
+/* An operation on the instance `fd` names: `[op, word, cookie]`. */
+static int inotify_op(long fd, unsigned long op, unsigned long word, struct quark_msg *reply) {
+    struct quark_msg msg;
+    unsigned long cookie;
+
+    int err = inotify_cookie(fd, &cookie);
+    if (err) {
+        return err;
+    }
+    zero(&msg, sizeof msg);
+    msg.tag = QUARK_VFS_TAG_INOTIFY;
+    msg.data[0] = op;
+    msg.data[1] = word;
+    msg.data[2] = cookie;
+    return vfs_call(&msg, reply);
+}
+
+int quark_vfs_inotify_remove(long fd, long wd) {
+    struct quark_msg reply;
+    return inotify_op(fd, QUARK_VFS_INOTIFY_REMOVE, (unsigned long)wd, &reply);
+}
+
+int quark_vfs_inotify_queued(long fd, unsigned long *bytes) {
+    struct quark_msg reply;
+    int err = inotify_op(fd, QUARK_VFS_INOTIFY_QUEUED, 0, &reply);
+    if (!err) {
+        *bytes = reply.data[0];
+    }
+    return err;
+}
+
 int quark_vfs_sync(void) {
     struct quark_msg msg;
     struct quark_msg reply;
@@ -683,8 +764,10 @@ int quark_vfs_handle(long fd, unsigned long *handle) {
     if (fd < 0 || __syscall2(SYS_FD_SERVED, (unsigned long)fd, (unsigned long)named) == QUARK_ERR) {
         return -1;
     }
-    /* Served, but by whom? Only the file server's cookies are its handles. */
-    if (named[0] != quark_vfs()) {
+    /* Served, but by whom? Only the file server's cookies are its handles,
+       and not every one of those: what is not a file is read through the
+       kernel, as the kernel's descriptors are. */
+    if (named[0] != quark_vfs() || (named[1] & QUARK_VFS_NOT_A_FILE)) {
         return -1;
     }
     if (handle) {

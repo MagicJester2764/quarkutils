@@ -124,10 +124,14 @@ static void note_file(long fd, unsigned long handle) {
     __atomic_store_n(&kind[fd], A_FILE, __ATOMIC_RELEASE);
 }
 
-/* Something has changed what `fd` names, or is about to. */
+/* Something has changed what `fd` names, or is about to. Whatever comes to
+   have the number waits until it is said not to: a note that the last thing
+   there did not, left behind, made the next thing made there answer EAGAIN
+   to a read that should have waited. */
 void __quark_fd_forget(long fd) {
     if (fd >= 0 && fd < MAX_FDS) {
         __atomic_store_n(&kind[fd], UNKNOWN, __ATOMIC_RELEASE);
+        __quark_fd_set_nonblock(fd, 0);
     }
 }
 
@@ -165,6 +169,62 @@ int __quark_fd_is_file(long fd) {
 static int is_open(long fd) {
     return fd >= 0 && fd < MAX_FDS &&
            __syscall3(SYS_FD_FLAGS, (unsigned long)fd, QUARK_FD_GETFLAGS, 0) != QUARK_ERR;
+}
+
+/* inotify. An instance is a descriptor the file server makes and says is
+   not a file, so this layer reads and polls it as the kernel's — the
+   kernel's read says whether the reader would wait — and a watch is a
+   request to the server, which names the instance by its cookie. What the
+   server can watch is its own filesystem: a path in one mounted in it is
+   EOPNOTSUPP. IN_NONBLOCK is the descriptor's, as O_NONBLOCK is. */
+#define LX_IN_NONBLOCK    04000
+#define LX_IN_CLOEXEC     02000000
+#define LX_IN_ALL_EVENTS  0xFFFu
+#define LX_IN_MASK_CREATE 0x10000000u
+#define LX_IN_MASK_ADD    0x20000000u
+
+long __quark_inotify_init(long flags) {
+    if (flags & ~(long)(LX_IN_NONBLOCK | LX_IN_CLOEXEC)) {
+        return -LX_EINVAL;
+    }
+    long fd;
+    int err = quark_vfs_inotify_init(&fd);
+    if (err) {
+        return vfs_errno(err);
+    }
+    if (flags & LX_IN_NONBLOCK) {
+        __quark_fd_set_nonblock(fd, 1);
+    }
+    if (flags & LX_IN_CLOEXEC) {
+        __syscall3(SYS_FD_FLAGS, (unsigned long)fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+    }
+    return fd;
+}
+
+long __quark_inotify_add_watch(long fd, const char *path, unsigned long mask) {
+    unsigned int m = (unsigned int)mask;
+    if (!(m & LX_IN_ALL_EVENTS) || ((m & LX_IN_MASK_ADD) && (m & LX_IN_MASK_CREATE))) {
+        return -LX_EINVAL;
+    }
+    if (!quark_vfs_inotify_is(fd)) {
+        return is_open(fd) ? -LX_EINVAL : -LX_EBADF;
+    }
+    if (!path) {
+        return -LX_EFAULT;
+    }
+    if (!*path) {
+        return -LX_ENOENT;
+    }
+    long wd;
+    int err = quark_vfs_inotify_add(fd, 0, path, m, &wd);
+    return err ? vfs_errno(err) : wd;
+}
+
+long __quark_inotify_rm_watch(long fd, long wd) {
+    if (!quark_vfs_inotify_is(fd)) {
+        return is_open(fd) ? -LX_EINVAL : -LX_EBADF;
+    }
+    return quark_vfs_inotify_remove(fd, wd) ? -LX_EINVAL : 0;
 }
 
 /* The answer for a descriptor that is not a file: `not_a_file` if it is
@@ -1202,7 +1262,8 @@ long __quark_read(long fd, void *buf, unsigned long n) {
            read is one this program is behind, and may not be stopped for:
            it ignores the signal, or has nobody who would start it again. A
            timer, a counter and a signal descriptor are read in whole
-           records, and refuse a buffer too small for one. */
+           records, and refuse a buffer too small for one; so is what a
+           server serves that is not a file, an inotify instance. */
         unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
         if (k == QUARK_ERR) {
             return -LX_EBADF;
@@ -1213,6 +1274,7 @@ long __quark_read(long fd, void *buf, unsigned long n) {
         case QUARK_FD_KIND_TIMER:
         case QUARK_FD_KIND_EVENT:
         case QUARK_FD_KIND_SIGNALS:
+        case QUARK_FD_KIND_SERVED:
             return -LX_EINVAL;
         default:
             return -LX_EBADF;

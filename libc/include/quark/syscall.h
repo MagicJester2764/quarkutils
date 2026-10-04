@@ -231,6 +231,9 @@
    number that came with it. */
 #define SYS_FD_SERVE_PIPE   231
 #define SYS_PIPE_PEER       232
+/* A server says what an object of its own is ready for, to a poll: one it
+   made saying it would, which is not a file. */
+#define SYS_FD_READY        233
 
 /* 0xF0  introspection */
 /* Turn the machine off (0) or start it again (1): for a holder of the right

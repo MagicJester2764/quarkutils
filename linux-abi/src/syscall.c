@@ -112,6 +112,10 @@ typedef unsigned long size_t;
 #define LX_timer_delete    226
 #define LX_signalfd        282
 #define LX_signalfd4       289
+#define LX_inotify_init    253
+#define LX_inotify_add_watch 254
+#define LX_inotify_rm_watch  255
+#define LX_inotify_init1   294
 #define LX_epoll_pwait     281
 #define LX_ioctl            16
 #define LX_readv            19
@@ -1624,6 +1628,14 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_tkill(a1, a2);
     case LX_tgkill:
         return __quark_tkill(a2, a3);
+    case LX_inotify_init:
+        return __quark_inotify_init(0);
+    case LX_inotify_init1:
+        return __quark_inotify_init(a1);
+    case LX_inotify_add_watch:
+        return __quark_inotify_add_watch(a1, (const char *)a2, (unsigned long)a3);
+    case LX_inotify_rm_watch:
+        return __quark_inotify_rm_watch(a1, a2);
     case LX_signalfd:
         return __quark_signalfd(a1, (const unsigned long *)a2, (unsigned long)a3, 0);
     case LX_signalfd4:

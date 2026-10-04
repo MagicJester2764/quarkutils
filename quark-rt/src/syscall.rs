@@ -390,6 +390,8 @@ pub const SYS_FD_KIND: u64 = 230;
 pub const SYS_FD_SERVE_PIPE: u64 = 231;
 /// Wait for the other end of a named pipe to be opened.
 pub const SYS_PIPE_PEER: u64 = 232;
+/// A server says what an object of its own is ready for, to a poll.
+pub const SYS_FD_READY: u64 = 233;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 64;
@@ -1961,6 +1963,33 @@ pub fn sys_fd_serve(client: usize, cookie: u64, at: usize) -> Result<usize, ()> 
     if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
 }
 
+/// [`sys_fd_serve`], for an object that is not a file: what is read from it
+/// comes when it comes, and this server will say when it is ready
+/// ([`sys_fd_ready`]). Until it does, a poll finds it ready for nothing.
+pub fn sys_fd_serve_ready(client: usize, cookie: u64, at: usize) -> Result<usize, ()> {
+    let ret = unsafe { syscall4(SYS_FD_SERVE, client as u64, cookie, at as u64, 1) };
+    if ret == u64::MAX { Err(()) } else { Ok(ret as usize) }
+}
+
+/// What object `cookie` — this server's, made with [`sys_fd_serve_ready`] —
+/// is ready for, in a poll's bits: [`FD_READY_READ`], [`FD_READY_WRITE`],
+/// [`FD_READY_HANGUP`]. Whoever polls it is told.
+pub fn sys_fd_ready(cookie: u64, bits: u32) -> Result<(), ()> {
+    let ret = unsafe { syscall2(SYS_FD_READY, cookie, bits as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+pub const FD_READY_READ: u32 = 1;
+pub const FD_READY_WRITE: u32 = 2;
+pub const FD_READY_HANGUP: u32 = 4;
+
+/// In `data[2]` of a read or a write the kernel makes through a served
+/// descriptor (`TAG_FD_READ`, `TAG_FD_WRITE`): the task may not wait.
+pub const FD_IO_DO_NOT_WAIT: u64 = 1;
+/// A server's count for such a read or write when it has nothing yet: the
+/// task is told it would block.
+pub const FD_IO_NOTHING_YET: u64 = 0xFFFF_FFFE;
+
 /// What giving a client an end of a named pipe came to.
 pub enum PipeEnd {
     /// The client's descriptor, and what it should wait on: 0 if the other
@@ -2915,7 +2944,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 31;
+pub const ABI_VERSION_MINOR: u32 = 32;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

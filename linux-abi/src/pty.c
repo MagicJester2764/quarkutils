@@ -13,6 +13,7 @@
  */
 
 #include <quark/syscall.h>
+#include <quark/vfs.h>
 
 #include "abi.h"
 
@@ -38,6 +39,7 @@
 #define TIOCNOTTY  0x5422
 #define TIOCGSID   0x5429
 #define TIOCGWINSZ 0x5413
+#define FIONREAD   0x541B
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
 #define TIOCSPTLCK 0x40045431
@@ -254,6 +256,18 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
                 return r == QUARK_NOT_ALLOWED ? -LX_EPERM : -LX_ENOTTY;
             }
         }
+    }
+    case FIONREAD: {
+        /* How much there is to read, of an inotify instance: its server
+           counts the bytes of events waiting. */
+        unsigned long n;
+        if (quark_vfs_inotify_queued(fd, &n) == 0) {
+            if (arg) {
+                *(int *)arg = (int)n;
+            }
+            return 0;
+        }
+        return __quark_blk_ioctl(fd, request, arg);
     }
     default:
         /* Not a terminal's question. A disk has a few of its own. */

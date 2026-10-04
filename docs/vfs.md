@@ -148,6 +148,8 @@ Every request below that takes a handle takes either kind.
 | 35 | `SYNC` | — | — | — |
 | 36 | `BIND` | `[path_len, descriptor, mode]` | path | `[id]` |
 | 37 | `CONNECT` | `[path_len, descriptor]` | path | — |
+| 38 | `INOTIFY_ADD` | `[path_len, mask, instance, 0, 0, base]` | path | `[watch]` |
+| 39 | `INOTIFY` | `[op, watch, instance]` | — | per op |
 
 28 to 30 are *Mounts*, below; 31 to 34 are what one file server says to
 another, and a client that says them is refused.
@@ -552,6 +554,57 @@ listening, reachable by nobody new; a new `BIND` at the path makes a new
 name. A FAT filesystem has no sockets, and neither does a mounted one
 (`NOT_SUPPORTED`): the kernel would know the listener by the mount's
 server, and a connector is calling this one.
+
+### INOTIFY_ADD, INOTIFY and what a watch is told
+
+inotify is this server's: every request that changes a file, and every
+open, read, write and close of one, is a request to it, so it can say
+what happened to whom. An *instance* is a descriptor it makes for the
+caller — `INOTIFY` op 0, whose reply is the caller's descriptor — served
+with the flag that says this server will say when it is ready
+(`SYS_FD_SERVE`, `SYS_FD_READY`). Its cookie has bit 40 set, which no
+handle's has: the C library takes such a descriptor for one of the
+kernel's, so a read of it goes through the kernel (`TAG_FD_READ`, with
+whether the reader may wait in `data[2]`) and a poll asks the kernel,
+which answers what this server said last.
+
+`INOTIFY_ADD` watches the inode at the path for the instance named by
+`data[2]` — its cookie, which the caller must hold (`SYS_FD_HOLDS`) —
+with Linux's mask in `data[1]`, following a last link unless the mask
+has `IN_DONT_FOLLOW`. It needs read permission on the inode, as on Linux;
+`IN_ONLYDIR` of what is not a directory is `NOT_DIR`; the inode watched
+already by the instance is the same watch, its mask replaced or, with
+`IN_MASK_ADD`, added to, and `IN_MASK_CREATE` of it is `EXISTS`. The
+reply is the watch's number, which the instance never gives out twice.
+There are 2048 watches across every instance; with none left it is
+`NO_SPACE`, as Linux's `ENOSPC`. A path in a filesystem mounted here, in
+`/dev` or `/proc`, or on FAT, is `NOT_SUPPORTED`: what is watched is
+this server's own ext2.
+
+`INOTIFY` op 1 ends watch `data[1]` (`NOT_FOUND` if the instance has
+none of that number), and the instance is told `IN_IGNORED`; op 2 says
+how many bytes of events wait to be read, which is `FIONREAD`.
+
+What a watch is told, as Linux tells it: of a directory, `IN_CREATE`,
+`IN_DELETE`, `IN_MOVED_FROM` and `IN_MOVED_TO` (one cookie for the two
+halves of a rename) with the entry's name, and the open, read, write,
+change of attributes and close of what is in it, by name — the name the
+directory has for the inode, looked for when a watch wants it; of
+anything, those of itself without a name, `IN_MOVE_SELF`, and when its
+last name goes `IN_DELETE_SELF` and then `IN_IGNORED`, together — Linux
+waits for its last descriptor to close before the second. `IN_ISDIR` says
+the subject is a directory, and `IN_ONESHOT` ends a watch at its first
+event. An instance has 4096 bytes for events not read: one the same as
+the last still waiting is not queued again, and one with no room is
+`IN_Q_OVERFLOW`, once, until that has been read.
+
+A read is of whole events; one with room for none is refused, which the
+C library says as `EINVAL`. A read that may wait and finds nothing is
+answered when the next request that made an event is done; one that may
+not is answered "nothing yet" (`0xFFFF_FFFE`), the would-block of every
+other descriptor. A held read is let go, unanswered, when its task asks
+anything else or dies. The instance goes with its last descriptor, and
+its watches with it.
 
 ### Devices
 

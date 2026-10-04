@@ -298,6 +298,20 @@ does on Linux. What is different is at the edges:
   POSIX leaves it undefined; here a descriptor is one end of a pipe, and the
   open fails with `EOPNOTSUPP`. `mknod` makes nothing else: a device is
   `EPERM`.
+- **inotify** is `inotify_init`, `inotify_init1` (`IN_NONBLOCK`,
+  `IN_CLOEXEC`), `inotify_add_watch` and `inotify_rm_watch`, and the file
+  server is what watches: an instance is a descriptor it makes, read with
+  `read` in whole `inotify_event`s — too small a buffer for the next is
+  `EINVAL` — polled with `poll`, `select` and `epoll`, and asked how much
+  waits with `FIONREAD`. Every event Linux has but `IN_UNMOUNT` comes:
+  made, removed, renamed (a cookie tying the halves), opened, read,
+  written, attributes changed, closed after writing or not, a file's own
+  move and end, and a watch's end, `IN_IGNORED`. Three differences: only
+  the root filesystem can be watched, on ext2 or ext4 — a path in a
+  mounted one, in `/dev` or `/proc`, is `EOPNOTSUPP`; a watch on a file
+  whose last name goes is told `IN_DELETE_SELF` and `IN_IGNORED` at once,
+  not when its last descriptor closes; and an instance has room for 4096
+  bytes of events, after which it says `IN_Q_OVERFLOW` once.
 
 ## Terminals
 

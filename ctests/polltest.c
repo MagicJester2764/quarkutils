@@ -105,6 +105,16 @@ int main(void) {
     check("and takes a byte", write(q[1], "q", 1) == 1 && read(q[0], &c, 1) == 1 && c == 'q');
     close(q[0]);
     close(q[1]);
+    /* And what is made in its place waits, as anything new does: the
+       layer's note that a descriptor does not wait went with it. It did
+       not, and an inotify instance made where a non-blocking one had been
+       answered its first read with EAGAIN. */
+    int r[2];
+    check("a pipe made where it was", pipe(r) == 0 && (r[0] == q[0] || r[1] == q[0]));
+    check("does not take its place's O_NONBLOCK",
+          !(fcntl(r[0], F_GETFL) & O_NONBLOCK) && !(fcntl(r[1], F_GETFL) & O_NONBLOCK));
+    close(r[0]);
+    close(r[1]);
 
     /* eventfd: a counter that is readable when it is not zero. */
     int ev = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);

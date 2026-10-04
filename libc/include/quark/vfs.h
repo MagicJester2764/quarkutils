@@ -44,6 +44,15 @@
 #define QUARK_VFS_TAG_SYNC    35
 #define QUARK_VFS_TAG_BIND    36
 #define QUARK_VFS_TAG_CONNECT 37
+#define QUARK_VFS_TAG_INOTIFY_ADD 38
+#define QUARK_VFS_TAG_INOTIFY     39
+/* QUARK_VFS_TAG_INOTIFY's operations. */
+#define QUARK_VFS_INOTIFY_INIT   0UL
+#define QUARK_VFS_INOTIFY_REMOVE 1UL
+#define QUARK_VFS_INOTIFY_QUEUED 2UL
+/* A cookie of the file server's with this bit is not a file, and never a
+   handle: an inotify instance, which is read and polled through the kernel. */
+#define QUARK_VFS_NOT_A_FILE (1UL << 40)
 /* QUARK_VFS_TAG_DEVCTL's operations: have a disk's driver read its partition
    table again. */
 #define QUARK_VFS_DEVCTL_RESCAN 1UL
@@ -275,6 +284,15 @@ int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode);
    bits `mode`; and connect `fd` to whatever listens at `path`. */
 int quark_vfs_bind(unsigned long base, const char *path, long fd, unsigned long mode);
 int quark_vfs_connect(unsigned long base, const char *path, long fd);
+/* inotify: a new instance, and the caller's descriptor for it; whether `fd`
+   is one; a watch of `path` for it, with Linux's mask, and the watch's
+   number; a watch ended; and how many bytes of events wait to be read. A
+   path in a filesystem mounted in the root's is QUARK_VFS_NOT_SUPPORTED. */
+int quark_vfs_inotify_init(long *fd);
+int quark_vfs_inotify_is(long fd);
+int quark_vfs_inotify_add(long fd, unsigned long base, const char *path, unsigned int mask, long *wd);
+int quark_vfs_inotify_remove(long fd, long wd);
+int quark_vfs_inotify_queued(long fd, unsigned long *bytes);
 /* Have everything written so far be on its disk before returning. */
 int quark_vfs_sync(void);
 /* Ask something of the device an open handle is: QUARK_VFS_DEVCTL_*. */

@@ -85,6 +85,24 @@ pub const TAG_SYNC: u64 = 35;
 pub const TAG_BIND: u64 = 36;
 /// Connect a local socket the caller holds to whatever listens at a name.
 pub const TAG_CONNECT: u64 = 37;
+/// Watch an inode for an inotify instance the caller holds: `[path_len,
+/// mask, instance, 0, 0, base]`, the path lent. The reply is the watch's
+/// number.
+pub const TAG_INOTIFY_ADD: u64 = 38;
+/// Everything else about inotify: `[op, watch, instance]`. [`INOTIFY_INIT`]
+/// makes an instance and answers with the caller's descriptor for it;
+/// [`INOTIFY_REMOVE`] ends a watch; [`INOTIFY_QUEUED`] says how many bytes
+/// of events wait to be read.
+pub const TAG_INOTIFY: u64 = 39;
+pub const INOTIFY_INIT: u64 = 0;
+pub const INOTIFY_REMOVE: u64 = 1;
+pub const INOTIFY_QUEUED: u64 = 2;
+/// Linux's IN_DONT_FOLLOW, in TAG_INOTIFY_ADD's mask.
+pub const INOTIFY_DONT_FOLLOW: u64 = 0x0200_0000;
+/// The bit in a cookie that says the descriptor is not a file: never in a
+/// handle's. The C library reads and polls such a descriptor through the
+/// kernel.
+pub const NOT_A_FILE: u64 = 1 << 40;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

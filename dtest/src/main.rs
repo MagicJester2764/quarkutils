@@ -854,6 +854,133 @@ fn test_served() {
     );
 }
 
+/// What the client thread of [`test_served_ready`] asks of its server.
+const ASK_READY_OPEN: u64 = 0x61;
+const ASK_READY_SAY: u64 = 0x62;
+const ASK_READY_DONE: u64 = 0x63;
+const COOKIE_READY: u64 = 0x6161;
+static READY_SERVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// What the client saw, a bit a check.
+static READY_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The client: is given a descriptor for something that is not a file, and
+/// polls and reads it before and after its server says it is ready.
+extern "C" fn ready_client() -> ! {
+    use core::sync::atomic::Ordering;
+    use quark_rt::ipc::Message;
+    let server = READY_SERVER.load(Ordering::Relaxed);
+    let ask = |tag: u64| -> Option<Message> {
+        let msg = Message { sender: 0, tag, data: [0; 6] };
+        let mut reply = Message::empty();
+        syscall::sys_call(server, &msg, &mut reply).ok().filter(|_| reply.tag == 0).map(|_| reply)
+    };
+    let mut bits = 0u64;
+    if let Some(given) = ask(ASK_READY_OPEN) {
+        let fd = given.data[0] as usize;
+        bits |= 1;
+        let mut buf = [0u8; 8];
+        let mut p = [syscall::PollFd::new(fd, syscall::POLL_READABLE)];
+        if syscall::sys_poll(&mut p, 0) == Ok(0) {
+            bits |= 2;
+        }
+        if syscall::sys_fd_read_nb(fd, &mut buf) == syscall::WOULD_BLOCK {
+            bits |= 4;
+        }
+        if ask(ASK_READY_SAY).is_some() {
+            let mut p = [syscall::PollFd::new(fd, syscall::POLL_READABLE)];
+            if syscall::sys_poll(&mut p, 0) == Ok(1) && p[0].revents & syscall::POLL_READABLE != 0 {
+                bits |= 8;
+            }
+            if syscall::sys_fd_read(fd, &mut buf) == 5 && &buf[..5] == b"ready" {
+                bits |= 16;
+            }
+        }
+        let _ = syscall::sys_fd_close(fd);
+    }
+    let _ = ask(ASK_READY_DONE);
+    READY_SEEN.store(bits, Ordering::Relaxed);
+    syscall::sys_exit_code(0);
+}
+
+/// A served object that is not a file: ready when its server says, and read
+/// as one that may not wait or as one that may — what an inotify instance is.
+fn test_served_ready() {
+    use core::sync::atomic::Ordering;
+    use quark_rt::ipc::{self, Message, TID_ANY};
+    println!("what a server says is ready:");
+    let me = syscall::sys_getpid() as usize;
+    READY_SEEN.store(0, Ordering::Relaxed);
+    READY_SERVER.store(me, Ordering::Relaxed);
+    // The thread calls this task: an Endpoint to it, in the space they share.
+    let minted =
+        syscall::sys_cap_mint(syscall::SLOT_SCRATCH, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok();
+    check("the client may call its server", minted);
+    let Ok(client) = thread::spawn_with_stack(ready_client, 8) else {
+        check("the client started", false);
+        return;
+    };
+    let mut said = false;
+    let mut nothing_yet = false;
+    let mut gave = false;
+    for _ in 0..400 {
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, 5).is_err() {
+            continue;
+        }
+        if ipc::fd_released_notice(&msg) {
+            while syscall::sys_fd_reap().is_some() {}
+            continue;
+        }
+        let from = msg.sender;
+        let mut reply = Message::empty();
+        match msg.tag {
+            ASK_READY_OPEN => match syscall::sys_fd_serve_ready(from, COOKIE_READY, syscall::ANY_FD) {
+                Ok(fd) => reply.data[0] = fd as u64,
+                Err(()) => reply.tag = u64::MAX,
+            },
+            ASK_READY_SAY => said = syscall::sys_fd_ready(COOKIE_READY, syscall::FD_READY_READ).is_ok(),
+            // The kernel, reading for the client: told whether it may wait.
+            ipc::TAG_FD_READ if msg.data[2] & syscall::FD_IO_DO_NOT_WAIT != 0 && !said => {
+                nothing_yet = msg.data[0] == COOKIE_READY;
+                reply.data[0] = syscall::FD_IO_NOTHING_YET;
+            }
+            ipc::TAG_FD_READ => {
+                gave = msg.data[2] & syscall::FD_IO_DO_NOT_WAIT == 0
+                    && syscall::sys_lent_write(from, 0, b"ready") == Ok(5);
+                reply.data[0] = 5;
+            }
+            ASK_READY_DONE => {
+                let _ = syscall::sys_reply(from, &reply);
+                break;
+            }
+            _ => reply.tag = u64::MAX,
+        }
+        let _ = syscall::sys_reply(from, &reply);
+    }
+    client.join();
+    let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
+    let bits = READY_SEEN.load(Ordering::Relaxed);
+    check("a server serves something that is not a file", bits & 1 != 0);
+    check("which is ready for nothing until its server says", bits & 2 != 0);
+    check("a read that may not wait says so to the server", nothing_yet);
+    check("and the server's nothing yet is would-block", bits & 4 != 0);
+    check("the server says it is ready", said);
+    check("and a poll finds it so", bits & 8 != 0);
+    check("a read that may wait says so too, and is answered", gave && bits & 16 != 0);
+    check(
+        "a server says nothing of what it did not make so",
+        syscall::sys_fd_ready(COOKIE_READY ^ 1, syscall::FD_READY_READ).is_err(),
+    );
+    // What the client closed may be collected after it said it was done.
+    for _ in 0..20 {
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, 5).is_ok() && ipc::fd_released_notice(&msg) {
+            while syscall::sys_fd_reap().is_some() {}
+            break;
+        }
+    }
+}
+
 const SHM_AT: usize = 0x94_0000_0000;
 
 fn test_big_region() {
@@ -9238,6 +9365,7 @@ pub extern "C" fn _start() -> ! {
         ("socketpair", test_socketpair),
         ("passing", test_fd_passing),
         ("local", test_local_sockets),
+        ("ready", test_served_ready),
         ("leak", test_no_leak),
         ("pollset", test_pollset),
         ("wake", test_wake_latency),

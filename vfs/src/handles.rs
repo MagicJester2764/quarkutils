@@ -203,6 +203,7 @@ pub fn release(handle: usize) -> Option<u32> {
     let ino = f.inode_num();
     gone(f);
     *f = OpenFile::empty();
+    crate::inotify::closed_handle(handle, ino);
     Some(ino)
 }
 
@@ -257,6 +258,7 @@ pub fn close(handle: usize, space: u64) -> Option<u32> {
     let ino = f.inode_num();
     gone(f);
     *f = OpenFile::empty();
+    crate::inotify::closed_handle(handle, ino);
     Some(ino)
 }
 
@@ -267,9 +269,10 @@ pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
     for (i, f) in table().iter_mut().enumerate() {
         if f.in_use && f.owner == space {
             closed[n] = f.inode_num();
-            n += 1;
             gone(f);
             *f = OpenFile::empty();
+            crate::inotify::closed_handle(i, closed[n]);
+            n += 1;
             // The program is going, so whoever waited through it is too.
             while crate::locks::drop_handle(i).is_some() {}
         }
