@@ -154,6 +154,8 @@
 #define SYS_EVENT_CREATE    131
 /* A signal that carries a value: a real-time one queues. */
 #define SYS_SIG_QUEUE       136
+/* A descriptor read for signals: signalfd. */
+#define SYS_SIGNAL_FD       137
 
 /* 0x90  time
  *
@@ -222,6 +224,7 @@
 #define QUARK_FD_KIND_MEMORY     10UL
 #define QUARK_FD_KIND_SOCKET     11UL
 #define QUARK_FD_KIND_SERVED     12UL
+#define QUARK_FD_KIND_SIGNALS    13UL
 /* A named pipe. A server gives a client an end of the pipe a key names, and
    whoever was given one waits here for the other end to be opened, with the
    number that came with it. */

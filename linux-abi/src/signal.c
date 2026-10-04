@@ -596,6 +596,35 @@ long __quark_timer_delete(long id) {
     return __syscall2(SYS_PTIMER, 3, (unsigned long)(unsigned int)id) == QUARK_ERR ? -LX_EINVAL : 0;
 }
 
+/* signalfd and signalfd4: a descriptor read for signals (SYS_SIGNAL_FD),
+   whose records the kernel lays out as Linux's signalfd_siginfo — a read of
+   one is a read like any other here. A descriptor of -1 is a new one;
+   another is one of the program's to read for a new set. SFD_NONBLOCK is
+   the descriptor's, as O_NONBLOCK is; SFD_CLOEXEC means nothing here, as
+   for a pipe or a counter. */
+#define LX_SFD_NONBLOCK 04000
+#define LX_SFD_CLOEXEC  02000000
+
+long __quark_signalfd(long fd, const unsigned long *mask, unsigned long size, long flags) {
+    if (size != 8 || (flags & ~(LX_SFD_NONBLOCK | LX_SFD_CLOEXEC))) {
+        return -LX_EINVAL;
+    }
+    if (!mask) {
+        return -LX_EFAULT;
+    }
+    unsigned long r = __syscall2(SYS_SIGNAL_FD, fd < 0 ? ~0UL : (unsigned long)fd, *mask);
+    if (r == QUARK_ERR) {
+        if (fd < 0) {
+            return -LX_EMFILE;
+        }
+        return __syscall1(SYS_FD_KIND, (unsigned long)fd) == QUARK_ERR ? -LX_EBADF : -LX_EINVAL;
+    }
+    if (fd < 0 && (flags & LX_SFD_NONBLOCK)) {
+        __quark_fd_set_nonblock((long)r, 1);
+    }
+    return (long)r;
+}
+
 /* sigaltstack: the stack for handlers that ask for one, this thread's. */
 struct lx_stack {
     void *ss_sp;

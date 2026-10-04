@@ -348,6 +348,7 @@ pub const SYS_EVENT_CREATE: u64 = 131;
 
 // --- 0x88  signals, continued again ---
 pub const SYS_SIG_QUEUE: u64 = 136;
+pub const SYS_SIGNAL_FD: u64 = 137;
 
 // --- 0x90  time ---
 pub const SYS_TICKS: u64 = 144;
@@ -2063,6 +2064,26 @@ pub fn sys_sig_queue_thread(tid: usize, signo: u64, value: u64) -> Result<(), No
     queued(unsafe { syscall4(SYS_SIG_QUEUE, tid as u64, signo, value, 4) })
 }
 
+/// A descriptor read for the signals in `mask` (bit `n - 1` for signal
+/// `n`): a read takes those waiting for the reader — its own task's first,
+/// then its program's — as 128-byte records, Linux's `signalfd_siginfo`.
+/// A program holds back what it reads for.
+pub fn sys_signal_fd(mask: u64) -> Result<usize, ()> {
+    match unsafe { syscall2(SYS_SIGNAL_FD, u64::MAX, mask) } {
+        u64::MAX => Err(()),
+        fd => Ok(fd as usize),
+    }
+}
+
+/// Signal descriptor `fd` is read for `mask` from now on, through every
+/// descriptor for it.
+pub fn sys_signal_fd_change(fd: usize, mask: u64) -> Result<(), ()> {
+    match unsafe { syscall2(SYS_SIGNAL_FD, fd as u64, mask) } {
+        u64::MAX => Err(()),
+        _ => Ok(()),
+    }
+}
+
 /// [`sys_sig_wait_for`], answering with everything that came with the
 /// signal.
 pub fn sys_sig_wait_info(set: u64, span: u64) -> Result<Option<(u64, SigInfo)>, ()> {
@@ -2772,7 +2793,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 29;
+pub const ABI_VERSION_MINOR: u32 = 30;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

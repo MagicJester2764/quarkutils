@@ -134,9 +134,15 @@ A program has what Linux gives it: `sigaction` with `SA_SIGINFO`,
 `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `SA_ONSTACK`; a mask for
 each thread (`sigprocmask`, `pthread_sigmask`); `kill`, `raise`,
 `pthread_kill`; `sigsuspend`, `pause`, `sigpending`, `sigwait`,
-`sigwaitinfo` and `sigtimedwait`; `sigqueue`, and for one thread
-`rt_tgsigqueueinfo` (musl has no function for it); `sigaltstack`; `alarm` and `setitimer(ITIMER_REAL)`; and `SIGCHLD` when a
+`sigwaitinfo` and `sigtimedwait`; `signalfd`; `sigqueue`, and for one
+thread `rt_tgsigqueueinfo` (musl has no function for it); `sigaltstack`; `alarm` and `setitimer(ITIMER_REAL)`; and `SIGCHLD` when a
 child ends, stops or is continued.
+
+**A signal can be read from a descriptor** (`signalfd`): one read for a set
+of signals, held back, is readable while one of them waits — to `poll`,
+`select` and `epoll` — and a read takes as many as fit, each as Linux's
+`struct signalfd_siginfo`, which the kernel writes. Whose signals a read
+takes is the reader's, so a forked child reads its own.
 
 **A real-time signal queues.** One raised while one of its number is
 waiting waits behind it with its own value, and each is handled, in the

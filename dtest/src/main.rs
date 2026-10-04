@@ -7846,6 +7846,82 @@ fn test_handlers() {
     );
     let _ = syscall::sys_sig_action(RT, syscall::SIG_DEFAULT);
 
+    // Read for rather than run: a signal descriptor, and what its reads give.
+    let field = |r: &[u8], at: usize| u32::from_le_bytes([r[at], r[at + 1], r[at + 2], r[at + 3]]);
+    let wanted = sig(RT) | sig(HANDLED_USR2);
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, wanted);
+    let sfd = syscall::sys_signal_fd(wanted).unwrap_or(usize::MAX);
+    check(
+        "a signal descriptor is made, and says what it is",
+        syscall::sys_fd_kind(sfd).is_some_and(|(kind, _)| kind == 13),
+    );
+    let mut records = [0u8; 4 * 128];
+    check(
+        "with nothing waiting, a read that may not wait says so",
+        syscall::sys_fd_read_nb(sfd, &mut records) == 0xFFFF_FFFE,
+    );
+    let mut poll = [syscall::PollFd::new(sfd, syscall::POLL_READABLE)];
+    let quiet = syscall::sys_poll(&mut poll, 0) == Ok(0);
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    let mut poll = [syscall::PollFd::new(sfd, syscall::POLL_READABLE)];
+    check(
+        "it is not readable until one of its signals waits, and then it is",
+        quiet && syscall::sys_poll(&mut poll, 0) == Ok(1),
+    );
+    let n = syscall::sys_fd_read(sfd, &mut records);
+    check(
+        "a read takes it, as Linux's record: the signal, how it was raised, and by whom",
+        n == 128
+            && field(&records, 0) == HANDLED_USR2 as u32
+            && field(&records, 8) == syscall::SI_USER as u32
+            && field(&records, 12) as u64 == pid
+            && field(&records, 16) == uid,
+    );
+    let queued = (1..=3).all(|v| syscall::sys_sig_queue(me, RT, 900 + v).is_ok());
+    let n = syscall::sys_fd_read(sfd, &mut records);
+    check(
+        "one read takes as many as there are, each with what it carried, in order",
+        queued
+            && n == 3 * 128
+            && (0..3).all(|i| field(&records[i * 128..], 44) == 901 + i as u32 && field(&records[i * 128..], 8) == syscall::SI_QUEUE as u32),
+    );
+    check("and they are taken", syscall::sys_sig_pending() & wanted == 0);
+    let mut small = [0u8; 100];
+    check("a read with no room for a record is refused", syscall::sys_fd_read_nb(sfd, &mut small) == u64::MAX);
+    let _ = syscall::sys_signal_fd_change(sfd, sig(RT));
+    let _ = syscall::sys_sig_raise(me, HANDLED_USR2);
+    check(
+        "read for another set, it does not take what it is no longer read for",
+        syscall::sys_fd_read_nb(sfd, &mut records) == 0xFFFF_FFFE && syscall::sys_sig_pending() & sig(HANDLED_USR2) != 0,
+    );
+    let _ = syscall::sys_sig_wait_info(sig(HANDLED_USR2), 0);
+    // A forked child reads its own, and a read waits for one to come.
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let mut mine = [0u8; 128];
+            let n = syscall::sys_fd_read(sfd, &mut mine);
+            let child = syscall::sys_pid_self();
+            syscall::sys_exit_program(if n == 128 && field(&mine, 0) == RT as u32 && field(&mine, 12) as u64 != child {
+                7
+            } else {
+                8
+            });
+        }
+        Ok(child) => {
+            syscall::sleep_ns(20_000_000);
+            let _ = syscall::sys_sig_raise(me, RT);
+            let _ = syscall::sys_sig_raise(child, RT);
+            check(
+                "a forked child's read waits, and takes its own, not its parent's",
+                wait_for(child) == Some(7) && syscall::sys_sig_pending() & sig(RT) != 0,
+            );
+        }
+        Err(()) => check("fork", false),
+    }
+    let _ = syscall::sys_sig_wait_info(sig(RT), 0);
+    let _ = syscall::sys_fd_close(sfd);
+    let _ = syscall::sys_sig_mask(syscall::SIG_SETMASK, 0);
+
     // A terminal says when its size changes.
     fresh();
     HANDLED_SIGNO.store(0, SeqCst);

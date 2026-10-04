@@ -103,6 +103,7 @@ long __quark_timer_settime(long id, long flags, const void *new_value, void *old
 long __quark_timer_gettime(long id, void *curr_value);
 long __quark_timer_getoverrun(long id);
 long __quark_timer_delete(long id);
+long __quark_signalfd(long fd, const unsigned long *mask, unsigned long size, long flags);
 long __quark_sigaltstack(const void *ss, void *old);
 /* As the program starts: where the kernel enters it to run a handler. */
 void __quark_sig_start(void);

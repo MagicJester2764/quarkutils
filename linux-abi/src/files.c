@@ -1195,9 +1195,23 @@ long __quark_read(long fd, void *buf, unsigned long n) {
     if (r == QUARK_ERR) {
         /* The kernel says only that it failed. A terminal that would not be
            read is one this program is behind, and may not be stopped for:
-           it ignores the signal, or has nobody who would start it again. */
+           it ignores the signal, or has nobody who would start it again. A
+           timer, a counter and a signal descriptor are read in whole
+           records, and refuse a buffer too small for one. */
         unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
-        return k != QUARK_ERR && QUARK_FD_KIND(k) == QUARK_FD_KIND_PTY_SLAVE ? -LX_EIO : -LX_EBADF;
+        if (k == QUARK_ERR) {
+            return -LX_EBADF;
+        }
+        switch (QUARK_FD_KIND(k)) {
+        case QUARK_FD_KIND_PTY_SLAVE:
+            return -LX_EIO;
+        case QUARK_FD_KIND_TIMER:
+        case QUARK_FD_KIND_EVENT:
+        case QUARK_FD_KIND_SIGNALS:
+            return -LX_EINVAL;
+        default:
+            return -LX_EBADF;
+        }
     }
     return (long)r;
 }
