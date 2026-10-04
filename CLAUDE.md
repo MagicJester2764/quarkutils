@@ -318,8 +318,8 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   reach, at the same addresses — a ring in anonymous memory, or a page of
   somebody else's, is a write that never arrives, and a line on the serial
   console saying so — and a device nobody has claimed reaches nothing at
-  all. `rtl8139`, `virtnet`, `virtblk`, `ahci`, `nvme` and `edu` claim
-  theirs. A driver can claim only the device it holds, and there is one
+  all. `rtl8139`, `virtnet`, `e1000`, `virtblk`, `ahci`, `nvme` and `edu`
+  claim theirs. A driver can claim only the device it holds, and there is one
   driver for each.
 - **A program declares what it needs; a spawner grants from that.** Capabilities
   come from a `quark_rt::manifest!` block compiled into the image, found by
@@ -961,12 +961,12 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
 
 `net` is the stack — Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, a resolver —
 and holds no device. Under it is a card's driver, which serves
-`quark_rt::nic`: `rtl8139` and `virtnet` so far, each registered as the
-first of `eth0` to `eth7` nobody has. The stack claims `eth0` when it has
-been registered. The cards' drivers are in the boot image, as the disks'
-are, though the root is not on them: started from `/usr/lib/drivers` they
-came up after the root, and the network said it was ready over the login
-prompt.
+`quark_rt::nic`: `rtl8139`, `virtnet` and `e1000` so far, each registered
+as the first of `eth0` to `eth7` nobody has. The stack claims `eth0` when
+it has been registered. The cards' drivers are in the boot image, as the
+disks' are, though the root is not on them: started from
+`/usr/lib/drivers` they came up after the root, and the network said it
+was ready over the login prompt.
 
 - **A card answers its claimant and nobody else.** A program that could send
   a frame, or read what comes, would be the network; `qfuzz` checks the

@@ -102,6 +102,22 @@ Everything through `quark_rt::pci`, by the address it was given:
   (`Refused::NotAllowed`): where a device is, and where its message goes,
   are not its driver's to change.
 
+## Network cards
+
+A card's driver serves `quark_rt::nic` to the stack (`net`) and registers
+as the first of `eth0` to `eth7` nobody has. `rtl8139` is the oldest card
+QEMU has, and `virtnet` virtio's (below). `e1000` is Intel's gigabit
+family — the 82540EM a PC in QEMU is given, the 82545EM, and the 82574L,
+which is `e1000e` and the q35 machine's — through its first BAR's
+registers: a ring of thirty-two descriptors that frames come into and
+eight they go out of, each naming its buffer by a sixty-four-bit address,
+in the oldest form every card of the family has, with nothing offloaded.
+Its address is where the card put it, in its first receive address, or
+else its EEPROM's. Its interrupt is a message where it has MSI (the
+82574L) and its line where it has not. Not done: the newer cards of the
+family (the I217 to I219 a laptop has, which want their PHY seen to),
+offloads, and more than one queue.
+
 ## virtio
 
 A virtio device (`quark_rt::virtio`) is driven through the same capability:

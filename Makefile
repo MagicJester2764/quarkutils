@@ -46,6 +46,7 @@ BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  input:INPUT disk:DISK vfs:VFS net:NET fb:FB ramdisk:RAMDISK \
                  auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK ahci:AHCI \
                  nvme:NVME usb:USB rtl8139:RTL8139 virtnet:VIRTNET \
+                 e1000:E1000 \
                  virtgpu:VIRTGPU
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
