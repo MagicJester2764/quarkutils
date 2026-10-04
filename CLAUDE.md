@@ -1548,6 +1548,12 @@ reads a file on a mounted disk. `docs/vfs.md` has the requests.
   it from what the file server says is mounted, for the programs written
   for Unix that look there: `mke2fs` refuses a mounted disk by reading it,
   and complains when it is missing.
+- **`/etc/machine-id` is the machine's, made once** by `init`, the first
+  time it starts with a root it can write: a random UUID's thirty-two hex
+  digits, from the kernel's random numbers, as systemd makes one — D-Bus
+  reads it, and so does whatever was written for systemd's Linux. Made when
+  an image is built, it would be every installation's from that image; one
+  that is there is left alone.
 
 At the edge of a mount two things are not as one kernel holding every
 filesystem would have them, and both are in `docs/vfs.md`: `..` at a

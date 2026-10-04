@@ -516,6 +516,41 @@ const DEVMGR_SLOT: usize = 11;
 /// module after them, as many as there are.
 const LOGD_SLOTS_FROM: usize = 16;
 
+/// What this machine is called by the programs that tell one machine from
+/// another — D-Bus first among them: thirty-two lowercase hex digits and a
+/// newline in /etc/machine-id, a random UUID's, as systemd makes one. Made
+/// the first time the machine starts with a root it can write, from the
+/// kernel's random numbers, so that two systems made from one image are two
+/// machines from then on; one that is there is left as it is. Written beside
+/// and renamed over, so that nothing ever reads half of one.
+fn machine_id(vfs: usize) {
+    const PATH: &[u8] = b"/etc/machine-id";
+    const NEW: &[u8] = b"/etc/machine-id.new";
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let there = vfs::open(vfs, PATH).is_ok_and(|(handle, size, _)| {
+        let _ = vfs::close(vfs, handle);
+        size != 0
+    });
+    let mut id = [0u8; 16];
+    if there || quark_rt::random::fill(&mut id).is_err() {
+        return;
+    }
+    // Version 4, of the variant RFC 4122 describes.
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    let mut text = [b'\n'; 33];
+    for (i, b) in id.iter().enumerate() {
+        text[2 * i] = HEX[(b >> 4) as usize];
+        text[2 * i + 1] = HEX[(b & 15) as usize];
+    }
+    let Ok(file) = vfs::open_new(vfs, NEW, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE, 0o444) else { return };
+    let written = vfs::write(vfs, file.handle, &text, 0) == Ok(33);
+    let _ = vfs::close(vfs, file.handle);
+    if written && vfs::rename(vfs, NEW, PATH).is_ok() {
+        println!("[init] This machine is {}", core::str::from_utf8(&text[..32]).unwrap_or("?"));
+    }
+}
+
 /// Give `tid` the right to call the nameserver.
 ///
 /// That is the only endpoint a program needs to be given. It finds everything
@@ -1241,6 +1276,7 @@ pub extern "C" fn _start() -> ! {
                 // written for Unix look for it: the root, and nothing else
                 // yet. A root that cannot be written goes without.
                 let _ = vfs::write_mtab(vfs);
+                machine_id(vfs);
                 let config = read_config(vfs).unwrap_or_default();
                 if !mgr.configure(vfs, &config) {
                     if let Some((path, len)) = default_session(vfs) {

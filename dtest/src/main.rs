@@ -365,6 +365,30 @@ fn test_control(init: usize) {
     check("nor is a name nobody has", services::stop(init, b"no-such-service") == Err(services::NO_SUCH));
 }
 
+/// What this machine is called by the programs that tell one machine from
+/// another — D-Bus first among them: /etc/machine-id, made once by init.
+fn test_machine_id() {
+    println!("the machine's id:");
+    let mut text = [0u8; 64];
+    let mut len = 0;
+    if let Some(v) = nameserver::lookup(b"vfs") {
+        if let Ok((handle, _, _)) = vfs::open(v, b"/etc/machine-id") {
+            len = vfs::read(v, handle, &mut text, 0).unwrap_or(0) as usize;
+            let _ = vfs::close(v, handle);
+        }
+    }
+    let id = &text[..len];
+    let hex = |c: &u8| c.is_ascii_digit() || (b'a'..=b'f').contains(c);
+    let well_formed = len == 33 && id[..32].iter().all(hex) && id[32] == b'\n';
+    check("/etc/machine-id is thirty-two hex digits and a newline", well_formed);
+    // As systemd makes one: a random UUID, version 4 of the variant RFC 4122
+    // describes, so that whatever reads it as a UUID reads a good one.
+    check(
+        "and is a random UUID's",
+        well_formed && id[12] == b'4' && matches!(id[16], b'8' | b'9' | b'a' | b'b'),
+    );
+}
+
 /// The keyboard, the display and a line typed at the console are the
 /// seat's: the user logged in at the console — who runs this — wherever
 /// their programs are, and nobody else.
@@ -9877,6 +9901,7 @@ pub extern "C" fn _start() -> ! {
         ("ipcfd", test_ipc_descriptor),
         ("services", test_services),
         ("seat", test_seat),
+        ("machine", test_machine_id),
         ("program", test_program_table),
         ("identity", test_identity),
         ("passwords", test_passwords),
