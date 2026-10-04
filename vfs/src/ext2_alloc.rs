@@ -3,7 +3,7 @@
 use crate::ext2::{
     flush_bgd, flush_superblock, raw_read_sector, Ext2State,
 };
-use crate::{DISK_IO_BUF, ERR_IO};
+use crate::{DISK_IO_BUF, ERR_IO, ERR_NO_SPACE};
 
 // ---------------------------------------------------------------------------
 // Block allocation
@@ -69,7 +69,9 @@ pub fn alloc_block(ext2: &mut Ext2State) -> Result<u32, u64> {
         }
     }
 
-    Err(ERR_IO) // no free blocks
+    // Full, which is not the disk failing: a program is told it has no room
+    // (ENOSPC), not that its write went wrong.
+    Err(ERR_NO_SPACE)
 }
 
 /// Free a block.
@@ -101,6 +103,9 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
     flush_bgd(ext2, group)?;
     flush_superblock(ext2)?;
 
+    // Whatever the block held is nobody's now: a volume in memory has the
+    // page back.
+    crate::disk::discard(ext2.block_to_lba(block), ext2.sectors_per_block);
     Ok(())
 }
 
@@ -170,7 +175,7 @@ pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
         }
     }
 
-    Err(ERR_IO) // no free inodes
+    Err(ERR_NO_SPACE)
 }
 
 /// Free an inode.

@@ -87,6 +87,8 @@ pub const TAG_ERROR: u64 = u64::MAX;
 pub const KIND_EXT2: u64 = 1;
 pub const KIND_EXT4: u64 = 2;
 pub const KIND_FAT: u64 = 3;
+/// ext2 in its server's own memory (`mount -t tmpfs`).
+pub const KIND_TMPFS: u64 = 4;
 
 /// OPEN makes the file if the name is free.
 pub const OPEN_CREATE: u64 = 1;

@@ -482,7 +482,7 @@ pub fn create_dir_entry(
     }
 
     // No space found — extend the directory with a new block
-    let new_block = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+    let new_block = crate::ext2_alloc::alloc_block(ext2)?;
     zero_block(ext2, new_block)?;
 
     let logical = total_blocks;

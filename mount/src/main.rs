@@ -4,13 +4,19 @@
 //! Put a filesystem somewhere, or say what is where.
 //!
 //! ```text
-//! mount                          what is mounted
-//! mount [--mkdir] DEVICE DIR     the filesystem on DEVICE, at DIR
+//! mount                               what is mounted
+//! mount [--mkdir] DEVICE DIR          the filesystem on DEVICE, at DIR
+//! mount [--mkdir] -t tmpfs SIZE DIR   a filesystem in memory, at DIR
 //! ```
 //!
 //! `DEVICE` is a disk or a partition as `/dev` names it — `/dev/disk0p2`,
 //! or `disk0p2` — and `DIR` a directory, which `--mkdir` makes if it is not
 //! there.
+//!
+//! A filesystem in memory is as big as `SIZE` says — `64M`, `1G`, or a
+//! number of mebibytes — and empty, its root anybody's to write in as
+//! `/tmp` is. What is in it is in the memory of the server that serves it,
+//! and goes when that does: at `umount`, and when the machine stops.
 //!
 //! **A mount is a server.** This starts a file server on the volume, the
 //! same program that serves the root, and hands it to the file server `DIR`
@@ -125,7 +131,25 @@ fn list(vfs_tid: usize) -> ! {
 fn usage() -> ! {
     println!("usage: mount");
     println!("       mount [--mkdir] DEVICE DIR");
+    println!("       mount [--mkdir] -t tmpfs SIZE DIR");
     syscall::sys_exit_code(2);
+}
+
+/// `64M`, `1G`, `512K` or `64`: how many mebibytes, if it is a whole number
+/// of them.
+fn megabytes(size: &[u8]) -> Option<u64> {
+    let (digits, scale) = match size.last()? {
+        b'K' | b'k' => (&size[..size.len() - 1], 1u64),
+        b'M' | b'm' => (&size[..size.len() - 1], 1 << 10),
+        b'G' | b'g' => (&size[..size.len() - 1], 1 << 20),
+        _ => (size, 1 << 10),
+    };
+    if digits.is_empty() || digits.len() > 12 {
+        return None;
+    }
+    let n = digits.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64))?;
+    let kilobytes = n.checked_mul(scale)?;
+    (kilobytes % 1024 == 0 && kilobytes > 0).then_some(kilobytes / 1024)
 }
 
 #[unsafe(no_mangle)]
@@ -137,36 +161,72 @@ pub extern "C" fn _start() -> ! {
     let mut words: [&[u8]; 3] = [b""; 3];
     let mut n = 0;
     let mut make = false;
-    for i in 1..args::argc() {
+    let mut kind: Option<&[u8]> = None;
+    let mut i = 1;
+    while i < args::argc() {
         match args::argv(i) {
             Some(b"--mkdir") => make = true,
+            Some(b"-t") if kind.is_none() => {
+                i += 1;
+                kind = Some(args::argv(i).unwrap_or_else(|| usage()));
+            }
             Some(word) if n < 2 && !word.starts_with(b"-") => {
                 words[n] = word;
                 n += 1;
             }
             _ => usage(),
         }
+        i += 1;
     }
-    if n == 0 && !make {
+    if n == 0 && !make && kind.is_none() {
         list(vfs_tid);
     }
     if n != 2 {
         usage();
     }
     let (source, dir) = (words[0], words[1]);
+    let in_memory = match kind {
+        None => false,
+        Some(b"tmpfs") => true,
+        Some(other) => fail(format_args!("{} is not a kind of filesystem this mounts by name; tmpfs is", text(other))),
+    };
 
     // Said first, before a file server is started to be refused its disk.
     if syscall::sys_get_uid().0 != 0 {
         fail(format_args!("only root mounts a filesystem"));
     }
 
-    let Some((driver, volume)) = device(source) else {
-        fail(format_args!("{} is not a disk or a partition of one", text(source)));
+    // What the server is told to serve: a driver's volume, or memory.
+    let mut size_text = [0u8; 20];
+    let (driver, volume): (&[u8], u64) = if in_memory {
+        let Some(mb) = megabytes(source) else {
+            fail(format_args!("{} is not a size: 64M, 1G, or a number of mebibytes", text(source)));
+        };
+        let mut at = size_text.len();
+        let mut left = mb;
+        loop {
+            at -= 1;
+            size_text[at] = b'0' + (left % 10) as u8;
+            left /= 10;
+            if left == 0 {
+                break;
+            }
+        }
+        (b"mem", 0)
+    } else {
+        let Some((driver, volume)) = device(source) else {
+            fail(format_args!("{} is not a disk or a partition of one", text(source)));
+        };
+        let there = nameserver::lookup(driver).and_then(|tid| block::info(tid, volume).ok());
+        if there.is_none() {
+            fail(format_args!("there is no {}", text(source)));
+        }
+        (driver, volume)
     };
-    let there = nameserver::lookup(driver).and_then(|tid| block::info(tid, volume).ok());
-    if there.is_none() {
-        fail(format_args!("there is no {}", text(source)));
-    }
+    let size_text: &[u8] = {
+        let start = size_text.iter().position(|&b| b != 0).unwrap_or(size_text.len());
+        &size_text[start..]
+    };
 
     let mut target = [0u8; 512];
     let Some(target_len) = whole(vfs_tid, dir, &mut target) else {
@@ -199,7 +259,8 @@ pub extern "C" fn _start() -> ! {
         digits[0] = b'0' + volume as u8;
         &digits[..1]
     };
-    let started = spawn::set_args(&server, &[b"vfs", driver, volume_text, b"mount"], &SCRATCH).is_ok()
+    let second = if in_memory { size_text } else { volume_text };
+    let started = spawn::set_args(&server, &[b"vfs", driver, second, b"mount"], &SCRATCH).is_ok()
         // It finds the disk's driver by name.
         && syscall::sys_cap_grant(server.tid, syscall::SLOT_ENDPOINT, syscall::SLOT_ENDPOINT).is_ok()
         && server.start().is_ok();
@@ -221,17 +282,27 @@ pub extern "C" fn _start() -> ! {
     let _ = syscall::sys_cap_delete(syscall::SLOT_SCRATCH);
     if !up {
         let _ = syscall::sys_task_kill(server.tid);
+        if in_memory {
+            fail(format_args!("there is not {} of memory to spare", text(source)));
+        }
         fail(format_args!(
             "{} has no filesystem this system knows, or is in use",
             text(source)
         ));
     }
 
+    // Where it came from, as the listing says it: the device, or, as Linux
+    // says of a filesystem in memory, "tmpfs".
     let mut from = [0u8; 32];
-    let name = source.strip_prefix(b"/dev/").unwrap_or(source);
-    from[..5].copy_from_slice(b"/dev/");
-    from[5..5 + name.len()].copy_from_slice(name);
-    if let Err(code) = vfs::mount(vfs_tid, server.tid, &from[..5 + name.len()], target) {
+    let from: &[u8] = if in_memory {
+        b"tmpfs"
+    } else {
+        let name = source.strip_prefix(b"/dev/").unwrap_or(source);
+        from[..5].copy_from_slice(b"/dev/");
+        from[5..5 + name.len()].copy_from_slice(name);
+        &from[..5 + name.len()]
+    };
+    if let Err(code) = vfs::mount(vfs_tid, server.tid, from, target) {
         let _ = syscall::sys_task_kill(server.tid);
         match code {
             vfs::ERR_PERMISSION => fail(format_args!("only root mounts a filesystem")),

@@ -33,7 +33,7 @@ code in `data[0]`:
 | 11 | `NOT_EMPTY` | The directory still has entries |
 | 12 | `NOT_SUPPORTED` | This filesystem cannot do that |
 | 13 | `NAME_TOO_LONG` | A path over 4095 bytes, or a name over 255 |
-| 14 | `NO_SPACE` | Nowhere to put what was written |
+| 14 | `NO_SPACE` | Nowhere to put what was written, or no inode for a new file |
 | 15 | `LOOP` | A lookup followed more than 40 symbolic links |
 | 16 | `WOULD_BLOCK` | A lock is held that keeps this one out |
 | 17 | `DEADLOCK` | Waiting for this lock would wait for ever |
@@ -593,7 +593,8 @@ mounted one.
 
 **A mount is a server.** A filesystem mounted in this one is served by a file
 server of its own — `vfs DRIVER VOLUME mount`, the same program started on
-another volume — and the server whose directory it is mounted on stands
+another volume, or `vfs mem MEGABYTES mount`, started on memory of its own
+with an empty ext2 made there — and the server whose directory it is mounted on stands
 between it and every client. A path that walks into that directory goes on
 in the other server; a file opened there is a handle here that names a
 handle there. A client sees none of it: it calls the server it always
@@ -639,7 +640,7 @@ mounted inside it; `INVALID_PATH` for a directory nothing is mounted on.
 
 `MOUNTS` counts every mounted filesystem: the root first, then each mount
 followed by whatever is mounted inside it. The record is written into what
-is lent; `kind` is 1 ext2, 2 ext4, 3 FAT32, and `pid` the process that
+is lent; `kind` is 1 ext2, 2 ext4, 3 FAT, 4 ext2 in memory (`tmpfs`), and `pid` the process that
 serves it. Past the last, the error is `NOT_FOUND` and its second word says
 how many there are.
 

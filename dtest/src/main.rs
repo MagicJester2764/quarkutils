@@ -3559,6 +3559,99 @@ fn slurp(vfs_tid: usize, path: &[u8], into: &mut [u8]) -> Result<usize, u64> {
     result
 }
 
+/// A filesystem in memory: `mount -t tmpfs` makes one, it holds what is
+/// written and says so when it is full, the memory a file took is given back
+/// when the file goes, and unmounting it takes everything in it.
+fn test_tmpfs() {
+    println!("tmpfs:");
+    let Some(vfs_tid) = nameserver::lookup(b"vfs") else {
+        check("find the file server", false);
+        return;
+    };
+    let at: &[u8] = b"/tmp/dtest-tmpfs";
+    // Whatever an earlier run left.
+    let _ = run(b"umount", &[at]);
+    let _ = vfs::mkdir(vfs_tid, at);
+    check("a filesystem in memory is mounted", run(b"mount", &[b"-t", b"tmpfs", b"16M", at]) == Some(0));
+    let mut record = [0u8; 512];
+    let listed = (0..8).find_map(|i| match vfs::mounted(vfs_tid, i, &mut record) {
+        Ok(Some(m)) if vfs::mount_record(&record[..m.len]).1 == at => Some(m),
+        _ => None,
+    });
+    check(
+        "and is listed as what it is",
+        listed.is_some_and(|m| vfs::mount_record(&record[..m.len]).0 == b"tmpfs" && m.kind == vfs::KIND_TMPFS),
+    );
+    check(
+        "its root is anybody's to write in, and nobody's to take another's file from",
+        vfs::lstat(vfs_tid, at).is_ok_and(|s| s.mode & 0o7777 == 0o1777),
+    );
+
+    const PAGES: u32 = 2048;
+    let mark = |n: u32| -> [u8; 4096] {
+        let mut page = [0u8; 4096];
+        for (i, byte) in page.iter_mut().enumerate() {
+            *byte = (n as u8).wrapping_mul(13) ^ (i as u8);
+        }
+        page[..4].copy_from_slice(&n.to_le_bytes());
+        page
+    };
+    let file: &[u8] = b"/tmp/dtest-tmpfs/eight";
+    let free = || syscall::sys_mem_info().0;
+    let before = free();
+    let opened = vfs::open_with(vfs_tid, file, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).ok();
+    check(
+        "eight megabytes are written to it",
+        opened.as_ref().is_some_and(|o| (0..PAGES).all(|n| vfs::write(vfs_tid, o.handle, &mark(n), n * 4096) == Ok(4096))),
+    );
+    let mut page = [0u8; 4096];
+    check(
+        "and read back as they were written",
+        opened.as_ref().is_some_and(|o| {
+            (0..PAGES).all(|n| vfs::read(vfs_tid, o.handle, &mut page, n * 4096) == Ok(4096) && page == mark(n))
+        }),
+    );
+    if let Some(o) = opened {
+        let _ = vfs::close(vfs_tid, o.handle);
+    }
+    let full = free();
+    check("they are in memory", before.saturating_sub(full) >= PAGES as usize * 3 / 4);
+    check("the file is taken away", vfs::unlink(vfs_tid, file).is_ok());
+    check(
+        "and the memory it was in is given back",
+        free().saturating_sub(full) >= PAGES as usize * 3 / 4,
+    );
+
+    // Filled to the brim: as much as it was made to hold and no more, and
+    // what it says then is that there is no room.
+    let filler: &[u8] = b"/tmp/dtest-tmpfs/filler";
+    let (written, last) = match vfs::open_with(vfs_tid, filler, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) {
+        Ok(o) => {
+            let mut n = 0u32;
+            let last = loop {
+                match vfs::write(vfs_tid, o.handle, &mark(n), n * 4096) {
+                    Ok(4096) if n < 8192 => n += 1,
+                    other => break other,
+                }
+            };
+            let _ = vfs::close(vfs_tid, o.handle);
+            (n, last)
+        }
+        Err(code) => (0, Err(code)),
+    };
+    check(
+        "it holds as much as it was made to, and then has no room",
+        written > 3500 && written < 4096 && last == Err(vfs::ERR_NO_SPACE),
+    );
+    let _ = vfs::unlink(vfs_tid, filler);
+    check("a file left in it", spill(vfs_tid, b"/tmp/dtest-tmpfs/left", b"left").is_ok());
+    check(
+        "is gone once it is unmounted, with the rest of it",
+        run(b"umount", &[at]) == Some(0) && vfs::open(vfs_tid, b"/tmp/dtest-tmpfs/left").err() == Some(vfs::ERR_NOT_FOUND),
+    );
+    let _ = vfs::rmdir(vfs_tid, at);
+}
+
 /// Two files written a block each in turn, so that each is in as many pieces
 /// as it has blocks: on ext4, a tree of extents past the inode — four
 /// pieces fit there — and past one block of them, which holds 340. Read
@@ -8607,6 +8700,7 @@ pub extern "C" fn _start() -> ! {
         ("diskfiles", test_disk_files),
         ("mounts", test_mounts),
         ("pieces", test_pieces),
+        ("tmpfs", test_tmpfs),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

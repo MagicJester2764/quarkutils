@@ -1082,7 +1082,7 @@ fn attach_here(sender: usize, msg: &Message) -> Result<(), u64> {
     if syscall::sys_call_timeout(tid, &adopt, &mut reply, ADOPT_TICKS) != CallOutcome::Replied {
         return Err(give_up(ERR_IO));
     }
-    if reply.tag != TAG_OK || !(KIND_EXT2..=KIND_FAT).contains(&reply.data[1]) {
+    if reply.tag != TAG_OK || !(KIND_EXT2..=KIND_TMPFS).contains(&reply.data[1]) {
         return Err(give_up(if reply.tag == TAG_ERROR && reply.data[0] == ERR_BUSY { ERR_BUSY } else { ERR_IO }));
     }
     mounts()[free] = Mount {

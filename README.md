@@ -44,7 +44,8 @@ sound/              The mixer: programs' streams, mixed into what the card
 ramdisk/            The same, in memory: an empty disk, or a root the bootloader brought.
 disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
-mount/  umount/     A filesystem put at a directory, by starting a file server for it.
+mount/  umount/     A filesystem put at a directory, by starting a file server
+                    for it: a disk's, or one in memory (`mount -t tmpfs`).
 net/                The network stack: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP and
                     a resolver, above whatever card is `eth0`.
 rtl8139/  virtnet/  Network cards: the RTL8139, and virtio's,

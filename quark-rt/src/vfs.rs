@@ -42,6 +42,8 @@ const TAG_ERROR: u64 = u64::MAX;
 pub const KIND_EXT2: u64 = 1;
 pub const KIND_EXT4: u64 = 2;
 pub const KIND_FAT: u64 = 3;
+/// ext2 in its server's own memory (`mount -t tmpfs`).
+pub const KIND_TMPFS: u64 = 4;
 
 /// [`devctl`]'s operations: have a disk's driver read its partition table
 /// again.
@@ -827,6 +829,7 @@ pub fn kind_name(kind: u64) -> &'static str {
         KIND_EXT2 => "ext2",
         KIND_EXT4 => "ext4",
         KIND_FAT => "vfat",
+        KIND_TMPFS => "tmpfs",
         _ => "unknown",
     }
 }

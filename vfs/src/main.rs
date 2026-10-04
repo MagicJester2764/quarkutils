@@ -16,6 +16,7 @@ pub mod ext2_ops;
 pub mod handles;
 pub mod journal;
 pub mod locks;
+pub mod mkfs;
 pub mod mounts;
 pub mod pager;
 pub mod protocol;
@@ -1305,17 +1306,40 @@ pub extern "C" fn _start() -> ! {
     // What to serve: `vfs DRIVER VOLUME`, a block driver by the name it
     // registered under and one of its volumes. Whoever starts this says;
     // with nothing said it is the first disk, and the volume a disk laid out
-    // the usual way keeps its root on.
-    let driver = quark_rt::args::argv(1).unwrap_or(b"disk0");
-    let disk_tid = match nameserver::lookup_retry(driver, 20) {
-        Some(tid) => tid,
-        None => {
-            println!("[vfs] No block driver called {}. Exiting.", core::str::from_utf8(driver).unwrap_or("?"));
-            syscall::sys_exit();
+    // the usual way keeps its root on. Or `vfs mem MEGABYTES`: as much of
+    // this server's own memory, which is what `mount -t tmpfs` starts.
+    let number = |arg: &[u8]| arg.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64));
+    let in_memory = quark_rt::args::argv(1) == Some(b"mem");
+    let driver: &[u8] = if in_memory { b"tmpfs" } else { quark_rt::args::argv(1).unwrap_or(b"disk0") };
+    let disk_tid = if in_memory {
+        // Not more than the machine has: what does not fit would be a
+        // filesystem that took the last frame from everybody else.
+        let (frames, _) = syscall::sys_mem_total();
+        match quark_rt::args::argv(2).and_then(number) {
+            Some(mb) if mb > 0 && mb << 20 <= frames as u64 * PAGE_SIZE as u64 => {
+                if disk::in_memory((mb << 20) as usize).is_err() {
+                    println!("[vfs] No room for {} MiB of memory to serve. Exiting.", mb);
+                    syscall::sys_exit();
+                }
+                disk::MEMORY
+            }
+            _ => {
+                println!("[vfs] Not a size of memory this machine has to serve. Exiting.");
+                syscall::sys_exit();
+            }
+        }
+    } else {
+        match nameserver::lookup_retry(driver, 20) {
+            Some(tid) => tid,
+            None => {
+                println!("[vfs] No block driver called {}. Exiting.", core::str::from_utf8(driver).unwrap_or("?"));
+                syscall::sys_exit();
+            }
         }
     };
     let volume = match quark_rt::args::argv(2) {
-        Some(arg) => arg.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64)),
+        _ if in_memory => Some(0),
+        Some(arg) => number(arg),
         // An EFI partition and then the root; or one partition; or no table
         // at all, and the filesystem on the device itself.
         None => quark_rt::block::info(disk_tid, 0).ok().map(|i| i.volumes.saturating_sub(1).min(2)),
@@ -1324,15 +1348,19 @@ pub extern "C" fn _start() -> ! {
         println!("[vfs] No volume to serve. Exiting.");
         syscall::sys_exit();
     };
-    say!(
-        "[vfs] Serving volume {} of {} (TID {})",
-        volume,
-        core::str::from_utf8(driver).unwrap_or("?"),
-        disk_tid
-    );
-    if let Err(why) = disk::claim(disk_tid, volume) {
-        println!("[vfs] The volume cannot be had ({}). Exiting.", why);
-        syscall::sys_exit();
+    if in_memory {
+        say!("[vfs] Serving {} MiB of memory", disk::memory().map_or(0, |m| m.len() >> 20));
+    } else {
+        say!(
+            "[vfs] Serving volume {} of {} (TID {})",
+            volume,
+            core::str::from_utf8(driver).unwrap_or("?"),
+            disk_tid
+        );
+        if let Err(why) = disk::claim(disk_tid, volume) {
+            println!("[vfs] The volume cannot be had ({}). Exiting.", why);
+            syscall::sys_exit();
+        }
     }
 
     // The page every sector passes through, and the sector cache (32 pages,
@@ -1351,6 +1379,18 @@ pub extern "C" fn _start() -> ! {
     // The volume begins at its own sector 0, wherever that is on the disk:
     // the driver knows, and this does not need to.
     let part_lba: u32 = 0;
+
+    // Memory has nothing on it until something is made there: a filesystem
+    // with only its root, which is anybody's to write in and nobody's to
+    // take another's file out of, as /tmp is.
+    if let Some(memory) = disk::memory() {
+        let mut uuid = [0u8; 16];
+        let _ = quark_rt::random::fill(&mut uuid);
+        if let Err(why) = mkfs::format(memory, 0o1777, syscall::unix_time() as u32, uuid) {
+            println!("[vfs] No filesystem in memory: {}. Exiting.", why);
+            syscall::sys_exit();
+        }
+    }
 
     // Detect filesystem type: check for ext2 magic at partition offset 1024 (sector 2)
     if DiskState::raw_read_sector(disk_tid, part_lba + 2).is_ok() {
@@ -1496,7 +1536,13 @@ pub extern "C" fn _start() -> ! {
 
     // What this serves, for whoever asks what is mounted.
     if is_ext2() {
-        let kind = if ext2_state().is_ext4() { KIND_EXT4 } else { KIND_EXT2 };
+        let kind = if disk::memory().is_some() {
+            KIND_TMPFS
+        } else if ext2_state().is_ext4() {
+            KIND_EXT4
+        } else {
+            KIND_EXT2
+        };
         mounts::describe(driver, volume, ext2::EXT2_ROOT_INO as u64, kind);
     } else {
         mounts::describe(driver, volume, disk.bpb.root_cluster as u64, KIND_FAT);

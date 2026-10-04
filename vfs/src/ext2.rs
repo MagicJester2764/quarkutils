@@ -1091,7 +1091,7 @@ pub fn write_file_data(
         if block_map(ext2, inode, logical)? != 0 {
             continue;
         }
-        let new_block = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+        let new_block = crate::ext2_alloc::alloc_block(ext2)?;
         // A block the write covers whole needs no zeroes under it: nothing
         // names it until the write is done.
         let covered = logical * bs >= offset && (logical + 1) * bs <= end_offset;
@@ -1220,7 +1220,7 @@ pub fn set_block_ptr(
     if logical < ppb {
         // Single indirect
         if inode.i_block[12] == 0 {
-            let ind = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+            let ind = crate::ext2_alloc::alloc_block(ext2)?;
             zero_block(ext2, ind)?;
             inode.i_block[12] = ind;
             inode.i_blocks += ext2.block_size / 512;
@@ -1233,7 +1233,7 @@ pub fn set_block_ptr(
     if logical < ppb * ppb {
         // Double indirect
         if inode.i_block[13] == 0 {
-            let dind = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+            let dind = crate::ext2_alloc::alloc_block(ext2)?;
             zero_block(ext2, dind)?;
             inode.i_block[13] = dind;
             inode.i_blocks += ext2.block_size / 512;
@@ -1242,7 +1242,7 @@ pub fn set_block_ptr(
         let idx2 = logical % ppb;
         let mut ind = read_block_ptr(ext2, inode.i_block[13], idx1)?;
         if ind == 0 {
-            ind = crate::ext2_alloc::alloc_block(ext2).map_err(|_| ERR_IO)?;
+            ind = crate::ext2_alloc::alloc_block(ext2)?;
             zero_block(ext2, ind)?;
             write_block_ptr(ext2, inode.i_block[13], idx1, ind)?;
             inode.i_blocks += ext2.block_size / 512;

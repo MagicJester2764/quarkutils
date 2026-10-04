@@ -1091,7 +1091,8 @@ first namespace of an NVMe controller, `virtblk` for a virtio disk.
 
 ## Files
 
-`vfs` serves ext2, ext4 and FAT32; `docs/vfs.md` is its protocol. What a
+`vfs` serves ext2, ext4 and FAT (12, 16 and 32), and ext2 in memory of
+its own; `docs/vfs.md` is its protocol. What a
 C program sees goes through `linux-abi`, which turns descriptors and
 Linux's calls into that protocol. `tools/check-rootfs.sh` in ../explosion runs
 `e2fsck` on the image a boot test just used, and it is the check for any
@@ -1117,6 +1118,10 @@ change here: it has found what reading the code did not.
 - **`/dev` is the server's, whatever the disk holds.** The lookup answers for
   the root's `dev` directory itself, so no path — through links, or relative —
   reaches the disk's copy, and nothing is made there.
+- **A full volume says it is full.** An allocator out of blocks or inodes
+  says `ERR_NO_SPACE`, and everything between it and the client passes that
+  on: a C program is told `ENOSPC`, which is what a program checks for. For
+  a long time it was `ERR_IO`, and a full disk read as a failing one.
 - **What the server says is on the disk is on the disk, not in the disk's
   cache.** A drive answers a write once it has the data, which may be in
   memory of its own; `block::TAG_FLUSH` asks it to write that out, and
@@ -1312,6 +1317,19 @@ coming, and an absolute symbolic link inside a mount is followed from the
 mount's root. A file there cannot be mapped, and a named pipe there cannot
 be opened.
 
+**A filesystem in memory is a mount like the others** (`mount -t tmpfs
+SIZE DIR`): `vfs mem MEGABYTES mount`, whose volume is a region of its own
+memory reserved and not backed (`disk::in_memory`), with ext2 made on it as
+it starts (`vfs/src/mkfs.rs`) — blocks of four kilobytes, so that a block
+is a page. A page has a frame once something is written to it, and gives
+it back when the block it holds is freed (`disk::discard`, from
+`ext2_alloc::free_block`), so a file removed is memory the machine has
+again. It is listed as `tmpfs`, of kind `KIND_TMPFS`, and what is in it goes
+with its server, at `umount` and when the machine stops. It is no bigger
+than the machine's memory. `init` mounts none: `/tmp` is on the root, where
+the crash test and `dtest pieces` leave files for the host's `e2fsck`, and a
+system that wants `/tmp` in memory says so where it starts things.
+
 A mount's server is told who is asking, and holds them to it: `dtest` runs
 a program as a user who is not root against a directory laid out in a
 mounted ext4 — a file of root's, one of a group the user is in besides its
@@ -1438,6 +1456,13 @@ mounts`):
   replaces it — which is safe because a buffer destroyed while it is being
   shown becomes a zombie and its pool stays mapped until nothing shows it.
   Toolkits do call `resize`, so this is a real gap rather than a preference.
+- **A mounted filesystem's server gives memory like any program**: `mount`
+  is an ordinary program and cannot start one in a better band than its
+  own. On a machine that writes memory out (`swapd`), a page of a mounted
+  server's that is out when the root's server is waiting on it is read back
+  through the root's server, which is waiting — for a minute, and then the
+  mount is taken for gone. A filesystem in memory is the likeliest to be
+  found that way: its files are pages nothing has touched lately.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
   where Linux makes the target, and `linkat` cannot name its source by
   descriptor (`AT_EMPTY_PATH`). FAT has no links.
