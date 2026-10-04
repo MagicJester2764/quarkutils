@@ -12,6 +12,8 @@
 //! svctest crash [MS [STATUS]] end with STATUS (3) after MS (200)
 //! svctest writer PATH         as serve, unregistered; SIGTERM has it write
 //!                             PATH a moment later, and end
+//! svctest stop NAME           ask the service manager to stop NAME, holding
+//!                             nothing: ends with the refusal's number
 //! ```
 //!
 //! What it does it says on its standard output, which is the service
@@ -19,7 +21,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use quark_rt::ipc::{Message, TID_ANY};
-use quark_rt::{args, nameserver, println, signal, syscall, vfs};
+use quark_rt::{args, nameserver, println, services, signal, syscall, vfs};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +43,7 @@ fn usage() -> ! {
     println!("       svctest needs WANT NAME");
     println!("       svctest crash [MS [STATUS]]");
     println!("       svctest writer PATH");
+    println!("       svctest stop NAME");
     syscall::sys_exit_code(2);
 }
 
@@ -119,6 +122,14 @@ pub extern "C" fn _start() -> ! {
                 .unwrap_or(false);
             println!("svctest: {} {}", if wrote { "wrote" } else { "could not write" }, name(path));
             syscall::sys_exit_code(if wrote { 0 } else { 1 });
+        }
+        Some(b"stop") => {
+            let Some(name) = args::argv(2) else { usage() };
+            let Some(init) = services::manager() else { syscall::sys_exit_code(255) };
+            match services::stop(init, name) {
+                Ok(()) => syscall::sys_exit_code(0),
+                Err(code) => syscall::sys_exit_code(code.min(250) as i32),
+            }
         }
         _ => usage(),
     }

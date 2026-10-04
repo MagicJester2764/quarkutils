@@ -37,6 +37,8 @@ pub const NOT_ALLOWED: u64 = 1;
 pub const NO_SUCH: u64 = 2;
 pub const SHUTTING_DOWN: u64 = 16;
 pub const INVALID: u64 = 22;
+/// A service that could not be started again is not stopped.
+pub const CANNOT: u64 = 95;
 
 /// The longest name a service has.
 pub const NAME_MAX: usize = 24;
@@ -225,6 +227,7 @@ pub fn why(code: u64) -> &'static str {
         NO_SUCH => "there is no such service",
         SHUTTING_DOWN => "the machine is shutting down",
         INVALID => "that is not a service's name",
+        CANNOT => "that service could not be started again, so it is not stopped",
         _ => "the service manager would not do that",
     }
 }

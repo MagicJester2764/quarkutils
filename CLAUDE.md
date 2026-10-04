@@ -640,6 +640,11 @@ registered, and what is done when it ends. `svc` asks it, as `init`
   has no `/boot` to read one from.
 - **init stays in the drivers' band**, because it starts `net` again and a
   spawner gives no better band than its own.
+- **Stopping a service is ending a program**, and asks what that asks:
+  TaskMgmt over every task, which init reads out of the caller's
+  capabilities. A stop is answered once the service has gone — init holds
+  the answer, not itself — and a service init could not start again is not
+  stopped at all.
 - **The session waits for services still starting, five seconds at most.**
   A line printed after the login prompt pushes the prompt off the line it is
   waited for on, and `net` said it was ready a moment after the prompt on a

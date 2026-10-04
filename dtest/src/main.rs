@@ -259,6 +259,51 @@ fn test_services() {
         said.is_some_and(|(n, _)| text[..n].windows(17).any(|w| w == b"(no such service)")),
     );
     test_restarts(init);
+    test_control(init);
+}
+
+/// Stopping, starting and starting again by name: for a program that may
+/// end anybody's, and refused to one that may not.
+fn test_control(init: usize) {
+    use quark_rt::services::{self, State};
+    let Ok(b) = services::state(init, b"svc-b") else { return };
+    // svctest asks for nothing in its manifest, so holds nothing.
+    let refused = load_program(b"/usr/bin/svctest", b"/usr/bin/SVCTEST.ELF", &[b"svctest", b"stop", b"svc-b"]).and_then(|child| {
+        let tid = child.tid;
+        child.start().ok()?;
+        syscall::sys_wait_for(tid).ok().map(|(_, status)| status)
+    });
+    check(
+        "a program that may not end others may not stop a service",
+        refused == Some(services::NOT_ALLOWED as i32),
+    );
+    check(
+        "and the service is as it was",
+        services::state(init, b"svc-b").is_ok_and(|s| s.state == State::Up && s.pid == b.pid),
+    );
+    check("one that may stops it", services::stop(init, b"svc-b").is_ok());
+    let stopped = services::state(init, b"svc-b");
+    check("which is stopped, and gone", stopped.is_ok_and(|s| s.state == State::Stopped && s.tid == 0));
+    syscall::sleep_ms(1500);
+    check(
+        "and stays stopped: a stop is not a failure",
+        services::state(init, b"svc-b").is_ok_and(|s| s.state == State::Stopped),
+    );
+    check("started", services::start(init, b"svc-b").is_ok());
+    let up = service_when(init, b"svc-b", 5_000, |s| s.state == State::Up);
+    check(
+        "it is up again, a new process",
+        up.is_some_and(|s| s.state == State::Up && s.pid != b.pid && s.starts == b.starts + 1),
+    );
+    check("started again", services::restart(init, b"svc-b").is_ok());
+    let again = service_when(init, b"svc-b", 5_000, |s| s.state == State::Up && s.starts == b.starts + 2);
+    check("and up once more", again.is_some_and(|s| s.state == State::Up && s.starts == b.starts + 2));
+    check(
+        "one that could not be started again is not stopped",
+        services::stop(init, b"vfs") == Err(services::CANNOT)
+            && services::state(init, b"vfs").is_ok_and(|s| s.state == State::Up),
+    );
+    check("nor is a name nobody has", services::stop(init, b"no-such-service") == Err(services::NO_SUCH));
 }
 
 /// How a service is doing once `done` says so, or `ms` have passed.

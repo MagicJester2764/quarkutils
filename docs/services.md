@@ -19,6 +19,8 @@ state is one of:
 | `starting` | running, and not yet registered under the name it is waited for by |
 | `waiting` | not started: something it needs is not up |
 | `restarting` | ended, and to be started again in a moment |
+| `stopping` | sent SIGTERM by `svc stop`, and not gone yet |
+| `stopped` | stopped by `svc stop`, and not started again until `svc start` |
 | `failed` | ended with a status that is not 0, and not started again |
 | `done` | ended by itself with status 0, and not started again |
 
@@ -104,6 +106,20 @@ future. A service's arguments are at most six.
 svc                     every service: what it is doing, its process, how
                         many times it has been started, for how long it has run
 svc status NAME         one, said in full
+svc start NAME          start it, once what it needs is up — and what it
+                        needs that is not running
+svc stop NAME           SIGTERM, five seconds, then the end of it; answered
+                        once it has gone, and not started again
+svc restart NAME        both
 ```
 
-Anybody may ask (`quark_rt::services::table`, `state`, `describe`).
+Anybody may ask what the services are doing (`quark_rt::services::table`,
+`state`, `describe`). Starting and stopping one is for a program holding
+TaskMgmt over every task — what ending somebody's program takes anyway —
+which init reads out of the caller's capabilities, as it may: it holds
+TaskMgmt too. `svc` asks for it in its manifest, so a session whose account
+has the `tasks` right has a `svc` that may, and any other one that may only
+look. A service init could not start again — a boot program it keeps no
+copy of — is not stopped either (`CANNOT`). A stop holds its caller's answer
+until the service has gone, and nobody else's: init goes on answering, and
+starting what is due, meanwhile.

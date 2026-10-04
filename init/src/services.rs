@@ -16,6 +16,11 @@
 //! What ends is started again as its policy says: a second later, and twice
 //! as long each time it ends within a minute of starting, up to a minute;
 //! the fifth such end in a row leaves it failed.
+//!
+//! `svc` stops, starts and starts again a service by name, for a caller
+//! holding TaskMgmt over every task ([`may_control`]). A stop is SIGTERM,
+//! five seconds, then the end of the program, and is answered once the
+//! service has gone: the caller waits, and nobody else does.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -45,6 +50,8 @@ const GIVE_UP: u32 = 5;
 /// How long after the first of them it is started again, and the longest.
 const FIRST_DELAY_NS: u64 = 1_000_000_000;
 const MAX_DELAY_NS: u64 = 60_000_000_000;
+/// How long a service is given to go after SIGTERM.
+const STOP_NS: u64 = 5_000_000_000;
 
 /// Where a service's program comes from.
 pub enum Program {
@@ -97,8 +104,13 @@ pub struct Service {
     ended: Option<i32>,
     /// How many times in a row it has ended within a minute of starting.
     quick: u32,
-    /// When it is started again, if it is `Restarting`.
+    /// When it is started again, if it is `Restarting`; when it is ended,
+    /// if it is `Stopping` and has not gone.
     due: u64,
+    /// Ended already, if it is `Stopping`.
+    killed: bool,
+    /// Started once it has stopped: `svc restart`.
+    then_start: bool,
     said_slow: bool,
     /// Why it is failed, or anything else worth saying about it.
     note: Option<&'static str>,
@@ -123,6 +135,8 @@ impl Service {
             ended: None,
             quick: 0,
             due: 0,
+            killed: false,
+            then_start: false,
             said_slow: false,
             note: None,
         }
@@ -145,6 +159,8 @@ pub struct Manager {
     running_name: Vec<u8>,
     /// When the session could first have been started.
     session_ready: u64,
+    /// Who is waiting for a service to stop: the caller and the service.
+    held: Vec<(usize, usize)>,
 }
 
 fn now() -> u64 {
@@ -189,6 +205,7 @@ impl Manager {
             running: 0,
             running_name: Vec::new(),
             session_ready: 0,
+            held: Vec::new(),
         }
     }
 
@@ -414,6 +431,17 @@ impl Manager {
         s.tid = 0;
         s.pid = 0;
         s.ended = Some(status);
+        if s.state == State::Stopping {
+            s.state = if s.then_start { State::Waiting } else { State::Stopped };
+            s.quick = 0;
+            s.then_start = false;
+            let (answered, held): (Vec<_>, Vec<_>) = self.held.drain(..).partition(|&(_, j)| j == i);
+            self.held = held;
+            for (caller, _) in answered {
+                reply(caller, proto::TAG_OK, [0; 6]);
+            }
+            return;
+        }
         let again = match s.policy {
             Policy::Always => true,
             Policy::OnFailure => status != 0,
@@ -460,6 +488,12 @@ impl Manager {
                 println!("[init] {} has not registered as {} after {} seconds", s.show(), text(want), SLOW_NS / 1_000_000_000);
             }
         }
+        // What was asked to stop and has not, ended.
+        for s in self.services.iter_mut().filter(|s| s.state == State::Stopping && !s.killed && s.due <= t) {
+            s.killed = true;
+            println!("[init] {} did not stop in {} seconds: ending it", s.show(), STOP_NS / 1_000_000_000);
+            let _ = syscall::sys_task_kill(s.tid);
+        }
         // What is due to be started again waits, like anything not started,
         // for what it needs.
         for s in self.services.iter_mut().filter(|s| s.state == State::Restarting && s.due <= t) {
@@ -499,7 +533,7 @@ impl Manager {
         if self.services.iter().any(|s| s.state == State::Starting) {
             sooner(LOOK_NS);
         }
-        for s in self.services.iter().filter(|s| s.state == State::Restarting) {
+        for s in self.services.iter().filter(|s| s.state == State::Restarting || (s.state == State::Stopping && !s.killed)) {
             sooner(s.due.saturating_sub(t).max(1));
         }
         if self.running == 0 && self.runs.is_empty() && self.services.iter().any(|s| s.session && s.state == State::Waiting) {
@@ -603,7 +637,79 @@ impl Manager {
                 }
                 None => refuse(msg.sender, proto::NO_SUCH),
             },
+            proto::TAG_START | proto::TAG_STOP | proto::TAG_RESTART => {
+                let Some(i) = self.named(msg) else { return refuse(msg.sender, proto::NO_SUCH) };
+                if !may_control(msg.sender) {
+                    return refuse(msg.sender, proto::NOT_ALLOWED);
+                }
+                match msg.tag {
+                    proto::TAG_START => match self.start(i) {
+                        true => reply(msg.sender, proto::TAG_OK, [0; 6]),
+                        false => refuse(msg.sender, proto::CANNOT),
+                    },
+                    tag => self.stop(i, msg.sender, tag == proto::TAG_RESTART),
+                }
+            }
             _ => refuse(msg.sender, proto::INVALID),
+        }
+    }
+
+    /// Start a service that is not running, and what it needs that is not
+    /// either: each when what it needs is up. False for one that cannot be.
+    fn start(&mut self, i: usize) -> bool {
+        let s = &mut self.services[i];
+        let running = matches!(s.state, State::Up | State::Starting | State::Stopping);
+        if matches!(s.program, Program::Boot) && !running {
+            return false;
+        }
+        match s.state {
+            State::Stopped | State::Failed | State::Done | State::Restarting => {
+                s.state = State::Waiting;
+                s.quick = 0;
+                s.note = None;
+            }
+            // Started once it has stopped.
+            State::Stopping => s.then_start = true,
+            _ => {}
+        }
+        for need in self.services[i].needs.clone() {
+            if let Some(j) = self.find(&need) {
+                if matches!(self.services[j].state, State::Stopped | State::Failed | State::Done) {
+                    self.start(j);
+                }
+            }
+        }
+        true
+    }
+
+    /// Stop a service, for `caller`, who is answered once it has gone — and
+    /// start it again then, if `then_start`.
+    fn stop(&mut self, i: usize, caller: usize, then_start: bool) {
+        let s = &mut self.services[i];
+        if matches!(s.program, Program::Boot) {
+            return refuse(caller, proto::CANNOT);
+        }
+        match s.state {
+            State::Up | State::Starting => {
+                let _ = syscall::sys_sig_raise(s.tid, syscall::SIGTERM);
+                s.state = State::Stopping;
+                s.due = now() + STOP_NS;
+                s.killed = false;
+                s.then_start = then_start;
+                self.held.push((caller, i));
+            }
+            State::Stopping => {
+                s.then_start |= then_start;
+                self.held.push((caller, i));
+            }
+            _ => {
+                if then_start {
+                    self.start(i);
+                } else if matches!(s.state, State::Waiting | State::Restarting) {
+                    s.state = State::Stopped;
+                }
+                reply(caller, proto::TAG_OK, [0; 6]);
+            }
         }
     }
 
@@ -716,6 +822,15 @@ impl Manager {
         }
         out
     }
+}
+
+/// Whether `tid` may stop and start services: it holds TaskMgmt over every
+/// task, which is what ending somebody's program takes anyway. Read out of
+/// its capabilities, which init may: it holds TaskMgmt too.
+fn may_control(tid: usize) -> bool {
+    (0..64)
+        .filter_map(|slot| syscall::sys_cap_read(tid, slot).ok())
+        .any(|c| c.valid && c.cap_type == syscall::CAP_TYPE_TASK_MGMT && c.param0 == 0)
 }
 
 fn reply(tid: usize, tag: u64, data: [u64; 6]) {

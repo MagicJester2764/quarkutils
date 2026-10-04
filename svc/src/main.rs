@@ -18,8 +18,13 @@
 //! what the services are doing; starting and stopping one is for an account
 //! that may end anybody's programs (the `tasks` right).
 
+use quark_rt::manifest::CapReq;
 use quark_rt::services;
 use quark_rt::{args, print, println, syscall};
+
+// What starting and stopping a service takes: what ending a program takes.
+// A session without it has a `svc` that may only look.
+quark_rt::manifest!([CapReq::task_mgmt(0)]);
 
 static mut TEXT: [u8; 32768] = [0; 32768];
 
