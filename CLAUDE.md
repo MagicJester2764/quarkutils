@@ -980,14 +980,20 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   keyboard may be the only keyboard there is.
 ## The network
 
-`net` is the stack — Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, a resolver —
-and holds no device. Under it is a card's driver, which serves
+`net` is the stack, and holds no device. The protocols are smoltcp's —
+Ethernet, ARP, IPv4 and IPv6, ICMP, UDP, TCP, DHCPv4 and a resolver —
+used as a dependency and not patched: what is this system's is the card
+under them and what programs ask of them. Under it is a card's driver,
+which serves
 `quark_rt::nic`: `rtl8139`, `virtnet` and `e1000` so far, each registered
 as the first of `eth0` to `eth7` nobody has. The stack claims `eth0` when
 it has been registered. The cards' drivers are in the boot image, as the
 disks' are, though the root is not on them: started from
 `/usr/lib/drivers` they came up after the root, and the network said it
-was ready over the login prompt.
+was ready over the login prompt. Beside the card is `lo`: 127.0.0.1 and
+::1, and the card's own addresses too, so that a connection to this
+machine by the address it has on its network is answered here rather than
+sent out to be answered by nobody.
 
 - **A card answers its claimant and nobody else.** A program that could send
   a frame, or read what comes, would be the network; `qfuzz` checks the
@@ -997,10 +1003,18 @@ was ready over the login prompt.
   stack (`nic::ARRIVED`), which asks for them until there are none.
   Neither ever waits on the other: the driver would be stopping its card for
   one client, and the stack every client for one card.
-- **Where the stack waits for the network inside a request** — an address
-  being resolved — it waits for the card's notice (`poll_nic_once`), and
-  sees to anything else the kernel says meanwhile: a client's death taken
-  there and dropped would leave its connections for ever.
+- **Nothing waits inside a request.** One that waits for the network — a
+  connection to be made or to come, bytes or room for them, a name — is
+  held with its reply and answered after the turn of the loop that brings
+  what it waits for; a task that asks something else, or dies, is waiting
+  for nothing. The stack before this one waited inside a request for the
+  card's notice, and had to see to everything else the kernel said
+  meanwhile: a client's death taken there and dropped left its
+  connections for ever.
+- **`lo` says everything it has in one turn.** What `lo` sends it receives
+  in the same poll, again and again until nothing is in flight: smoltcp's
+  own loopback keeps its queue to itself, and a reset or an echo's answer
+  waited there for a timer nobody had set.
 
 ## Sound
 

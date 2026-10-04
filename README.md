@@ -46,8 +46,9 @@ disks/              What disks there are, what is on each, and who has it.
 parts/              A disk's partition table: print it, make one, add to it.
 mount/  umount/     A filesystem put at a directory, by starting a file server
                     for it: a disk's, or one in memory (`mount -t tmpfs`).
-net/                The network stack: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP and
-                    a resolver, above whatever card is `eth0`.
+net/                The network stack, on smoltcp: IPv4 and IPv6, TCP and UDP,
+                    DHCP and a resolver, above whatever card is `eth0`, and
+                    `lo`.
 rtl8139/  virtnet/  Network cards: the RTL8139, and virtio's,
 e1000/              and Intel's gigabit cards, the e1000 and the e1000e.
 edu/                QEMU's teaching device: the smallest driver there is for
