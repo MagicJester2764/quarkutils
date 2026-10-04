@@ -418,6 +418,9 @@ pub const SYS_FD_SERVE_PIPE: u64 = 231;
 pub const SYS_PIPE_PEER: u64 = 232;
 /// A server says what an object of its own is ready for, to a poll.
 pub const SYS_FD_READY: u64 = 233;
+/// A connected pair whose writes are messages, each read whole: a
+/// `socketpair` of `SOCK_SEQPACKET`.
+pub const SYS_PACKET_PAIR: u64 = 234;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 64;

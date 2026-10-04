@@ -63,6 +63,10 @@ struct cmsghdr {
 #define AF_INET      2
 #define AF_INET6     10
 #define SOCK_STREAM  1
+#define SOCK_SEQPACKET 5
+/* The flags pipe2 and socketpair take, Linux's numbers. */
+#define PAIR_NONBLOCK 04000
+#define PAIR_CLOEXEC  02000000
 
 /* Linux's poll bits, which are not Quark's. */
 #define LX_POLLIN   0x001
@@ -129,12 +133,27 @@ long __quark_ftruncate(long fd, long length) {
  * The clipboard is what needed this. A client pasting creates a pipe, hands
  * the write end to the compositor, and reads the read end until end of file --
  * which is the whole reason the compositor never sees the data. */
+/* What pipe2 and socketpair are asked for of the two descriptors they make:
+   neither to wait, and both to close when the program becomes another. */
+static void pair_flags(unsigned long a, unsigned long b, long flags) {
+    if (flags & PAIR_NONBLOCK) {
+        __quark_fd_set_nonblock((long)a, 1);
+        __quark_fd_set_nonblock((long)b, 1);
+    }
+    if (flags & PAIR_CLOEXEC) {
+        __syscall3(SYS_FD_FLAGS, a, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+        __syscall3(SYS_FD_FLAGS, b, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+    }
+}
+
 long __quark_pipe(int *fds, long flags) {
-    /* O_CLOEXEC survives an exec here rather than closing, because a Quark
-       descriptor table is kept across `SYS_EXEC_SPACE` and nothing marks
-       entries; a program that depends on it closes what it does not want.
-       O_NONBLOCK is honoured: both ends are recorded as non-blocking, and the
-       read and write paths use the calls that answer EAGAIN. */
+    /* O_CLOEXEC marks both ends to close when the program becomes another
+       (SYS_FD_FLAGS, which SYS_EXEC_SPACE honours). It said once that
+       nothing could, and musl's posix_spawn, which hears how the exec went
+       by reading a pipe whose writing end an exec closes, waited instead for
+       every program it started to end. O_NONBLOCK is honoured: both ends are
+       recorded as non-blocking, and the read and write paths use the calls
+       that answer EAGAIN. */
     if (!fds) {
         return -LX_EFAULT;
     }
@@ -156,27 +175,28 @@ long __quark_pipe(int *fds, long flags) {
     }
     fds[0] = (int)r;
     fds[1] = (int)w;
-    if (flags & LX_O_NONBLOCK) {
-        __quark_fd_set_nonblock((long)r, 1);
-        __quark_fd_set_nonblock((long)w, 1);
-    }
+    pair_flags(r, w, flags);
     return 0;
 }
 
 long __quark_socketpair(long domain, long type, long protocol, int *sv) {
-    /* Only a local stream, which is what a Wayland connection is. */
-    if (domain != AF_UNIX || (type & 0xF) != SOCK_STREAM || protocol != 0) {
+    /* A local stream, which is what a Wayland connection is; or a local
+       stream of messages each kept whole, which is what Rust's standard
+       library makes to hear how a program it forked and exec'd fared. */
+    int kind = (int)(type & 0xF);
+    if (domain != AF_UNIX || (kind != SOCK_STREAM && kind != SOCK_SEQPACKET) || protocol != 0) {
         return -LX_ENOSYS;
     }
     if (!sv) {
         return -LX_EFAULT;
     }
-    unsigned long r = __syscall0(SYS_SOCKETPAIR);
+    unsigned long r = __syscall0(kind == SOCK_SEQPACKET ? SYS_PACKET_PAIR : SYS_SOCKETPAIR);
     if (r == QUARK_ERR) {
         return -LX_EMFILE;
     }
     sv[0] = (int)(r >> 32);
     sv[1] = (int)(r & 0xFFFFFFFF);
+    pair_flags(r >> 32, r & 0xFFFFFFFF, type);
     return 0;
 }
 

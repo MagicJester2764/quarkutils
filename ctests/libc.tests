@@ -7,6 +7,7 @@ fixedtest
 dltest
 pietest
 linuxtest
+packettest
 filetest
 dirtest
 threadfile

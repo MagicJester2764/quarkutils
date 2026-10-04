@@ -237,6 +237,9 @@
 /* A server says what an object of its own is ready for, to a poll: one it
    made saying it would, which is not a file. */
 #define SYS_FD_READY        233
+/* A connected pair whose writes are messages, each read whole:
+   socketpair of SOCK_SEQPACKET. */
+#define SYS_PACKET_PAIR     234
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215
