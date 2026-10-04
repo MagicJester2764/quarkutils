@@ -289,8 +289,11 @@ impl Stack {
         });
         for (h, head, dropped) in stuck {
             // Said by `netctl`, not on the console: a line printed after
-            // a prompt pushes the prompt off its line.
-            if let Some(addr) = head {
+            // a prompt pushes the prompt off its line. A way out is not
+            // given up: what holds it up is more often the card's one
+            // question a second being asked about somebody else.
+            let routers = [self.router.map(IpAddress::Ipv4), self.ndp.router().map(IpAddress::Ipv6)];
+            if let Some(addr) = head.filter(|a| !routers.contains(&Some(*a))) {
                 self.given_up.retain(|&(a, _)| a != addr);
                 self.given_up.push((addr, t + GIVEN_UP));
             }
@@ -388,12 +391,10 @@ impl Stack {
     /// A stream nobody wants: one listening goes now, and any other is reset
     /// and goes once it has said so.
     pub fn drop_stream(&mut self, side: Side, h: SocketHandle) {
-        let t = self.sockets(side).get_mut::<tcp::Socket>(h);
-        if t.state() == tcp::State::Listen {
+        if self.sockets(side).get::<tcp::Socket>(h).state() == tcp::State::Listen {
             self.sockets(side).remove(h);
         } else {
-            t.abort();
-            self.retire(side, h);
+            self.let_go(side, h, true);
         }
     }
 
@@ -401,6 +402,25 @@ impl Stack {
     /// it has said goodbye, or after a minute whether it has or not.
     pub fn retire(&mut self, side: Side, h: SocketHandle) {
         self.retiring.push((side, h, now()));
+    }
+
+    /// Let a stream go: aborted if `abort`, closed if not, and retired. One
+    /// still connecting has nobody to say goodbye to, and goes now — as
+    /// Linux's does: closed, it was a reset for an address that had not
+    /// answered, and the stream waited a minute to send it, asking "who has
+    /// it?" every second for the whole card.
+    pub fn let_go(&mut self, side: Side, h: SocketHandle, abort: bool) {
+        let t = self.sockets(side).get_mut::<tcp::Socket>(h);
+        if t.state() == tcp::State::SynSent {
+            self.sockets(side).remove(h);
+            return;
+        }
+        if abort {
+            t.abort();
+        } else {
+            t.close();
+        }
+        self.retire(side, h);
     }
 
     fn sweep(&mut self) {
@@ -411,8 +431,10 @@ impl Stack {
             let s = self.sockets(side).get::<tcp::Socket>(h);
             let done = match s.state() {
                 // Aborted, and the reset sent: smoltcp forgets the other end
-                // when it has.
-                tcp::State::Closed => s.remote_endpoint().is_none(),
+                // when it has. One not sent in a moment is for an address
+                // nothing answers for, and waiting for it asks after that
+                // address every second, for the whole card.
+                tcp::State::Closed => s.remote_endpoint().is_none() || t - since > STUCK,
                 tcp::State::TimeWait | tcp::State::Listen => true,
                 _ => false,
             };
@@ -580,6 +602,17 @@ impl Stack {
                 let _ = write!(out, " {}", a);
             }
             out.push('\n');
+        }
+        // The streams let go of, saying goodbye: where to, and how far
+        // they have got.
+        for &(side, h, _) in &self.retiring {
+            let t = match side {
+                Side::Eth => self.eth_sockets.get::<tcp::Socket>(h),
+                Side::Lo => self.lo_sockets.get::<tcp::Socket>(h),
+            };
+            if let Some(to) = t.remote_endpoint() {
+                let _ = writeln!(out, "  goodbye  {}  {}", to, t.state());
+            }
         }
         let _ = writeln!(out, "lo");
         for a in self.lo.ip_addrs() {

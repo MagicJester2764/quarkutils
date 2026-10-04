@@ -439,8 +439,7 @@ impl Clients {
             net.drop_stream(c.side, c.socket);
             return;
         }
-        Self::tcp(net, c.side, c.socket).close();
-        net.retire(c.side, c.socket);
+        net.let_go(c.side, c.socket, false);
     }
 
     // --- UDP ---
