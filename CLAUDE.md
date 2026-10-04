@@ -568,7 +568,10 @@ is what its parent was, and a program may say it of itself. Anybody may
 read it: `ps`, and `/proc/PID/cmdline` and `comm`.
 
 **A session runs on a terminal when the distribution says so.** `init` reads
-`/etc/init.conf`: `start <path> [arguments]` lines name programs to start
+`/etc/init.conf` (`docs/services.md`): `service` lines name services — a
+program, the services it needs, the name it is up once it has registered —
+which `init` starts once what they need is up, in whatever order the lines
+are in; `start <path> [arguments]` lines name programs to start
 and leave running — a driver or a server besides the ones `init` knows by
 name, given what its manifest asks for; `run <path> [arguments]` lines name
 programs to run to their end, in order, before anybody is let in — loading

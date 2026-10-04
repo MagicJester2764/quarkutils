@@ -31,6 +31,7 @@ pub mod net;
 pub mod nic;
 pub mod pci;
 pub mod pcm;
+pub mod services;
 pub mod socket;
 pub mod sound;
 pub mod random;

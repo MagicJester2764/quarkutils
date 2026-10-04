@@ -1,11 +1,16 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod services;
+
 use quark_rt::devices;
 use quark_rt::ipc::Message;
 use quark_rt::nameserver;
 use quark_rt::spawn::{self, Scratch, Spawned};
 use quark_rt::{println, syscall, vfs};
+use services::{Manager, Policy, Program};
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_INFO_ADDR: usize = 0x80_4000_0000;
@@ -635,7 +640,7 @@ fn offer_driver(devmgr_tid: usize, image: &[u8], name: &[u8]) -> Option<u64> {
     (reply.tag == 0).then_some(reply.data[0])
 }
 
-fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> BootContext {
+fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: &mut Manager) -> BootContext {
     println!("[init] Mounting boot image");
 
     // Map the entire rootfs image
@@ -671,6 +676,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         // scheduled as a server, and that arrives the same way.
                         grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"nameserver"], &SPAWN_SCRATCH);
+                        mgr.boot(b"nameserver", info.tid, Program::Boot, Policy::Never, None);
                         let _ = info.start();
                         println!("[init] Spawned nameserver (TID {})", info.tid);
                     }
@@ -712,6 +718,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         grant_caps_from_manifest(data, info.tid);
                         let _ = spawn::set_args(&info, &[b"fb"], &SPAWN_SCRATCH);
                         fb_tid = info.tid;
+                        mgr.boot(b"fb", info.tid, Program::Boot, Policy::Never, Some(b"fb"));
                         let _ = info.start();
                         // It learns the mode from init before it registers, so
                         // this is the one call init cannot make with a
@@ -749,6 +756,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_pipe_fd_set(my_tid, 1, pipe, true);
                             let _ = syscall::sys_pipe_fd_set(my_tid, 2, pipe, true);
                         }
+                        mgr.boot(b"console", info.tid, Program::Boot, Policy::Never, Some(b"console"));
                         let _ = info.start();
                         println!("[init] Spawned console (TID {})", info.tid);
                         // The framebuffer device could not be given a stdout
@@ -787,6 +795,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         let _ = spawn::set_args(&info, &[b"devmgr"], &SPAWN_SCRATCH);
                         // init made it, so init may call it before it has
                         // a name — and nobody else can.
+                        mgr.boot(b"devmgr", info.tid, Program::Boot, Policy::Never, Some(devices::NAME));
                         if syscall::sys_cap_mint(DEVMGR_SLOT, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0).is_ok()
                             && info.start().is_ok()
                         {
@@ -853,6 +862,23 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                         let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
                     }
                     let _ = spawn::set_args(&info, &[&namebuf[..namelen]], &SPAWN_SCRATCH);
+                    // Which of them are started again, and from a copy kept
+                    // here: what nobody else holds a part of.
+                    let base_len = e.name[0..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+                    let mut lbuf = [0u8; 8];
+                    for j in 0..base_len {
+                        lbuf[j] = e.name[j].to_ascii_lowercase();
+                    }
+                    let lname = &lbuf[..base_len];
+                    let (program, policy, register): (Program, Policy, Option<&[u8]>) = match lname {
+                        b"auth" => (Program::Image(data.to_vec()), Policy::OnFailure, Some(quark_rt::auth::NAME)),
+                        b"net" => (Program::Image(data.to_vec()), Policy::OnFailure, Some(b"net")),
+                        b"sound" => (Program::Image(data.to_vec()), Policy::OnFailure, Some(b"sound")),
+                        b"keyboard" => (Program::Boot, Policy::Never, Some(b"keyboard")),
+                        _ => (Program::Boot, Policy::Never, None),
+                    };
+                    mgr.boot(lname, tid, program, policy, register);
+                    mgr.boot_argv(lname, &[&namebuf[..namelen]], true);
                     let _ = info.start();
                     if spawned_count < 32 {
                         spawned_tids[spawned_count] = tid;
@@ -901,6 +927,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             &[b"ramdisk", b"module", &at[..at_len], &len[..len_len]],
                             &SPAWN_SCRATCH,
                         );
+                        mgr.boot(b"ramdisk", info.tid, Program::Boot, Policy::Never, None);
                         let _ = info.start();
                         // And init's own right to that memory goes. It was
                         // given it to read the module, as it is every
@@ -945,6 +972,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                             let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
                         }
                         let _ = spawn::set_args(&info, &[b"input"], &SPAWN_SCRATCH);
+                        mgr.boot(b"input", info.tid, Program::Boot, Policy::Never, Some(b"input"));
                         let _ = info.start();
                         println!("[init] Spawned input (TID {})", info.tid);
                     }
@@ -1014,224 +1042,30 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
 // Phase 2: Load remaining programs from disk
 // ---------------------------------------------------------------------------
 
-const MAX_DEFERRED: usize = 16;
-/// The arguments a `run` line in `/etc/init.conf` may give a program.
-const MAX_RUN_ARGS: usize = 6;
-
-struct DeferredTasks {
-    spawns: [Option<Spawned>; MAX_DEFERRED],
-    count: usize,
+/// `/etc/init.conf`, as text: what the distribution wants done once there
+/// are files (`services::Manager::configure` says what the lines are).
+fn read_config(vfs_tid: usize) -> Option<alloc::vec::Vec<u8>> {
+    let (handle, size, is_dir) = vfs::open(vfs_tid, b"/etc/init.conf").ok()?;
+    let mut text = alloc::vec![0u8; (size as usize).min(16384)];
+    let got = if is_dir { 0 } else { vfs::read(vfs_tid, handle, &mut text, 0).unwrap_or(0) };
+    let _ = vfs::close(vfs_tid, handle);
+    text.truncate(got as usize);
+    Some(text)
 }
 
-impl DeferredTasks {
-    fn new() -> Self {
-        const NONE: Option<Spawned> = None;
-        DeferredTasks { spawns: [NONE; MAX_DEFERRED], count: 0 }
-    }
-
-    /// Start each deferred task one at a time, waiting for each to exit
-    /// before starting the next (prevents interleaved output).
-    ///
-    /// Waiting for *it*: anything else that ends meanwhile — a driver a
-    /// `start` line asked for, which found no device — is collected and the
-    /// wait goes on. It used to take whichever child ended first for the
-    /// one it had just started.
-    fn start_sequentially(&mut self) {
-        for i in 0..self.count {
-            if let Some(info) = self.spawns[i].take() {
-                let tid = info.tid;
-                if info.start().is_err() {
-                    continue;
-                }
-                while matches!(syscall::sys_wait(), Ok((ended, _)) if ended != tid) {}
-            }
-        }
-    }
-}
-
-/// `/etc/init.conf`: what the distribution wants done once there are files.
-///
-/// Two directives, and a line that is neither is a comment, a blank, or
-/// something from the future:
-///
-/// ```text
-/// start PATH [ARGUMENT...]  a program to start and leave running: a driver
-///                           or a server, before anything is run
-/// run PATH [ARGUMENT...]    a program to run to its end before the session,
-///                           in the order the lines are in
-/// session PATH              what the session is
-/// ```
-///
-/// `start` is how a distribution adds a driver to the ones this program
-/// knows by name. It is given what its manifest asks for, as they are —
-/// this task holds everything, the right to map a device's registers
-/// included — and is not waited for; one that finds no device ends, and is
-/// collected.
-///
-/// `run` is for what has to be done once at boot by a program that can read
-/// a file — loading the console's font is the first. A distribution that
-/// wants its users on a terminal names `getty` as the session; one with no
-/// such file gets `login`, started straight onto the console as it always
-/// was. Which of those a system is, is the distribution's to say and not
-/// this program's to guess.
-struct Config {
-    text: [u8; 1024],
-    len: usize,
-}
-
-impl Config {
-    fn read(vfs_tid: usize) -> Option<Config> {
-        let (handle, size, is_dir) = vfs::open(vfs_tid, b"/etc/init.conf").ok()?;
-        let mut config = Config { text: [0; 1024], len: 0 };
-        let want = (size as usize).min(config.text.len());
-        let got = if is_dir {
-            0
-        } else {
-            vfs::read(vfs_tid, handle, &mut config.text[..want], 0).unwrap_or(0)
-        };
-        let _ = vfs::close(vfs_tid, handle);
-        config.len = got as usize;
-        Some(config)
-    }
-
-    /// The lines that begin with `directive`, each as the words after it.
-    fn each<'a>(&'a self, directive: &'a [u8]) -> impl Iterator<Item = impl Iterator<Item = &'a [u8]>> + 'a {
-        self.text[..self.len].split(|&b| b == b'\n').filter_map(move |line| {
-            let mut words = line
-                .split(|&b| b == b' ' || b == b'\t' || b == b'\r')
-                .filter(|w| !w.is_empty());
-            (words.next() == Some(directive)).then_some(words)
-        })
-    }
-}
-
-/// Load a program `/etc/init.conf` names and wire it to the console, to be
-/// started when everything before it has been: one a `run` line asks for, or
-/// the session. `arguments` are what follows its own name.
-fn spawn_session(
-    vfs_tid: usize,
-    path: &[u8],
-    arguments: &[&[u8]],
-    what: &str,
-    console_pipe: usize,
-    input_tid: usize,
-    deferred: &mut DeferredTasks,
-) -> bool {
-    if path.len() > 64 || !path.starts_with(b"/") {
-        return false;
-    }
-    // Read it through the VFS into memory of this task's, and load it.
-    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
-    match spawn::load_path(vfs_tid, path, VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) {
-        Ok(info) => {
-            let tid = info.tid;
-            if console_pipe != 0 {
-                let _ = syscall::sys_pipe_fd_set(tid, 1, console_pipe, true);
-                let _ = syscall::sys_pipe_fd_set(tid, 2, console_pipe, true);
-            }
-            if input_tid != 0 {
-                let _ = syscall::sys_fd_set(tid, 0, input_tid, 1);
-            }
-            let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-            let mut argv: [&[u8]; MAX_RUN_ARGS + 1] = [b""; MAX_RUN_ARGS + 1];
-            argv[0] = name;
-            let n = arguments.len().min(MAX_RUN_ARGS);
-            argv[1..1 + n].copy_from_slice(&arguments[..n]);
-            let _ = spawn::set_args(&info, &argv[..1 + n], &SPAWN_SCRATCH);
-            println!("[init] Spawned {} (TID {}, deferred start)", what, tid);
-            if deferred.count < MAX_DEFERRED {
-                deferred.spawns[deferred.count] = Some(info);
-                deferred.count += 1;
-            }
-            true
-        }
-        Err(()) => false,
-    }
-}
-
-/// Load a program a `start` line of `/etc/init.conf` names, wire what it
-/// prints to the console, and start it now.
-fn start_program(vfs_tid: usize, path: &[u8], arguments: &[&[u8]], console_pipe: usize) -> bool {
-    if path.len() > 64 || !path.starts_with(b"/") {
-        return false;
-    }
-    let grant = |image: &[u8], tid: usize| grant_caps_from_manifest(image, tid);
-    let Ok(info) = spawn::load_path(vfs_tid, path, VFS_IMAGE_BASE, &SPAWN_SCRATCH, grant) else {
-        return false;
-    };
-    if console_pipe != 0 {
-        let _ = syscall::sys_pipe_fd_set(info.tid, 1, console_pipe, true);
-        let _ = syscall::sys_pipe_fd_set(info.tid, 2, console_pipe, true);
-    }
-    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-    let mut argv: [&[u8]; MAX_RUN_ARGS + 1] = [b""; MAX_RUN_ARGS + 1];
-    argv[0] = name;
-    let n = arguments.len().min(MAX_RUN_ARGS);
-    argv[1..1 + n].copy_from_slice(&arguments[..n]);
-    let _ = spawn::set_args(&info, &argv[..1 + n], &SPAWN_SCRATCH);
-    println!("[init] Started {} (TID {})", core::str::from_utf8(name).unwrap_or("a program"), info.tid);
-    info.start().is_ok()
-}
-
-fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> DeferredTasks {
-    let mut deferred = DeferredTasks::new();
-
-    // What is mounted, written down where programs that were written for
-    // Unix look for it: the root, and nothing else yet. Whatever the last
-    // system to run from this disk left there described that system. A root
-    // that cannot be written goes without.
-    let _ = vfs::write_mtab(vfs_tid);
-
-    // What the distribution asked for, if it asked: the programs to run
-    // first, in order, and then the session.
-    if let Some(config) = Config::read(vfs_tid) {
-        for mut words in config.each(b"start") {
-            let Some(path) = words.next() else { continue };
-            let mut arguments: [&[u8]; MAX_RUN_ARGS] = [b""; MAX_RUN_ARGS];
-            let mut n = 0;
-            for word in words.take(MAX_RUN_ARGS) {
-                arguments[n] = word;
-                n += 1;
-            }
-            if !start_program(vfs_tid, path, &arguments[..n], console_pipe) {
-                println!("[init] /etc/init.conf asks for a program to be started that will not load.");
-            }
-        }
-        for mut words in config.each(b"run") {
-            let Some(path) = words.next() else { continue };
-            let mut arguments: [&[u8]; MAX_RUN_ARGS] = [b""; MAX_RUN_ARGS];
-            let mut n = 0;
-            for word in words.take(MAX_RUN_ARGS) {
-                arguments[n] = word;
-                n += 1;
-            }
-            // No keyboard: it runs before anybody is there to type.
-            if !spawn_session(vfs_tid, path, &arguments[..n], "a program to run", console_pipe, 0, &mut deferred) {
-                println!("[init] /etc/init.conf asks for a program to be run that will not load.");
-            }
-        }
-        if let Some(path) = config.each(b"session").next().and_then(|mut words| words.next()) {
-            if spawn_session(vfs_tid, path, &[], "session", console_pipe, input_tid, &mut deferred) {
-                return deferred;
-            }
-            println!("[init] /etc/init.conf names a session program that will not load.");
-        }
-    }
-
-    // Open /usr/bin directory via VFS
+/// What the session is when `/etc/init.conf` names none: `login` from
+/// `/usr/bin`, or the shell, by whatever name the file has there.
+fn default_session(vfs_tid: usize) -> Option<([u8; 48], usize)> {
     let (dir_handle, _, _) = match vfs::open(vfs_tid, b"/usr/bin") {
         Ok(h) => h,
         Err(_) => {
             println!("[init] /usr/bin not found on VFS.");
-            return deferred;
+            return None;
         }
     };
-
-    // Find LOGIN.ELF (or QSH.ELF as fallback) in /usr/bin
     let mut login_entry: Option<vfs::DirEntry> = None;
     let mut shell_entry: Option<vfs::DirEntry> = None;
     let mut index = 0u32;
-
     loop {
         match vfs::readdir(vfs_tid, dir_handle, index) {
             Ok(Some(entry)) => {
@@ -1244,39 +1078,21 @@ fn load_from_vfs(vfs_tid: usize, console_pipe: usize, input_tid: usize) -> Defer
                 }
                 index += 1;
             }
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         }
     }
     let _ = vfs::close(vfs_tid, dir_handle);
-
-    let entry = match login_entry.or(shell_entry) {
-        Some(e) => e,
-        None => {
-            println!("[init] login/shell not found in /usr/bin");
-            return deferred;
-        }
+    let Some(entry) = login_entry.or(shell_entry) else {
+        println!("[init] login/shell not found in /usr/bin");
+        return None;
     };
-
-    // Get the actual filename from the entry
-    let name_bytes = entry.name_bytes();
-    let mut namebuf = [0u8; 48];
-    let namelen = name_bytes.len();
-    namebuf[..namelen].copy_from_slice(name_bytes);
-    let loading_name = if login_entry.is_some() { "login" } else { "shell" };
-
-    // Build path: "/usr/bin/QSH.ELF" or "/usr/bin/LOGIN.ELF"
+    let name = entry.name_bytes();
     let mut path = [0u8; 48];
     let prefix = b"/usr/bin/";
+    let len = (prefix.len() + name.len()).min(path.len());
     path[..prefix.len()].copy_from_slice(prefix);
-    path[prefix.len()..prefix.len() + namelen].copy_from_slice(&namebuf[..namelen]);
-    let path_len = prefix.len() + namelen;
-
-    if !spawn_session(vfs_tid, &path[..path_len], &[], loading_name, console_pipe, input_tid, &mut deferred) {
-        println!("[init]   FAILED to spawn");
-    }
-
-    deferred
+    path[prefix.len()..len].copy_from_slice(&name[..len - prefix.len()]);
+    Some((path, len))
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1134,7 @@ pub extern "C" fn _start() -> ! {
 
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     let mod_count = info.module_count as usize;
+    let mut mgr = Manager::new();
 
     // Find boot image module
     let mut found = false;
@@ -1329,7 +1146,7 @@ pub extern "C" fn _start() -> ! {
             let size = (m.phys_end - m.phys_start) as usize;
 
             // Phase 1: Load essential services from boot image
-            let ctx = load_essentials_from_boot_image(phys, size);
+            let ctx = load_essentials_from_boot_image(phys, size, &mut mgr);
 
             // Unload boot image — return pages to the physical memory allocator
             let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -1339,6 +1156,7 @@ pub extern "C" fn _start() -> ! {
             // Phase 2: Start VFS, wait for it to register
             let vfs_tid = if let Some(vfs) = ctx.vfs_spawn {
                 println!("[init] Starting VFS (TID {})", vfs.tid);
+                mgr.boot(b"vfs", vfs.tid, Program::Boot, Policy::Never, Some(b"vfs"));
                 let _ = vfs.start();
                 match nameserver::lookup_retry(b"vfs", 50) {
                     Some(tid) => {
@@ -1365,17 +1183,23 @@ pub extern "C" fn _start() -> ! {
                 }
             }
 
-            // Phase 3: Load remaining programs from VFS (loaded but not started)
-            let mut deferred = if let Some(vfs) = vfs_tid {
-                load_from_vfs(vfs, ctx.console_pipe, ctx.input_tid)
+            // Phase 3: what the root says to start, to run and to log in
+            // through, which the service manager does from here on.
+            mgr.wire(ctx.console_pipe, ctx.input_tid);
+            if let Some(vfs) = vfs_tid {
+                // What is mounted, written down where programs that were
+                // written for Unix look for it: the root, and nothing else
+                // yet. A root that cannot be written goes without.
+                let _ = vfs::write_mtab(vfs);
+                let config = read_config(vfs).unwrap_or_default();
+                if !mgr.configure(vfs, &config) {
+                    if let Some((path, len)) = default_session(vfs) {
+                        mgr.default_session(&path[..len]);
+                    }
+                }
             } else {
                 println!("[init] No VFS, skipping disk program loading.");
-                DeferredTasks::new()
-            };
-
-            // Phase 4: Start non-essential programs
-            println!("[init] All programs loaded. Starting deferred tasks.");
-            deferred.start_sequentially();
+            }
 
             found = true;
             break;
@@ -1386,26 +1210,10 @@ pub extern "C" fn _start() -> ! {
         println!("[init] ERROR: boot image module not found!");
     }
 
-    // Everything is started, so step out of the band that let those grants be
-    // made — nothing init does from here needs to come before a driver.
-    let me = syscall::sys_getpid() as usize;
-    let _ = syscall::sys_task_priority(me, syscall::PRIO_NORMAL);
-
-    // Collect the dead. A task that has exited keeps its slot, its kernel
-    // stack and its address space until a parent collects it, and init is the
-    // parent of everything the system starts — so an init that never waits is
-    // a steady leak of the table that decides how many tasks can exist at all.
-    //
-    // Blocking here rather than spinning: this is the same wait a shell does
-    // for a foreground command, and it is what init has to do for the rest of
-    // the machine's life.
-    loop {
-        if syscall::sys_wait().is_err() {
-            // No children at all, which should not happen while the servers
-            // are up. Wait rather than ask again as fast as the machine can.
-            syscall::sleep_ticks(100);
-        }
-    }
+    // init stays in the drivers' band: it starts services again, and a
+    // spawner can give no better band than it is in. It does very little
+    // there — it waits for things to end, and for `svc`.
+    mgr.serve()
 }
 
 #[panic_handler]

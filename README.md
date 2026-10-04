@@ -18,9 +18,11 @@ quark-rt/           The Rust runtime: system calls, IPC, the allocator, stdio,
                     protocols between a disk or a card and what is above it.
                     The std fork's PAL for x86_64-unknown-quark is built on it.
 
-init/               The first program. Loads the services from the boot image,
-                    grants each what its manifest asks for, and starts a
-                    session: `login`, or what `/etc/init.conf` names.
+init/               The first program, and the service manager. Loads the
+                    services from the boot image, grants each what its
+                    manifest asks for, starts what `/etc/init.conf` names
+                    once what each needs is up, and then a session: `login`,
+                    or what `/etc/init.conf` names. `svc` asks it.
 nameserver/         Register a name, look one up, be granted the endpoint.
 devmgr/             What is in the machine: holds every PCI device and starts
                     the driver for each, holding that device and no other —
@@ -83,7 +85,7 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/ lsusb/
-fbmode/ play/ mixer/ netctl/
+fbmode/ play/ mixer/ netctl/ svc/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
@@ -96,6 +98,7 @@ ctests/             The C library's own tests, one per lie a ported program
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
 fstest/ nettest/ socktest/ threadtest/ mousetest/ disktest/ ipcping/
 capdemo/ wmdemo/ wmtype/                One subsystem each, exercised.
+svctest/            A service for the service manager's checks to keep.
 
 rootfs/             What goes in /etc.
 linker.ld           The link script every program here is linked with.
@@ -104,7 +107,8 @@ rust-std-patches/   The std fork's port to Quark, mirrored: the commit it left
                     upstream at, a patch for the files upstream has, and the
                     files it adds. Generated; see its README.
 docs/               C on Quark, and where it is not Linux; the VFS
-                    protocol; the compositor; users; devices.
+                    protocol; the compositor; users; devices; the network;
+                    the services.
 tools/check-abi.sh  The numbers here agree with each other and with the kernel.
 tools/std-patches.sh  The mirror above agrees with the fork.
 ```

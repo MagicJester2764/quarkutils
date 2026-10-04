@@ -212,6 +212,54 @@ fn test_ipc_descriptor() {
     let _ = syscall::sys_fd_close(FD);
 }
 
+/// The service manager: init answers as `init`, says what every service is
+/// doing, and has started each when what it needs was up. The test
+/// services are the acceptance images' (`svctest` in `/etc/init.conf`):
+/// svc-a needs svc-b and is listed first, and fails at once if it is started
+/// before svc-b has registered, which takes svc-b a moment; svc-c needs a
+/// service there is not.
+fn test_services() {
+    use quark_rt::services::{self, State};
+    println!("the service manager:");
+    let Some(init) = services::manager() else {
+        check("init answers as the service manager", false);
+        return;
+    };
+    check("init answers as the service manager", true);
+    let up = |name: &[u8]| services::state(init, name).is_ok_and(|s| s.state == State::Up && s.tid != 0);
+    check("the nameserver is a service, and up", up(b"nameserver"));
+    check("so are the console and the file server", up(b"console") && up(b"vfs"));
+    check(
+        "a name nobody has is no service",
+        services::state(init, b"no-such-service").err() == Some(services::NO_SUCH),
+    );
+    let mut text = [0u8; 4096];
+    let listed = services::table(init, &mut text).ok();
+    check(
+        "the table lists them",
+        listed.is_some_and(|(n, _)| {
+            let t = &text[..n];
+            t.windows(3).any(|w| w == b"vfs") && t.windows(10).any(|w| w == b"nameserver")
+        }),
+    );
+    let Ok(b) = services::state(init, b"svc-b") else {
+        println!("  (no svc-a, svc-b and svc-c here: their checks are not made)");
+        return;
+    };
+    check("svc-b is up, registered", b.state == State::Up);
+    let a = services::state(init, b"svc-a");
+    check("svc-a, which needs svc-b and is listed before it, is up", a.is_ok_and(|a| a.state == State::Up));
+    check("having been started once", a.is_ok_and(|a| a.starts == 1));
+    check("and found svc-b registered when it began", nameserver::lookup(b"svc-a").is_some());
+    let c = services::state(init, b"svc-c");
+    check("svc-c, which needs a service there is not, waits", c.is_ok_and(|c| c.state == State::Waiting && c.starts == 0));
+    let said = services::describe(init, b"svc-c", &mut text).ok();
+    check(
+        "and says what for",
+        said.is_some_and(|(n, _)| text[..n].windows(17).any(|w| w == b"(no such service)")),
+    );
+}
+
 static SHARE_GO: sync::Semaphore = sync::Semaphore::new(0);
 static SHARE_DONE: sync::Semaphore = sync::Semaphore::new(0);
 static SHARE_SAW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -9624,6 +9672,7 @@ pub extern "C" fn _start() -> ! {
         ("close", test_close),
         ("fds", test_fd_table),
         ("ipcfd", test_ipc_descriptor),
+        ("services", test_services),
         ("program", test_program_table),
         ("identity", test_identity),
         ("passwords", test_passwords),
