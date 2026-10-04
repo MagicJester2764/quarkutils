@@ -121,10 +121,13 @@ int main(void)
     /* Each made ready. */
     write(p[1], "x", 1);
     eventfd_write(counter, 1);
-    struct itimerspec soon;
+    /* Long enough after everything else that a wait has to wait for it. */
+    struct itimerspec soon, later;
     memset(&soon, 0, sizeof soon);
     soon.it_value.tv_nsec = 1000000;
-    timerfd_settime(timer, 0, &soon, NULL);
+    later = soon;
+    later.it_value.tv_nsec = 50000000;
+    timerfd_settime(timer, 0, &later, NULL);
     sigqueue(getpid(), queued_sig, (union sigval){.sival_int = 5});
     struct sigevent sev;
     memset(&sev, 0, sizeof sev);
@@ -138,14 +141,21 @@ int main(void)
     close(open(DIR "/made", O_CREAT | O_WRONLY, 0644));
     write(q[1], "y", 1);
 
+    /* For two seconds at most. What is ready already is reported at every
+     * wait, and nothing here reads it, so a wait does not wait: a count of
+     * waits was a few milliseconds, and the timer, or the file server
+     * saying what it had seen, came after it. */
     unsigned seen = 0;
-    for (int round = 0; round < 40 && seen != 0x7F; round++) {
+    struct timespec began, now;
+    clock_gettime(CLOCK_MONOTONIC, &began);
+    do {
         struct epoll_event out[16];
         int n = epoll_wait(ep, out, 16, 50);
         for (int i = 0; i < n; i++)
             if ((out[i].events & EPOLLIN) && out[i].data.u64 < 0x80)
                 seen |= (unsigned)out[i].data.u64;
-    }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (seen != 0x7F && (now.tv_sec - began.tv_sec) * 1000 + (now.tv_nsec - began.tv_nsec) / 1000000 < 2000);
     for (int i = 0; i < 7; i++) {
         char line[64];
         snprintf(line, sizeof line, "%s is reported, by its own token", what[i]);
