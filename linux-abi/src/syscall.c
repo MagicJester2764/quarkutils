@@ -175,6 +175,9 @@ typedef unsigned long size_t;
 #define LX_setfsuid        122
 #define LX_setfsgid        123
 #define LX_arch_prctl      158
+#define LX_prctl           157
+#define LX_mremap          25
+#define LX_get_robust_list 274
 #define LX_sched_getaffinity 204
 #define LX_getcpu          309
 #define LX_futex           202
@@ -510,6 +513,52 @@ static long do_mmap_file(long fd, unsigned long hint, unsigned long len, long pr
     return (flags & LX_MAP_FIXED_NOREPLACE) ? -LX_EEXIST : -LX_ENOMEM;
 }
 
+/* The first thread's stack: its top, the page above the one the arguments
+   are on, where the environment musl was handed still is when the constructor below runs.
+   Every loader here makes it 256 pages (`quark_rt::spawn`, process.c). */
+extern char **__environ;
+static unsigned long first_stack_top;
+#define FIRST_STACK_PAGES 256UL
+
+/* Anonymous memory that is shared: memory named by a descriptor nobody
+   keeps, mapped, so that a forked child has these pages and not a copy of
+   them — which is what MAP_SHARED|MAP_ANONYMOUS is for: a lock, a
+   condition, a count a parent and its children all see. */
+static long do_mmap_shared(unsigned long hint, unsigned long len, long flags) {
+    if (len == 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    unsigned long fd = __syscall1(SYS_MEMFD_CREATE, pages);
+    if (fd == QUARK_ERR) {
+        return -LX_ENOMEM;
+    }
+    long at = do_mmap_fd((long)fd, hint, len, flags);
+    __syscall1(SYS_FD_CLOSE, fd);
+    return at == -LX_ENODEV ? -LX_ENOMEM : at;
+}
+
+#define LX_MREMAP_MAYMOVE 1
+#define LX_MREMAP_FIXED   2
+
+/* mremap, for the one question asked of it here that has an answer: whether
+   a mapping can grow where it is. That is how musl finds how far the first
+   thread's stack goes (pthread_getattr_np) — page by page down from its
+   top, until the page it names is not there. Nothing grows in place here:
+   a page of the first stack is ENOMEM, it cannot, and any other EFAULT, as
+   for a page that is not there. Nothing is moved, either (MREMAP_MAYMOVE
+   is ENOMEM), and musl's realloc copies instead. */
+static long do_mremap(unsigned long old, unsigned long new_len, long flags) {
+    if ((old & (PAGE_SIZE - 1)) || new_len == 0 || (flags & ~(long)(LX_MREMAP_MAYMOVE | LX_MREMAP_FIXED))) {
+        return -LX_EINVAL;
+    }
+    if (flags & LX_MREMAP_MAYMOVE) {
+        return -LX_ENOMEM;
+    }
+    unsigned long bottom = first_stack_top - FIRST_STACK_PAGES * PAGE_SIZE;
+    return first_stack_top && old >= bottom && old < first_stack_top ? -LX_ENOMEM : -LX_EFAULT;
+}
+
 static long do_munmap(unsigned long at, unsigned long len) {
     unmap_pages(at, (len + PAGE_SIZE - 1) / PAGE_SIZE);
     return 0;
@@ -717,6 +766,84 @@ static void usage_of(unsigned long whose, unsigned long u[4]) {
     if (__syscall2(SYS_USAGE, whose, (unsigned long)u) == QUARK_ERR) {
         u[0] = u[1] = u[2] = u[3] = 0;
     }
+}
+
+/* A clock of a thread's or a program's processor time, as Linux numbers
+   one (pthread_getcpuclockid, clock_getcpuclockid): negative, a task or a
+   process id above three bits that say which — bit 2 a thread's. A thread's
+   is any thread of this program's; a program's, this one's. What it has
+   used, into `u`; or EINVAL. */
+static long cpu_clock(long id, unsigned long u[4]) {
+    long who = ~(id >> 3);
+    if ((id & 3) == 3 || who <= 0) {
+        return -LX_EINVAL;
+    }
+    unsigned long mine = __syscall1(SYS_PID, 0);
+    if (id & 4) {
+        if (__syscall1(SYS_PID, (unsigned long)who) != mine ||
+            __syscall3(SYS_USAGE, 4, (unsigned long)u, (unsigned long)who) == QUARK_ERR) {
+            return -LX_EINVAL;
+        }
+        return 0;
+    }
+    if ((unsigned long)who != mine) {
+        return -LX_EINVAL;
+    }
+    usage_of(0, u);
+    return 0;
+}
+
+#define LX_PR_SET_NAME 15
+#define LX_PR_GET_NAME 16
+
+/* What this thread is called: PR_SET_NAME and PR_GET_NAME, which is how
+   musl names a thread for itself (pthread_setname_np); one it has not named
+   is called what its program is. Any other option is as it was: not here. */
+static long prctl(long option, long arg) {
+    char *name = (char *)arg;
+    unsigned long me = __syscall0(SYS_GETPID);
+    if (option == LX_PR_SET_NAME) {
+        if (!name) {
+            return -LX_EFAULT;
+        }
+        unsigned long n = 0;
+        while (n < 15 && name[n]) {
+            n++;
+        }
+        return __syscall5(SYS_TASK_NAME, me, 0, (unsigned long)name, n, 0) == QUARK_ERR ? -LX_EINVAL : 0;
+    }
+    if (option == LX_PR_GET_NAME) {
+        if (!name) {
+            return -LX_EFAULT;
+        }
+        unsigned long n = __syscall4(SYS_TASK_NAME, me, 1, (unsigned long)name, 15);
+        if (n == QUARK_ERR || n == 0) {
+            /* Its program's: the last part of what it was started as. */
+            char line[128];
+            unsigned long len = __syscall4(SYS_PROGRAM_NAME, me, 1, (unsigned long)line, sizeof line - 1);
+            if (len == QUARK_ERR) {
+                len = 0;
+            }
+            line[len] = 0;
+            const char *base = line;
+            for (const char *c = line; *c; c++) {
+                if (*c == '/') {
+                    base = c + 1;
+                }
+            }
+            n = 0;
+            while (n < 15 && base[n]) {
+                name[n] = base[n];
+                n++;
+            }
+            if (n >= 4 && name[n - 4] == '.' && name[n - 3] == 'E' && name[n - 2] == 'L' && name[n - 1] == 'F') {
+                n -= 4;
+            }
+        }
+        name[n < 16 ? n : 15] = 0;
+        return 0;
+    }
+    return -LX_ENOSYS;
 }
 
 /* That, as a struct rusage: two timevals and fourteen counts, of which the
@@ -946,6 +1073,7 @@ void __quark_sig_start(void);
    it twice, which is the same as once. */
 __attribute__((constructor(101))) static void quark_start(void) {
     __quark_sig_start();
+    first_stack_top = ((unsigned long)__environ + 4095UL) & ~4095UL;
 }
 
 /* Every call musl makes arrives here. A handler runs wherever the kernel
@@ -1015,7 +1143,13 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (a5 != -1L) {
             return do_mmap_fd(a5, (unsigned long)a1, (unsigned long)a2, a4);
         }
+        if ((a4 & 3) == 1 || (a4 & 3) == 3) {
+            return do_mmap_shared((unsigned long)a1, (unsigned long)a2, a4);
+        }
         return do_mmap((unsigned long)a1, (unsigned long)a2, a4);
+
+    case LX_mremap:
+        return do_mremap((unsigned long)a1, (unsigned long)a3, a4);
 
     case LX_munmap:
         return do_munmap((unsigned long)a1, (unsigned long)a2);
@@ -1436,6 +1570,18 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             ts->tv_nsec = (long)(ran % 1000000000UL);
             return 0;
         }
+        /* Another thread's, or this program's by its process id. */
+        if (a1 < 0) {
+            unsigned long u[4];
+            long r = cpu_clock(a1, u);
+            if (r) {
+                return r;
+            }
+            unsigned long ran = (a1 & 3) == 1 ? u[0] : u[0] + u[1];
+            ts->tv_sec = (long)(ran / 1000000000UL);
+            ts->tv_nsec = (long)(ran % 1000000000UL);
+            return 0;
+        }
         /* The kernel's clock, in nanoseconds. The real-time clocks are the
            date — the one read at boot, or set since — and every other clock
            counts from boot, which is what a monotonic clock is for. On a
@@ -1454,6 +1600,10 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
            machine, and on one with nothing better it moves ten milliseconds
            at a time; Linux says a nanosecond of a clock like that too. */
         struct lx_timespec *ts = (struct lx_timespec *)a2;
+        unsigned long u[4];
+        if (a1 < 0 && cpu_clock(a1, u)) {
+            return -LX_EINVAL;
+        }
         if (ts) {
             ts->tv_sec = 0;
             ts->tv_nsec = 1;
@@ -1671,9 +1821,33 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return do_itimer(a1, (const long *)a2, (long *)a3);
     case LX_getitimer:
         return do_itimer(a1, NULL, (long *)a2);
+    /* Where this thread's robust list is: what the kernel walks if the thread
+       dies holding one of its mutexes, which musl walks itself when a thread
+       ends the ordinary way. musl asks get_robust_list first, to learn
+       whether there is such a thing. */
     case LX_set_robust_list:
+        if (a2 != 24) {
+            return -LX_EINVAL;
+        }
+        return __syscall1(SYS_ROBUST_LIST, (unsigned long)a1) == QUARK_ERR ? -LX_EINVAL : 0;
+    case LX_get_robust_list: {
+        if (a1 != 0 && (unsigned long)a1 != __syscall0(SYS_GETPID)) {
+            return -LX_EPERM;
+        }
+        unsigned long head = __syscall1(SYS_ROBUST_LIST, ~0UL);
+        if (a2) {
+            *(unsigned long *)a2 = head;
+        }
+        if (a3) {
+            *(unsigned long *)a3 = 24;
+        }
+        return 0;
+    }
     case LX_rseq:
         return -LX_ENOSYS;
+
+    case LX_prctl:
+        return prctl(a1, a2);
 
     /* Limits. Two are facts about this system — a program has sixty-four
        descriptors and a megabyte of stack — and the rest are not kept. */

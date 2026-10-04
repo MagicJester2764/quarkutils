@@ -92,6 +92,28 @@ too. The difference is only visible to code that mixes the two kinds.
   change that: nothing pins one. The kernel itself serves one processor at
   a time, so threads that compute run in parallel and threads that make
   system calls take turns at them.
+- **A thread is cancelled where it waits**: in a read or a write, a
+  condition wait, a sleep, a poll or a join — every cancellation point
+  musl has — and its cleanup handlers run. musl's cancellation signal ends
+  the wait it finds the thread in rather than having it made again, and
+  musl, told EINTR at a cancellation point with a cancel pending, acts.
+- **A thread has a name**: `pthread_setname_np` and `pthread_getname_np`,
+  and `prctl(PR_SET_NAME)` for itself, fifteen bytes; one not named is
+  called what its program is. `/proc/PID/task/TID/comm` says it, and is
+  written by the program's own threads; `/proc/PID/comm` is the first
+  thread's.
+- `pthread_getattr_np` of the first thread says where its stack is: the
+  megabyte below the page its arguments are on.
+- **Memory mapped `MAP_SHARED | MAP_ANONYMOUS` is shared with a forked
+  child**, so a process-shared mutex, condition, barrier or semaphore in
+  it works across `fork`. Memory mapped privately is the child's own copy,
+  as on Linux.
+- **A robust mutex whose owner died says so** (`EOWNERDEAD`): a thread
+  that ended holding one — musl lets it go itself — and a program that
+  ended holding one in shared memory, by `_exit`, a kill or a fault, which
+  the kernel lets go from the list musl keeps (`set_robust_list`).
+- `pthread_getcpuclockid` gives a clock that reads that thread's own
+  processor time, and `clock_getcpuclockid` this program's.
 - A child that has ended waits to be collected, as a zombie does, and is
   collected by `wait`. `wait4` reports no resource usage: the structure is
   zeroed.
@@ -253,9 +275,12 @@ does on Linux. What is different is at the edges:
   kept by `exec` unless marked close-on-exec, and can be `dup`ed onto
   standard output — but the file itself is in the file server, and reading
   one is a message to it.
-- There is no `/proc`. The one path under it that is answered is
-  `/proc/self/fd/N` for a descriptor that is a terminal, because that is how
-  musl's `ttyname` asks what a terminal is called.
+- `/proc` is the file server's, and says what Linux's does of the system
+  and of each program — `self`, `cpuinfo`, `meminfo`, `mounts`, `uptime`,
+  `version`, and a program's `cmdline`, `comm`, `mounts`, `stat`,
+  `status` and `task` — read when it is read. `/proc/self/fd/N` is this
+  layer's, for a descriptor that is a terminal, because that is how musl's
+  `ttyname` asks what a terminal is called.
 - `/dev` has `null`, `zero`, `full`, `random` and `urandom`. `/dev/tty`,
   `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` are names for
   descriptors the program already has, and `/dev/ptmx` and `/dev/pts/N` are
@@ -465,9 +490,9 @@ An address asked for without either is still only a hint, and ignored.
 A call the layer has no answer for returns `ENOSYS`, on purpose: a C library
 told "no" copes, and one handed a made-up answer fails somewhere unrelated
 and much later. The ones a ported program is most likely to meet:
-`set_robust_list`, `rseq`, `statx` (musl falls back to
-`fstatat`), and `epoll_wait` on anything but the descriptors the kernel can
-poll.
+`rseq`, `statx` (musl falls back to `fstatat`), `prctl` but for a
+thread's name, `sched_setaffinity`, and `epoll_wait` on anything but the
+descriptors the kernel can poll.
 
 `socket` of any family but the local one answers `EAFNOSUPPORT`, which is
 the answer a program has something to do about: there is no network for a

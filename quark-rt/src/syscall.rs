@@ -259,6 +259,8 @@ impl Usage {
 pub const USAGE_PROGRAM: u64 = 0;
 pub const USAGE_CHILDREN: u64 = 1;
 pub const USAGE_TASK: u64 = 2;
+/// [`sys_usage`]'s 4: one task, any.
+pub const USAGE_OF_TASK: u64 = 4;
 const USAGE_OF: u64 = 3;
 
 /// What this program, the children it has collected, or this task has used.
@@ -269,6 +271,18 @@ pub fn sys_usage(whose: u64) -> Result<Usage, ()> {
 /// What the program task `tid` is a task of has used. Anybody may ask.
 pub fn sys_usage_of(tid: usize) -> Result<Usage, ()> {
     usage(USAGE_OF, tid as u64)
+}
+
+/// What task `tid` itself has used: a thread's own processor clock.
+pub fn sys_usage_of_task(tid: usize) -> Result<Usage, ()> {
+    usage(USAGE_OF_TASK, tid as u64)
+}
+
+/// Where the caller's robust list's head is, in its memory: the mutexes the
+/// kernel marks as their owner's dead if the caller dies holding them. 0 for
+/// none, `u64::MAX` to ask. Where it was.
+pub fn sys_robust_list(head: u64) -> u64 {
+    unsafe { syscall1(SYS_ROBUST_LIST, head) }
 }
 
 fn usage(whose: u64, of: u64) -> Result<Usage, ()> {
@@ -352,6 +366,8 @@ pub const SYS_FUTEX_WAIT: u64 = 128;
 pub const SYS_FUTEX_WAKE: u64 = 129;
 pub const SYS_FUTEX_WAIT_TIMEOUT: u64 = 130;
 pub const SYS_EVENT_CREATE: u64 = 131;
+/// Where the caller's robust list is: `set_robust_list`.
+pub const SYS_ROBUST_LIST: u64 = 132;
 
 // --- 0x88  signals, continued again ---
 pub const SYS_SIG_QUEUE: u64 = 136;
@@ -610,6 +626,27 @@ pub const PROGRAM_NAME_MAX: usize = 128;
 /// Say what `tid`'s program was started as — `tid` a task of this program's,
 /// or a child it has made and not started: its arguments, each ended by a
 /// nought, as much of them as fits.
+/// What a task is called: a thread's name, Linux's `comm`.
+pub const SYS_TASK_NAME: u64 = 215;
+/// The longest a task's name is.
+pub const TASK_NAME_MAX: usize = 15;
+
+/// Call task `tid` — one of the caller's program, or, for a server, one of
+/// the program of `client`, who is calling it — `name`: its first fifteen
+/// bytes. `client` is 0 for the caller's own.
+pub fn sys_task_name_set(tid: usize, name: &[u8], client: usize) -> Result<(), ()> {
+    let n = name.len().min(TASK_NAME_MAX);
+    let ret = unsafe { syscall5(SYS_TASK_NAME, tid as u64, 0, name.as_ptr() as u64, n as u64, client as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// What task `tid` is called, into `out`: how long the name is, 0 for none —
+/// its program's name, then.
+pub fn sys_task_name(tid: usize, out: &mut [u8]) -> Option<usize> {
+    let ret = unsafe { syscall4(SYS_TASK_NAME, tid as u64, 1, out.as_mut_ptr() as u64, out.len() as u64) };
+    (ret != u64::MAX).then_some(ret as usize)
+}
+
 pub fn sys_program_name_set(tid: usize, args: &[&[u8]]) -> Result<(), ()> {
     let mut line = [0u8; PROGRAM_NAME_MAX];
     let mut n = 0;
@@ -2386,6 +2423,15 @@ pub fn sys_pid(tid: usize) -> Option<u64> {
     }
 }
 
+/// Task `tid`'s own number, never given to another: its program's process id
+/// if it is the task the program began as, and no process id otherwise.
+pub fn sys_task_number(tid: usize) -> Option<u64> {
+    match unsafe { syscall2(SYS_PID, tid as u64, 1) } {
+        u64::MAX => None,
+        n => Some(n),
+    }
+}
+
 /// This program's process id.
 pub fn sys_pid_self() -> u64 {
     unsafe { syscall1(SYS_PID, 0) }
@@ -2983,7 +3029,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 33;
+pub const ABI_VERSION_MINOR: u32 = 34;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

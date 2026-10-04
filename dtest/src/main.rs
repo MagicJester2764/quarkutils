@@ -854,6 +854,104 @@ fn test_served() {
     );
 }
 
+/// What [`test_threads`]'s thread did: its task id, its name, and how long
+/// it spun.
+static THREAD_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static THREAD_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A robust list of one entry, as a C library lays it out: the head, three
+/// words — the first entry, the offset from an entry to its mutex's word,
+/// the entry being changed — and the entry, a word to the next and the
+/// mutex's word after it.
+#[repr(C)]
+struct RobustOne {
+    head: [u64; 3],
+    entry: u64,
+    word: u32,
+}
+static mut ROBUST_ONE: RobustOne = RobustOne { head: [0; 3], entry: 0, word: 0 };
+
+/// Names itself, spins until told, then holds a robust mutex and ends
+/// without letting it go.
+extern "C" fn named_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::sys_task_name_set(me, b"dtest-worker", 0);
+    THREAD_TID.store(me, Ordering::SeqCst);
+    while !THREAD_GO.load(Ordering::SeqCst) {}
+    unsafe {
+        let r = &mut *core::ptr::addr_of_mut!(ROBUST_ONE);
+        let head = core::ptr::addr_of!(r.head) as u64;
+        r.head = [core::ptr::addr_of!(r.entry) as u64, 8, 0];
+        r.entry = head;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(r.word), me as u32);
+        syscall::sys_robust_list(head);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// What a thread library keeps with the kernel: names, another thread's
+/// processor time, the first task's number, a robust list walked at death.
+fn test_thread_library() {
+    use core::sync::atomic::Ordering;
+    println!("what a thread library keeps with the kernel:");
+    let me = syscall::sys_getpid() as usize;
+    let mut name = [0u8; 16];
+    check(
+        "a task names itself, and is called so",
+        syscall::sys_task_name_set(me, b"dtest-main", 0).is_ok()
+            && syscall::sys_task_name(me, &mut name) == Some(10)
+            && &name[..10] == b"dtest-main",
+    );
+    check(
+        "a name is fifteen bytes at most",
+        syscall::sys_task_name_set(me, b"a-name-longer-than-fifteen", 0).is_ok()
+            && syscall::sys_task_name(me, &mut name) == Some(15)
+            && &name[..15] == b"a-name-longer-t",
+    );
+    let other = (1..64).find(|&t| syscall::sys_pid(t).is_some() && syscall::sys_pid(t) != syscall::sys_pid(me));
+    check(
+        "and nobody names a task of another program",
+        other.is_some_and(|t| syscall::sys_task_name_set(t, b"x", 0).is_err()),
+    );
+    check(
+        "the task a program began as has its process id for its own number",
+        syscall::sys_task_number(me) == syscall::sys_pid(me),
+    );
+    THREAD_TID.store(0, Ordering::SeqCst);
+    THREAD_GO.store(false, Ordering::SeqCst);
+    let Ok(t) = thread::spawn_with_stack(named_thread, 8) else {
+        check("a thread", false);
+        return;
+    };
+    let mut waited = 0;
+    while THREAD_TID.load(Ordering::SeqCst) == 0 && waited < 1000 {
+        syscall::sleep_ms(1);
+        waited += 1;
+    }
+    let tid = THREAD_TID.load(Ordering::SeqCst);
+    syscall::sleep_ms(100);
+    check(
+        "a thread is called what it named itself, as another reads it",
+        tid != 0 && syscall::sys_task_name(tid, &mut name) == Some(12) && &name[..12] == b"dtest-worker",
+    );
+    check("and its own number is not its program's process id", syscall::sys_task_number(tid) != syscall::sys_pid(tid));
+    let used = syscall::sys_usage_of_task(tid).map(|u| u.total_ns()).unwrap_or(0);
+    let mine = syscall::sys_usage(syscall::USAGE_TASK).map(|u| u.total_ns()).unwrap_or(u64::MAX);
+    check(
+        "what it used is read by another thread, and is its own",
+        used >= 30_000_000 && used != mine,
+    );
+    THREAD_GO.store(true, Ordering::SeqCst);
+    t.join();
+    let word = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ROBUST_ONE.word)) };
+    check("a robust mutex it ended holding is marked as its owner's dead", word == 0x4000_0000);
+    check("and its list goes with it", syscall::sys_robust_list(u64::MAX) == 0);
+    check(
+        "a name taken back is its program's again",
+        syscall::sys_task_name_set(me, b"", 0).is_ok() && syscall::sys_task_name(me, &mut name) == Some(0),
+    );
+}
+
 /// What the client thread of [`test_served_ready`] asks of its server.
 const ASK_READY_OPEN: u64 = 0x61;
 const ASK_READY_SAY: u64 = 0x62;
@@ -9464,6 +9562,7 @@ pub extern "C" fn _start() -> ! {
         ("passing", test_fd_passing),
         ("local", test_local_sockets),
         ("ready", test_served_ready),
+        ("library", test_thread_library),
         ("leak", test_no_leak),
         ("pollset", test_pollset),
         ("edges", test_pollset_edges),

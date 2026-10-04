@@ -9,7 +9,10 @@
 //! `mounts`, `uptime` and `version`; and a directory for each program, by
 //! its process id, holding `cmdline`, `comm`, `mounts`, `stat` and `status`
 //! — each in Linux's form, since that is what a program that reads one was
-//! written for.
+//! written for — and `task`, a directory for each of its threads by its task
+//! id, holding the thread's `comm`. A `comm` is the one thing here that is
+//! written: a thread's name (`SYS_TASK_NAME`), which a program sets for its
+//! own threads, and which is its program's name until it does.
 //!
 //! A file is made when it is read, from what the kernel says at that moment:
 //! one read in pieces may see it change between them, as on Linux. Each says
@@ -45,6 +48,12 @@ pub enum Node {
     Process(u64),
     /// A file in one.
     Of(u64, Each),
+    /// A program's `task`, its threads' directories.
+    Tasks(u64),
+    /// A thread's directory, by its program's process id and its task id.
+    Task(u64, usize),
+    /// A thread's `comm`.
+    TaskComm(u64, usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,6 +92,8 @@ const EACH: [(&[u8], Each); 5] = [
 
 const DIR_MODE: u64 = 0o040555;
 const FILE_MODE: u64 = 0o100444;
+/// A `comm`, which its program may write.
+const COMM_MODE: u64 = 0o100644;
 const LINK_MODE: u64 = 0o120777;
 
 /// Ids beside anything a filesystem or `/dev` hands out: past four
@@ -102,7 +113,53 @@ fn id_of(node: Node) -> u64 {
         Node::File(f) => ID + 2 + f as u64,
         Node::Process(pid) => (ID + 0x100).wrapping_add(pid.wrapping_mul(8)),
         Node::Of(pid, e) => (ID + 0x101 + e as u64).wrapping_add(pid.wrapping_mul(8)),
+        // Past every program's own, a thread's four apiece.
+        Node::Tasks(pid) => (ID << 8).wrapping_add(pid.wrapping_mul(1024)),
+        Node::Task(pid, tid) => (ID << 8).wrapping_add(pid.wrapping_mul(1024)) + 4 + tid as u64 * 4,
+        Node::TaskComm(pid, tid) => (ID << 8).wrapping_add(pid.wrapping_mul(1024)) + 5 + tid as u64 * 4,
     }
+}
+
+/// Whether task `tid` is a thread of the program whose process id is `pid`,
+/// and has not ended.
+fn task_of(pid: u64, tid: usize) -> bool {
+    tid != 0
+        && tid < MAX_TASKS
+        && matches!(syscall::sys_task_info(tid), Ok((state, _, _)) if state != DEAD)
+        && syscall::sys_pid(tid) == Some(pid)
+}
+
+/// What the thread `tid` is called: its own name, or its program's.
+fn comm_of(pid: u64, tid: usize, out: &mut [u8; 20]) -> usize {
+    let mut own = [0u8; syscall::TASK_NAME_MAX];
+    if let Some(n) = syscall::sys_task_name(tid, &mut own).filter(|&n| n > 0) {
+        let n = n.min(own.len());
+        out[..n].copy_from_slice(&own[..n]);
+        return n;
+    }
+    let mut line = [0u8; syscall::PROGRAM_NAME_MAX];
+    let len = syscall::sys_program_name(tid, &mut line).unwrap_or(0).min(line.len());
+    let name = match syscall::program_comm(&line[..len]) {
+        [] => {
+            let mut digits = [0u8; 20];
+            let d = decimal(pid, &mut digits);
+            out[..d.len()].copy_from_slice(d);
+            return d.len();
+        }
+        name => name,
+    };
+    out[..name.len()].copy_from_slice(name);
+    name.len()
+}
+
+/// The thread a program's own `comm` is: the task it began as, whose task
+/// id its process id is the endpoint of; or, gone, the first that is left.
+fn first_thread(pid: u64, p: &Program) -> usize {
+    (1..MAX_TASKS).find(|&tid| task_of(pid, tid) && syscall::sys_task_number(tid) == Some(pid)).unwrap_or(p.tid)
+}
+
+fn is_comm(node: Node) -> bool {
+    matches!(node, Node::Of(_, Each::Comm) | Node::TaskComm(..))
 }
 
 /// Whether there is a `/proc` here at all. A filesystem mounted in another
@@ -217,13 +274,17 @@ fn processes(from: u64, out: &mut [u64; MAX_TASKS]) -> usize {
     n
 }
 
-/// `name` as a process id that is there: digits, none of them a leading
-/// nought.
-fn pid_named(name: &[u8]) -> Option<u64> {
+/// `name` as a number: digits, none of them a leading nought.
+fn number(name: &[u8]) -> Option<u64> {
     if name.is_empty() || name.len() > 19 || name[0] == b'0' {
         return None;
     }
-    let pid = name.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64))?;
+    name.iter().try_fold(0u64, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u64))
+}
+
+/// `name` as a process id that is there.
+fn pid_named(name: &[u8]) -> Option<u64> {
+    let pid = number(name)?;
     program(pid).map(|_| pid)
 }
 
@@ -291,10 +352,28 @@ pub fn walk(rest: &[u8], follow_last: bool) -> Result<Walked, u64> {
             Node::Process(pid) => match name {
                 b"." => at,
                 b".." => return Ok(Walked::Back(i)),
+                b"task" => Node::Tasks(pid),
                 _ => match EACH.iter().find(|(n, _)| *n == name) {
                     Some((_, e)) => Node::Of(pid, *e),
                     None => return Err(ERR_NOT_FOUND),
                 },
+            },
+            Node::Tasks(pid) => match name {
+                b"." => at,
+                b".." => Node::Process(pid),
+                _ => {
+                    let tid = number(name).ok_or(ERR_NOT_FOUND)? as usize;
+                    if !task_of(pid, tid) {
+                        return Err(ERR_NOT_FOUND);
+                    }
+                    Node::Task(pid, tid)
+                }
+            },
+            Node::Task(pid, tid) => match name {
+                b"." => at,
+                b".." => Node::Tasks(pid),
+                b"comm" => Node::TaskComm(pid, tid),
+                _ => return Err(ERR_NOT_FOUND),
             },
             // A file has nothing in it.
             _ => return Err(ERR_NOT_DIR),
@@ -402,7 +481,7 @@ pub fn path_of(pid: u64) -> &'static [u8] {
 /// OPEN of something here, found by a walk or by [`lookup`].
 pub fn open(sender: usize, path: &[u8], node: Node, flags: u64) {
     let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
-    let is_dir = matches!(node, Node::Dir | Node::Process(_));
+    let is_dir = matches!(node, Node::Dir | Node::Process(_) | Node::Tasks(_) | Node::Task(..));
     let looks = asks(flags);
     if flags & OPEN_CREATE != 0 && flags & OPEN_EXCLUSIVE != 0 {
         return error_reply(sender, ERR_EXISTS);
@@ -414,25 +493,37 @@ pub fn open(sender: usize, path: &[u8], node: Node, flags: u64) {
     if node == Node::Myself && !looks {
         return error_reply(sender, ERR_LOOP);
     }
-    // What a file here says is the kernel's to say: nothing is written.
-    if !looks && flags & (OPEN_WRITE | OPEN_TRUNCATE | OPEN_APPEND) != 0 {
+    // What a file here says is the kernel's to say: nothing is written but
+    // a thread's name, and that only by its own program.
+    let writes = flags & (OPEN_WRITE | OPEN_TRUNCATE | OPEN_APPEND) != 0;
+    if !looks && writes && !is_comm(node) {
         return error_reply(sender, if is_dir { ERR_IS_DIR } else { ERR_PERMISSION });
     }
-    if let Node::Process(pid) | Node::Of(pid, _) = node {
+    let pid_of = match node {
+        Node::Process(pid) | Node::Of(pid, _) | Node::Tasks(pid) => Some(pid),
+        Node::Task(pid, tid) | Node::TaskComm(pid, tid) if task_of(pid, tid) => Some(pid),
+        Node::Task(..) | Node::TaskComm(..) => return error_reply(sender, ERR_NOT_FOUND),
+        _ => None,
+    };
+    if let Some(pid) = pid_of {
         if program(pid).is_none() {
             return error_reply(sender, ERR_NOT_FOUND);
         }
+        if !looks && writes && syscall::sys_pid(sender) != Some(pid) {
+            return error_reply(sender, ERR_PERMISSION);
+        }
     }
     let (mode, access) = match node {
-        Node::Dir | Node::Process(_) => (DIR_MODE, 5),
+        Node::Dir | Node::Process(_) | Node::Tasks(_) | Node::Task(..) => (DIR_MODE, 5),
         Node::Myself => (LINK_MODE, 7),
+        _ if is_comm(node) => (COMM_MODE, 6),
         _ => (FILE_MODE, 4),
     };
     let file = OpenFile {
         in_use: true,
         owner: space_of(sender),
         is_dir,
-        writable: false,
+        writable: is_comm(node),
         link: looks || node == Node::Myself,
         fs: FsFileData::Proc(node),
         ..OpenFile::empty()
@@ -493,8 +584,36 @@ pub fn serve(sender: usize, msg: &Message) {
         TAG_READDIR_BULK if is_dir => list(sender, node, msg.data[1], msg.data[2] as usize),
         TAG_READDIR_BULK => error_reply(sender, ERR_NOT_DIR),
         TAG_WRITE | TAG_TRUNCATE if is_dir => error_reply(sender, ERR_IS_DIR),
+        TAG_WRITE if is_comm(node) && !link => name(sender, node, msg.data[3] as usize),
+        // An open that empties a name first, as `echo x > comm` does.
+        TAG_TRUNCATE if is_comm(node) && !link => reply_opened(sender, [0; 6]),
         TAG_WRITE | TAG_TRUNCATE => error_reply(sender, ERR_PERMISSION),
         _ => error_reply(sender, ERR_NOT_SUPPORTED),
+    }
+}
+
+/// WRITE of a `comm`: the thread it is is called what was written, up to a
+/// newline, fifteen bytes of it — by the kernel, which asks that the writer
+/// be of the thread's program.
+fn name(sender: usize, node: Node, len: usize) {
+    let tid = match node {
+        Node::TaskComm(pid, tid) if task_of(pid, tid) => tid,
+        Node::Of(pid, Each::Comm) => match program(pid) {
+            Some(p) => first_thread(pid, &p),
+            None => return error_reply(sender, ERR_NOT_FOUND),
+        },
+        _ => return error_reply(sender, ERR_NOT_FOUND),
+    };
+    let mut buf = [0u8; 64];
+    let n = len.min(buf.len());
+    if n > 0 && syscall::sys_lent_read(sender, 0, &mut buf[..n]) != Ok(n) {
+        return error_reply(sender, ERR_IO);
+    }
+    let text = &buf[..n];
+    let text = &text[..text.iter().position(|&b| b == b'\n').unwrap_or(text.len())];
+    match syscall::sys_task_name_set(tid, text, sender) {
+        Ok(()) => crate::reply_count(sender, len as u64),
+        Err(()) => error_reply(sender, ERR_PERMISSION),
     }
 }
 
@@ -524,11 +643,17 @@ fn stat(sender: usize, node: Node) {
             (LINK_MODE, 1, decimal(pid, &mut digits).len() as u64, None)
         }
         Node::File(_) => (FILE_MODE, 1, 0, None),
-        Node::Process(pid) | Node::Of(pid, _) => {
+        Node::Process(pid) | Node::Of(pid, _) | Node::Tasks(pid) | Node::Task(pid, _) | Node::TaskComm(pid, _) => {
             let Some(p) = program(pid) else {
                 return error_reply(sender, ERR_NOT_FOUND);
             };
-            let mode = if is_process(node) { DIR_MODE } else { FILE_MODE };
+            let mode = if is_process(node) {
+                DIR_MODE
+            } else if is_comm(node) {
+                COMM_MODE
+            } else {
+                FILE_MODE
+            };
             (mode, if is_process(node) { 2 } else { 1 }, 0, syscall::sys_get_tuid(p.tid).ok())
         }
     };
@@ -552,8 +677,10 @@ fn stat(sender: usize, node: Node) {
     }
 }
 
+/// Whether `node` is a directory of a program's: its own, its `task`, a
+/// thread's.
 fn is_process(node: Node) -> bool {
-    matches!(node, Node::Process(_))
+    matches!(node, Node::Process(_) | Node::Tasks(_) | Node::Task(..))
 }
 
 /// `/proc`'s entries before the programs': `.`, `..`, `self` and the files.
@@ -563,7 +690,7 @@ fn is_process(node: Node) -> bool {
 const FIXED: u64 = 3 + FILES.len() as u64;
 
 fn list(sender: usize, node: Node, start: u64, room: usize) {
-    if let Node::Process(pid) = node {
+    if let Node::Process(pid) | Node::Tasks(pid) | Node::Task(pid, _) = node {
         if program(pid).is_none() {
             return error_reply(sender, ERR_NOT_FOUND);
         }
@@ -611,6 +738,23 @@ fn list(sender: usize, node: Node, start: u64, room: usize) {
             for (i, (name, e)) in EACH.iter().enumerate() {
                 put(2 + i as u64, id_of(Node::Of(pid, *e)), DT_REG, name);
             }
+            put(2 + EACH.len() as u64, id_of(Node::Tasks(pid)), DT_DIR, b"task");
+        }
+        // Its threads, each at its task id past `.` and `..`.
+        Node::Tasks(pid) => {
+            put(0, id_of(node), DT_DIR, b".");
+            put(1, id_of(Node::Process(pid)), DT_DIR, b"..");
+            for tid in 1..MAX_TASKS {
+                let mut digits = [0u8; 20];
+                if task_of(pid, tid) && !put(2 + tid as u64, id_of(Node::Task(pid, tid)), DT_DIR, decimal(tid as u64, &mut digits)) {
+                    break;
+                }
+            }
+        }
+        Node::Task(pid, tid) => {
+            put(0, id_of(node), DT_DIR, b".");
+            put(1, id_of(Node::Tasks(pid)), DT_DIR, b"..");
+            put(2, id_of(Node::TaskComm(pid, tid)), DT_REG, b"comm");
         }
         _ => return error_reply(sender, ERR_NOT_DIR),
     }
@@ -666,11 +810,11 @@ fn make(node: Node) -> Result<&'static [u8], u64> {
             let mut line = [0u8; syscall::PROGRAM_NAME_MAX];
             let len = syscall::sys_program_name(p.tid, &mut line).unwrap_or(0).min(line.len());
             let line = &line[..len];
-            let mut digits = [0u8; 20];
-            let name = match syscall::program_comm(line) {
-                [] => decimal(pid, &mut digits),
-                name => name,
-            };
+            // What it is called is what its first thread is: its own name,
+            // if it has given itself one, as on Linux.
+            let mut own = [0u8; 20];
+            let n = comm_of(pid, first_thread(pid, &p), &mut own);
+            let name = &own[..n];
             match each {
                 Each::Cmdline => t.bytes(line),
                 Each::Comm => {
@@ -682,6 +826,13 @@ fn make(node: Node) -> Result<&'static [u8], u64> {
                 Each::Status => status(&mut t, pid, &p, name),
             }
         }
+        Node::TaskComm(pid, tid) if task_of(pid, tid) => {
+            let mut own = [0u8; 20];
+            let n = comm_of(pid, tid, &mut own);
+            t.bytes(&own[..n]);
+            t.bytes(b"\n");
+        }
+        Node::TaskComm(..) => return Err(ERR_NOT_FOUND),
         _ => return Err(ERR_IS_DIR),
     }
     Ok(t.done())

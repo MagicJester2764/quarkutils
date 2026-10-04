@@ -50,3 +50,4 @@ signalfdtest
 unixtest
 inotifytest
 epolltest
+pthreadtest

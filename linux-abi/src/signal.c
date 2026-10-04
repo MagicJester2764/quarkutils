@@ -46,6 +46,8 @@
 #define LX_SIGSEGV 11
 #define LX_SIGPIPE 13
 #define LX_SIGSTOP 19
+/* musl's own, for pthread_cancel. */
+#define LX_SIGCANCEL 33
 
 #define LX_SIG_DFL 0UL
 #define LX_SIG_IGN 1UL
@@ -362,7 +364,14 @@ long __quark_sigaction(long sig, const struct lx_ksigaction *act, struct lx_ksig
             if (act->flags & LX_SA_ONSTACK) {
                 how |= Q_ONSTACK;
             }
-            if (act->flags & LX_SA_RESTART) {
+            /* musl's cancellation signal asks for the call it cuts short
+               to be made again, as on Linux, where its handler finds the
+               thread at the instruction of the cancellable call and turns
+               it aside there. Here that call is this layer's, which no
+               such window holds: so the wait it ends is not made again,
+               and musl, told EINTR at a cancellation point with a cancel
+               pending, acts on it. */
+            if ((act->flags & LX_SA_RESTART) && sig != LX_SIGCANCEL) {
                 how |= Q_RESTARTS;
             }
             if (act->flags & LX_SA_SIGINFO) {

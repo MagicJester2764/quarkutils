@@ -676,11 +676,19 @@ programs written to read it:
 | `mounts` | a line for each mounted filesystem, as `MOUNTS` counts them: source, place, kind, `rw 0 0` |
 | `uptime` | seconds since the machine started, and an idle time of nought |
 | `version` | `Quark version` and the system calls' version |
-| `PID/` | a directory for each program by its process id, a program's own: `cmdline` (what it was started as, each argument ended by a NUL), `comm`, `mounts`, `stat` and `status` |
+| `PID/` | a directory for each program by its process id, a program's own: `cmdline` (what it was started as, each argument ended by a NUL), `comm`, `mounts`, `stat`, `status` and `task` |
+| `PID/task/TID/` | a directory for each of the program's threads by its task id, holding its `comm` |
 
 A file is made when it is read, so each read is of it as it is then, and
-`STAT` says it is empty. Nothing is written, made, removed or renamed there
-(`PERMISSION`); a program that has ended is `NOT_FOUND`. `/proc` is mode
+`STAT` says it is empty. A program is called what its first thread is —
+the task it began as — and a thread what it has named itself
+(`SYS_TASK_NAME`), or its program's name until it does: `comm`, and the
+name `stat` and `status` give. A `comm` is the one thing written there:
+by a thread of its own program, which names the thread — up to a newline,
+fifteen bytes — through the kernel, which asks that the writer be calling
+this server and be of the thread's program. Nothing else is written, made,
+removed or renamed there (`PERMISSION`); a program or a thread that has
+ended is `NOT_FOUND`. `/proc` is mode
 `0555`, a program's directory is its user's and group's, and both can be a
 working directory and the start of a relative path.
 

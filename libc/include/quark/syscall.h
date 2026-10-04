@@ -234,6 +234,12 @@
 /* A server says what an object of its own is ready for, to a poll: one it
    made saying it would, which is not a file. */
 #define SYS_FD_READY        233
+/* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
+   read, arg2 = the name or where it goes, arg3 = its length or the room. */
+#define SYS_TASK_NAME       215
+/* Where the caller's robust list is (set_robust_list), or u64 all ones to
+   ask. */
+#define SYS_ROBUST_LIST     132
 
 /* 0xF0  introspection */
 /* Turn the machine off (0) or start it again (1): for a holder of the right
