@@ -17,6 +17,12 @@
 //! port free again once its socket is closed. And IPv6 on the wire: a
 //! connection to the host at fec0::2, which QEMU's user network is, from
 //! the address a router's advertisement gave this machine on fec0::/64.
+//! And the machine's resolver, at 127.0.0.1:53 and [::1]:53: a name only a
+//! DNS server knows — quark.localhost, which a resolver says is this
+//! machine (RFC 6761), as the host's does that QEMU's DNS asks — of both
+//! families; and a name with a lifetime, asked again and answered from
+//! what was kept. That one is example.com, which only the internet knows:
+//! a host that cannot reach it fails that check, and says so.
 //!
 //! Exits 0 only if every check holds.
 
@@ -312,6 +318,97 @@ fn over_ipv6() {
     check("a connection to a port nobody listens on is refused", matches!(refused, Err(socket::Error::ConnectFailed)));
 }
 
+/// A DNS question for `name`, of `qtype`, with `id`: its length in `out`.
+fn dns_question(id: u16, name: &[u8], qtype: u16, out: &mut [u8]) -> usize {
+    out[..2].copy_from_slice(&id.to_be_bytes());
+    out[2..12].copy_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    let mut at = 12;
+    for label in name.split(|&b| b == b'.') {
+        out[at] = label.len() as u8;
+        out[at + 1..at + 1 + label.len()].copy_from_slice(label);
+        at += 1 + label.len();
+    }
+    out[at] = 0;
+    out[at + 1..at + 5].copy_from_slice(&[(qtype >> 8) as u8, qtype as u8, 0, 1]);
+    at + 5
+}
+
+/// Whether an answer of `n` bytes with `id` gives `addr` for a record of
+/// `qtype`.
+fn dns_says(a: &[u8], n: usize, id: u16, qtype: u16, addr: &[u8]) -> bool {
+    if n < 12 || a[..2] != id.to_be_bytes() || a[2] & 0x80 == 0 || a[3] & 0x0F != 0 {
+        return false;
+    }
+    let answers = u16::from_be_bytes([a[6], a[7]]);
+    // Past the question, a name of labels, then its type and class.
+    let mut at = 12;
+    while at < n && a[at] != 0 {
+        at += 1 + a[at] as usize;
+    }
+    at += 5;
+    for _ in 0..answers {
+        // A name: a pointer, or labels.
+        while at < n && a[at] != 0 && a[at] & 0xC0 != 0xC0 {
+            at += 1 + a[at] as usize;
+        }
+        at += if at < n && a[at] & 0xC0 == 0xC0 { 2 } else { 1 };
+        if at + 10 > n {
+            return false;
+        }
+        let rtype = u16::from_be_bytes([a[at], a[at + 1]]);
+        let len = u16::from_be_bytes([a[at + 8], a[at + 9]]) as usize;
+        at += 10;
+        if at + len > n {
+            return false;
+        }
+        if rtype == qtype && &a[at..at + len] == addr {
+            return true;
+        }
+        at += len;
+    }
+    false
+}
+
+fn resolver(net_tid: usize) {
+    let (Ok(s4), Ok(s6)) = (UdpSocket::bind(Endpoint::v4(LO4, 0)), UdpSocket::bind(Endpoint::v6(LO6, 0))) else {
+        check("sockets to ask the resolver with", false);
+        return;
+    };
+    s4.set_read_timeout(Some(8_000_000_000));
+    s6.set_read_timeout(Some(8_000_000_000));
+    let (mut q, mut a) = ([0u8; 64], [0u8; 512]);
+    let n = dns_question(0x1234, b"quark.localhost", 1, &mut q);
+    let sent = s4.send_to(&q[..n], Endpoint::v4(LO4, 53)).is_ok();
+    let got = s4.recv_from(&mut a);
+    let from53 = matches!(got, Ok((_, from)) if from == Endpoint::v4(LO4, 53));
+    let len = got.map_or(0, |(k, _)| k);
+    check("the resolver at 127.0.0.1:53 answers", sent && from53 && len >= 12);
+    check("that quark.localhost is 127.0.0.1", dns_says(&a, len, 0x1234, 1, &LO4));
+    let n = dns_question(0x4321, b"quark.localhost", 28, &mut q);
+    let sent = s6.send_to(&q[..n], Endpoint::v6(LO6, 53)).is_ok();
+    let len = s6.recv_from(&mut a).map_or(0, |(k, _)| k);
+    check("and the one at [::1]:53, that it is ::1", sent && dns_says(&a, len, 0x4321, 28, &LO6));
+    check("the old protocol's lookup goes through it too", net::dns_resolve(net_tid, b"quark.localhost") == Ok(LOOPBACK));
+    // quark.localhost is said with a lifetime of nothing, which is not
+    // kept. A name with one is asked twice, and the second time answered
+    // from what was kept, with nothing asked of a server.
+    let n = dns_question(0x5678, b"example.com", 1, &mut q);
+    let _ = s4.send_to(&q[..n], Endpoint::v4(LO4, 53));
+    let first = s4.recv_from(&mut a).map_or(0, |(k, _)| k);
+    let answered = first >= 12 && a[3] & 0x0F == 0 && u16::from_be_bytes([a[6], a[7]]) > 0;
+    if !answered {
+        println!("  (example.com had no answer: can the host reach the internet?)");
+    }
+    let before = net::resolver_counts(net_tid);
+    let n = dns_question(0x8765, b"example.com", 1, &mut q);
+    let _ = s4.send_to(&q[..n], Endpoint::v4(LO4, 53));
+    let len = s4.recv_from(&mut a).map_or(0, |(k, _)| k);
+    let after = net::resolver_counts(net_tid);
+    let kept = matches!((before, after), (Ok(b), Ok(a)) if a[2] == b[2] + 1 && a[1] == b[1]);
+    let same = len == first && a[..2] == 0x8765u16.to_be_bytes() && a[3] & 0x0F == 0;
+    check("a name asked again is answered from what was kept", answered && kept && same);
+}
+
 fn host_over_ipv6() {
     let stream = TcpStream::connect_timeout(Endpoint::v6(ECHO6, ECHO_PORT), 5_000_000_000);
     check("a connection to the host over IPv6, at fec0::2", stream.is_ok());
@@ -346,6 +443,7 @@ pub extern "C" fn _start() -> ! {
     datagrams_over_loopback();
     over_ipv6();
     host_over_ipv6();
+    resolver(net_tid);
     let failed = unsafe { FAILED };
     println!("nettest: {}", if failed == 0 { "ok" } else { "FAIL" });
     syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });

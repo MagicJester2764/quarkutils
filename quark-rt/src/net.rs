@@ -13,6 +13,7 @@ const TAG_TCP_LISTEN: u64 = 11;
 const TAG_TCP_SEND: u64 = 13;
 const TAG_TCP_RECV: u64 = 14;
 const TAG_TCP_CLOSE: u64 = 15;
+const TAG_RESOLVER: u64 = 21;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most a datagram carries.
@@ -86,6 +87,20 @@ pub fn info(net_tid: usize) -> Result<(u64, u32), u64> {
     }
     if reply.tag == TAG_ERROR { return Err(reply.data[0]); }
     Ok((reply.data[0], reply.data[1] as u32))
+}
+
+/// What the machine's resolver has done: questions asked of it, asked of a
+/// server, answered from what it kept, and failed.
+pub fn resolver_counts(net_tid: usize) -> Result<[u64; 4], u64> {
+    let msg = Message { sender: 0, tag: TAG_RESOLVER, data: [0; 6] };
+    let mut reply = Message::empty();
+    if syscall::sys_call(net_tid, &msg, &mut reply).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok([reply.data[0], reply.data[1], reply.data[2], reply.data[3]])
 }
 
 /// Send an ICMP echo request and wait for the reply.

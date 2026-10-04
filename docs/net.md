@@ -102,6 +102,22 @@ waiting to be accepted on one listener; a minute for a connection to be
 answered, or for data to be acknowledged. Ports the stack chooses are
 32768 to 49151.
 
+## The resolver
+
+DNS on 127.0.0.1:53 and [::1]:53, for this machine only: what musl asks
+when `/etc/resolv.conf` names nobody, which is always. A question is asked
+of the servers DHCP and routers' advertisements named, one after another,
+two seconds each and six in all, and the answer is handed back as it came,
+with the asker's id — a failure, `SERVFAIL`. An answer is kept for the
+least of its TTLs; one that a name is not there, by its zone's SOA, and
+without one not at all (RFC 2308); and handed out again with its TTLs what
+is left of them: 256 answers, 64 questions waiting. An answer cut short
+is handed back cut short and not kept: nothing is asked again over TCP.
+
+`TAG_RESOLVER` (21) asks what it has done: `[asked, asked of a server,
+answered from what was kept, failed]`. The old protocol's lookup
+(`TAG_DNS_RESOLVE`) is a question of type A put to it.
+
 ## Before sockets were descriptors
 
 Programs built before this spoke to the stack by tags of their own: a

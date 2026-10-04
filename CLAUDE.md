@@ -1021,6 +1021,14 @@ sent out to be answered by nobody.
   card's driver lets every multicast frame in: the e1000's MPE, without
   which it let in none, and the RTL8139's hash registers all ones, which
   QEMU's starts with and a card need not.
+- **The machine has a resolver** (`net/src/resolver.rs`): DNS on
+  127.0.0.1:53 and [::1]:53, which musl asks when `/etc/resolv.conf` names
+  nobody — and nothing writes one — and which the old protocol's lookups
+  go through. It forwards, to DHCP's servers and the routers', and keeps
+  an answer for as long as its TTLs say (a negative one by its SOA, and
+  without one not at all, RFC 2308), handing it out again with what is
+  left of them. Only `lo` hears it: it answers this machine and nobody on
+  the network.
 - **`lo` says everything it has in one turn.** What `lo` sends it receives
   in the same poll, again and again until nothing is in flight: smoltcp's
   own loopback keeps its queue to itself, and a reset or an echo's answer

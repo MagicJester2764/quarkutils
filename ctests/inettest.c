@@ -344,6 +344,23 @@ static void names(void)
     check("and that ::1 is itself", r == 0 && res && res->ai_family == AF_INET6);
     if (res)
         freeaddrinfo(res);
+    /* A name only a DNS server knows, asked of the machine's resolver at
+       127.0.0.1, which /etc/resolv.conf, by saying nothing, leaves musl to
+       ask: quark.localhost is the machine (RFC 6761), as the host's
+       resolver says, which QEMU's DNS asks. */
+    res = NULL;
+    hints.ai_flags = 0;
+    r = getaddrinfo("quark.localhost", "7", &hints, &res);
+    four = six = 0;
+    for (struct addrinfo *p = res; r == 0 && p; p = p->ai_next) {
+        if (p->ai_family == AF_INET)
+            four |= ((struct sockaddr_in *)p->ai_addr)->sin_addr.s_addr == htonl(INADDR_LOOPBACK);
+        if (p->ai_family == AF_INET6)
+            six |= IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)p->ai_addr)->sin6_addr);
+    }
+    check("and through the machine's resolver, that quark.localhost is both", r == 0 && four && six);
+    if (res)
+        freeaddrinfo(res);
 }
 
 int main(void)

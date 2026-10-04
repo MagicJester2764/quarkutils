@@ -4,9 +4,11 @@
 extern crate alloc;
 
 mod card;
+mod dns;
 mod legacy;
 mod lo;
 mod ndp;
+mod resolver;
 mod sockets;
 mod stack;
 
@@ -21,9 +23,10 @@ use quark_rt::{nameserver, nic, println, syscall};
 // holding every port on the machine and every interrupt line.
 //
 // The protocols are smoltcp's (`stack`), unpatched; what is this server's is
-// the card under them (`card`) and what programs ask of them: sockets that
-// are descriptors (`sockets`), and the calls programs made before there
-// were (`legacy`).
+// the card under them (`card`), what routers say (`ndp`), the machine's
+// resolver (`resolver`), and what programs ask of them: sockets that are
+// descriptors (`sockets`), and the calls programs made before there were
+// (`legacy`).
 //
 // In the drivers' band all the same, as it was then: in the servers' it
 // waited for `init`, which starts the system in the drivers' band, and had
@@ -102,6 +105,7 @@ pub extern "C" fn _start() -> ! {
     let mut net = stack::Stack::new(link, mac);
     let mut clients = legacy::Clients::new();
     let mut socks = sockets::Sockets::new();
+    let mut resolver = resolver::Resolver::new(&mut net);
 
     // An address first, before anybody can ask for anything.
     let began = ms();
@@ -126,6 +130,7 @@ pub extern "C" fn _start() -> ! {
         net.poll();
         clients.settle(&mut net);
         socks.settle(&mut net);
+        resolver.settle(&mut net);
         let due = net.poll_delay().map_or(MAX_SLEEP_MS, |d| d.total_millis()).min(MAX_SLEEP_MS);
         let Some(msg) = wait(&mut net, due) else { continue };
         // A client has died: its connections go, and anything it was
@@ -134,6 +139,7 @@ pub extern "C" fn _start() -> ! {
         if let Some(dead) = death_notice(&msg) {
             clients.gone(&mut net, dead);
             socks.forget(dead);
+            resolver.forget(dead);
             continue;
         }
         if fd_released_notice(&msg) {
@@ -148,8 +154,16 @@ pub extern "C" fn _start() -> ! {
         // waiting for what it asked before, of either kind.
         clients.abandon(&mut net, msg.sender);
         socks.forget(msg.sender);
+        resolver.forget(msg.sender);
         if matches!(msg.tag, TAG_FD_READ | TAG_FD_WRITE) && sockets::Sockets::is_ours(msg.data[0]) {
             socks.io(&mut net, &msg);
+        } else if msg.tag == legacy::TAG_DNS_RESOLVE {
+            match resolver::name_of(&msg) {
+                Some(name) => resolver.resolve_for(&mut net, msg.sender, &name),
+                None => resolver::refuse_name(msg.sender),
+            }
+        } else if msg.tag == resolver::TAG_RESOLVER {
+            resolver.counts(msg.sender);
         } else if msg.tag == sockets::TAG_SOCKET {
             // A socket closed a moment ago is gone before anything is asked
             // of another: what it had may be what is asked for.

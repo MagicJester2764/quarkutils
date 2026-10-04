@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 quark-rt = { path = "../quark-rt" }
 # The protocols, unpatched: Ethernet, ARP, IPv4 and IPv6, ICMP, UDP, TCP,
-# and the DHCPv4 and DNS clients. What is Quark's is around them.
+# and the DHCPv4 client. What is Quark's is around them.
 smoltcp = { version = "0.12", default-features = false, features = [
     "alloc",
     "medium-ethernet",
@@ -15,13 +15,11 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "proto-ipv6",
     "socket-tcp",
     "socket-udp",
-    "socket-icmp", "socket-raw",
+    "socket-icmp",
+    "socket-raw",
     "socket-dhcpv4",
-    "socket-dns",
-    "proto-dns",
     "iface-max-addr-count-8",
     "iface-max-route-count-4",
-    "dns-max-server-count-4",
 ] }
 
 [profile.dev]

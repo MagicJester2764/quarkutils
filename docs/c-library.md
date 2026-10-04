@@ -480,7 +480,8 @@ it is ready for; a `connect` that may not wait is `EINPROGRESS`, and
 writable when it is done, with `SO_ERROR` saying how. `FIONREAD` says what a
 read would find: a stream's bytes, or the next datagram's length.
 `getaddrinfo` is musl's own: `/etc/hosts` first, which has `localhost`, and
-then the DNS server `/etc/resolv.conf` names, or 127.0.0.1.
+then the DNS server `/etc/resolv.conf` names — nothing writes one — or
+127.0.0.1, which is the network stack's resolver (`docs/net.md`).
 
 - **A call that waits, waits in a poll.** What the stack is asked it
   answers at once, and where Linux's call would wait the layer waits for

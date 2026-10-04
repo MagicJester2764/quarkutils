@@ -5,19 +5,20 @@
 //! A connection is a number in a table here, the program that asked for it
 //! its only user, and a socket in one of the stack's sets. What a program
 //! waits for — a connection to be made or come, bytes to come, room for its
-//! bytes, a datagram, an echo, a name — is held with its reply and answered
+//! bytes, a datagram, an echo — is held with its reply and answered
 //! when the stack has it ([`Clients::settle`], after every turn of the
 //! loop), or when it gives up waiting. A program that asks anything else
 //! is not waiting any more; one that dies takes its connections with it.
+//! A name (`TAG_DNS_RESOLVE`) is the resolver's to look up.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::{dns, icmp, tcp, udp};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Duration;
-use smoltcp::wire::{DnsQueryType, Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint, Ipv4Address};
 
 use crate::stack::{Side, Stack};
 
@@ -50,10 +51,9 @@ const TCP_BUF: usize = 64 * 1024;
 /// A connection nothing is heard on for this long is given up: a connect
 /// to somewhere that never answers, too.
 const TCP_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a datagram, an echo and a name are waited for.
+/// How long a datagram and an echo are waited for.
 const UDP_WAIT_MS: u64 = 10_000;
 const PING_WAIT_MS: u64 = 3_000;
-const DNS_WAIT_MS: u64 = 5_000;
 /// What the kernel's fd path packs into one message.
 const SOCK_CHUNK: usize = 40;
 /// The longest datagram a program sends or receives here.
@@ -62,9 +62,6 @@ const MAX_DATAGRAM: usize = 1472;
 const MAX_SEGMENT_IO: usize = 4096;
 /// The error for a request that has to wait behind another task's.
 const ERR_BUSY: u64 = 4;
-/// Names remembered, and for how long.
-const DNS_CACHE: usize = 8;
-const DNS_KEEP_MS: u64 = 300_000;
 /// Where the ports this server chooses come from.
 const EPHEMERAL: (u16, u16) = (49152, 65535);
 
@@ -109,21 +106,6 @@ struct Ping {
     since_ticks: u64,
 }
 
-struct Lookup {
-    tid: usize,
-    name: [u8; 48],
-    len: usize,
-    query: dns::QueryHandle,
-    since: u64,
-}
-
-struct Cached {
-    name: [u8; 48],
-    len: usize,
-    addr: Ipv4Address,
-    until: u64,
-}
-
 pub struct Clients {
     conns: Vec<Option<Conn>>,
     /// A UDP socket for each port a program has used, eth's and lo's.
@@ -131,9 +113,6 @@ pub struct Clients {
     reader: Option<UdpReader>,
     icmp: Option<SocketHandle>,
     ping: Option<Ping>,
-    dns: Option<SocketHandle>,
-    lookup: Option<Lookup>,
-    cache: Vec<Cached>,
     next_port: u16,
 }
 
@@ -210,9 +189,6 @@ impl Clients {
             reader: None,
             icmp: None,
             ping: None,
-            dns: None,
-            lookup: None,
-            cache: Vec::new(),
             next_port: EPHEMERAL.0,
         }
     }
@@ -255,7 +231,6 @@ impl Clients {
                 let packed = mac.iter().enumerate().fold(0u64, |w, (i, &b)| w | (b as u64) << (8 * i));
                 ok(tid, [packed, net.ipv4_word() as u64, 0, 0, 0, 0]);
             }
-            TAG_DNS_RESOLVE => self.resolve(net, msg),
             TAG_TCP_CONNECT => self.connect(net, msg),
             TAG_TCP_LISTEN => self.listen(net, msg),
             TAG_TCP_SEND => self.tcp_send(net, msg),
@@ -599,88 +574,6 @@ impl Clients {
         }
     }
 
-    // --- names ---
-
-    fn resolve(&mut self, net: &mut Stack, msg: &Message) {
-        let tid = msg.sender;
-        let mut name = [0u8; 48];
-        for i in 0..6 {
-            name[i * 8..i * 8 + 8].copy_from_slice(&msg.data[i].to_le_bytes());
-        }
-        let len = name.iter().position(|&b| b == 0).unwrap_or(48);
-        // A name that is not one is refused here rather than asked of the
-        // network: a query leaves the machine, and whatever is upstream
-        // reads it.
-        if !quark_rt::net::valid_hostname(&name[..len]) {
-            return refuse(tid, 1);
-        }
-        let now_ms = ms();
-        self.cache.retain(|c| c.until > now_ms);
-        if let Some(c) = self.cache.iter().find(|c| c.name[..c.len] == name[..len]) {
-            return ok(tid, [u32::from_be_bytes(c.addr.octets()) as u64, 0, 0, 0, 0, 0]);
-        }
-        if self.lookup.is_some() {
-            return refuse(tid, 4);
-        }
-        let socket = match self.dns {
-            Some(s) => s,
-            None => {
-                let servers = net.dns();
-                let s = net.sockets(Side::Eth).add(dns::Socket::new(&servers, vec![]));
-                self.dns = Some(s);
-                s
-            }
-        };
-        let servers = net.dns();
-        let (sockets, cx) = net.parts(Side::Eth);
-        let d = sockets.get_mut::<dns::Socket>(socket);
-        d.update_servers(&servers);
-        let Ok(text) = core::str::from_utf8(&name[..len]) else {
-            return refuse(tid, 1);
-        };
-        match d.start_query(cx, text, DnsQueryType::A) {
-            Ok(query) => {
-                let _ = syscall::sys_task_watch(tid);
-                self.lookup = Some(Lookup { tid, name, len, query, since: now_ms });
-            }
-            Err(_) => refuse(tid, 5),
-        }
-    }
-
-    fn deliver_name(&mut self, net: &mut Stack) {
-        let (Some(l), Some(socket)) = (self.lookup.as_ref(), self.dns) else { return };
-        let d = net.sockets(Side::Eth).get_mut::<dns::Socket>(socket);
-        match d.get_query_result(l.query) {
-            Err(dns::GetQueryResultError::Pending) => {
-                if ms() - l.since > DNS_WAIT_MS {
-                    d.cancel_query(l.query);
-                    let l = self.lookup.take().unwrap();
-                    refuse(l.tid, 3);
-                }
-            }
-            Err(_) => {
-                let l = self.lookup.take().unwrap();
-                refuse(l.tid, 2);
-            }
-            Ok(addrs) => {
-                let l = self.lookup.take().unwrap();
-                match addrs.iter().find_map(|a| match a {
-                    IpAddress::Ipv4(v) => Some(*v),
-                    _ => None,
-                }) {
-                    Some(addr) => {
-                        if self.cache.len() >= DNS_CACHE {
-                            self.cache.remove(0);
-                        }
-                        self.cache.push(Cached { name: l.name, len: l.len, addr, until: ms() + DNS_KEEP_MS });
-                        ok(l.tid, [u32::from_be_bytes(addr.octets()) as u64, 0, 0, 0, 0, 0]);
-                    }
-                    None => refuse(l.tid, 2),
-                }
-            }
-        }
-    }
-
     // --- after every turn ---
 
     /// Answer whoever waits for what the stack now has.
@@ -733,18 +626,11 @@ impl Clients {
         }
         self.deliver_datagram(net);
         self.deliver_echo(net);
-        self.deliver_name(net);
     }
 
     /// `tid` is not waiting for anything here any more: a connection it was
-    /// waiting to be made, or to come, is not wanted, and nor is a name.
+    /// waiting to be made, or to come, is not wanted.
     pub fn abandon(&mut self, net: &mut Stack, tid: usize) {
-        if let (Some(l), Some(socket)) = (self.lookup.as_ref(), self.dns) {
-            if l.tid == tid {
-                net.sockets(Side::Eth).get_mut::<dns::Socket>(socket).cancel_query(l.query);
-                self.lookup = None;
-            }
-        }
         for i in 0..self.conns.len() {
             let Some(c) = self.conns[i].as_mut() else { continue };
             if c.owner != tid {
