@@ -17,16 +17,27 @@
 //! several sockets ([`Stack::listen`]), and packets are taken in one at a
 //! time, with a socket listening again on each side after every one while
 //! there is room for another connection ([`Stack::refill`]).
+//!
+//! A datagram for an address on the network that nothing answers "who has
+//! it?" for waits at the head of its socket's queue for an answer, and
+//! smoltcp sends a socket's queue in order: one for nobody held up every
+//! datagram behind it, to anybody, for good. So every datagram the card's
+//! sockets queue goes through [`Stack::send_datagram`], which keeps what is
+//! queued where; a socket that has sent nothing for [`STUCK`] has its queue
+//! let go of, and the address at its head is given up for [`GIVEN_UP`] —
+//! what is sent there meanwhile is dropped where it is sent, as a datagram
+//! may be, and what is sent anywhere else goes.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use quark_rt::{nic, println, syscall};
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, tcp};
+use smoltcp::socket::{dhcpv4, tcp, udp, Socket};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr};
 
 use crate::card::Card;
 use crate::filter;
@@ -61,6 +72,21 @@ pub const TCP_TIMEOUT: Duration = Duration::from_secs(60);
 /// A stream let go of that is still saying goodbye after this long goes
 /// anyway.
 const RETIRE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a datagram socket on the card may send nothing while it has
+/// something to send — three tries at "who has it?" — before its queue is
+/// let go of.
+const STUCK: Duration = Duration::from_secs(3);
+/// How long an address nothing answered for is given up for.
+const GIVEN_UP: Duration = Duration::from_secs(30);
+
+/// A datagram socket on the card with something queued: for where, how
+/// long each, and since when it has sent nothing.
+struct Queued {
+    socket: SocketHandle,
+    datagrams: VecDeque<(IpAddress, usize)>,
+    idle: Option<Instant>,
+}
 
 /// A stream socket with the buffers and the timeout every stream has here.
 pub fn new_stream() -> tcp::Socket<'static> {
@@ -103,6 +129,12 @@ pub struct Stack {
     listens: Vec<Option<Listen>>,
     /// Streams let go of, still saying goodbye, and since when.
     retiring: Vec<(Side, SocketHandle, Instant)>,
+    /// The card's datagram sockets with something to send.
+    queued: Vec<Queued>,
+    /// Addresses nothing answered for, and until when they are given up.
+    given_up: Vec<(IpAddress, Instant)>,
+    /// Datagrams dropped for them.
+    pub unanswered: u64,
 }
 
 impl Stack {
@@ -143,6 +175,9 @@ impl Stack {
             filter,
             listens: Vec::new(),
             retiring: Vec::new(),
+            queued: Vec::new(),
+            given_up: Vec::new(),
+            unanswered: 0,
         }
     }
 
@@ -163,7 +198,9 @@ impl Stack {
             self.refill(Side::Eth);
         }
         self.ndp.turn(&mut self.eth, &mut self.lo, &mut self.eth_sockets, t);
+        let before = self.datagrams_waiting();
         self.eth.poll_egress(t, &mut self.card, &mut self.eth_sockets);
+        self.unstick(&before, t);
         for _ in 0..LO_TURNS {
             while !matches!(self.lo.poll_ingress_single(t, &mut self.lo_dev, &mut self.lo_sockets), PollIngressSingleResult::None) {
                 self.refill(Side::Lo);
@@ -175,6 +212,92 @@ impl Stack {
         }
         self.dhcp_events();
         self.sweep();
+    }
+
+    /// Queue a datagram on `side`'s socket `h`, for `to`; on the card, kept
+    /// account of. One for an address given up for is dropped here.
+    pub fn send_datagram(&mut self, side: Side, h: SocketHandle, data: &[u8], to: IpEndpoint) -> Result<(), udp::SendError> {
+        if side == Side::Lo {
+            return self.lo_sockets.get_mut::<udp::Socket>(h).send_slice(data, to);
+        }
+        let t = now();
+        self.given_up.retain(|&(_, until)| until > t);
+        if self.given_up.iter().any(|&(a, _)| a == to.addr) {
+            self.unanswered += 1;
+            return Ok(());
+        }
+        self.eth_sockets.get_mut::<udp::Socket>(h).send_slice(data, to)?;
+        match self.queued.iter_mut().find(|q| q.socket == h) {
+            Some(q) => q.datagrams.push_back((to.addr, data.len())),
+            None => self.queued.push(Queued { socket: h, datagrams: VecDeque::from([(to.addr, data.len())]), idle: None }),
+        }
+        Ok(())
+    }
+
+    /// Take a datagram socket out of `side`'s set, and out of the account.
+    pub fn remove_datagram(&mut self, side: Side, h: SocketHandle) {
+        if side == Side::Eth {
+            self.queued.retain(|q| q.socket != h);
+        }
+        self.sockets(side).remove(h);
+    }
+
+    /// The card's datagram sockets with something to send, and how much.
+    fn datagrams_waiting(&self) -> Vec<(SocketHandle, usize)> {
+        self.eth_sockets
+            .iter()
+            .filter_map(|(h, s)| match s {
+                Socket::Udp(u) if u.send_queue() > 0 => Some((h, u.send_queue())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// After the card's turn: what each datagram socket sent comes off its
+    /// account, from the front; one that has sent nothing for [`STUCK`] has
+    /// its queue let go of, and the address at its head is given up.
+    fn unstick(&mut self, before: &[(SocketHandle, usize)], t: Instant) {
+        let after = self.datagrams_waiting();
+        let mut stuck = Vec::new();
+        self.queued.retain_mut(|q| {
+            // Sent everything, or gone.
+            let Some(&(_, now)) = after.iter().find(|(h, _)| *h == q.socket) else { return false };
+            let was = before.iter().find(|(h, _)| *h == q.socket).map_or(now, |&(_, n)| n);
+            if now < was {
+                let mut sent = was - now;
+                while let Some(&(_, len)) = q.datagrams.front() {
+                    if len > sent {
+                        break;
+                    }
+                    sent -= len;
+                    q.datagrams.pop_front();
+                }
+                q.idle = None;
+                return true;
+            }
+            match q.idle {
+                None => q.idle = Some(t),
+                Some(since) if t - since >= STUCK => {
+                    stuck.push((q.socket, q.datagrams.front().map(|&(a, _)| a), q.datagrams.len()));
+                    return false;
+                }
+                Some(_) => {}
+            }
+            true
+        });
+        for (h, head, dropped) in stuck {
+            // Said by `netctl`, not on the console: a line printed after
+            // a prompt pushes the prompt off its line.
+            if let Some(addr) = head {
+                self.given_up.retain(|&(a, _)| a != addr);
+                self.given_up.push((addr, t + GIVEN_UP));
+            }
+            self.unanswered += dropped.max(1) as u64;
+            let s = self.eth_sockets.get_mut::<udp::Socket>(h);
+            let at = s.endpoint();
+            s.close();
+            let _ = s.bind(at);
+        }
     }
 
     /// Listen at `local`, keeping up to `backlog` connections made and not
@@ -448,6 +571,13 @@ impl Stack {
                 }
                 out.push('\n');
             }
+        }
+        if self.unanswered > 0 || !self.given_up.is_empty() {
+            let _ = write!(out, "  datagrams dropped for addresses nothing answered: {}", self.unanswered);
+            for (a, _) in &self.given_up {
+                let _ = write!(out, " {}", a);
+            }
+            out.push('\n');
         }
         let _ = writeln!(out, "lo");
         for a in self.lo.ip_addrs() {

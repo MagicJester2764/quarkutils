@@ -1062,6 +1062,19 @@ sent out to be answered by nobody.
   signal ends, and SO_RCVTIMEO bounds. A call held by a server cannot be
   ended by a signal (the kernel's *Known gaps*), so a request that waits is
   for programs written for this system, which say so.
+- **A datagram for nobody holds nothing up** (`Stack::send_datagram`). It
+  waits at the head of its socket for an answer to "who has it?", and
+  smoltcp sends a socket's queue in order: a fuzzer's datagram for an
+  address on the network that nothing answers for held up everything behind
+  it, to anybody, for good, and an echo request did the same to every ping
+  after it. So every datagram the card's sockets queue goes through the
+  stack, which keeps account of what is queued where; a socket that sends
+  nothing for three seconds has its queue let go of, and the address at its
+  head is given up for thirty — what is sent there meanwhile is dropped where
+  it is sent. A new place that queues a datagram on the card goes through it
+  too, and one that takes a datagram socket out uses `remove_datagram`. The
+  old protocol's ports and pings are bounded the same way: an echo has a
+  socket of its own, and no more than sixty-four ports are kept.
 - **A stream let go of says goodbye before it goes** (`Stack::retire`): its
   FIN, or the reset for one closed with something unread, as Linux does,
   and then it is taken out of its set — after a minute whether it has
