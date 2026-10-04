@@ -1657,10 +1657,12 @@ mounts`):
   Which is why a user's session has to *begin* holding nothing: there is no
   later point at which it is taken away.
 - **The device manager starts sixteen drivers at most**, as any program
-  without `TaskMgmt` may have sixteen children, and starts none twice: a
-  driver that ends leaves its device without one until the machine starts
-  again. A device's driver is one program, so a second card of a kind has
-  a second driver that cannot register the first one's name.
+  without `TaskMgmt` may have sixteen children. A driver that ends by
+  itself, or fails five times in a row, leaves its device without one until
+  the machine starts again; and what a failed driver served is its
+  claimants' to ask for again, which the network stack does and a disk's
+  file server does not. A device's driver is one program, so a second card
+  of a kind has a second driver that cannot register the first one's name.
 - **USB is what a PC's keyboard, mouse and disks need, and no more.**
   Keyboards and mice that speak the boot protocol — not a tablet, whose
   absolute pointer needs its report descriptor read — disks of 512-byte
