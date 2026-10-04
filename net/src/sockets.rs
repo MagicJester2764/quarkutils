@@ -788,7 +788,7 @@ impl Sockets {
             fail(tid, EFAULT);
             return true;
         }
-        match datagram(net, side, h).send_slice(&buf, to) {
+        match net.send_datagram(side, h, &buf, to) {
             Ok(()) => ok(tid, [len as u64, 0, 0, 0, 0, 0]),
             Err(udp::SendError::BufferFull) => return false,
             Err(udp::SendError::Unaddressable) => fail(tid, if to.port == 0 { EINVAL } else { ENETUNREACH }),
@@ -1149,9 +1149,9 @@ impl Sockets {
                 net.retire(side, h);
             }
             (Kind::Datagram, Some((side, h))) => {
-                net.sockets(side).remove(h);
+                net.remove_datagram(side, h);
                 if let Some(lo) = s.lo {
-                    net.sockets(Side::Lo).remove(lo);
+                    net.remove_datagram(Side::Lo, lo);
                 }
             }
             _ => {}

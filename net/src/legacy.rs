@@ -60,6 +60,10 @@ const PING_WAIT_MS: u64 = 3_000;
 const SOCK_CHUNK: usize = 40;
 /// The longest datagram a program sends or receives here.
 const MAX_DATAGRAM: usize = 1472;
+/// The most ports the old protocol keeps a datagram socket on. A send that
+/// names no port is given a new one, and each kept its socket for good: a
+/// fuzzer's sends were a hundred kilobytes of the stack each.
+const MAX_UDP_PORTS: usize = 64;
 /// What a program sends or receives through `TAG_TCP_SEND` and `RECV` at once.
 const MAX_SEGMENT_IO: usize = 4096;
 /// The error for a request that has to wait behind another task's.
@@ -100,20 +104,27 @@ struct UdpReader {
     since: u64,
 }
 
+/// The one echo request waiting for its answer, and the socket it was sent
+/// from: one for each, bound to its own ident and taken out with it. One
+/// socket for every ping kept what it could not send — an echo to an
+/// address on the network that nothing answers for — and was full after
+/// eight, and heard only the first ident it was bound to.
 struct Ping {
     tid: usize,
     id: u16,
     seq: u16,
     since: u64,
     since_ticks: u64,
+    socket: SocketHandle,
 }
 
 pub struct Clients {
     conns: Vec<Option<Conn>>,
     /// A UDP socket for each port a program has used, eth's and lo's.
+    /// The one least lately used goes, when another is wanted and there
+    /// are [`MAX_UDP_PORTS`].
     udp: Vec<(u16, SocketHandle, SocketHandle)>,
     reader: Option<UdpReader>,
-    icmp: Option<SocketHandle>,
     ping: Option<Ping>,
     next_port: u16,
 }
@@ -189,7 +200,6 @@ impl Clients {
             conns,
             udp: Vec::new(),
             reader: None,
-            icmp: None,
             ping: None,
             next_port: EPHEMERAL.0,
         }
@@ -437,8 +447,20 @@ impl Clients {
 
     /// The UDP socket on `port`, eth's and lo's, made if there is none.
     fn udp_on(&mut self, net: &mut Stack, port: u16) -> Option<(SocketHandle, SocketHandle)> {
-        if let Some(&(_, e, l)) = self.udp.iter().find(|(p, _, _)| *p == port) {
-            return Some((e, l));
+        if let Some(i) = self.udp.iter().position(|(p, _, _)| *p == port) {
+            // Kept in the order they were last used.
+            let entry = self.udp.remove(i);
+            self.udp.push(entry);
+            return Some((entry.1, entry.2));
+        }
+        if self.udp.len() >= MAX_UDP_PORTS {
+            // Not one somebody is waiting to receive on.
+            let reading = self.reader.as_ref().map(|r| r.port);
+            if let Some(i) = self.udp.iter().position(|(p, _, _)| Some(*p) != reading) {
+                let (_, e, l) = self.udp.remove(i);
+                net.remove_datagram(Side::Eth, e);
+                net.remove_datagram(Side::Lo, l);
+            }
         }
         let mut eth = new_udp();
         let mut lo = new_udp();
@@ -469,7 +491,7 @@ impl Clients {
         };
         let side = net.side_for(dst);
         let socket = if side == Side::Eth { e } else { l };
-        let sent = net.sockets(side).get_mut::<udp::Socket>(socket).send_slice(&payload[..len], IpEndpoint::new(dst, dst_port));
+        let sent = net.send_datagram(side, socket, &payload[..len], IpEndpoint::new(dst, dst_port));
         if sent.is_ok() { ok(tid, [0; 6]) } else { refuse(tid, 1) }
     }
 
@@ -520,25 +542,14 @@ impl Clients {
         let dst = IpAddress::Ipv4(v4(msg.data[0]));
         let id = msg.data[1] as u16;
         let seq = msg.data[2] as u16;
-        let side = net.side_for(dst);
-        let socket = match self.icmp {
-            Some(s) => s,
-            None => {
-                let s = icmp::Socket::new(
-                    icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 8 * 256]),
-                    icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 8 * 256]),
-                );
-                let h = net.sockets(Side::Eth).add(s);
-                self.icmp = Some(h);
-                h
-            }
-        };
         // Echo to this machine is answered without a socket on lo: the
         // stack answers an echo itself, and what comes back is the reply.
-        let _ = side;
-        let s = net.sockets(Side::Eth).get_mut::<icmp::Socket>(socket);
-        if !s.is_open() {
-            let _ = s.bind(icmp::Endpoint::Ident(id));
+        let mut s = icmp::Socket::new(
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 4 * 256]),
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 1], vec![0; 256]),
+        );
+        if s.bind(icmp::Endpoint::Ident(id)).is_err() {
+            return refuse(tid, 2);
         }
         let repr = Icmpv4Repr::EchoRequest { ident: id, seq_no: seq, data: b"quark ping......" };
         let sent = s.send(repr.buffer_len(), dst).map(|buf| {
@@ -548,31 +559,43 @@ impl Clients {
         if sent.is_err() {
             return refuse(tid, 2);
         }
+        let socket = net.sockets(Side::Eth).add(s);
         let _ = syscall::sys_task_watch(tid);
-        self.ping = Some(Ping { tid, id, seq, since: ms(), since_ticks: syscall::sys_ticks() });
+        self.ping = Some(Ping { tid, id, seq, since: ms(), since_ticks: syscall::sys_ticks(), socket });
+    }
+
+    /// The ping is over, answered or not: its socket goes, and whatever it
+    /// could not send with it.
+    fn end_ping(&mut self, net: &mut Stack) -> Option<Ping> {
+        let p = self.ping.take()?;
+        net.sockets(Side::Eth).remove(p.socket);
+        Some(p)
     }
 
     fn deliver_echo(&mut self, net: &mut Stack) {
-        let (Some(p), Some(socket)) = (self.ping.as_ref(), self.icmp) else { return };
-        let s = net.sockets(Side::Eth).get_mut::<icmp::Socket>(socket);
+        let Some(p) = self.ping.as_ref() else { return };
+        let (id, seq, since) = (p.id, p.seq, p.since);
+        let s = net.sockets(Side::Eth).get_mut::<icmp::Socket>(p.socket);
         while s.can_recv() {
             let Ok((data, _from)) = s.recv() else { break };
             let packet = Icmpv4Packet::new_unchecked(data);
             if let Ok(Icmpv4Repr::EchoReply { ident, seq_no, data }) =
                 Icmpv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::default())
             {
-                if ident == p.id && seq_no == p.seq {
-                    let p = self.ping.take().unwrap();
+                if ident == id && seq_no == seq {
+                    let len = data.len() as u64 + 8;
+                    let Some(p) = self.end_ping(net) else { return };
                     let rtt = syscall::sys_ticks() - p.since_ticks;
                     // How many hops it came: not said by the socket, so the
                     // most an answer starts with.
-                    return ok(p.tid, [rtt, 64, data.len() as u64 + 8, 0, 0, 0]);
+                    return ok(p.tid, [rtt, 64, len, 0, 0, 0]);
                 }
             }
         }
-        if ms() - p.since > PING_WAIT_MS {
-            let p = self.ping.take().unwrap();
-            refuse(p.tid, 1);
+        if ms() - since > PING_WAIT_MS {
+            if let Some(p) = self.end_ping(net) {
+                refuse(p.tid, 1);
+            }
         }
     }
 
@@ -647,7 +670,7 @@ impl Clients {
             self.reader = None;
         }
         if self.ping.as_ref().is_some_and(|p| p.tid == tid) {
-            self.ping = None;
+            self.end_ping(net);
         }
     }
 

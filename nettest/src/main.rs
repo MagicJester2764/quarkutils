@@ -42,6 +42,9 @@ const ECHO_IP: u32 = 0x0A00_0202;
 const ECHO6: [u8; 16] = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 const ECHO_PORT: u16 = 7007;
 const LOCAL_PORT: u16 = 40007;
+/// An address on this network that nothing answers for: what is sent there
+/// waits for an answer to "who has it?" that never comes.
+const NOWHERE: [u8; 4] = [10, 0, 2, 99];
 /// 127.0.0.1, and a port a thread of this program listens on there.
 const LOOPBACK: u32 = 0x7F00_0001;
 const LOOP_PORT: u16 = 40100;
@@ -89,6 +92,55 @@ fn udp(net_tid: usize) {
         }
         Err(_) => check("and comes back", false),
     }
+}
+
+/// What waits for an address nothing on the network answers for holds up
+/// nothing else for more than a moment: not the next echo request, whatever
+/// ident it has, and not the next datagram from the same socket.
+fn nowhere(net_tid: usize) {
+    let first = net::icmp_ping(net_tid, ECHO_IP, 0x1234, 1);
+    let second = net::icmp_ping(net_tid, ECHO_IP, 0x4321, 1);
+    check("an echo request is answered, whatever ident the one before it had", first.is_ok() && second.is_ok());
+    let nowhere = u32::from_be_bytes(NOWHERE);
+    let _ = net::icmp_ping(net_tid, nowhere, 0x5151, 1);
+    check(
+        "and so is one sent after one that nothing answered",
+        net::icmp_ping(net_tid, ECHO_IP, 0x5152, 1).is_ok(),
+    );
+    let Ok(s) = UdpSocket::bind(Endpoint::v4([0, 0, 0, 0], 0)) else {
+        check("a datagram socket", false);
+        return;
+    };
+    s.set_read_timeout(Some(1_000_000_000));
+    let _ = s.send_to(b"nobody", Endpoint::v4(NOWHERE, 9));
+    // The echo, sent again each second: the first may go with what was
+    // waiting for nobody.
+    let mut back = false;
+    for _ in 0..8 {
+        let _ = s.send_to(b"quark-udp", Endpoint::v4([10, 0, 2, 2], ECHO_PORT));
+        let mut buf = [0u8; 16];
+        if matches!(s.recv_from(&mut buf), Ok((9, _))) && &buf[..9] == b"quark-udp" {
+            back = true;
+            break;
+        }
+    }
+    check("a datagram for nobody holds up the next from its socket for no more than a moment", back);
+}
+
+/// The old protocol keeps a socket on each port it has sent from — and no
+/// more than 64 of them, whatever a program sends from.
+fn old_ports(net_tid: usize) {
+    for port in 0..70u16 {
+        let _ = net::udp_send(net_tid, b"x", LOOPBACK, 9, 41_000 + port);
+    }
+    static mut TEXT: [u8; 32768] = [0; 32768];
+    let text = unsafe { &mut *core::ptr::addr_of_mut!(TEXT) };
+    let n = net::status(net_tid, text).map_or(0, |(n, _)| n);
+    let kept = text[..n]
+        .split(|&b| b == b'\n')
+        .filter(|l| l.windows(4).any(|w| w == b"udp4") && l.windows(16).any(|w| w == b"the old protocol"))
+        .count();
+    check("the old protocol keeps sockets on no more than 64 ports", kept > 0 && kept <= 64);
 }
 
 fn tcp(net_tid: usize) {
@@ -490,6 +542,8 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(1);
     };
     udp(net_tid);
+    nowhere(net_tid);
+    old_ports(net_tid);
     tcp(net_tid);
     many(net_tid);
     loopback(net_tid);

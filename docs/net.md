@@ -95,6 +95,14 @@ one call: one that asks something else, or dies, is waiting for nothing.
   `EMSGSIZE`: nothing is cut into fragments.
 - A port somebody has is `EADDRINUSE`; an address this machine does not
   have, `EADDRNOTAVAIL`.
+- A datagram for an address on the network that nothing answers "who has
+  it?" for is sent as if it went, and goes nowhere, as a datagram may: a
+  socket on the card that has sent nothing for three seconds with something
+  to send has what it holds let go of, and the address at the head of it is
+  given up for thirty, everything sent there dropped where it is sent. A
+  socket sends its datagrams in order, so before this one for nobody held up
+  everything behind it, to anybody, for good. `netctl` says how many were
+  dropped, and for whom.
 
 ## Limits
 
@@ -160,4 +168,7 @@ name (7), a stream connected, listened for, sent to, received from and
 closed by a handle the task owned (10, 11, 13, 14, 15), and a descriptor
 the kernel read and wrote forty bytes a call through (`FdKind::Socket`, 16
 and 17). They still work, on the same stack — sixty-four streams in the
-machine, thirty-two a task — and nothing written now should use them.
+machine, thirty-two a task, datagram sockets on sixty-four ports, the
+least lately used given up for another — and nothing written now should
+use them. An echo is sent from a socket of its own, bound to its ident and
+taken out when it is answered or given up on.

@@ -192,8 +192,7 @@ impl Resolver {
     fn ask(net: &mut Stack, upstream: SocketHandle, p: &mut Pending) -> bool {
         let Some(&server) = servers(net).get(p.server) else { return false };
         p.sent = now();
-        let s = net.sockets(Side::Eth).get_mut::<udp::Socket>(upstream);
-        let _ = s.send_slice(&p.message, IpEndpoint::new(server, PORT));
+        let _ = net.send_datagram(Side::Eth, upstream, &p.message, IpEndpoint::new(server, PORT));
         true
     }
 
