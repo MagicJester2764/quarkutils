@@ -581,6 +581,12 @@ pub fn sys_task_priority(tid: usize, band: u8) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// The band task `tid` was put in, whatever it is running in for now.
+pub fn sys_task_band(tid: usize) -> Option<u8> {
+    let ret = unsafe { syscall2(SYS_TASK_PRIORITY, tid as u64, u64::MAX) };
+    (ret != u64::MAX).then_some(ret as u8)
+}
+
 /// Ask to be told when `tid` dies.
 ///
 /// The notification arrives at the caller's next receive as a message from the
@@ -2580,7 +2586,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 25;
+pub const ABI_VERSION_MINOR: u32 = 26;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

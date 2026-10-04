@@ -6052,6 +6052,21 @@ fn test_devices() {
         n >= 2 && syscall::sys_pci_device(0, &mut record).is_none(),
     );
     check("and reads none of their configuration", n >= 2 && syscall::sys_pci_read(0, 0, 4).is_err());
+    // Every driver runs in the drivers' band, which its manifest asks for
+    // and the device manager gives it: and so is never preempted by an
+    // ordinary program, and its memory is never taken when memory is short.
+    let drivers = list.iter().flatten().filter(|d| d.driver != 0);
+    let mut ran = 0;
+    let mut in_band = true;
+    for d in drivers {
+        ran += 1;
+        let band = syscall::sys_task_band(d.driver);
+        if band != Some(syscall::PRIO_DRIVER) {
+            in_band = false;
+            println!("        {} is in band {:?}", core::str::from_utf8(d.driver_name()).unwrap_or("?"), band);
+        }
+    }
+    check("every driver the device manager started is in the drivers' band", ran > 0 && in_band);
     let card = found(&|d| d.header.class >> 8 == 0x0200);
     match card {
         None => println!("        no network card here: whose it is, is not checked"),
