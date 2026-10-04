@@ -1451,9 +1451,9 @@ mounts`):
   of a file, or its wait for a lock, runs its handler when the server has
   answered. A real-time signal queues, as on Linux, but in a queue of 64 a
   program, and one more is refused with `EAGAIN`. `alarm` and `setitimer` are
-  the kernel's one alarm for a program, in real time, to the nanosecond: the
-  timers that count time spent running are refused, and so is
-  `timer_create`, which every program asked falls back from.
+  the kernel's one alarm for a program, in real time, to the nanosecond, and
+  `timer_create` is 32 more: the timers that count time spent running are
+  refused, on either.
 - **A program's first thread is not numbered as its process.** `getpid` is
   a process id, 64 or more, and `gettid` a task id, below 64. On Linux the
   two are equal in the first thread, and code that finds its main thread by

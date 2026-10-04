@@ -8772,6 +8772,86 @@ fn test_clock() {
         "the clock does not go back, whichever processor is asked",
         CLOCK_ASKED.load(Ordering::SeqCst) == askers + 1 && CLOCK_WENT_BACK.load(Ordering::SeqCst) == 0,
     );
+
+    // A program's timers, which raise a signal: held back here, and taken.
+    const TIMER_SIG: u64 = 41;
+    let held = 1u64 << (TIMER_SIG - 1);
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::sys_sig_mask(syscall::SIG_BLOCK, held);
+    let made = syscall::sys_ptimer_create(syscall::PTIMER_SINCE_BOOT, TIMER_SIG, 77, 0);
+    check("a program makes a timer that raises a signal", made.is_ok());
+    let id = made.unwrap_or(0);
+    let before = syscall::sys_clock();
+    let set = syscall::sys_ptimer_set(id, ns(20 * MS), 0) == Ok((0, 0));
+    let stands = syscall::sys_ptimer_get(id);
+    check(
+        "set, it says how long is left of it",
+        set && matches!(stands, Ok((left, 0)) if left > 0 && left <= 20 * MS),
+    );
+    let got = syscall::sys_sig_wait_info(held, ns(500 * MS));
+    let waited = syscall::sys_clock() - before;
+    check(
+        "and when that is up its signal is raised, carrying its number and its value",
+        matches!(got, Ok(Some((TIMER_SIG, info)))
+            if info.code == syscall::SI_TIMER && info.who == id as u64 && info.value == 77)
+            && waited >= 20 * MS,
+    );
+    check("once, and then it is disarmed", syscall::sys_ptimer_get(id) == Ok((0, 0)));
+    let _ = syscall::sys_ptimer_set(id, ns(MS), ns(MS));
+    syscall::sleep_ns(40 * MS);
+    let was = syscall::sys_ptimer_set(id, 0, 0);
+    let got = syscall::sys_sig_wait_info(held, 0);
+    check(
+        "one that fires while its signal waits raises no other, and that one counts the overruns",
+        matches!(was, Ok((_, every)) if every == MS)
+            && matches!(got, Ok(Some((TIMER_SIG, info))) if info.who >> 32 >= 10)
+            && syscall::sys_sig_wait_info(held, 0) == Ok(None),
+    );
+    let at = syscall::sys_clock() + 15 * MS;
+    let _ = syscall::sys_ptimer_set_at(id, at, 0);
+    let got = syscall::sys_sig_wait_info(held, ns(500 * MS));
+    check("a timer set for a time fires then", matches!(got, Ok(Some(_))) && syscall::sys_clock() >= at);
+    let _ = syscall::sys_ptimer_delete(id);
+    check("ended, it is no more", syscall::sys_ptimer_get(id).is_err() && syscall::sys_ptimer_delete(id).is_err());
+
+    // For one task, and for nobody.
+    let mine = syscall::sys_ptimer_create(syscall::PTIMER_SINCE_BOOT, TIMER_SIG, 5, me);
+    let quiet = syscall::sys_ptimer_create(syscall::PTIMER_SINCE_BOOT, 0, 0, 0);
+    let (mine, quiet) = (mine.unwrap_or(usize::MAX), quiet.unwrap_or(usize::MAX));
+    let _ = syscall::sys_ptimer_set(mine, ns(5 * MS), 0);
+    let _ = syscall::sys_ptimer_set(quiet, ns(5 * MS), ns(5 * MS));
+    let got = syscall::sys_sig_wait_info(held, ns(500 * MS));
+    check(
+        "a timer for one task raises its signal for that task",
+        matches!(got, Ok(Some((TIMER_SIG, info))) if info.code == syscall::SI_TIMER && info.value == 5),
+    );
+    syscall::sleep_ns(20 * MS);
+    check(
+        "and one that raises nothing fires on its beat and raises nothing",
+        matches!(syscall::sys_ptimer_get(quiet), Ok((left, every)) if left > 0 && left <= 5 * MS && every == 5 * MS)
+            && syscall::sys_sig_wait_info(held, 0) == Ok(None),
+    );
+    check(
+        "a timer is not on a clock there is none of, nor for another program's task",
+        syscall::sys_ptimer_create(3, TIMER_SIG, 0, 0).is_err()
+            && syscall::sys_ptimer_create(syscall::PTIMER_SINCE_BOOT, TIMER_SIG, 0, 1).is_err(),
+    );
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(if syscall::sys_ptimer_get(quiet).is_err() { 7 } else { 8 }),
+        Ok(child) => check("a forked child has none of its parent's timers", wait_for(child) == Some(7)),
+        Err(()) => check("fork", false),
+    }
+    let _ = syscall::sys_ptimer_delete(mine);
+    let _ = syscall::sys_ptimer_delete(quiet);
+    let mut made = 0;
+    while made < 100 && syscall::sys_ptimer_create(syscall::PTIMER_DATE, 0, 0, 0).is_ok() {
+        made += 1;
+    }
+    check("a program may have 32", made == 32);
+    for id in 0..32 {
+        let _ = syscall::sys_ptimer_delete(id);
+    }
+    let _ = syscall::sys_sig_mask(syscall::SIG_UNBLOCK, held);
 }
 
 /// The word a thread asks to have cleared when it ends, as every thread a C

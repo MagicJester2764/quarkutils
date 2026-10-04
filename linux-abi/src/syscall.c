@@ -105,6 +105,11 @@ typedef unsigned long size_t;
 #define LX_tgkill          234
 #define LX_rt_sigqueueinfo 129
 #define LX_rt_tgsigqueueinfo 297
+#define LX_timer_create    222
+#define LX_timer_settime   223
+#define LX_timer_gettime   224
+#define LX_timer_getoverrun 225
+#define LX_timer_delete    226
 #define LX_epoll_pwait     281
 #define LX_ioctl            16
 #define LX_readv            19
@@ -1606,6 +1611,16 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_tkill(a1, a2);
     case LX_tgkill:
         return __quark_tkill(a2, a3);
+    case LX_timer_create:
+        return __quark_timer_create(a1, (const void *)a2, (int *)a3);
+    case LX_timer_settime:
+        return __quark_timer_settime(a1, a2, (const void *)a3, (void *)a4);
+    case LX_timer_gettime:
+        return __quark_timer_gettime(a1, (void *)a2);
+    case LX_timer_getoverrun:
+        return __quark_timer_getoverrun(a1);
+    case LX_timer_delete:
+        return __quark_timer_delete(a1);
     case LX_rt_sigqueueinfo:
         return __quark_sigqueue(a1, -1, a2, (const void *)a3);
     case LX_rt_tgsigqueueinfo:

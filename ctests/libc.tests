@@ -45,3 +45,4 @@ handlertest
 usagetest
 layouttest
 sigqueuetest
+ptimertest

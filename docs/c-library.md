@@ -188,8 +188,23 @@ What is different:
   `si_stime`); `getrusage` and `wait4` do.
 - The interval timers that count time spent running (`ITIMER_VIRTUAL`,
   `ITIMER_PROF`) are refused: the time is measured (`getrusage`, below) and
-  limited (`RLIMIT_CPU`), but nothing counts it down. `timer_create` is
-  `ENOSYS`, and the programs that try it first fall back to `setitimer`.
+  limited (`RLIMIT_CPU`), but nothing counts it down. For the same reason
+  `timer_create` on `CLOCK_PROCESS_CPUTIME_ID` or a thread's clock is
+  `EINVAL`.
+- **A timer set for a date does not follow the date** when somebody sets
+  it: it fires when as much time has gone by as there was until that date
+  when it was set. Every wait here is by the time since boot.
+
+**A program has timers of its own** (`timer_create`, `timer_settime`,
+`timer_gettime`, `timer_getoverrun`, `timer_delete`): the kernel's, 32 of
+them, on `CLOCK_REALTIME`, `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME`. Each
+raises a signal carrying its value — for the program (`SIGEV_SIGNAL`, and
+`SIGALRM` carrying its own number when nothing is said), for one thread
+(`SIGEV_THREAD_ID`), or for a thread of musl's that calls a function
+(`SIGEV_THREAD`) — or nothing (`SIGEV_NONE`). One that fires while its last
+signal still waits raises no other; that one counts the overruns
+(`si_overrun`, and `timer_getoverrun` after it). A forked child has none,
+and `exec` ends them.
 
 ## Job control
 
@@ -373,7 +388,7 @@ An address asked for without either is still only a hint, and ignored.
 A call the layer has no answer for returns `ENOSYS`, on purpose: a C library
 told "no" copes, and one handed a made-up answer fails somewhere unrelated
 and much later. The ones a ported program is most likely to meet:
-`timer_create`, `set_robust_list`, `rseq`, `statx` (musl falls back to
+`set_robust_list`, `rseq`, `statx` (musl falls back to
 `fstatat`), and `epoll_wait` on anything but the descriptors the layer can
 poll.
 

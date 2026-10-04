@@ -220,6 +220,16 @@ __asm__(
 void __quark_sig_entry(void);
 void __quark_sig_run(struct quark_sigframe *f, void *fp);
 
+/* A timer's signal says so, and has the timer's number where a process id
+   would be and its overruns where a user would be. */
+#define LX_SI_TIMER (-2)
+#define TIMERS 32
+
+/* The overruns that came with the last signal of each of this program's
+   timers, which is what timer_getoverrun answers: only the signal says
+   them. A forked child has no timers to ask about, and exec starts over. */
+static int timer_overruns[TIMERS];
+
 /* What came with a signal, as siginfo says it: who raised it and what it
    carried — or, for a fault, where it was. */
 static void fill_info(struct lx_siginfo *si, int sig, long code, unsigned long who,
@@ -233,6 +243,9 @@ static void fill_info(struct lx_siginfo *si, int sig, long code, unsigned long w
         si->u.rt.pid = (int)(who & 0xFFFFFFFFUL);
         si->u.rt.uid = (unsigned int)(who >> 32);
         si->u.rt.value = value;
+    }
+    if (code == LX_SI_TIMER && (who & 0xFFFFFFFFUL) < TIMERS) {
+        timer_overruns[who & 0xFFFFFFFFUL] = (int)(who >> 32);
     }
 }
 
@@ -452,6 +465,135 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
             return -LX_EINTR;
         }
     }
+}
+
+/* POSIX's timers: the kernel's (SYS_PTIMER), which raise a signal. What
+   musl hands timer_create is Linux's sigevent as the kernel takes it: a
+   signal for the program, one for one thread (SIGEV_THREAD_ID, which musl
+   builds SIGEV_THREAD on: a thread of its own waits for the signal and
+   calls the function), or none. None at all is SIGALRM carrying the
+   timer's own number. */
+#define LX_SIGEV_SIGNAL    0
+#define LX_SIGEV_NONE      1
+#define LX_SIGEV_THREAD_ID 4
+#define LX_SIGALRM         14
+#define LX_TIMER_ABSTIME   1
+#define LX_CLOCK_REALTIME  0
+#define LX_CLOCK_MONOTONIC 1
+#define LX_CLOCK_BOOTTIME  7
+
+struct lx_sigevent {
+    unsigned long sigev_value;
+    int sigev_signo;
+    int sigev_notify;
+    int sigev_tid;
+};
+
+long __quark_timer_create(long clock, const void *sevp, int *id) {
+    if (!id) {
+        return -LX_EFAULT;
+    }
+    if (clock != LX_CLOCK_REALTIME && clock != LX_CLOCK_MONOTONIC && clock != LX_CLOCK_BOOTTIME) {
+        /* The processor-time clocks among them: nothing counts those down. */
+        return -LX_EINVAL;
+    }
+    unsigned long signo = LX_SIGALRM | 0x100, value = 0, task = 0;
+    if (sevp) {
+        const struct lx_sigevent *e = sevp;
+        value = e->sigev_value;
+        signo = (unsigned long)e->sigev_signo;
+        switch (e->sigev_notify) {
+        case LX_SIGEV_NONE:
+            signo = 0;
+            break;
+        case LX_SIGEV_THREAD_ID:
+            if (e->sigev_tid <= 0) {
+                return -LX_EINVAL;
+            }
+            task = (unsigned long)e->sigev_tid;
+            /* fall through */
+        case LX_SIGEV_SIGNAL:
+            if (signo < 1 || signo > NSIG) {
+                return -LX_EINVAL;
+            }
+            break;
+        default:
+            return -LX_EINVAL;
+        }
+    }
+    unsigned long r = __syscall5(SYS_PTIMER, 0, (unsigned long)clock, signo, value, task);
+    if (r == QUARK_ERR) {
+        /* A thread of another program, or as many timers as there may be. */
+        return task ? -LX_EINVAL : -LX_EAGAIN;
+    }
+    timer_overruns[r % TIMERS] = 0;
+    *id = (int)r;
+    return 0;
+}
+
+/* Linux's itimerspec: the interval, then the value, each seconds and
+   nanoseconds. */
+static unsigned long timespec_ns(const long *ts) {
+    return quark_nanos((unsigned long)ts[0], (unsigned long)ts[1]);
+}
+
+static int timespec_bad(const long *ts) {
+    return ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000L;
+}
+
+static void timespec_of(long *ts, unsigned long ns) {
+    ts[0] = (long)(ns / 1000000000UL);
+    ts[1] = (long)(ns % 1000000000UL);
+}
+
+long __quark_timer_settime(long id, long flags, const void *new_value, void *old_value) {
+    const long *nv = new_value;
+    if (!nv) {
+        return -LX_EFAULT;
+    }
+    if (timespec_bad(nv) || timespec_bad(nv + 2)) {
+        return -LX_EINVAL;
+    }
+    unsigned long first = timespec_ns(nv + 2), every = timespec_ns(nv);
+    int absolute = (flags & LX_TIMER_ABSTIME) != 0;
+    unsigned long when = !first ? 0 : absolute ? first : quark_span(first);
+    unsigned long was[2] = {0, 0};
+    unsigned long timer = (unsigned long)(unsigned int)id | (absolute ? 1UL << 32 : 0);
+    if (__syscall5(SYS_PTIMER, 1, timer, when, every ? quark_span(every) : 0, (unsigned long)was) ==
+        QUARK_ERR) {
+        return -LX_EINVAL;
+    }
+    if (old_value) {
+        long *ov = old_value;
+        timespec_of(ov, was[1]);
+        timespec_of(ov + 2, was[0]);
+    }
+    return 0;
+}
+
+long __quark_timer_gettime(long id, void *curr_value) {
+    if (!curr_value) {
+        return -LX_EFAULT;
+    }
+    unsigned long stands[2] = {0, 0};
+    if (__syscall3(SYS_PTIMER, 2, (unsigned long)(unsigned int)id, (unsigned long)stands) == QUARK_ERR) {
+        return -LX_EINVAL;
+    }
+    long *cv = curr_value;
+    timespec_of(cv, stands[1]);
+    timespec_of(cv + 2, stands[0]);
+    return 0;
+}
+
+long __quark_timer_getoverrun(long id) {
+    if (__syscall3(SYS_PTIMER, 2, (unsigned long)(unsigned int)id, 0) == QUARK_ERR) {
+        return -LX_EINVAL;
+    }
+    return timer_overruns[(unsigned long)id % TIMERS];
+}
+
+long __quark_timer_delete(long id) {
+    return __syscall2(SYS_PTIMER, 3, (unsigned long)(unsigned int)id) == QUARK_ERR ? -LX_EINVAL : 0;
 }
 
 /* sigaltstack: the stack for handlers that ask for one, this thread's. */

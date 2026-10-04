@@ -169,6 +169,9 @@
 #define QUARK_CLOCK_WALL    1UL
 /* Say what time it is: nanoseconds since 1970. For a holder of the right. */
 #define SYS_CLOCK_SET       150
+/* A program's timer that raises a signal: by what the first argument
+   says, make one, set it, say how it stands, end it. */
+#define SYS_PTIMER          151
 #define QUARK_SPAN_NS       (1UL << 63)
 
 /* 0xC0  memory, continued */

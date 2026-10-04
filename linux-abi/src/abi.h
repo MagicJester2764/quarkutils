@@ -98,6 +98,11 @@ long __quark_sigtimedwait(const unsigned long *set, void *info, const long *time
 long __quark_kill(long pid, long sig);
 long __quark_tkill(long tid, long sig);
 long __quark_sigqueue(long pid, long tid, long sig, const void *info);
+long __quark_timer_create(long clock, const void *sevp, int *id);
+long __quark_timer_settime(long id, long flags, const void *new_value, void *old_value);
+long __quark_timer_gettime(long id, void *curr_value);
+long __quark_timer_getoverrun(long id);
+long __quark_timer_delete(long id);
 long __quark_sigaltstack(const void *ss, void *old);
 /* As the program starts: where the kernel enters it to run a handler. */
 void __quark_sig_start(void);

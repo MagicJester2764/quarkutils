@@ -354,6 +354,7 @@ pub const SYS_TICKS: u64 = 144;
 pub const SYS_BOOT_TIME: u64 = 145;
 pub const SYS_CLOCK: u64 = 149;
 pub const SYS_CLOCK_SET: u64 = 150;
+pub const SYS_PTIMER: u64 = 151;
 
 // --- 0xB0  sockets ---
 pub const SYS_SOCK_FD: u64 = 176;
@@ -1366,6 +1367,61 @@ pub fn sys_clock() -> u64 {
 /// It moves when somebody sets it ([`sys_clock_set`]).
 pub fn sys_clock_wall() -> u64 {
     unsafe { syscall1(SYS_CLOCK, 1) }
+}
+
+/// The clocks a program's timer is on: the date, and the time since boot.
+pub const PTIMER_DATE: u64 = 0;
+pub const PTIMER_SINCE_BOOT: u64 = 1;
+/// [`SigInfo::code`] for a timer's signal, whose `who` is the timer's
+/// number and, in the high half, its overruns.
+pub const SI_TIMER: i64 = -2;
+
+/// A timer of this program's on `clock` that raises `signo` (0 for none)
+/// carrying `value`, for the program or for its task `task` alone (0 for
+/// the program). Made disarmed. Its number.
+pub fn sys_ptimer_create(clock: u64, signo: u64, value: u64, task: usize) -> Result<usize, ()> {
+    match unsafe { syscall5(SYS_PTIMER, 0, clock, signo, value, task as u64) } {
+        u64::MAX => Err(()),
+        id => Ok(id as usize),
+    }
+}
+
+fn ptimer_set(id: u64, first: u64, every: u64) -> Result<(u64, u64), ()> {
+    let mut was = [0u64; 2];
+    match unsafe { syscall5(SYS_PTIMER, 1, id, first, every, was.as_mut_ptr() as u64) } {
+        u64::MAX => Err(()),
+        _ => Ok((was[0], was[1])),
+    }
+}
+
+/// Timer `id` first fires `first` from now and then every `every` (spans:
+/// ticks, or [`ns`]); a `first` of 0 disarms it. How it stood before, in
+/// nanoseconds: left, and between firings.
+pub fn sys_ptimer_set(id: usize, first: u64, every: u64) -> Result<(u64, u64), ()> {
+    ptimer_set(id as u64, first, every)
+}
+
+/// The same, first firing at `at`, a time on its clock in nanoseconds.
+pub fn sys_ptimer_set_at(id: usize, at: u64, every: u64) -> Result<(u64, u64), ()> {
+    ptimer_set(id as u64 | 1 << 32, at, every)
+}
+
+/// How timer `id` stands, in nanoseconds: left until it next fires (0 if it
+/// is disarmed), and between firings.
+pub fn sys_ptimer_get(id: usize) -> Result<(u64, u64), ()> {
+    let mut stands = [0u64; 2];
+    match unsafe { syscall3(SYS_PTIMER, 2, id as u64, stands.as_mut_ptr() as u64) } {
+        u64::MAX => Err(()),
+        _ => Ok((stands[0], stands[1])),
+    }
+}
+
+/// Timer `id` is no more.
+pub fn sys_ptimer_delete(id: usize) -> Result<(), ()> {
+    match unsafe { syscall2(SYS_PTIMER, 3, id as u64) } {
+        u64::MAX => Err(()),
+        _ => Ok(()),
+    }
 }
 
 /// Say what the date is: `nanos` nanoseconds since 1970, now. For a holder
@@ -2716,7 +2772,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 28;
+pub const ABI_VERSION_MINOR: u32 = 29;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
