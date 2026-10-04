@@ -319,6 +319,40 @@ static void unmap_pages(unsigned long at, unsigned long pages) {
     }
 }
 
+#define LX_MAP_FIXED           0x10
+#define LX_MAP_FIXED_NOREPLACE 0x100000
+
+/* Where a mapping goes, with the arena's lock held: where the program said,
+   for one it places itself, or else where the arena says. A dynamic loader
+   places itself every segment of a library after the first, inside the span
+   the first took, and that is what MAP_FIXED is for: whatever was in the
+   range goes, as on Linux — MAP_FIXED_NOREPLACE says it must have been
+   empty, and the kernel, which never maps over anything, says whether it
+   was. 0 for an address no mapping can be at. */
+static unsigned long place(unsigned long hint, unsigned long pages, long flags) {
+    if (!(flags & (LX_MAP_FIXED | LX_MAP_FIXED_NOREPLACE))) {
+        unsigned long at = arena_place(pages);
+        return at < MMAP_LIMIT && pages <= (MMAP_LIMIT - at) / PAGE_SIZE ? at : 0;
+    }
+    if ((hint & (PAGE_SIZE - 1)) || hint < QUARK_USER_MIN || pages > (QUARK_USER_END - hint) / PAGE_SIZE) {
+        return 0;
+    }
+    if (flags & LX_MAP_FIXED) {
+        unmap_pages(hint, pages);
+    }
+    return hint;
+}
+
+/* The arena after a mapping at `at`: past it, if it reaches beyond where the
+   next would go — and never back, since a mapping a program placed itself
+   may be below where the arena has got to. */
+static void placed(unsigned long at, unsigned long pages) {
+    unsigned long end = at + pages * PAGE_SIZE;
+    if (end > arena_next() && at < MMAP_LIMIT) {
+        mmap_next = end;
+    }
+}
+
 
 #ifdef QUARK_ABI_TRACE
 /* A porting aid, off unless asked for: an unimplemented call otherwise reaches
@@ -355,17 +389,17 @@ static void trace(const char *what, long n) {
    machine is refused unless MAP_NORESERVE says the program knows — calloc of
    a size nothing could hold has to come back NULL, not succeed and then die
    reading it. MAP_POPULATE asks for all of it now, which can be refused. */
-static long do_mmap(unsigned long len, long flags) {
+static long do_mmap(unsigned long hint, unsigned long len, long flags) {
     if (len == 0) {
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     __quark_lock(&arena_lock);
-    unsigned long at = arena_place(pages);
-    if (at >= MMAP_LIMIT || pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
+    unsigned long at = place(hint, pages, flags);
+    if (at == 0) {
         __quark_unlock(&arena_lock);
         trace("mmap-arena-full", (long)pages);
-        return -LX_ENOMEM;
+        return (flags & (LX_MAP_FIXED | LX_MAP_FIXED_NOREPLACE)) ? -LX_EINVAL : -LX_ENOMEM;
     }
     unsigned long how = (flags & LX_MAP_POPULATE) ? QUARK_MAP_POPULATE : 0;
     if (!(flags & LX_MAP_NORESERVE)) {
@@ -374,24 +408,24 @@ static long do_mmap(unsigned long len, long flags) {
     if (__syscall3(SYS_MAP_ANON, at, pages, how) == QUARK_ERR) {
         __quark_unlock(&arena_lock);
         trace("mmap-failed-pages", (long)pages);
-        return -LX_ENOMEM;
+        return (flags & LX_MAP_FIXED_NOREPLACE) ? -LX_EEXIST : -LX_ENOMEM;
     }
-    mmap_next = at + pages * PAGE_SIZE;
+    placed(at, pages);
     __quark_unlock(&arena_lock);
     return (long)at;
 }
 
 /* Map memory named by a descriptor, at an address of our choosing. */
-static long do_mmap_fd(long fd, unsigned long len) {
+static long do_mmap_fd(long fd, unsigned long hint, unsigned long len, long flags) {
     if (len == 0) {
         return -LX_EINVAL;
     }
     unsigned long pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     __quark_lock(&arena_lock);
-    unsigned long at = arena_place(pages);
-    if (at >= MMAP_LIMIT || pages > (MMAP_LIMIT - at) / PAGE_SIZE) {
+    unsigned long at = place(hint, pages, flags);
+    if (at == 0) {
         __quark_unlock(&arena_lock);
-        return -LX_ENOMEM;
+        return (flags & (LX_MAP_FIXED | LX_MAP_FIXED_NOREPLACE)) ? -LX_EINVAL : -LX_ENOMEM;
     }
     /* The whole region is mapped, whatever the caller asked to see of it --
        Quark has no partial mapping of a descriptor. The call says how much
@@ -404,7 +438,7 @@ static long do_mmap_fd(long fd, unsigned long len) {
         return -LX_ENODEV;
     }
     unsigned long real = (got + PAGE_SIZE - 1) / PAGE_SIZE;
-    mmap_next = at + (real > pages ? real : pages) * PAGE_SIZE;
+    placed(at, real > pages ? real : pages);
     __quark_unlock(&arena_lock);
     return (long)at;
 }
@@ -416,7 +450,7 @@ static long do_mmap_fd(long fd, unsigned long len) {
 /* A file, through the VFS: a memory object whose pages the server provides
    as they are touched. The capability it grants is only needed to make the
    mapping, which keeps the object; it goes straight after. */
-static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long off) {
+static long do_mmap_file(long fd, unsigned long hint, unsigned long len, long prot, long flags, long off) {
     if (len == 0 || off < 0 || (off & (PAGE_SIZE - 1))) {
         return -LX_EINVAL;
     }
@@ -433,17 +467,23 @@ static long do_mmap_file(long fd, unsigned long len, long prot, long flags, long
     unsigned long how = (write ? QUARK_OBJECT_WRITE : 0) | (shared ? QUARK_OBJECT_SHARED : 0) |
                         ((prot & LX_PROT_EXEC) ? QUARK_OBJECT_EXEC : 0);
     __quark_lock(&arena_lock);
-    unsigned long at = arena_place(pages);
+    unsigned long at = place(hint, pages, flags);
     unsigned long r = QUARK_ERR;
-    if (at < MMAP_LIMIT && pages <= (MMAP_LIMIT - at) / PAGE_SIZE) {
+    if (at != 0) {
         r = __syscall5(SYS_OBJECT_MAP, slot, at, pages, (unsigned long)off / PAGE_SIZE, how);
     }
     if (r != QUARK_ERR) {
-        mmap_next = at + pages * PAGE_SIZE;
+        placed(at, pages);
     }
     __quark_unlock(&arena_lock);
     __syscall1(SYS_CAP_DELETE, slot);
-    return r == QUARK_ERR ? -LX_ENOMEM : (long)at;
+    if (r != QUARK_ERR) {
+        return (long)at;
+    }
+    if (at == 0) {
+        return (flags & (LX_MAP_FIXED | LX_MAP_FIXED_NOREPLACE)) ? -LX_EINVAL : -LX_ENOMEM;
+    }
+    return (flags & LX_MAP_FIXED_NOREPLACE) ? -LX_EEXIST : -LX_ENOMEM;
 }
 
 static long do_munmap(unsigned long at, unsigned long len) {
@@ -928,12 +968,12 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
            mappings come out of.
            A mapping of a file is a memory object the VFS pages, below. */
         if (a5 >= 0 && __quark_fd_is_file(a5)) {
-            return do_mmap_file(a5, (unsigned long)a2, a3, a4, a6);
+            return do_mmap_file(a5, (unsigned long)a1, (unsigned long)a2, a3, a4, a6);
         }
         if (a5 != -1L) {
-            return do_mmap_fd(a5, (unsigned long)a2);
+            return do_mmap_fd(a5, (unsigned long)a1, (unsigned long)a2, a4);
         }
-        return do_mmap((unsigned long)a2, a4);
+        return do_mmap((unsigned long)a1, (unsigned long)a2, a4);
 
     case LX_munmap:
         return do_munmap((unsigned long)a1, (unsigned long)a2);

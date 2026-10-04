@@ -349,7 +349,10 @@ gigabytes never crosses a multiple of two gigabytes: pixman's stress test
 turns bit 31 of an image's address over, adds to it and turns it back,
 which is the address only while the image does not. A program's code is where it was
 linked: nothing is built to be loaded anywhere (PIE), and `dlopen` has
-nothing to load.
+nothing to load. `mmap` with an address and `MAP_FIXED` puts the mapping
+there, over whatever was; `MAP_FIXED_NOREPLACE` is refused (`EEXIST`) where
+something is, and an address below where programs live (512 GiB) is refused.
+An address asked for without either is still only a hint, and ignored.
 
 ## What is refused
 

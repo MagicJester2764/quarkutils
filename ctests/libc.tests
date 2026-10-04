@@ -3,6 +3,7 @@
 tlstest
 ctortest
 mmaptest
+fixedtest
 filetest
 dirtest
 threadfile
