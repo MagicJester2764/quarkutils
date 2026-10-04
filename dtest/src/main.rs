@@ -3207,6 +3207,16 @@ fn test_endpoint_objects() {
     }
     // Minting for yourself is ownership; minting for a stranger is not.
     check("a task may mint a capability to itself", mint_endpoint(SELF_SLOT, me));
+    // Nor is this a holder of one for init, which anybody may call who looks
+    // its name up — as the services' checks do, before these. What that
+    // handed over goes, or the check below is of a holder, which may.
+    if let Some(number) = syscall::sys_task_number(INIT_TID) {
+        for slot in 0..64 {
+            if syscall::sys_cap_read(me, slot).is_ok_and(|c| c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.param0 == number) {
+                let _ = syscall::sys_cap_delete(slot);
+            }
+        }
+    }
     check(
         "but not to a task it did not make and cannot call",
         !mint_endpoint(STRANGER_SLOT, INIT_TID),
