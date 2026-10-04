@@ -47,7 +47,7 @@ BOOT_SERVICES := nameserver:NAMESRVR keyboard:KEYBOARD qtty:QTTY \
                  auth:AUTH devmgr:DEVMGR virtblk:VIRTBLK ahci:AHCI \
                  nvme:NVME usb:USB rtl8139:RTL8139 virtnet:VIRTNET \
                  e1000:E1000 \
-                 virtgpu:VIRTGPU
+                 virtgpu:VIRTGPU hda:HDA sound:SOUND
 USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  login:LOGIN getty:GETTY ps:PS ipcping:IPCPING ping:PING \
                  shutdown:SHUTDOWN dtest:DTEST dchild:DCHILD qfuzz:QFUZZ \
@@ -58,14 +58,16 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  vfs:VFS mount:MOUNT umount:UMOUNT su:SU passwd:PASSWD \
                  useradd:USERADD userdel:USERDEL groupadd:GROUPADD \
                  gpasswd:GPASSWD id:ID date:DATE swapd:SWAPD \
-                 free:FREE lspci:LSPCI lsusb:LSUSB fbmode:FBMODE
+                 free:FREE lspci:LSPCI lsusb:LSUSB fbmode:FBMODE \
+                 play:PLAY mixer:MIXER
 
 # Drivers for devices nothing needs while the system starts: the device
 # manager reads them from /usr/lib/drivers and starts each for the devices it
 # says it drives. A device's driver that the root is on goes in BOOT_SERVICES,
 # and so does a network card's, so that the network is up — and has said so
-# on the console — before anybody is asked to log in, and a USB controller's,
-# whose keyboard may be the only one there is.
+# on the console — before anybody is asked to log in, a USB controller's,
+# whose keyboard may be the only one there is, and a sound card's, which the
+# mixer (`sound`, started with the network) claims as soon as it is there.
 DRIVERS       := edu:EDU
 
 # Programs written in C, built against libc/.

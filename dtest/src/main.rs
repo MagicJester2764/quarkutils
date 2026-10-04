@@ -5949,6 +5949,91 @@ fn test_display() {
 /// on it, and no i8042: that anything was typed at all is the keyboard's
 /// check. What is asked here is that the controller is driven, what is
 /// plugged in is driven as what it is, and that the disk is a disk.
+/// Sound: the mixer's streams and what they say, and on a machine with a
+/// card, that the card plays at its rate and a stream is played at its.
+fn test_sound() {
+    use quark_rt::ipc::Message;
+    use quark_rt::sound::{self, Stream};
+    println!("sound:");
+    let Some(server) = nameserver::lookup(b"sound") else {
+        println!("  (no sound server; nothing to ask)");
+        return;
+    };
+    let first = Stream::open(48_000, 2);
+    if nameserver::lookup(b"pcm0").is_none() {
+        check("with no card, a stream is refused", first.is_err());
+        return;
+    }
+    let Ok(s) = first else {
+        check("a stream is had at the card's own rate", false);
+        return;
+    };
+    check("a stream is had at the card's own rate", true);
+    check("and at another, of one channel", Stream::open(44_100, 1).is_ok());
+    check("not at a rate it cannot have", Stream::open(4_000, 2).is_err() && Stream::open(192_000, 2).is_err());
+    check("nor of three channels", Stream::open(48_000, 3).is_err());
+    let raw = |tag: u64, data: [u64; 6]| {
+        let msg = Message { sender: 0, tag, data };
+        let mut reply = Message::empty();
+        syscall::sys_call(server, &msg, &mut reply).is_ok() && reply.tag == 0
+    };
+    check("nor of eight-bit samples", !raw(sound::TAG_OPEN, [48_000, 2, 8, 0, 0, 0]));
+    {
+        let more = [Stream::open(48_000, 2), Stream::open(48_000, 2), Stream::open(48_000, 2)];
+        check(
+            "four a program, and no more",
+            more.iter().all(|m| m.is_ok()) && Stream::open(48_000, 2).is_err(),
+        );
+    }
+
+    // A tenth of a second of silence: taken, and waiting or mixed.
+    let silence = [0u8; 19200];
+    check("what is written is taken", s.write(&silence) == silence.len());
+    check(
+        "and is waiting to be mixed, or has been",
+        s.status().is_some_and(|st| st.waiting + st.played == 4800),
+    );
+    check("and is mixed, all of it, before long", s.drain() && s.status().is_some_and(|st| st.waiting == 0 && st.played == 4800));
+
+    // A stream keeps a third of a second or so, and takes the rest as it
+    // is played: a second of it, written whole, takes most of a second —
+    // by the card's own clock, which plays 48,000 frames a second while
+    // there is something to play, give or take a tenth.
+    let mut taken = 0;
+    for _ in 0..8 {
+        taken += s.write(&silence);
+    }
+    check("a stream takes no more than it keeps", taken > 0 && taken < 8 * silence.len());
+    let (Some(a), began) = (s.status(), syscall::sys_clock()) else {
+        check("the card says how much it has played", false);
+        return;
+    };
+    let mut all = true;
+    for _ in 0..10 {
+        all &= s.write_all(&silence);
+    }
+    let (Some(b), ended) = (s.status(), syscall::sys_clock()) else {
+        check("the card says how much it has played", false);
+        return;
+    };
+    let took = ended - began;
+    check("and takes the rest as it is played", all && took > 500_000_000 && took < 3_000_000_000);
+    let rate = (b.card - a.card) * 1_000_000_000 / took.max(1);
+    if !(43_200..=52_800).contains(&rate) {
+        println!("  (the card played {} frames a second)", rate);
+    }
+    check("the card plays 48,000 frames a second", (43_200..=52_800).contains(&rate));
+    check("drained, nothing waits", s.drain() && s.status().is_some_and(|st| st.waiting == 0));
+
+    check("a stream's volume is its own to set", s.set_volume(50) == Some(50));
+    check("but not past a hundred", s.set_volume(101).is_none());
+    check("and the mix's can be asked", sound::volume(None).is_some_and(|v| v <= 100));
+    let id = s.id();
+    drop(s);
+    check("a stream closed is no stream", !raw(sound::TAG_STATUS, [id, 0, 0, 0, 0, 0]));
+    check("nor is one never opened", !raw(sound::TAG_STATUS, [0xFFFF_FF00, 0, 0, 0, 0, 0]));
+}
+
 fn test_usb() {
     use quark_rt::{block, devices, usb};
     println!("usb:");
@@ -8367,6 +8452,7 @@ pub extern "C" fn _start() -> ! {
         ("devices", test_devices),
         ("usb", test_usb),
         ("display", test_display),
+        ("sound", test_sound),
         ("layout", test_layout),
         ("clock", test_clock),
         ("power", test_power),

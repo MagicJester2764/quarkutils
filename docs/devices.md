@@ -168,6 +168,20 @@ mouse that does not speak the boot protocol — a tablet's absolute pointer,
 which needs its report descriptor read — more than one unit of a disk, a disk
 whose blocks are not 512 bytes, and anything isochronous (sound, cameras).
 
+## Sound
+
+Intel's HD audio (`hda`) is a controller with codecs behind it, which it
+talks to through two rings in memory — commands out and answers back —
+and a stream, a list of buffers it plays round and round, saying when it
+has finished each. The driver asks the first codec for its audio function,
+takes the pin that can play and is connected to something — a speaker
+first, then line out, then headphones — finds a way back from it to a
+converter through mixers and selectors, turns each widget on the way on
+and its amplifiers to no gain, and plays one stream of four periods
+through it, sixteen-bit stereo at 48 kHz, which the mixer (`sound`)
+fills. Not done: recording, more than one pin at once, a jack's being
+plugged into, and the codec's own volume.
+
 ## Asking what is there
 
 The device manager registers as `devices` and answers anybody:

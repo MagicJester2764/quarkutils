@@ -981,6 +981,37 @@ was ready over the login prompt.
   sees to anything else the kernel says meanwhile: a client's death taken
   there and dropped would leave its connections for ever.
 
+## Sound
+
+`sound` is the mixer, and holds no device. Under it is a sound card's
+driver, which serves `quark_rt::pcm` and registers as the first of `pcm0`
+to `pcm7` nobody has: `hda` so far, Intel's HD audio, which plays one
+stream out of the first codec's first pin that can play. A program opens a
+stream of its own — any rate from 8 to 96 kHz, one channel or two, sixteen
+bits — and writes to it (`quark_rt::sound`; `play` and `mixer` are the
+programs). The mixer keeps a third of a second of each stream, and mixes a
+period out of all of them, resampled to the card's 48 kHz, whenever the
+card has room for one.
+
+- **Nothing waits on anybody.** A write takes what fits and says how much;
+  a program told "full" is notified when there is room, and `write_all`
+  waits for that notice or a tenth of a second. The card notifies the mixer
+  when it has played a period (`pcm::PLAYED`) and the mixer writes until
+  the card says it is full. A mixer that waited on a program would be
+  every program's sound stopping for one; a card that waited on the mixer,
+  sound that stuttered for nothing.
+- **A card answers its claimant and nobody else**, and the mixer claims it
+  first: it looks for `pcm0` every second for the minute after it starts,
+  and when a stream is opened. `qfuzz` checks the card refuses anybody else.
+- **A card plays only while it has something to.** After a turn of its
+  ring with nothing written it stops, and the next write starts it again
+  from its first period; so a machine with nothing to say takes no
+  interrupts for it, and QEMU's recording (`AUDIO=1` in ExplOSion) holds
+  what was played and nothing else.
+- **A stream is its program's.** It is named by its slot and the opening it
+  was, so a closed one's id names nothing; it is refused to every other
+  program, and goes when its program does. Four a program.
+
 ## Disks
 
 A disk driver serves *volumes* (`quark_rt::block`): volume 0 is the whole

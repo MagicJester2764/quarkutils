@@ -73,6 +73,8 @@ enum Kind {
     Devices,
     Card,
     Usb,
+    Sound,
+    Pcm,
 }
 
 struct Target {
@@ -127,7 +129,16 @@ const TARGETS: &[Target] = &[
     // A USB controller's driver, where there is one. It answers anybody what
     // is plugged in, and keys and movement to `input` alone.
     Target { name: b"usb0", kind: Kind::Usb, tags: &[0, 1, 2, 3, 4, 5, 6, 7] },
+    // The mixer, which anybody may open a stream of and write to; and the
+    // volume of the whole mix, which anybody may set — and which is set back
+    // afterwards to what it was.
+    Target { name: b"sound", kind: Kind::Sound, tags: &[0, 1, 2, 3, 4, 5] },
+    // A sound card's driver, which answers the mixer and nobody else.
+    Target { name: b"pcm0", kind: Kind::Pcm, tags: &[0, 1, 2, 3] },
 ];
+
+/// The volume of the whole mix, before.
+static mut VOLUME_BEFORE: Option<u64> = None;
 
 /// Whether what the USB controller's driver said was plugged in, before.
 static mut USB_BEFORE: bool = false;
@@ -544,6 +555,11 @@ fn job(kind: Kind, tid: usize, net_before: NetBefore) -> Result<(), Problem> {
             fail("stopped saying what is plugged in", unsafe { USB_BEFORE } && quark_rt::usb::device(tid, 0).is_none())?;
             fail("gave keys to a program that is not input", !refused(tid, 5))
         }
+        Kind::Sound => {
+            fail("no longer says the mix's volume", quark_rt::sound::volume(None).is_none())?;
+            fail("refuses to set it back", unsafe { VOLUME_BEFORE }.is_some_and(|v| quark_rt::sound::volume(Some(v)) != Some(v)))
+        }
+        Kind::Pcm => fail("answers a program that has not claimed it", !refused(tid, quark_rt::pcm::TAG_POSITION)),
     }
 }
 
@@ -648,7 +664,7 @@ fn report(t: &Target, outcome: &Outcome) {
 fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     let Some(tid) = nameserver::lookup(t.name) else {
         // A USB controller, and an i8042, are not on every machine.
-        let optional = matches!(t.kind, Kind::Usb | Kind::Keyboard);
+        let optional = matches!(t.kind, Kind::Usb | Kind::Keyboard | Kind::Pcm | Kind::Sound);
         return if optional { Outcome::Absent } else { Outcome::Skipped("not registered") };
     };
     // Refusing a harmless request is what makes the rest safe to send.
@@ -656,6 +672,7 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
         Kind::Disk => refused(tid, 2),
         Kind::Keyboard => refused(tid, 5),
         Kind::Card => refused(tid, quark_rt::nic::TAG_RECEIVE),
+        Kind::Pcm => refused(tid, quark_rt::pcm::TAG_POSITION),
         _ => true,
     };
     if !probe {
@@ -687,6 +704,9 @@ fn run(rng: &mut Rng, t: &Target, rounds: u32) -> Outcome {
     }
     if t.kind == Kind::Usb {
         unsafe { USB_BEFORE = quark_rt::usb::device(tid, 0).is_some() };
+    }
+    if t.kind == Kind::Sound {
+        unsafe { VOLUME_BEFORE = quark_rt::sound::volume(None) };
     }
     if t.kind == Kind::Net && !net_before.pinged {
         println!("  note  net: 10.0.2.2 does not answer pings here, so that is not checked");
