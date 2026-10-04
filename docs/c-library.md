@@ -312,6 +312,19 @@ does on Linux. What is different is at the edges:
   whose last name goes is told `IN_DELETE_SELF` and `IN_IGNORED` at once,
   not when its last descriptor closes; and an instance has room for 4096
   bytes of events, after which it says `IN_Q_OVERFLOW` once.
+- **epoll is the kernel's set**, and watches what `poll` can: pipes,
+  streams and sockets of the local family, terminals, timers, counters,
+  signal and inotify descriptors, and other sets — one is readable while a
+  wait on it would report something, four deep at most, and one that would
+  watch itself through another is `ELOOP`. `EPOLLET` is kept: a watch is
+  reported when something has come since it was last looked at, which can
+  be more often than Linux says it (a read of a pipe is something having
+  happened to it) and never less. So is `EPOLLONESHOT`, until
+  `EPOLL_CTL_MOD`, and `EPOLLRDHUP`, said with `EPOLLHUP` when the other
+  end has gone. A file and memory are `EPERM`, as on Linux, the set itself
+  `EINVAL`, a watch twice `EEXIST` and what is not watched `ENOENT`. A set
+  watches 32 descriptors, and there are 64 sets in the machine, a `poll`
+  that is waiting holding one of them.
 
 ## Terminals
 
@@ -453,7 +466,7 @@ A call the layer has no answer for returns `ENOSYS`, on purpose: a C library
 told "no" copes, and one handed a made-up answer fails somewhere unrelated
 and much later. The ones a ported program is most likely to meet:
 `set_robust_list`, `rseq`, `statx` (musl falls back to
-`fstatat`), and `epoll_wait` on anything but the descriptors the layer can
+`fstatat`), and `epoll_wait` on anything but the descriptors the kernel can
 poll.
 
 `socket` of any family but the local one answers `EAFNOSUPPORT`, which is

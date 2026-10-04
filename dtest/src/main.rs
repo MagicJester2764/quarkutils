@@ -1360,6 +1360,104 @@ fn test_no_leak() {
     }
 }
 
+/// Edges, one-shots and sets in sets: what epoll asks of a set.
+fn test_pollset_edges() {
+    use syscall::PollRefused;
+    println!("edges, one-shots and sets in sets:");
+    let pairs = [syscall::sys_socketpair(), syscall::sys_socketpair(), syscall::sys_socketpair()];
+    let (Ok((a, b)), Ok((c, d)), Ok((e, f))) = (pairs[0], pairs[1], pairs[2]) else {
+        check("three pairs to watch", false);
+        return;
+    };
+    let (Ok(set), Ok(inner)) = (syscall::sys_pollset_create(), syscall::sys_pollset_create()) else {
+        check("two sets", false);
+        return;
+    };
+    let mut ready = [syscall::Ready::empty(); 4];
+    let mut buf = [0u8; 8];
+    let wait = |set: usize, ready: &mut [syscall::Ready]| syscall::sys_pollset_wait(set, ready, syscall::ns(2_000_000));
+
+    // An edge: told when something came, once.
+    check(
+        "an edge is watched",
+        syscall::sys_pollset_add(set, b, syscall::POLL_READABLE | syscall::POLL_EDGE, 1).is_ok(),
+    );
+    check("with nothing come, it is not reported", wait(set, &mut ready) == Ok(0));
+    let _ = syscall::sys_fd_write(a, b"x");
+    check("something comes: it is reported", wait(set, &mut ready) == Ok(1) && ready[0].token == 1);
+    check("and not again while nothing more comes, though it is unread", wait(set, &mut ready) == Ok(0));
+    let _ = syscall::sys_fd_write(a, b"y");
+    check("more comes: it is reported again", wait(set, &mut ready) == Ok(1) && ready[0].token == 1);
+    let _ = syscall::sys_fd_read(b, &mut buf);
+
+    // A one-shot: told once, until it is modified.
+    let once = syscall::POLL_READABLE | syscall::POLL_ONCE;
+    check("a one-shot is watched", syscall::sys_pollset_add(set, d, once, 2).is_ok());
+    let _ = syscall::sys_fd_write(c, b"x");
+    check("it is reported", wait(set, &mut ready) == Ok(1) && ready[0].token == 2);
+    let _ = syscall::sys_fd_write(c, b"y");
+    check("and then not, whatever comes", wait(set, &mut ready) == Ok(0));
+    check(
+        "until it is modified",
+        syscall::sys_pollset_modify(set, d, once, 2).is_ok() && wait(set, &mut ready) == Ok(1) && ready[0].token == 2,
+    );
+    let _ = syscall::sys_fd_read(d, &mut buf);
+
+    // A set in a set.
+    check("a set watches a pair", syscall::sys_pollset_add(inner, f, syscall::POLL_READABLE, 9).is_ok());
+    check("and a set watches that set", syscall::sys_pollset_add(set, inner, syscall::POLL_READABLE, 3).is_ok());
+    check("which is not ready while nothing in it is", wait(set, &mut ready) == Ok(0));
+    let _ = syscall::sys_fd_write(e, b"x");
+    check("and is once something in it is", wait(set, &mut ready) == Ok(1) && ready[0].token == 3);
+    let mut p = [syscall::PollFd::new(inner, syscall::POLL_READABLE)];
+    check("a poll says so too", syscall::sys_poll(&mut p, 0) == Ok(1));
+    check("and the set inside says what", wait(inner, &mut ready) == Ok(1) && ready[0].token == 9);
+    let _ = syscall::sys_fd_read(f, &mut buf);
+
+    // What is refused, and why.
+    check(
+        "a set that would lead back is refused",
+        syscall::sys_pollset_ctl(inner, 0, set, syscall::POLL_READABLE, 4) == Err(PollRefused::Loop),
+    );
+    check(
+        "and so is the set itself",
+        syscall::sys_pollset_ctl(set, 0, set, syscall::POLL_READABLE, 4) == Err(PollRefused::NotOne),
+    );
+    check(
+        "what is watched already says so",
+        syscall::sys_pollset_ctl(set, 0, b, syscall::POLL_READABLE, 1) == Err(PollRefused::Exists),
+    );
+    check(
+        "what is not watched says so",
+        syscall::sys_pollset_ctl(set, 2, a, 0, 0) == Err(PollRefused::Absent),
+    );
+    if let Ok(memory) = syscall::sys_memfd_create(1) {
+        check(
+            "memory can never be ready",
+            syscall::sys_pollset_ctl(set, 0, memory, syscall::POLL_READABLE, 5) == Err(PollRefused::Cannot),
+        );
+        let _ = syscall::sys_fd_close(memory);
+    }
+
+    // The other end gone, said beside a hangup to a watch that asked.
+    check(
+        "asked to be told the other end has gone",
+        syscall::sys_pollset_modify(set, b, syscall::POLL_READABLE | syscall::POLL_PEER_GONE, 1).is_ok(),
+    );
+    let _ = syscall::sys_fd_close(a);
+    let n = wait(set, &mut ready);
+    check(
+        "it is",
+        n == Ok(1)
+            && ready[0].token == 1
+            && ready[0].events & syscall::POLL_HANGUP != 0
+            && ready[0].events & syscall::POLL_PEER_GONE != 0,
+    );
+    for fd in [b, c, d, e, f, inner, set] {
+        let _ = syscall::sys_fd_close(fd);
+    }
+}
+
 fn test_pollset() {
     println!("waiting on a set:");
     let (a, b) = match syscall::sys_socketpair() {
@@ -9368,6 +9466,7 @@ pub extern "C" fn _start() -> ! {
         ("ready", test_served_ready),
         ("leak", test_no_leak),
         ("pollset", test_pollset),
+        ("edges", test_pollset_edges),
         ("wake", test_wake_latency),
         ("poll", test_poll),
         ("environment", test_environment),

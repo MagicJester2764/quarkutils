@@ -881,10 +881,18 @@ long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *un
     return (long)n;
 }
 
-long __quark_epoll_create(void) {
+#define LX_EPOLL_CLOEXEC 02000000
+
+long __quark_epoll_create(long flags) {
+    if (flags & ~(long)LX_EPOLL_CLOEXEC) {
+        return -LX_EINVAL;
+    }
     unsigned long fd = __syscall0(SYS_POLLSET_CREATE);
     if (fd == QUARK_ERR) {
         return -LX_EMFILE;
+    }
+    if (flags & LX_EPOLL_CLOEXEC) {
+        __syscall3(SYS_FD_FLAGS, fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
     }
     return (long)fd;
 }
@@ -900,6 +908,23 @@ struct lx_epoll_event {
 #define LX_EPOLL_CTL_DEL 2
 #define LX_EPOLL_CTL_MOD 3
 
+/* epoll's own bits, beside poll's. */
+#define LX_EPOLLRDNORM    0x040
+#define LX_EPOLLWRNORM    0x100
+#define LX_EPOLLRDHUP     0x2000
+#define LX_EPOLLEXCLUSIVE (1u << 28)
+#define LX_EPOLLONESHOT   (1u << 30)
+#define LX_EPOLLET        (1u << 31)
+
+/* Whether a descriptor is there: its flags can be read. */
+static int is_there(long fd) {
+    return fd >= 0 && __syscall3(SYS_FD_FLAGS, (unsigned long)fd, QUARK_FD_GETFLAGS, 0) != QUARK_ERR;
+}
+
+/* The kernel's set is epoll's: edge-triggered and one-shot watches, a set
+   watched by a set, and why it would not, as Linux says it. A file answers
+   at once whichever way it is asked, and Linux will not watch one: EPERM,
+   as for memory the kernel refuses. */
 long __quark_epoll_ctl(long epfd, long op, long fd, void *event) {
     struct lx_epoll_event *e = event;
     unsigned long qop;
@@ -909,6 +934,12 @@ long __quark_epoll_ctl(long epfd, long op, long fd, void *event) {
     case LX_EPOLL_CTL_DEL: qop = 2; break;
     default: return -LX_EINVAL;
     }
+    if (!is_there(epfd) || !is_there(fd)) {
+        return -LX_EBADF;
+    }
+    if (__quark_fd_is_file(fd)) {
+        return -LX_EPERM;
+    }
 
     unsigned long events = 0;
     unsigned long token = 0;
@@ -916,18 +947,39 @@ long __quark_epoll_ctl(long epfd, long op, long fd, void *event) {
         if (!e) {
             return -LX_EFAULT;
         }
-        if (e->events & LX_POLLIN) {
+        unsigned int ev = e->events;
+        if ((ev & LX_EPOLLEXCLUSIVE) && qop == 1) {
+            return -LX_EINVAL;
+        }
+        if (ev & (LX_POLLIN | LX_EPOLLRDNORM)) {
             events |= QW_READABLE;
         }
-        if (e->events & LX_POLLOUT) {
+        if (ev & (LX_POLLOUT | LX_EPOLLWRNORM)) {
             events |= QW_WRITABLE;
+        }
+        if (ev & LX_EPOLLRDHUP) {
+            events |= QUARK_POLL_PEER_GONE;
+        }
+        if (ev & LX_EPOLLET) {
+            events |= QUARK_POLL_EDGE;
+        }
+        if (ev & LX_EPOLLONESHOT) {
+            events |= QUARK_POLL_ONCE;
         }
         token = (unsigned long)e->data;
     }
 
-    unsigned long r = __syscall5(SYS_POLLSET_CTL, (unsigned long)epfd, qop,
+    unsigned long r = __syscall5(SYS_POLLSET_CTL, (unsigned long)epfd, qop | QUARK_POLLSET_WHY,
                                  (unsigned long)fd, events, token);
-    return r == QUARK_ERR ? -LX_EINVAL : 0;
+    switch (r) {
+    case 0:                    return 0;
+    case QUARK_POLLSET_EXISTS: return -LX_EEXIST;
+    case QUARK_POLLSET_ABSENT: return -LX_ENOENT;
+    case QUARK_POLLSET_CANNOT: return -LX_EPERM;
+    case QUARK_POLLSET_LOOP:   return -LX_ELOOP;
+    case QUARK_POLLSET_FULL:   return -LX_ENOSPC;
+    default:                   return -LX_EINVAL;
+    }
 }
 
 struct qw_ready {
@@ -978,6 +1030,9 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns
         }
         if (ready[i].events & QW_HANGUP) {
             ev |= LX_POLLHUP;
+        }
+        if (ready[i].events & QUARK_POLL_PEER_GONE) {
+            ev |= LX_EPOLLRDHUP;
         }
         out[i].events = ev;
         out[i].data = ready[i].token;

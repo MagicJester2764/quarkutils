@@ -307,6 +307,20 @@
    never held back — set to say it is one. */
 #define QUARK_POLL_UNDER       1UL
 #define QUARK_POLLSET_UNDER    (1UL << 8)
+/* SYS_POLLSET_CTL: op | QUARK_POLLSET_WHY says why it refused, as one of the
+   QUARK_POLLSET_* reasons; and a watch's events besides 1 readable and 2
+   writable — the other end gone, said beside a hangup; an edge; a
+   one-shot. */
+#define QUARK_POLLSET_WHY      (1UL << 8)
+#define QUARK_POLLSET_NOT_ONE  1UL
+#define QUARK_POLLSET_EXISTS   2UL
+#define QUARK_POLLSET_ABSENT   3UL
+#define QUARK_POLLSET_CANNOT   4UL
+#define QUARK_POLLSET_LOOP     5UL
+#define QUARK_POLLSET_FULL     6UL
+#define QUARK_POLL_PEER_GONE   0x10UL
+#define QUARK_POLL_EDGE        (1UL << 16)
+#define QUARK_POLL_ONCE        (1UL << 17)
 
 /* The system call wrappers.
  *

@@ -226,7 +226,7 @@ long __quark_recvmsg(long fd, void *msg, long flags);
    `poll` and `epoll_wait` say milliseconds, `ppoll` and `pselect` a
    timespec, and the kernel keeps what any of them says to the nanosecond. */
 long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *under);
-long __quark_epoll_create(void);
+long __quark_epoll_create(long flags);
 long __quark_epoll_ctl(long epfd, long op, long fd, void *event);
 long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns,
                         const unsigned long *under);

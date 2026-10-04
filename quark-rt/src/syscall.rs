@@ -94,6 +94,13 @@ pub const POLL_HANGUP: u32 = 4;
 /// A descriptor that cannot be waited on. Reported by [`sys_poll`] in
 /// `revents`; [`sys_pollset_add`] refuses such a descriptor outright instead.
 pub const POLL_INVALID: u32 = 8;
+/// Asked for beside readable, said beside a hangup: the other end has gone.
+pub const POLL_PEER_GONE: u32 = 0x10;
+/// In a set's watch: reported when what it watches has been noted since it
+/// was last looked at, and is ready then (epoll's EPOLLET).
+pub const POLL_EDGE: u32 = 1 << 16;
+/// In a set's watch: reported once, and then not until it is modified.
+pub const POLL_ONCE: u32 = 1 << 17;
 
 // --- 0x50  capabilities ---
 pub const SYS_CAP_MINT: u64 = 80;
@@ -1605,6 +1612,38 @@ pub fn sys_pollset_remove(set: usize, fd: usize) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// Why a set would not add, modify or remove a watch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PollRefused {
+    /// Not a set of this program's, or the set itself to be watched.
+    NotOne,
+    /// Watched already.
+    Exists,
+    /// Not watched.
+    Absent,
+    /// Can never be ready.
+    Cannot,
+    /// A set that leads back to this one, or a chain too deep.
+    Loop,
+    /// The set is full.
+    Full,
+}
+
+/// [`sys_pollset_add`] (op 0), [`sys_pollset_modify`] (1) or
+/// [`sys_pollset_remove`] (2), told why not.
+pub fn sys_pollset_ctl(set: usize, op: u64, fd: usize, events: u32, token: u64) -> Result<(), PollRefused> {
+    let ret = unsafe { syscall5(SYS_POLLSET_CTL, set as u64, op | 1 << 8, fd as u64, events as u64, token) };
+    match ret {
+        0 => Ok(()),
+        2 => Err(PollRefused::Exists),
+        3 => Err(PollRefused::Absent),
+        4 => Err(PollRefused::Cannot),
+        5 => Err(PollRefused::Loop),
+        6 => Err(PollRefused::Full),
+        _ => Err(PollRefused::NotOne),
+    }
+}
+
 /// Wait until something in the set is ready, or `timeout` passes: a span,
 /// ticks or nanoseconds from [`ns`].
 ///
@@ -2944,7 +2983,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 32;
+pub const ABI_VERSION_MINOR: u32 = 33;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

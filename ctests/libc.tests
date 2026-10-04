@@ -49,3 +49,4 @@ ptimertest
 signalfdtest
 unixtest
 inotifytest
+epolltest

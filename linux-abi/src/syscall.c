@@ -2092,7 +2092,7 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_epoll_pwait:
         return __quark_epoll_wait(a1, (void *)a2, a3, wait_ms((int)a4), (const unsigned long *)a5);
     case LX_epoll_create1:
-        return __quark_epoll_create();
+        return __quark_epoll_create(a1);
     case LX_epoll_ctl:
         return __quark_epoll_ctl(a1, a2, a3, (void *)a4);
     case LX_epoll_wait:
