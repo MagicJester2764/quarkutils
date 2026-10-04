@@ -3652,6 +3652,188 @@ fn test_tmpfs() {
     let _ = vfs::rmdir(vfs_tid, at);
 }
 
+/// `/proc`, as the root's file server keeps it: what a program can read of
+/// itself, of another program and of the machine, and that a spawner says
+/// what it started.
+fn test_proc() {
+    println!("proc:");
+    let Some(vfs_tid) = nameserver::lookup(b"vfs") else {
+        check("find the file server", false);
+        return;
+    };
+    // The whole of a file there, into `out`: how long it is.
+    let slurp = |path: &[u8], out: &mut [u8]| -> Option<usize> {
+        let o = vfs::open_with(vfs_tid, path, 0).ok()?;
+        let mut n = 0;
+        while n < out.len() {
+            match vfs::read(vfs_tid, o.handle, &mut out[n..], n as u32) {
+                Ok(0) => break,
+                Ok(got) => n += got as usize,
+                Err(_) => break,
+            }
+        }
+        let _ = vfs::close(vfs_tid, o.handle);
+        Some(n)
+    };
+    let has = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
+    // `/proc/PID/NAME` into `out`.
+    let path_for = |pid: u64, name: &[u8], out: &mut [u8; 64]| -> usize {
+        let mut digits = [0u8; 20];
+        let d = decimal(pid as usize, &mut digits);
+        let mut n = 0;
+        for part in [&b"/proc/"[..], d, b"/", name] {
+            out[n..n + part.len()].copy_from_slice(part);
+            n += part.len();
+        }
+        n
+    };
+    let me = syscall::sys_pid_self();
+    let mut digits = [0u8; 20];
+    let mine = decimal(me as usize, &mut digits);
+    let mut link = [0u8; 32];
+    check(
+        "/proc/self is a link to this program's process id",
+        vfs::readlink(vfs_tid, b"/proc/self", &mut link).is_ok_and(|n| &link[..n] == mine),
+    );
+    let mut text = [0u8; 8192];
+    check(
+        "its cmdline is what it was started as, each argument ended by a nought",
+        slurp(b"/proc/self/cmdline", &mut text).is_some_and(|n| {
+            n > 0 && text[n - 1] == 0 && text[..n].split(|&b| b == 0).next().is_some_and(|first| first.ends_with(b"dtest"))
+        }),
+    );
+    check(
+        "its comm is its name",
+        slurp(b"/proc/self/comm", &mut text).is_some_and(|n| &text[..n] == b"dtest\n"),
+    );
+    let mut path = [0u8; 64];
+    let len = path_for(me, b"status", &mut path);
+    let mut line = [0u8; 40];
+    let pid_line = {
+        let mut n = 0;
+        for part in [&b"\nPid:\t"[..], mine, b"\n"] {
+            line[n..n + part.len()].copy_from_slice(part);
+            n += part.len();
+        }
+        &line[..n]
+    };
+    check(
+        "by its process id, its status says its name and that process id",
+        slurp(&path[..len], &mut text).is_some_and(|n| text[..n].starts_with(b"Name:\tdtest\n") && has(&text[..n], pid_line)),
+    );
+    let len = path_for(me, b"stat", &mut path);
+    check(
+        "and its stat begins with the process id and the name in brackets",
+        slurp(&path[..len], &mut text).is_some_and(|n| {
+            text[..n].starts_with(mine) && text[mine.len()..n].starts_with(b" (dtest) ") && text[..n].ends_with(b"\n")
+        }),
+    );
+    let number_after = |text: &[u8], label: &[u8]| -> Option<u64> {
+        let at = if label.is_empty() { 0 } else { text.windows(label.len()).position(|w| w == label)? + label.len() };
+        let digits = text[at..].iter().skip_while(|&&b| b == b' ' || b == b'\t');
+        let mut n = None;
+        for &b in digits.take_while(|b| b.is_ascii_digit()) {
+            n = Some(n.unwrap_or(0) * 10 + (b - b'0') as u64);
+        }
+        n
+    };
+    let (frames, _) = syscall::sys_mem_total();
+    check(
+        "meminfo says as much memory as the kernel does",
+        slurp(b"/proc/meminfo", &mut text)
+            .is_some_and(|n| number_after(&text[..n], b"MemTotal:") == Some(frames as u64 * 4)),
+    );
+    let (cpus, _) = syscall::sys_cpus();
+    check(
+        "cpuinfo has a paragraph for each processor",
+        slurp(b"/proc/cpuinfo", &mut text).is_some_and(|n| {
+            text[..n].split(|&b| b == b'\n').filter(|l| l.starts_with(b"processor\t: ")).count() == cpus
+        }),
+    );
+    let up = syscall::sys_clock() / 1_000_000_000;
+    check(
+        "uptime is how long the machine has been up",
+        slurp(b"/proc/uptime", &mut text)
+            .is_some_and(|n| number_after(&text[..n], b"").is_some_and(|s| s + 1 >= up && s <= up + 1)),
+    );
+    check(
+        "mounts says the root first",
+        slurp(b"/proc/mounts", &mut text).is_some_and(|n| {
+            let first = text[..n].split(|&b| b == b'\n').next().unwrap_or(b"");
+            first.split(|&b| b == b' ').nth(1) == Some(b"/")
+        }),
+    );
+    check(
+        "version says it is Quark",
+        slurp(b"/proc/version", &mut text).is_some_and(|n| text[..n].starts_with(b"Quark version ")),
+    );
+    let listed = vfs::open_with(vfs_tid, b"/proc", vfs::OPEN_DIRECTORY).ok().map(|o| {
+        let (mut saw_self, mut saw_me, mut start) = (false, false, 0);
+        let mut entries = [vfs::DirEntry::empty(); 16];
+        while let Ok(page) = vfs::readdir_bulk(vfs_tid, o.handle, start, &mut entries) {
+            for e in &entries[..page.count] {
+                saw_self |= &e.name[..e.name_len] == b"self";
+                saw_me |= &e.name[..e.name_len] == mine && e.is_dir;
+            }
+            if page.end || page.count == 0 {
+                break;
+            }
+            start = page.next;
+        }
+        let _ = vfs::close(vfs_tid, o.handle);
+        saw_self && saw_me
+    });
+    check("listing /proc shows self, and this program as a directory", listed == Some(true));
+    check(
+        "nothing there is written, and nothing is made there",
+        vfs::open_with(vfs_tid, b"/proc/meminfo", vfs::OPEN_WRITE).err() == Some(vfs::ERR_PERMISSION)
+            && vfs::open_with(vfs_tid, b"/proc/dtest-new", vfs::OPEN_CREATE).is_err()
+            && vfs::mkdir(vfs_tid, b"/proc/dtest-dir").is_err(),
+    );
+
+    // Where this program is, and back: a program's directory is somewhere
+    // to be, and a relative path from it is one of its files.
+    let mut was = [0u8; 256];
+    let was_len = vfs::getcwd(vfs_tid, &mut was).unwrap_or(0);
+    let mut here = [0u8; 64];
+    let moved = vfs::chdir(vfs_tid, b"/proc/self").is_ok();
+    let here_len = vfs::getcwd(vfs_tid, &mut here).unwrap_or(0);
+    let relative = slurp(b"comm", &mut text).is_some_and(|n| &text[..n] == b"dtest\n");
+    let back = was_len > 0 && vfs::chdir(vfs_tid, &was[..was_len]).is_ok();
+    check(
+        "a program's directory can be gone into, is called /proc/PID, and its files are there",
+        moved && here[..here_len].starts_with(b"/proc/") && &here[6..here_len] == mine && relative && back,
+    );
+
+    // A child is called what its spawner said, before it has run, and is
+    // gone from /proc once it is.
+    match load_child(&[b"dchild", b"sleep"]) {
+        Some(child) => {
+            let tid = child.tid;
+            let pid = syscall::sys_pid(tid).unwrap_or(0);
+            let len = path_for(pid, b"cmdline", &mut path);
+            check(
+                "a child is what its spawner says it was started as, before it has run",
+                slurp(&path[..len], &mut text).is_some_and(|n| &text[..n] == b"dchild\0sleep\0"),
+            );
+            let _ = child.start();
+            let len = path_for(pid, b"comm", &mut path);
+            check(
+                "and is called by that name",
+                slurp(&path[..len], &mut text).is_some_and(|n| &text[..n] == b"dchild\n"),
+            );
+            let _ = syscall::sys_task_kill(tid);
+            let _ = wait_for(tid);
+            let len = path_for(pid, b"status", &mut path);
+            check(
+                "once it has ended and been collected, it is not there",
+                vfs::open_with(vfs_tid, &path[..len], 0).err() == Some(vfs::ERR_NOT_FOUND),
+            );
+        }
+        None => check("loaded a child to name", false),
+    }
+}
+
 /// Two files written a block each in turn, so that each is in as many pieces
 /// as it has blocks: on ext4, a tree of extents past the inode — four
 /// pieces fit there — and past one block of them, which holds 340. Read
@@ -8700,6 +8882,7 @@ pub extern "C" fn _start() -> ! {
         ("diskfiles", test_disk_files),
         ("mounts", test_mounts),
         ("pieces", test_pieces),
+        ("proc", test_proc),
         ("tmpfs", test_tmpfs),
         ("files", test_files),
         ("fifo", test_named_pipes),

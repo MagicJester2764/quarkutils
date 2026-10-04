@@ -19,6 +19,7 @@ pub mod locks;
 pub mod mkfs;
 pub mod mounts;
 pub mod pager;
+pub mod procfs;
 pub mod protocol;
 pub mod who;
 
@@ -737,6 +738,11 @@ fn cwd_of(sender: usize) -> (cwd::Where, &'static [u8]) {
                 FsFileData::DevDir if ext2_dir::dev_dir() != 0 => {
                     return (cwd::Where::Inode(ext2_dir::dev_dir()), b"/");
                 }
+                FsFileData::Proc(node) if file.is_dir => {
+                    if let Ok(base) = procfs::base(node) {
+                        return (cwd::Where::Inode(base), b"/");
+                    }
+                }
                 _ => {}
             }
         }
@@ -1298,8 +1304,10 @@ pub extern "C" fn _start() -> ! {
     unsafe { QUIET = to_be_mounted };
     if to_be_mounted {
         mounts::to_be_mounted();
-        // Its `dev` is a directory on its disk. The devices are the root's.
+        // Its `dev` is a directory on its disk. The devices are the root's,
+        // and so is `/proc`.
         devices::disable();
+        procfs::disable();
     }
     say!("[vfs] Started.");
 
@@ -1528,6 +1536,7 @@ pub extern "C" fn _start() -> ! {
     if unsafe { FS_TYPE } == FsType::Ext2 {
         if !to_be_mounted {
             ext2_dir::note_dev_dir(ext2_state());
+            ext2_dir::note_proc_dir(ext2_state());
         }
         if !ext2_state().read_only {
             recover_orphans();
@@ -1611,6 +1620,8 @@ pub extern "C" fn _start() -> ! {
         // for and gave up on is not a request any more, and granting it later
         // would hand a lock to a program that had stopped asking.
         locks::drop_task(sender);
+        // And `/proc/self` is the caller's.
+        procfs::serving(sender);
 
         // The kernel, reading or writing through a descriptor for a task that
         // may know nothing of this protocol: `[cookie, length]`, wherever the
@@ -1685,6 +1696,11 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
             if devices::is_ours(sender, msg) =>
         {
             devices::serve(sender, msg)
+        }
+        TAG_READ | TAG_WRITE | TAG_STAT | TAG_READDIR_BULK | TAG_TRUNCATE
+            if procfs::is_ours(sender, msg) =>
+        {
+            procfs::serve(sender, msg)
         }
         TAG_OPEN if msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE) != 0 => {
             transacted(|| handle_open(disk, sender, msg))
@@ -1904,8 +1920,11 @@ fn handle_setattr(sender: usize, msg: &Message) {
         match get_handle(msg.data[5].wrapping_sub(1) as usize, sender) {
             Some(file) => match file.fs {
                 FsFileData::Ext2 { inode_num } => Ok(inode_num),
-                // The devices are the server's, and are what they are.
-                FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir => Err(ERR_PERMISSION),
+                // The devices are the server's, and are what they are; so is
+                // what /proc says.
+                FsFileData::Device(_) | FsFileData::Disk(_) | FsFileData::DevDir | FsFileData::Proc(_) => {
+                    Err(ERR_PERMISSION)
+                }
                 _ => Err(ERR_NOT_SUPPORTED),
             },
             None => Err(ERR_INVALID_HANDLE),
@@ -1913,11 +1932,15 @@ fn handle_setattr(sender: usize, msg: &Message) {
     } else {
         protocol::lent_path(sender, 0, len, 0).and_then(|path| {
             let base = base_of(sender, msg.data[5])?;
-            if ext2_dir::dev_dir() == 0 && devices::refuses(ext2_whole_path(base, path)?) {
+            if (ext2_dir::dev_dir() == 0 || ext2_dir::proc_dir() == 0)
+                && lexically_refused(ext2_whole_path(base, path)?)
+            {
                 return Err(ERR_PERMISSION);
             }
             match ext2_dir::resolve(ext2_state(), base, path, uid, gid, msg.data[2] == 0)? {
-                ext2_dir::Found::Inode(ino, _, _) if ino != ext2_dir::dev_dir() => Ok(ino),
+                ext2_dir::Found::Inode(ino, _, _) if ino != ext2_dir::dev_dir() && ino != ext2_dir::proc_dir() => {
+                    Ok(ino)
+                }
                 _ => Err(ERR_PERMISSION),
             }
         })
@@ -1958,16 +1981,24 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
             Ok(b) => b,
             Err(code) => return error_reply(sender, code),
         };
-        // The lookup itself finds /dev, through links and all, when the root
-        // has one. Without it, the path is matched as written.
-        if ext2_dir::dev_dir() == 0 {
+        // The lookup itself finds /dev and /proc, through links and all,
+        // when the root has them. Without them, the path is matched as
+        // written.
+        if ext2_dir::dev_dir() == 0 || ext2_dir::proc_dir() == 0 {
             let whole = match ext2_whole_path(base, path) {
                 Ok(p) => p,
                 Err(code) => return error_reply(sender, code),
             };
-            match devices::lookup(whole) {
-                devices::Lookup::Elsewhere => {}
-                found => return devices::open(sender, whole, found, flags),
+            if ext2_dir::dev_dir() == 0 {
+                match devices::lookup(whole) {
+                    devices::Lookup::Elsewhere => {}
+                    found => return devices::open(sender, whole, found, flags),
+                }
+            }
+            if ext2_dir::proc_dir() == 0 {
+                if let Some(found) = procfs::lookup(whole, flags & OPEN_NOFOLLOW == 0) {
+                    return procfs::open_found(sender, whole, found, flags);
+                }
             }
         }
         open_ext2(sender, base, path, flags, given_mode(msg.data[2]));
@@ -1979,6 +2010,9 @@ fn handle_open(disk: &DiskState, sender: usize, msg: &Message) {
         match devices::lookup(path) {
             devices::Lookup::Elsewhere => {}
             found => return devices::open(sender, path, found, flags),
+        }
+        if let Some(found) = procfs::lookup(path, flags & OPEN_NOFOLLOW == 0) {
+            return procfs::open_found(sender, path, found, flags);
         }
         open_fat32(disk, sender, path, flags);
     }
@@ -2003,6 +2037,7 @@ pub(crate) fn base_of(sender: usize, word: u64) -> Result<u32, u64> {
     match file.fs {
         FsFileData::Ext2 { inode_num } if file.is_dir => Ok(inode_num),
         FsFileData::DevDir if ext2_dir::dev_dir() != 0 => Ok(ext2_dir::dev_dir()),
+        FsFileData::Proc(node) if file.is_dir => procfs::base(node),
         FsFileData::Remote(ref remote) if file.is_dir => Ok(mounts::covered(remote)),
         _ => Err(ERR_NOT_DIR),
     }
@@ -2015,6 +2050,13 @@ pub(crate) fn local_cwd(sender: usize) -> u32 {
         cwd::Where::Inode(ino) => ino,
         _ => ext2::EXT2_ROOT_INO,
     }
+}
+
+/// Whether `path` is under a `/dev` or a `/proc` the root has no directory
+/// for, where nothing may be made, removed or renamed: matched as written,
+/// since the lookup cannot find them.
+fn lexically_refused(path: &[u8]) -> bool {
+    (ext2_dir::dev_dir() == 0 && devices::refuses(path)) || (ext2_dir::proc_dir() == 0 && procfs::refuses(path))
 }
 
 /// `path` from `base` written out whole, for a root with no /dev to find.
@@ -2105,6 +2147,10 @@ fn open_ext2(sender: usize, base: u32, path: &[u8], flags: u64, mode: Option<u16
         }
         Ok(ext2_dir::Found::Inode(ino, _, _)) if ino == ext2_dir::dev_dir() => {
             return devices::open(sender, path, devices::Lookup::Dir, flags);
+        }
+        Ok(ext2_dir::Found::Proc(node)) => return procfs::open(sender, path, node, flags),
+        Ok(ext2_dir::Found::Inode(ino, _, _)) if ino == ext2_dir::proc_dir() => {
+            return procfs::open(sender, path, procfs::Node::Dir, flags);
         }
         Ok(ext2_dir::Found::Inode(ino, inode, holder)) => Ok((ino, inode, holder)),
         Err(code) => Err(code),
@@ -2498,7 +2544,7 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
     let made = if unsafe { FS_TYPE } == FsType::Ext2 {
         if ext2_state().read_only {
             Err(ERR_READ_ONLY)
-        } else if ext2_dir::dev_dir() == 0 && devices::refuses(path) {
+        } else if lexically_refused(path) {
             Err(ERR_PERMISSION)
         } else {
             let (uid, gid) = get_sender_uid_gid(sender);
@@ -2509,7 +2555,7 @@ fn handle_mkdir(disk: &DiskState, sender: usize, msg: &Message) {
         }
     } else {
         match fat_path(disk, sender, msg.data[5], path) {
-            Ok(path) if devices::refuses(path) => Err(ERR_PERMISSION),
+            Ok(path) if devices::refuses(path) || procfs::refuses(path) => Err(ERR_PERMISSION),
             Ok(path) => fat32_mkdir(disk, path),
             Err(code) => Err(code),
         }
@@ -2536,7 +2582,7 @@ fn handle_mknod(sender: usize, msg: &Message) {
         Err(ERR_PERMISSION)
     } else if ext2_state().read_only {
         Err(ERR_READ_ONLY)
-    } else if ext2_dir::dev_dir() == 0 && devices::refuses(path) {
+    } else if lexically_refused(path) {
         Err(ERR_PERMISSION)
     } else {
         let (uid, gid) = get_sender_uid_gid(sender);
@@ -2791,7 +2837,7 @@ fn settle(inodes: &[u32]) {
 fn fat_rename_request(disk: &DiskState, sender: usize, msg: &Message) -> Result<(), u64> {
     static mut FROM: [u8; MAX_PATH] = [0; MAX_PATH];
     let from = protocol::lent_path(sender, 0, msg.data[0] as usize, 0).and_then(|p| fat_path(disk, sender, msg.data[5], p))?;
-    if devices::refuses(from) {
+    if devices::refuses(from) || procfs::refuses(from) {
         return Err(ERR_PERMISSION);
     }
     let kept = unsafe { &mut *core::ptr::addr_of_mut!(FROM) };
@@ -2802,7 +2848,7 @@ fn fat_rename_request(disk: &DiskState, sender: usize, msg: &Message) -> Result<
     let from = &kept[..from.len()];
     let to = protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096)
         .and_then(|p| fat_path(disk, sender, msg.data[4], p))?;
-    if devices::refuses(to) {
+    if devices::refuses(to) || procfs::refuses(to) {
         return Err(ERR_PERMISSION);
     }
     fat32_rename(disk, from, to)
@@ -2819,7 +2865,7 @@ fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
         let done = match msg.tag {
             TAG_UNLINK | TAG_RMDIR => protocol::lent_path(sender, 0, msg.data[0] as usize, 0)
                 .and_then(|path| fat_path(disk, sender, msg.data[5], path))
-                .and_then(|path| match devices::refuses(path) {
+                .and_then(|path| match devices::refuses(path) || procfs::refuses(path) {
                     true => Err(ERR_PERMISSION),
                     false => fat32_remove(disk, path, msg.tag == TAG_RMDIR),
                 }),
@@ -2838,10 +2884,9 @@ fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
         Ok(p) => p,
         Err(code) => return error_reply(sender, code),
     };
-    // With a /dev on the disk, the lookup keeps everything out of it. A link's
-    // target is only text, and may name a device.
-    let lexical = ext2_dir::dev_dir() == 0;
-    if lexical && msg.tag != TAG_SYMLINK && devices::refuses(first) {
+    // With a /dev and a /proc on the disk, the lookup keeps everything out
+    // of them. A link's target is only text, and may name a device.
+    if msg.tag != TAG_SYMLINK && lexically_refused(first) {
         return error_reply(sender, ERR_PERMISSION);
     }
     let base = match base_of(sender, msg.data[5]) {
@@ -2854,7 +2899,7 @@ fn handle_namespace(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_UNLINK => ext2_ops::unlink(e2, base, first, uid, gid),
         TAG_RMDIR => ext2_ops::rmdir(e2, base, first, uid, gid),
         tag => match protocol::lent_path(sender, msg.data[0] as usize, msg.data[1] as usize, 4096) {
-            Ok(second) if lexical && devices::refuses(second) => Err(ERR_PERMISSION),
+            Ok(second) if lexically_refused(second) => Err(ERR_PERMISSION),
             Ok(second) => match tag {
                 // The second path's own base; SYMLINK resolves only that path,
                 // and takes the ordinary one for it.
@@ -2888,8 +2933,15 @@ fn handle_readlink(disk: &DiskState, sender: usize, msg: &Message) {
         Err(code) => return error_reply(sender, code),
     };
     if unsafe { FS_TYPE } != FsType::Ext2 {
-        // No links on FAT32: whatever is there is not one.
-        return match fat_path(disk, sender, msg.data[5], path).and_then(|p| resolve_path(disk, p)) {
+        // No links on FAT32: whatever is there is not one, but /proc's own.
+        let path = match fat_path(disk, sender, msg.data[5], path) {
+            Ok(p) => p,
+            Err(code) => return error_reply(sender, code),
+        };
+        if let Some(found) = procfs::lookup(path, false) {
+            return procfs::readlink(sender, found, path_len, msg.data[1] as usize);
+        }
+        return match resolve_path(disk, path) {
             Ok(_) => error_reply(sender, ERR_INVALID_PATH),
             Err(code) => error_reply(sender, code),
         };
@@ -2900,9 +2952,19 @@ fn handle_readlink(disk: &DiskState, sender: usize, msg: &Message) {
     };
     let (uid, gid) = get_sender_uid_gid(sender);
     let e2 = ext2_state();
+    if ext2_dir::proc_dir() == 0 {
+        match ext2_whole_path(base, path).map(|whole| procfs::lookup(whole, false)) {
+            Ok(Some(found)) => return procfs::readlink(sender, found, path_len, msg.data[1] as usize),
+            Ok(None) => {}
+            Err(code) => return error_reply(sender, code),
+        }
+    }
     let inode = match ext2_dir::resolve(e2, base, path, uid, gid, false) {
         Ok(ext2_dir::Found::Inode(_, inode, _)) => inode,
         Ok(ext2_dir::Found::Device(_)) => return error_reply(sender, ERR_INVALID_PATH),
+        Ok(ext2_dir::Found::Proc(node)) => {
+            return procfs::readlink(sender, Ok(node), path_len, msg.data[1] as usize)
+        }
         Err(code) => return error_reply(sender, code),
     };
     let len = match ext2_ops::read_link(e2, &inode) {
@@ -2930,10 +2992,18 @@ fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
         } else {
             protocol::lent_path(sender, 0, msg.data[0] as usize, 0).and_then(|path| {
                 let base = base_of(sender, msg.data[5])?;
-                ext2_dir::resolve_inode(ext2_state(), base, path, uid, gid, true).map(|f| f.0)
+                match ext2_dir::resolve(ext2_state(), base, path, uid, gid, true)? {
+                    ext2_dir::Found::Inode(ino, _, _) => Ok(ino),
+                    // A program's directory in /proc is somewhere to be.
+                    ext2_dir::Found::Proc(node) => procfs::base(node),
+                    ext2_dir::Found::Device(_) => Err(ERR_NOT_DIR),
+                }
             })
         };
         found.and_then(|ino| {
+            if procfs::base_pid(ino).is_some() {
+                return if procfs::base_there(ino) { move_to(sender, space, ino) } else { Err(ERR_NOT_FOUND) };
+            }
             let dir = ext2::read_inode(ext2_state(), ino)?;
             if !dir.is_dir() {
                 Err(ERR_NOT_DIR)
@@ -2976,12 +3046,16 @@ fn handle_chdir(disk: &DiskState, sender: usize, msg: &Message) {
 /// and this server is told nothing and needs to be. Kept here by program, a
 /// working directory stopped at `fork`, because a child is another program.
 fn move_to(sender: usize, space: u64, ino: u32) -> Result<cwd::Where, u64> {
+    let fs = match procfs::base_pid(ino) {
+        Some(pid) => FsFileData::Proc(procfs::Node::Process(pid)),
+        None => FsFileData::Ext2 { inode_num: ino },
+    };
     let dir = OpenFile {
         in_use: true,
         by_fd: true,
         is_dir: true,
         may_write: false,
-        fs: FsFileData::Ext2 { inode_num: ino },
+        fs,
         ..OpenFile::empty()
     };
     if let Some(handle) = handles::alloc(dir) {
@@ -3124,6 +3198,7 @@ fn handle_stat(sender: usize, msg: &Message) {
         | FsFileData::Disk(_)
         | FsFileData::Remote(_)
         | FsFileData::DevDir
+        | FsFileData::Proc(_)
         | FsFileData::None => {
             return error_reply(sender, ERR_INVALID_HANDLE)
         }

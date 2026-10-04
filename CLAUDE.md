@@ -544,7 +544,15 @@ the layer's uses of itself (`SYS_FD_DUP`, a sleep, a change of identity) ask
 `getpid()`; C that hands `getpid()` to a Quark call is handing over the wrong
 number. Rust is unchanged: `quark_rt` spawns, waits and kills by task id, and
 `syscall::sys_pid` is there for a program that wants the other one. `ps`
-shows both.
+shows both, and what each program was started as.
+
+**A program is what it was started as**, and the kernel keeps it, a
+hundred and twenty-eight bytes of its arguments (`SYS_PROGRAM_NAME`): a
+spawner says it for the child it has made and not started
+(`spawn::set_args_env` does, for every spawner), and the C layer's
+`execve` says it for what the program is about to become. A fork's child
+is what its parent was, and a program may say it of itself. Anybody may
+read it: `ps`, and `/proc/PID/cmdline` and `comm`.
 
 **A session runs on a terminal when the distribution says so.** `init` reads
 `/etc/init.conf`: `start <path> [arguments]` lines name programs to start
@@ -1118,6 +1126,17 @@ change here: it has found what reading the code did not.
 - **`/dev` is the server's, whatever the disk holds.** The lookup answers for
   the root's `dev` directory itself, so no path — through links, or relative —
   reaches the disk's copy, and nothing is made there.
+- **So is `/proc`** (`vfs/src/procfs.rs`), the same way: the walk hands
+  what is left of a path to it at the root's `proc` directory and takes the
+  path back at a `..` that comes up out of a program's directory. A file
+  there is made when it is read, from what the kernel says then, in
+  Linux's form. A program's directory is no inode, so as a working
+  directory or the start of a relative path it is a number past every
+  inode's (`procfs::base`, `0xC000_0000` and the process id), which the
+  walk turns back into `/proc/PID/` — anything new that takes a directory
+  handle as a base has to let it through to the walk, not read it as an
+  inode. A root with no `proc` directory gets `/proc` matched as written,
+  as one with no `dev` gets `/dev`.
 - **A full volume says it is full.** An allocator out of blocks or inodes
   says `ERR_NO_SPACE`, and everything between it and the client passes that
   on: a C program is told `ENOSPC`, which is what a program checks for. For
@@ -1463,6 +1482,11 @@ mounts`):
   through the root's server, which is waiting — for a minute, and then the
   mount is taken for gone. A filesystem in memory is the likeliest to be
   found that way: its files are pages nothing has touched lately.
+- **`/proc` is what this system can say**, which is less than Linux: no
+  `fd`, `exe`, `environ`, `maps` or `cwd` in a program's directory, no
+  `stat` or `loadavg` for the machine, and no time a program started. The
+  idle time in `uptime` is nought, since nothing counts it, and `meminfo`
+  knows nothing of caches.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
   where Linux makes the target, and `linkat` cannot name its source by
   descriptor (`AT_EMPTY_PATH`). FAT has no links.

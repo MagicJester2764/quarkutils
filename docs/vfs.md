@@ -577,6 +577,28 @@ Only root opens one (`PERMISSION`).
   one that only reads, `INVALID_PATH` for a partition's. `BUSY` if a
   partition is in use. The reply is how many volumes there now are.
 
+### /proc
+
+`/proc` is the server's too, found the way `/dev` is (and on a root with no
+`proc` directory, matched as written). It is in Linux's form, for the
+programs written to read it:
+
+| Name | What it says |
+|---|---|
+| `self` | a link to the caller's process id |
+| `cpuinfo` | a paragraph for each processor: what `cpuid` says, its features as Linux names them, less what the kernel has not turned on |
+| `meminfo` | `MemTotal`, `MemFree`, `MemAvailable`, `SwapTotal` and `SwapFree`, from the kernel; `Buffers` and `Cached` are nought |
+| `mounts` | a line for each mounted filesystem, as `MOUNTS` counts them: source, place, kind, `rw 0 0` |
+| `uptime` | seconds since the machine started, and an idle time of nought |
+| `version` | `Quark version` and the system calls' version |
+| `PID/` | a directory for each program by its process id, a program's own: `cmdline` (what it was started as, each argument ended by a NUL), `comm`, `mounts`, `stat` and `status` |
+
+A file is made when it is read, so each read is of it as it is then, and
+`STAT` says it is empty. Nothing is written, made, removed or renamed there
+(`PERMISSION`); a program that has ended is `NOT_FOUND`. `/proc` is mode
+`0555`, a program's directory is its user's and group's, and both can be a
+working directory and the start of a relative path.
+
 ### STATFS
 
 The lent buffer is filled with eight little-endian 64-bit words: the
@@ -629,7 +651,7 @@ capability for it (`SYS_CALL_WITH`, which lends and offers at once), and
 filesystem came from and where it is being put, each ended by a NUL — which
 is what `MOUNTS` gives back. Only user 0 mounts (`PERMISSION`). The
 directory must exist and be one (`NOT_FOUND`, `NOT_DIR`), must not be the
-root, `/dev` or mounted on already (`BUSY`), and must not be in a FAT32
+root, `/dev`, `/proc` or mounted on already (`BUSY`), and must not be in a FAT
 filesystem, which has no directory that could say what is on it
 (`NOT_SUPPORTED`). A server that does not answer `ADOPT` as a filesystem
 waiting to be mounted, within a third of a second, is not mounted (`IO`).

@@ -337,6 +337,8 @@ fn dir_path(disk: &DiskState, file: &OpenFile) -> Result<&'static [u8], u64> {
         FsFileData::Ext2 { inode_num } => ext2_dir::path_of(crate::ext2_state(), inode_num),
         FsFileData::Fat32 { first_cluster, .. } => crate::fat_dir_path(disk, first_cluster),
         FsFileData::DevDir => Ok(b"/dev"),
+        FsFileData::Proc(crate::procfs::Node::Dir) => Ok(b"/proc"),
+        FsFileData::Proc(crate::procfs::Node::Process(pid)) => Ok(crate::procfs::path_of(pid)),
         FsFileData::Remote(r) => remote_path(&r),
         _ => Err(ERR_NOT_DIR),
     }
@@ -513,6 +515,7 @@ fn start_of(sender: usize, word: u64) -> Option<Start> {
         FsFileData::Remote(r) => Some(Start::Remote(r)),
         FsFileData::Ext2 { inode_num } => Some(Start::Local(inode_num)),
         FsFileData::DevDir if ext2_dir::dev_dir() != 0 => Some(Start::Local(ext2_dir::dev_dir())),
+        FsFileData::Proc(node) => crate::procfs::base(node).ok().map(Start::Local),
         _ => None,
     }
 }
@@ -1053,9 +1056,13 @@ fn attach_here(sender: usize, msg: &Message) -> Result<(), u64> {
         ext2_dir::Found::Inode(ino, inode, _) if inode.is_dir() => ino,
         _ => return Err(ERR_NOT_DIR),
     };
-    // One filesystem to a directory, and not on the root or on /dev, which
-    // are this server's own.
-    if dir == EXT2_ROOT_INO || dir == ext2_dir::dev_dir() || mounts().iter().any(|m| m.in_use && m.dir == dir) {
+    // One filesystem to a directory, and not on the root, /dev or /proc,
+    // which are this server's own.
+    if dir == EXT2_ROOT_INO
+        || dir == ext2_dir::dev_dir()
+        || dir == ext2_dir::proc_dir()
+        || mounts().iter().any(|m| m.in_use && m.dir == dir)
+    {
         return Err(ERR_BUSY);
     }
     let free = mounts().iter().position(|m| !m.in_use).ok_or(ERR_TOO_MANY_OPEN)?;
@@ -1171,7 +1178,7 @@ fn detach(sender: usize, msg: &Message) {
         let base = crate::base_of(sender, msg.data[5])?;
         let dir = match ext2_dir::resolve_to(crate::ext2_state(), base, path, uid, gid, true, false)? {
             ext2_dir::Found::Inode(ino, _, _) => ino,
-            ext2_dir::Found::Device(_) => return Err(ERR_INVALID_PATH),
+            ext2_dir::Found::Device(_) | ext2_dir::Found::Proc(_) => return Err(ERR_INVALID_PATH),
         };
         // Not a directory anything is mounted on.
         let m = at(dir).ok_or(ERR_INVALID_PATH)?;
@@ -1203,17 +1210,34 @@ fn detach(sender: usize, msg: &Message) {
 /// server is counted — its own first, each followed by whatever is mounted
 /// inside it. Past the last, the error's second word is how many there are.
 fn list(sender: usize, msg: &Message) {
-    let mut n = msg.data[0];
+    let page = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, RECORD_MAX) };
+    match nth(msg.data[0], page) {
+        Ok((len, kind, pid)) => match syscall::sys_lent_write(sender, 0, &page[..len]) {
+            Ok(n) if n == len => reply_opened(sender, [len as u64, kind, pid, 0, 0, 0]),
+            _ => error_reply(sender, ERR_IO),
+        },
+        Err(total) => {
+            let reply = Message { sender: 0, tag: TAG_ERROR, data: [ERR_NOT_FOUND, total, 0, 0, 0, 0] };
+            let _ = syscall::sys_reply(sender, &reply);
+        }
+    }
+}
+
+/// The `n`th filesystem under this server, as MOUNTS counts them: its record
+/// written to `page` (as long as a record may be), and how long that is,
+/// its kind and the process serving it. Past the last, how many there are.
+fn nth(mut n: u64, page: &mut [u8]) -> Result<(usize, u64, u64), u64> {
     let mut total = 0u64;
-    let give = |record: &[u8], kind: u64, pid: u64| match syscall::sys_lent_write(sender, 0, record) {
-        Ok(len) if len == record.len() => reply_opened(sender, [len as u64, kind, pid, 0, 0, 0]),
-        _ => error_reply(sender, ERR_IO),
+    let copy = |record: &[u8], page: &mut [u8]| {
+        let len = record.len().min(page.len());
+        page[..len].copy_from_slice(&record[..len]);
+        len
     };
     // A server mounted in nothing is the root, and speaks for itself.
     if unsafe { PARENT_TID } == 0 {
         if n == 0 {
             let record = unsafe { &(&*core::ptr::addr_of!(SELF_RECORD))[..SELF_RECORD_LEN] };
-            return give(record, unsafe { SELF_KIND }, syscall::sys_pid_self());
+            return Ok((copy(record, page), unsafe { SELF_KIND }, syscall::sys_pid_self()));
         }
         n -= 1;
         total += 1;
@@ -1224,17 +1248,15 @@ fn list(sender: usize, msg: &Message) {
         }
         if n == 0 {
             let mount = &mounts()[m];
-            return give(&mount.record[..mount.record_len], mount.kind, mount.pid);
+            return Ok((copy(&mount.record[..mount.record_len], page), mount.kind, mount.pid));
         }
         n -= 1;
         total += 1;
         // And what is mounted in it.
-        let page = unsafe { core::slice::from_raw_parts_mut(CLIENT_BUF as *mut u8, RECORD_MAX) };
         let ask = Message { sender: 0, tag: TAG_MOUNTS, data: [n, 0, 0, 0, 0, 0] };
-        match send(m, &ask, Lend::In(page)) {
+        match send(m, &ask, Lend::In(&mut page[..RECORD_MAX])) {
             Ok(reply) if reply.tag != TAG_ERROR => {
-                let len = (reply.data[0] as usize).min(RECORD_MAX);
-                return give(&page[..len], reply.data[1], reply.data[2]);
+                return Ok(((reply.data[0] as usize).min(RECORD_MAX), reply.data[1], reply.data[2]));
             }
             Ok(reply) => {
                 n -= reply.data[1].min(n);
@@ -1243,6 +1265,11 @@ fn list(sender: usize, msg: &Message) {
             Err(_) => {}
         }
     }
-    let reply = Message { sender: 0, tag: TAG_ERROR, data: [ERR_NOT_FOUND, total, 0, 0, 0, 0] };
-    let _ = syscall::sys_reply(sender, &reply);
+    Err(total)
+}
+
+/// The `n`th filesystem mounted here, for `/proc/mounts`: its record in
+/// `page`, which has room for one, and how long it is and its kind.
+pub fn record(n: u64, page: &mut [u8; RECORD_MAX]) -> Option<(usize, u64)> {
+    nth(n, page).ok().map(|(len, kind, _)| (len, kind))
 }

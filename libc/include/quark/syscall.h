@@ -136,6 +136,7 @@
 #define QUARK_GROUPS_SET    1UL
 #define QUARK_MAX_GROUPS    16
 #define SYS_IDENTIFY        213
+#define SYS_PROGRAM_NAME    214
 
 /* 0x90  time */
 #define SYS_TIMER_CREATE    146

@@ -1312,6 +1312,9 @@ pub extern "C" fn _start() -> ! {
             syscall::sys_exit();
         }
     }
+    // Everything else is named by whatever started it. This was started by
+    // the kernel, which says nothing of what it started.
+    let _ = syscall::sys_program_name_set(syscall::sys_getpid() as usize, &[b"init"]);
 
     let info = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     let mod_count = info.module_count as usize;

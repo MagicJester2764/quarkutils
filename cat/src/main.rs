@@ -54,7 +54,7 @@ pub extern "C" fn _start() -> ! {
             None => continue,
         };
 
-        let (handle, size, is_dir) = match vfs::open(vfs_tid, path) {
+        let (handle, _, is_dir) = match vfs::open(vfs_tid, path) {
             Ok(h) => h,
             Err(code) => {
                 if let Ok(s) = core::str::from_utf8(path) {
@@ -74,11 +74,13 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
 
-        // Read and print file contents page by page
+        // Read and print file contents page by page, to the end of the
+        // file — which is where a read finds nothing, not where its size
+        // said: a file in /proc says it is empty and is not, and a file
+        // somebody is writing is longer than it was.
         let mut offset = 0u32;
-        while offset < size {
-            let to_read = PAGE_SIZE.min((size - offset) as usize) as u32;
-            match vfs::read(vfs_tid, handle, &mut page[..to_read as usize], offset) {
+        loop {
+            match vfs::read(vfs_tid, handle, &mut page[..PAGE_SIZE], offset) {
                 Ok(bytes_read) => {
                     if bytes_read == 0 {
                         break;

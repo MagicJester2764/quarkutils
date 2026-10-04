@@ -272,6 +272,30 @@ static void drop_stage(const struct segment *segs, int n, unsigned long base,
     }
 }
 
+/* Tell the kernel what this program is about to become: its arguments, each
+   ended by a nought, as much of them as it keeps — what `ps` and `/proc`
+   say it is. Said just before it becomes it; a kernel too old to keep it
+   says no, and that is all. */
+static void say_name(char *const argv[]) {
+    char line[128];
+    unsigned long n = 0;
+    for (unsigned long i = 0; argv && argv[i]; i++) {
+        unsigned long len = 0;
+        while (argv[i][len]) {
+            len++;
+        }
+        if (n + len + 1 > sizeof line) {
+            break;
+        }
+        for (unsigned long j = 0; j < len; j++) {
+            line[n + j] = argv[i][j];
+        }
+        line[n + len] = 0;
+        n += len + 1;
+    }
+    __syscall4(SYS_PROGRAM_NAME, __syscall0(SYS_GETPID), 0, (unsigned long)line, n);
+}
+
 long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     if (!path || !path[0]) {
         return -LX_ENOENT;
@@ -415,6 +439,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* The last call this program makes. Everything above it was preparation
        that could fail and leave the caller as it was; this does not return. */
+    say_name(argv);
     __syscall3(SYS_EXEC_SPACE, cr3, eh.e_entry, stack_top);
     /* Only reached if the kernel refused, which means the space is not the
        caller's or has a task in it — neither of which can be true here. */

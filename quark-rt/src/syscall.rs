@@ -581,6 +581,43 @@ pub fn sys_task_priority(tid: usize, band: u8) -> Result<(), ()> {
     if ret == u64::MAX { Err(()) } else { Ok(()) }
 }
 
+/// What a program was started as: its command line, set and read.
+pub const SYS_PROGRAM_NAME: u64 = 214;
+/// How much of a program's command line the kernel keeps.
+pub const PROGRAM_NAME_MAX: usize = 128;
+
+/// Say what `tid`'s program was started as — `tid` a task of this program's,
+/// or a child it has made and not started: its arguments, each ended by a
+/// nought, as much of them as fits.
+pub fn sys_program_name_set(tid: usize, args: &[&[u8]]) -> Result<(), ()> {
+    let mut line = [0u8; PROGRAM_NAME_MAX];
+    let mut n = 0;
+    for arg in args {
+        if n + arg.len() + 1 > line.len() {
+            break;
+        }
+        line[n..n + arg.len()].copy_from_slice(arg);
+        n += arg.len() + 1;
+    }
+    let ret = unsafe { syscall4(SYS_PROGRAM_NAME, tid as u64, 0, line.as_ptr() as u64, n as u64) };
+    if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// What `tid`'s program was started as, into `out`: how many bytes.
+pub fn sys_program_name(tid: usize, out: &mut [u8]) -> Option<usize> {
+    let ret = unsafe { syscall4(SYS_PROGRAM_NAME, tid as u64, 1, out.as_mut_ptr() as u64, out.len() as u64) };
+    (ret != u64::MAX).then_some(ret as usize)
+}
+
+/// What a program is called: the last part of the first of its arguments,
+/// fifteen bytes of it at most, as Unix's `comm` is.
+pub fn program_comm(line: &[u8]) -> &[u8] {
+    let first = &line[..line.iter().position(|&b| b == 0).unwrap_or(line.len())];
+    let base = &first[first.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
+    let base = base.strip_suffix(b".ELF").unwrap_or(base);
+    &base[..base.len().min(15)]
+}
+
 /// The band task `tid` was put in, whatever it is running in for now.
 pub fn sys_task_band(tid: usize) -> Option<u8> {
     let ret = unsafe { syscall2(SYS_TASK_PRIORITY, tid as u64, u64::MAX) };
@@ -2607,7 +2644,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 26;
+pub const ABI_VERSION_MINOR: u32 = 27;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

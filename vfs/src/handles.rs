@@ -54,6 +54,8 @@ pub enum FsFileData {
     Remote(crate::mounts::Remote),
     /// `/dev` itself.
     DevDir,
+    /// `/proc`, or something in it.
+    Proc(crate::procfs::Node),
     None,
 }
 
@@ -303,6 +305,8 @@ pub fn lock_key(file: &OpenFile) -> Option<u32> {
             Some(0x4000_0000 | (r.mount as u32 & 0xF) << 26 | (r.id as u32 & 0x03FF_FFFF))
         }
         FsFileData::DevDir => Some(crate::devices::DIR_ID as u32),
+        // What is here is the kernel's to say, and nobody's to lock.
+        FsFileData::Proc(_) => None,
         FsFileData::None => None,
     }
 }

@@ -225,8 +225,9 @@ pub fn setattr(e2: &mut Ext2State, ino: u32, a: &Attrs, uid: u32, gid: u32) -> R
 }
 
 /// A directory the caller may change: it exists, is a directory, and the
-/// caller may write and search it. `/dev` is never one: its names are the
-/// server's devices, and a name made there on the disk would be hidden.
+/// caller may write and search it. `/dev` and `/proc` are never one: their
+/// names are the server's, and a name made there on the disk would be
+/// hidden.
 fn writable_dir(
     e2: &Ext2State,
     base: u32,
@@ -238,7 +239,7 @@ fn writable_dir(
     if !dir.is_dir() {
         return Err(ERR_NOT_DIR);
     }
-    if ino == ext2_dir::dev_dir() || !ext2::check_permission(&dir, uid, gid, 3) {
+    if ino == ext2_dir::dev_dir() || ino == ext2_dir::proc_dir() || !ext2::check_permission(&dir, uid, gid, 3) {
         return Err(ERR_PERMISSION);
     }
     Ok((ino, dir))

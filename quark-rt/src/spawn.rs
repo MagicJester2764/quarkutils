@@ -524,6 +524,9 @@ pub fn set_args_env(
     if given.is_err() {
         release(scratch.args, 1);
     }
+    // And what it was started as, which is what `ps` and `/proc` say it is.
+    // A kernel too old to keep it says no, and that is all.
+    let _ = syscall::sys_program_name_set(info.tid, args);
     given
 }
 

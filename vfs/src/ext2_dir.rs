@@ -97,12 +97,36 @@ pub fn dev_dir() -> u32 {
     DEV_DIR.load(Ordering::Relaxed)
 }
 
+/// The root's `proc` directory, whose names are the server's `/proc`
+/// (`procfs`) rather than anything on the disk. 0 if the filesystem has none.
+static PROC_DIR: AtomicU32 = AtomicU32::new(0);
+
+/// Find the root's `proc` directory. Called once the filesystem is mounted.
+pub fn note_proc_dir(ext2: &Ext2State) {
+    let found = read_inode(ext2, EXT2_ROOT_INO)
+        .and_then(|root| find_entry(ext2, &root, b"proc"))
+        .ok()
+        .flatten()
+        .and_then(|(ino, _)| match read_inode(ext2, ino) {
+            Ok(inode) if inode.is_dir() => Some(ino),
+            _ => None,
+        });
+    PROC_DIR.store(found.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The inode of the root's `proc` directory, or 0.
+pub fn proc_dir() -> u32 {
+    PROC_DIR.load(Ordering::Relaxed)
+}
+
 /// What a lookup found.
 pub enum Found {
     /// An inode: its number, itself, and the directory that holds it.
     Inode(u32, Ext2Inode, u32),
     /// One of the server's devices, reached through the root's `dev`.
     Device(Device),
+    /// Something under the root's `proc`.
+    Proc(crate::procfs::Node),
 }
 
 /// The path being walked, rewritten in place as links expand. The server
@@ -172,6 +196,23 @@ pub fn resolve_to(
     let mut pos = 0usize;
     let mut links = 0usize;
     let mut cur_ino = if path.first() == Some(&b'/') { EXT2_ROOT_INO } else { base };
+    // A program's directory under /proc is no inode: a path from one is
+    // walked from /proc, through it.
+    if let Some(pid) = crate::procfs::base_pid(cur_ino) {
+        let mut digits = [0u8; 20];
+        let d = crate::procfs::decimal(pid, &mut digits);
+        if d.len() + 1 + len > MAX_PATH {
+            return Err(ERR_NAME_TOO_LONG);
+        }
+        walk.copy_within(0..len, d.len() + 1);
+        walk[..d.len()].copy_from_slice(d);
+        walk[d.len()] = b'/';
+        len += d.len() + 1;
+        cur_ino = proc_dir();
+        if cur_ino == 0 {
+            return Err(ERR_NOT_FOUND);
+        }
+    }
     let mut cur = read_inode(ext2, cur_ino)?;
     let mut holder = 0u32;
 
@@ -208,6 +249,18 @@ pub fn resolve_to(
                 Some(_) => Err(ERR_NOT_DIR),
                 None => Err(ERR_NOT_FOUND),
             };
+        }
+        let proc = proc_dir();
+        if proc != 0 && cur_ino == proc && !is_dot {
+            // And /proc is the server's: it is walked there for as long as
+            // the path stays below it.
+            match crate::procfs::walk(&walk[start..len], follow_last)? {
+                crate::procfs::Walked::At(node) => return Ok(Found::Proc(node)),
+                crate::procfs::Walked::Back(used) => {
+                    pos = start + used;
+                    continue;
+                }
+            }
         }
 
         let (child_ino, _) = find_entry(ext2, &cur, &walk[start..pos])?.ok_or(ERR_NOT_FOUND)?;
@@ -265,6 +318,9 @@ static mut PATH_OUT: [u8; MAX_PATH + 1] = [0; MAX_PATH + 1];
 /// The absolute path of directory `ino`, walked up through each `..` to the
 /// root. A directory that has lost its name is `ERR_NOT_FOUND`: it is nowhere.
 pub fn path_of(ext2: &Ext2State, ino: u32) -> Result<&'static [u8], u64> {
+    if let Some(pid) = crate::procfs::base_pid(ino) {
+        return Ok(crate::procfs::path_of(pid));
+    }
     let out = unsafe { &mut *core::ptr::addr_of_mut!(PATH_OUT) };
     if ino == EXT2_ROOT_INO {
         out[0] = b'/';
@@ -326,7 +382,7 @@ pub fn resolve_inode(
 ) -> Result<(u32, Ext2Inode, u32), u64> {
     match resolve(ext2, base, path, uid, gid, follow_last)? {
         Found::Inode(ino, inode, holder) => Ok((ino, inode, holder)),
-        Found::Device(_) => Err(ERR_PERMISSION),
+        Found::Device(_) | Found::Proc(_) => Err(ERR_PERMISSION),
     }
 }
 

@@ -65,7 +65,8 @@ qtty/               The text console. What the machine boots into, and to
                     It is UTF-8, and draws what `setfont` gives it a font for.
 input/              Line discipline for whoever reads, raw events for whoever
                     has claimed the keyboard.
-vfs/                ext2, ext4 and FAT32, and the pager for mapped files.
+vfs/                ext2, ext4 and FAT, a filesystem in memory, /dev and
+                    /proc, and the pager for mapped files.
 wm/                 A Wayland compositor you run: `wm <program>`.
 
 libc/               A small C library against the raw ABI.
