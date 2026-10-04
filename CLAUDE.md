@@ -1011,6 +1011,16 @@ sent out to be answered by nobody.
   card's notice, and had to see to everything else the kernel said
   meanwhile: a client's death taken there and dropped left its
   connections for ever.
+- **IPv6 is what a router says.** smoltcp answers neighbour solicitations
+  and does not listen to routers, so the stack does (`net/src/ndp.rs`): an
+  address on the link from the card's, a router solicitation, and from an
+  advertisement — read from a raw socket that sees every ICMPv6 packet
+  beside smoltcp — a default route, an address on each prefix made from
+  the card's EUI-64, and the DNS servers it names, each for as long as it
+  said. Advertisements are multicast, and so is finding a neighbour, so a
+  card's driver lets every multicast frame in: the e1000's MPE, without
+  which it let in none, and the RTL8139's hash registers all ones, which
+  QEMU's starts with and a card need not.
 - **`lo` says everything it has in one turn.** What `lo` sends it receives
   in the same poll, again and again until nothing is in flight: smoltcp's
   own loopback keeps its queue to itself, and a reset or an echo's answer

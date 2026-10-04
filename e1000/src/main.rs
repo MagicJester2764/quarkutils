@@ -75,9 +75,11 @@ const CTRL_SLU: u32 = 1 << 6;
 const CTRL_RST: u32 = 1 << 26;
 const RAH_AV: u32 = 1 << 31;
 
-/// Receive: on; broadcasts too; the checksum taken off. Buffers of 2048
-/// bytes, which is what nought in the size field means.
-const RCTL_VALUE: u32 = 1 << 1 | 1 << 15 | 1 << 26;
+/// Receive: on; every multicast, which IPv6 finds its router and its
+/// neighbours by, where the table of them lets nothing through; broadcasts
+/// too; the checksum taken off. Buffers of 2048 bytes, which is what
+/// nought in the size field means.
+const RCTL_VALUE: u32 = 1 << 1 | 1 << 4 | 1 << 15 | 1 << 26;
 /// Transmit: on; short frames padded; the collision threshold and distance
 /// the datasheets give for full duplex.
 const TCTL_VALUE: u32 = 1 << 1 | 1 << 3 | 0x0F << 4 | 0x40 << 12;

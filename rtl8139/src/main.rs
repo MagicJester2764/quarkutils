@@ -35,6 +35,8 @@ const REG_IMR: u16 = 0x3C;
 const REG_ISR: u16 = 0x3E;
 const REG_TCR: u16 = 0x40;
 const REG_RCR: u16 = 0x44;
+/// The multicast filter: eight bytes, a bit for each of 64 hashes.
+const REG_MAR: u16 = 0x08;
 const REG_CONFIG1: u16 = 0x52;
 
 const CR_RST: u8 = 0x10;
@@ -197,6 +199,12 @@ pub extern "C" fn _start() -> ! {
     }
     outl(io + REG_RBSTART, ring as u32);
     outw(io + REG_IMR, ISR_ROK | ISR_TOK);
+    // Every multicast hash: accepting multicast lets through what these
+    // say, which a card need not start with all of, and IPv6 finds its
+    // router and its neighbours by multicast.
+    for i in 0..8 {
+        outb(io + REG_MAR + i, 0xFF);
+    }
     outl(io + REG_RCR, RCR_VALUE);
     outl(io + REG_TCR, TCR_VALUE);
     outb(io + REG_CR, CR_RE | CR_TE);

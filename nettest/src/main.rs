@@ -14,7 +14,9 @@
 //! machine's own addresses: a stream — connected without waiting, accepted,
 //! a quarter of a megabyte through it, half closed — and datagrams, each
 //! said ready by a poll; IPv6's loopback beside IPv4's, a refusal, and a
-//! port free again once its socket is closed.
+//! port free again once its socket is closed. And IPv6 on the wire: a
+//! connection to the host at fec0::2, which QEMU's user network is, from
+//! the address a router's advertisement gave this machine on fec0::/64.
 //!
 //! Exits 0 only if every check holds.
 
@@ -22,8 +24,10 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use quark_rt::socket::{self, Addr, Endpoint, Shutdown, TcpListener, TcpStream, UdpSocket};
 use quark_rt::{nameserver, net, println, syscall, thread};
 
-/// 10.0.2.2, the host as QEMU's user network shows it.
+/// 10.0.2.2, the host as QEMU's user network shows it; and fec0::2, as it
+/// shows it over IPv6.
 const ECHO_IP: u32 = 0x0A00_0202;
+const ECHO6: [u8; 16] = [0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 const ECHO_PORT: u16 = 7007;
 const LOCAL_PORT: u16 = 40007;
 /// 127.0.0.1, and a port a thread of this program listens on there.
@@ -308,6 +312,24 @@ fn over_ipv6() {
     check("a connection to a port nobody listens on is refused", matches!(refused, Err(socket::Error::ConnectFailed)));
 }
 
+fn host_over_ipv6() {
+    let stream = TcpStream::connect_timeout(Endpoint::v6(ECHO6, ECHO_PORT), 5_000_000_000);
+    check("a connection to the host over IPv6, at fec0::2", stream.is_ok());
+    let Ok(stream) = stream else { return };
+    let on_prefix = matches!(stream.local(), Ok(Endpoint { addr: Addr::V6(a), .. }) if a[..8] == ECHO6[..8]);
+    check("from this machine's address on fec0::/64", on_prefix);
+    let mut got = [0u8; 16];
+    let mut n = 0;
+    let sent = stream.write_all(b"quark-v6").is_ok();
+    while sent && n < 8 {
+        match stream.read(&mut got[n..]) {
+            Ok(k) if k > 0 => n += k,
+            _ => break,
+        }
+    }
+    check("and what goes out comes back", &got[..n] == b"quark-v6");
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
@@ -323,6 +345,7 @@ pub extern "C" fn _start() -> ! {
     stream_over_loopback();
     datagrams_over_loopback();
     over_ipv6();
+    host_over_ipv6();
     let failed = unsafe { FAILED };
     println!("nettest: {}", if failed == 0 { "ok" } else { "FAIL" });
     syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });

@@ -625,13 +625,13 @@ impl Clients {
         let socket = match self.dns {
             Some(s) => s,
             None => {
-                let servers = net.dns.clone();
+                let servers = net.dns();
                 let s = net.sockets(Side::Eth).add(dns::Socket::new(&servers, vec![]));
                 self.dns = Some(s);
                 s
             }
         };
-        let servers = net.dns.clone();
+        let servers = net.dns();
         let (sockets, cx) = net.parts(Side::Eth);
         let d = sockets.get_mut::<dns::Socket>(socket);
         d.update_servers(&servers);

@@ -6,6 +6,7 @@ extern crate alloc;
 mod card;
 mod legacy;
 mod lo;
+mod ndp;
 mod sockets;
 mod stack;
 

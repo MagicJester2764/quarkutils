@@ -3,7 +3,8 @@
 //! streams that are not one socket's — a port listened on, and a stream let
 //! go of that has not finished saying goodbye.
 //!
-//! `eth0` is the card. `lo` is what this machine says to itself: 127.0.0.1
+//! `eth0` is the card: IPv4 by DHCP, and IPv6 by what routers advertise
+//! (`ndp`). `lo` is what this machine says to itself: 127.0.0.1
 //! and ::1, and the card's own addresses too, so that a connection to the
 //! machine by the address it has on its network is answered here rather
 //! than sent out to be answered by nobody. A socket is in one interface's
@@ -27,6 +28,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use crate::card::Card;
 use crate::lo::Lo;
+use crate::ndp::Ndp;
 
 /// Which interface a socket goes through.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,7 +92,9 @@ pub struct Stack {
     /// What DHCP gave, or what was taken when it gave nothing.
     pub ipv4: Option<Ipv4Cidr>,
     pub router: Option<Ipv4Address>,
-    pub dns: Vec<IpAddress>,
+    /// The DNS servers DHCP named.
+    dns4: Vec<IpAddress>,
+    pub ndp: Ndp,
     listens: Vec<Option<Listen>>,
     /// Streams let go of, still saying goodbye, and since when.
     retiring: Vec<(Side, SocketHandle, Instant)>,
@@ -103,7 +107,7 @@ impl Stack {
         let _ = quark_rt::random::fill(&mut seed);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = u64::from_le_bytes(seed);
-        let eth = Interface::new(config, &mut card, now());
+        let mut eth = Interface::new(config, &mut card, now());
 
         let mut lo_dev = Lo::new();
         let mut lo_config = Config::new(HardwareAddress::Ip);
@@ -116,6 +120,7 @@ impl Stack {
 
         let mut eth_sockets = SocketSet::new(vec![]);
         let dhcp = eth_sockets.add(dhcpv4::Socket::new());
+        let ndp = Ndp::new(&mut eth, &mut eth_sockets, mac, now());
         Stack {
             card,
             eth,
@@ -127,7 +132,8 @@ impl Stack {
             mac,
             ipv4: None,
             router: None,
-            dns: Vec::new(),
+            dns4: Vec::new(),
+            ndp,
             listens: Vec::new(),
             retiring: Vec::new(),
         }
@@ -149,6 +155,7 @@ impl Stack {
             }
             self.refill(Side::Eth);
         }
+        self.ndp.turn(&mut self.eth, &mut self.lo, &mut self.eth_sockets, t);
         self.eth.poll_egress(t, &mut self.card, &mut self.eth_sockets);
         for _ in 0..LO_TURNS {
             while !matches!(self.lo.poll_ingress_single(t, &mut self.lo_dev, &mut self.lo_sockets), PollIngressSingleResult::None) {
@@ -379,7 +386,7 @@ impl Stack {
         }
         self.ipv4 = Some(cidr);
         self.router = router;
-        self.dns = dns;
+        self.dns4 = dns;
     }
 
     /// What QEMU's user network would have given, when DHCP gave nothing.
@@ -414,6 +421,13 @@ impl Stack {
             Side::Eth => (&mut self.eth_sockets, self.eth.context()),
             Side::Lo => (&mut self.lo_sockets, self.lo.context()),
         }
+    }
+
+    /// The DNS servers there are: DHCP's, then what routers advertised.
+    pub fn dns(&self) -> Vec<IpAddress> {
+        let mut all = self.dns4.clone();
+        all.extend(self.ndp.servers.iter().map(|&(s, _)| IpAddress::Ipv6(s)));
+        all
     }
 
     /// The card's IPv4 address, as one word, high byte first; 0 for none.
