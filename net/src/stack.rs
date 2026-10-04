@@ -183,6 +183,16 @@ impl Stack {
         }
     }
 
+    /// The card's driver, started again: claimed, at whatever address it
+    /// says the card has.
+    pub fn relink(&mut self, link: nic::Link, mac: [u8; 6]) {
+        self.card.relink(link);
+        if mac != self.mac {
+            self.mac = mac;
+            self.eth.set_hardware_addr(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        }
+    }
+
     /// Whether the card has an address.
     pub fn configured(&self) -> bool {
         self.ipv4.is_some()

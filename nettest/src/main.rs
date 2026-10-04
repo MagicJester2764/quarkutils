@@ -29,6 +29,12 @@
 //! which needs the right to run the network (`NetAdmin`), asked for here
 //! and held by root's session; and without it, the same change is refused.
 //!
+//! `nettest again` is something else: it ends the card's driver and waits
+//! for the network to work again — the device manager starting the driver
+//! again, and the stack claiming the card again. Only when asked: a sweep
+//! that runs every program with every argument would end the driver often
+//! enough to have the device manager give up on it.
+//!
 //! Exits 0 only if every check holds.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -58,7 +64,9 @@ const CHUNK: usize = 16 * 1024;
 static mut OUT: [u8; CHUNK] = [0; CHUNK];
 static mut IN: [u8; CHUNK] = [0; CHUNK];
 
-quark_rt::manifest!([CapReq::net_admin()]);
+// The right to end a program is for `nettest again`, which ends the card's
+// driver.
+quark_rt::manifest!([CapReq::net_admin(), CapReq::task_mgmt(0)]);
 
 static mut FAILED: u32 = 0;
 
@@ -547,9 +555,53 @@ fn host_over_ipv6() {
     check("and what goes out comes back", &got[..n] == b"quark-v6");
 }
 
+/// An echo from the host, over the card, within a second or so: a socket of
+/// its own, a datagram, and the answer.
+fn echoes() -> bool {
+    let Ok(s) = UdpSocket::bind(Endpoint::v4([0, 0, 0, 0], 0)) else { return false };
+    s.set_read_timeout(Some(1_000_000_000));
+    let _ = s.send_to(b"quark-again", Endpoint::v4([10, 0, 2, 2], ECHO_PORT));
+    let mut buf = [0u8; 16];
+    matches!(s.recv_from(&mut buf), Ok((11, _))) && &buf[..11] == b"quark-again"
+}
+
+/// `nettest again`: the card's driver ended, and what comes of it — the
+/// device manager starts it again, the stack takes the card up again, and
+/// the network works. Only when asked: ended again and again — a sweep
+/// that runs this program with every argument it can think of — the driver
+/// would be given up on.
+fn again() -> ! {
+    println!("nettest: the card's driver, ended");
+    check("an echo comes back before", (0..5).any(|_| echoes()));
+    let Some(driver) = nameserver::lookup(b"eth0") else {
+        check("a card's driver", false);
+        syscall::sys_exit_code(1);
+    };
+    let pid = syscall::sys_pid(driver);
+    check("the card's driver is ended", syscall::sys_task_kill(driver).is_ok());
+    // A second before the device manager starts it again, and a moment for
+    // the stack to take the card.
+    let back = (0..30).any(|_| {
+        if echoes() {
+            return true;
+        }
+        syscall::sleep_ms(500);
+        false
+    });
+    check("and the network works again", back);
+    let again = nameserver::lookup(b"eth0");
+    check("through a driver started again", again.is_some() && again.and_then(syscall::sys_pid) != pid);
+    let failed = unsafe { FAILED };
+    println!("nettest again: {}", if failed == 0 { "ok" } else { "FAIL" });
+    syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    if quark_rt::args::argv(1) == Some(&b"again"[..]) {
+        again();
+    }
     println!("nettest: echo at 10.0.2.2:{}", ECHO_PORT);
     let Some(net_tid) = nameserver::lookup_retry(b"net", 100) else {
         println!("nettest: no network service");

@@ -27,9 +27,15 @@ starts the driver once, holding:
 | its standard output | the console, as the device manager's own |
 | `argv[1]` = the device's address, `BB:DD.F` | which device is its own (`quark_rt::pci::this_device`) |
 
-It is the drivers' parent and watches them. A driver that ends is collected,
-and its device has no driver until the machine starts again: nothing starts
-a driver a second time yet.
+It is the drivers' parent and watches them. A driver that ends is collected.
+One that ended by itself — status 0 — has left its device driverless. One
+that failed is started again for the same device, holding the same things,
+from a copy of its image kept for the purpose: a second later, and twice as
+long after each failure within a minute of starting, up to a minute; the
+fifth such failure in a row leaves the device without a driver until the
+machine starts again. Whatever the old driver served — a card's claim, a
+disk's — went with it, and is its claimant's to ask for again: `net` claims
+`eth0` anew once a driver has registered it.
 
 ## A driver says what it drives
 

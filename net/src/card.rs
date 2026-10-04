@@ -16,13 +16,26 @@ pub struct Card {
     pub link: nic::Link,
     /// Frames may have come since the driver was last asked.
     pub stirred: bool,
+    /// Its driver has ended, and a new one has not been claimed: the device
+    /// manager starts one again, which registers `eth0` anew.
+    pub lost: bool,
     frame: [u8; nic::FRAME],
     filter: filter::Shared,
 }
 
 impl Card {
     pub fn new(link: nic::Link, filter: filter::Shared) -> Card {
-        Card { link, stirred: true, frame: [0; nic::FRAME], filter }
+        let _ = quark_rt::syscall::sys_task_watch(link.tid);
+        Card { link, stirred: true, lost: false, frame: [0; nic::FRAME], filter }
+    }
+
+    /// The card's driver again, a new one: claimed, and asked at once what
+    /// has come.
+    pub fn relink(&mut self, link: nic::Link) {
+        let _ = quark_rt::syscall::sys_task_watch(link.tid);
+        self.link = link;
+        self.lost = false;
+        self.stirred = true;
     }
 }
 

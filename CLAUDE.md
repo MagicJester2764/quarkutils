@@ -1007,8 +1007,15 @@ the device manager, holds every device (`CapReq::pci_devices()`, which only
   seen to, which is also when its keyboard can be typed on. It takes either only from its parent: a program that
   could hand it a driver would be handed a device.
 - **The device manager is the drivers' parent**, watches them, and collects
-  one that ends; its device has no driver again. Nothing starts it again
-  (the service manager will).
+  one that ends. One that failed — a status that is not 0 — is started
+  again for its device, from a copy of its image the device manager keeps:
+  a second later, twice as long after each failure within a minute of
+  starting, up to a minute, and the fifth such failure in a row leaves the
+  device without one. What the driver served is the claimant's to find
+  again: `net` watches its card's driver and claims `eth0` anew once a
+  driver has registered it (`nettest again`); a disk's claimant — the file
+  server of the root — does not, and a root whose disk's driver failed is
+  gone until the machine starts again.
 - **What is in the machine is a question** (`lspci`, `lspci -v`): the
   device manager answers it, and holds nothing back but the devices.
 - **A virtio device is a PCI device like any other** (`quark_rt::virtio`):

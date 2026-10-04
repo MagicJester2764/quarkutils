@@ -130,7 +130,17 @@ pub extern "C" fn _start() -> ! {
         println!("[net] Failed to register with nameserver.");
     }
 
+    let mut asked_for_card = 0;
     loop {
+        // The card's driver ended: the device manager starts it again, and
+        // it is claimed once it has registered, asked after once a second.
+        if net.card.lost && ms() - asked_for_card >= 1_000 {
+            asked_for_card = ms();
+            if let Some((link, mac)) = nic::Link::claim(b"eth0") {
+                net.relink(link, mac);
+                println!("[net] eth0 again");
+            }
+        }
         net.poll();
         clients.settle(&mut net);
         socks.settle(&mut net);
@@ -141,6 +151,9 @@ pub extern "C" fn _start() -> ! {
         // waiting for. Nobody is waiting for an answer to this; the same tag
         // from anybody else is an unknown request.
         if let Some(dead) = death_notice(&msg) {
+            if dead == net.card.link.tid {
+                net.card.lost = true;
+            }
             clients.gone(&mut net, dead);
             socks.forget(dead);
             resolver.forget(dead);

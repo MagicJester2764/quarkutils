@@ -27,12 +27,20 @@
 //! device.
 //!
 //! It is each driver's parent: it watches them, and one that ends is
-//! collected and its device is driverless again. And it says what it found
+//! collected. One that failed — a status that is not 0: a fault, a signal —
+//! is started again for its device, from a copy of its image kept for the
+//! purpose: a second later, and twice as long after each failure within a
+//! minute of starting, up to a minute; the fifth such failure in a row and
+//! the device is left without one. One that ended by itself has left its
+//! device driverless. And it says what it found
 //! to anybody who asks ([`devices::TAG_DEVICE`], [`devices::TAG_BAR`]),
 //! which is all `lspci` is — and whether a program is one of its drivers
 //! ([`devices::TAG_IS_DRIVER`]), which is how `input` knows to take keys
 //! from a USB host controller's driver and from nobody else.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use quark_rt::devices::{self, Device as Entry, TAG_BAR, TAG_DEVICE, TAG_FILES, TAG_IS_DRIVER, TAG_OFFER};
 use quark_rt::ipc::{death_notice, Message, TAG_PING, TID_ANY};
 use quark_rt::manifest::{self, CapReq};
@@ -63,12 +71,49 @@ const GRANT_SCRATCH: usize = syscall::SLOT_SCRATCH;
 /// Where the right to call a driver is kept while it is asked whether it
 /// is up.
 const PING_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
+/// A failure this soon after a start is one in a row.
+const QUICK_NS: u64 = 60_000_000_000;
+/// How many in a row leave a device without a driver.
+const GIVE_UP: u32 = 5;
+/// How long after the first of them a driver is started again, and the
+/// longest.
+const FIRST_DELAY_NS: u64 = 1_000_000_000;
+const MAX_DELAY_NS: u64 = 60_000_000_000;
 
 #[derive(Clone, Copy)]
 struct Slot {
     info: Info,
     driver: usize,
     name: [u8; 16],
+    /// The image its driver was started from, in [`images`].
+    image: Option<usize>,
+    /// When its driver was last started, how many times in a row it has
+    /// failed soon after, and when it is to be started again (0: it is not).
+    started: u64,
+    quick: u32,
+    due: u64,
+}
+
+static mut IMAGES: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+
+/// The images drivers were started from, by name: kept to start them again.
+fn images() -> &'static mut Vec<([u8; 16], Vec<u8>)> {
+    unsafe { &mut *core::ptr::addr_of_mut!(IMAGES) }
+}
+
+/// Where the image of the driver called `name` is kept: a copy of `image`
+/// the first time.
+fn keep(image: &[u8], name: &[u8; 16]) -> usize {
+    let kept = images();
+    if let Some(i) = kept.iter().position(|(n, _)| n == name) {
+        return i;
+    }
+    kept.push((*name, image.to_vec()));
+    kept.len() - 1
+}
+
+fn now() -> u64 {
+    syscall::sys_clock()
 }
 
 static mut TABLE: [Option<Slot>; MAX_DEVICES] = [None; MAX_DEVICES];
@@ -126,6 +171,9 @@ fn start(image: &[u8], name: &[u8], slot: &mut Slot) -> bool {
     slot.name = [0; 16];
     let n = name.len().min(16);
     slot.name[..n].copy_from_slice(&name[..n]);
+    slot.image = Some(keep(image, &slot.name));
+    slot.started = now();
+    slot.due = 0;
     let mut at = [0u8; 7];
     println!(
         "[devmgr] {} drives {} ({:04x}:{:04x}), task {}",
@@ -307,7 +355,10 @@ pub extern "C" fn _start() -> ! {
         if count == MAX_DEVICES {
             break;
         }
-        unsafe { (*core::ptr::addr_of_mut!(TABLE))[count] = Some(Slot { info, driver: 0, name: [0; 16] }) };
+        unsafe {
+            (*core::ptr::addr_of_mut!(TABLE))[count] =
+                Some(Slot { info, driver: 0, name: [0; 16], image: None, started: 0, quick: 0, due: 0 })
+        };
         count += 1;
     }
     unsafe { *core::ptr::addr_of_mut!(COUNT) = count };
@@ -323,17 +374,19 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
+        again();
+        let t = now();
+        let wait = table().iter().flatten().filter(|s| s.due != 0).map(|s| s.due.saturating_sub(t)).min();
         let mut msg = Message::empty();
-        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+        let heard = match wait {
+            Some(ns) => syscall::sys_recv_timeout(TID_ANY, &mut msg, syscall::ns(ns.max(1))).is_ok(),
+            None => syscall::sys_recv(TID_ANY, &mut msg).is_ok(),
+        };
+        if !heard {
             continue;
         }
         if let Some(gone) = death_notice(&msg) {
-            // A driver ended: collected, and its device has none.
-            for slot in table().iter_mut().flatten().filter(|s| s.driver == gone) {
-                slot.driver = 0;
-                slot.name = [0; 16];
-            }
-            let _ = syscall::sys_wait_for(gone);
+            ended(gone);
             continue;
         }
         if msg.sender == 0 {
@@ -341,6 +394,47 @@ pub extern "C" fn _start() -> ! {
         }
         let reply = answer(&msg, parent);
         let _ = syscall::sys_reply(msg.sender, &reply);
+    }
+}
+
+/// Driver `gone` ended: collected, and started again if it failed.
+fn ended(gone: usize) {
+    let status = syscall::sys_wait_for(gone).map_or(0, |(_, status)| status);
+    let t = now();
+    for slot in table().iter_mut().flatten().filter(|s| s.driver == gone) {
+        slot.driver = 0;
+        let name = slot.name;
+        let shown = core::str::from_utf8(&name[..name.iter().position(|&b| b == 0).unwrap_or(16)]).unwrap_or("a driver");
+        if status == 0 || slot.image.is_none() {
+            slot.name = [0; 16];
+            continue;
+        }
+        slot.quick = if t.saturating_sub(slot.started) < QUICK_NS { slot.quick + 1 } else { 1 };
+        if slot.quick >= GIVE_UP {
+            println!(
+                "[devmgr] {} ended with status {}, the fifth time in a row within a minute of starting; its device is left without a driver",
+                shown, status
+            );
+            continue;
+        }
+        let delay = (FIRST_DELAY_NS << (slot.quick - 1)).min(MAX_DELAY_NS);
+        slot.due = t + delay;
+        println!("[devmgr] {} ended with status {}; starting it again in {} s", shown, status, delay / 1_000_000_000);
+    }
+}
+
+/// Start again every driver that is due.
+fn again() {
+    let t = now();
+    for slot in table().iter_mut().flatten().filter(|s| s.due != 0 && s.due <= t && s.driver == 0) {
+        slot.due = 0;
+        let Some(i) = slot.image else { continue };
+        // A copy: what is kept is not to be read while it is added to.
+        let (name, image) = images()[i].clone();
+        let len = name.iter().position(|&b| b == 0).unwrap_or(16);
+        if !start(&image, &name[..len], slot) {
+            println!("[devmgr] {} would not start again", core::str::from_utf8(&name[..len]).unwrap_or("a driver"));
+        }
     }
 }
 
