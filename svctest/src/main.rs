@@ -10,8 +10,9 @@
 //!                             starts — it does not wait for it — and then
 //!                             as serve; ends with status 3 if it was not
 //! svctest crash [MS [STATUS]] end with STATUS (3) after MS (200)
-//! svctest writer PATH         as serve, unregistered; SIGTERM has it write
-//!                             PATH a moment later, and end
+//! svctest writer PATH [MS]    as serve, unregistered; SIGTERM has it write
+//!                             PATH MS (300) later, and end: a service with
+//!                             something to finish as it stops
 //! svctest stop NAME           ask the service manager to stop NAME, holding
 //!                             nothing: ends with the refusal's number
 //! ```
@@ -42,16 +43,21 @@ fn usage() -> ! {
     println!("usage: svctest serve NAME [MS]");
     println!("       svctest needs WANT NAME");
     println!("       svctest crash [MS [STATUS]]");
-    println!("       svctest writer PATH");
+    println!("       svctest writer PATH [MS]");
     println!("       svctest stop NAME");
     syscall::sys_exit_code(2);
 }
 
-/// Answer whoever calls, until SIGTERM, if it is being listened for.
+/// Answer whoever calls, until SIGTERM, if it is being listened for: Unix's
+/// signal 15, or the task signal a program written for this system is asked
+/// to stop with.
 fn serve() {
     loop {
         let mut msg = Message::empty();
         if syscall::sys_recv(TID_ANY, &mut msg).is_err() || msg.sender == 0 {
+            if signal::extract_signal(&msg) & signal::SIG_TERM != 0 {
+                STOP.store(true, Ordering::SeqCst);
+            }
             if STOP.load(Ordering::SeqCst) {
                 return;
             }
@@ -111,7 +117,7 @@ pub extern "C" fn _start() -> ! {
             serve();
             // Slower than a server that only has to go: whoever stops this
             // has to wait for it.
-            syscall::sleep_ms(300);
+            syscall::sleep_ms(number(args::argv(3), 300));
             let wrote = nameserver::lookup(b"vfs")
                 .and_then(|v| vfs::open_fd(v, path, vfs::OPEN_WRITE | vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE, 0o644).ok())
                 .map(|fd| {

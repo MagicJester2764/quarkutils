@@ -62,6 +62,16 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_exit_code(1);
     }
 
+    // The services first, in order — what nothing still running needs, then
+    // what it needed, each given SIGTERM and five seconds — and then the log
+    // written and the files synced: a service that writes as it goes has its
+    // file server still there to write to. init answers once it has done.
+    if let Some(init) = quark_rt::services::manager() {
+        if let Err(code) = quark_rt::services::stop_all(init, force) {
+            println!("shutdown: the services were not stopped in order: {}", quark_rt::services::why(code));
+        }
+    }
+
     // The file servers are among what is about to be ended, and a write is
     // answered a moment before it is recorded for good. Have it recorded.
     if let Some(vfs_tid) = quark_rt::nameserver::lookup(b"vfs") {

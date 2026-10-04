@@ -18,9 +18,14 @@
 //! the fifth such end in a row leaves it failed.
 //!
 //! `svc` stops, starts and starts again a service by name, for a caller
-//! holding TaskMgmt over every task ([`may_control`]). A stop is SIGTERM,
-//! five seconds, then the end of the program, and is answered once the
+//! holding TaskMgmt over every task ([`may_control`]). A stop is SIGTERM
+//! ([`terminate`]), five seconds, then the end of the program, and is answered once the
 //! service has gone: the caller waits, and nobody else does.
+//!
+//! A shutdown asks for every service to be stopped first (`TAG_STOP_ALL`):
+//! the ones nothing still running needs, then what they needed, a rank at a
+//! time; then the log is written out and the files synced, and only then is
+//! the caller answered. Nothing is started again from then on.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -165,6 +170,19 @@ pub struct Manager {
     session_ready: u64,
     /// Who is waiting for a service to stop: the caller and the service.
     held: Vec<(usize, usize)>,
+    /// The machine is going down: who asked, whether the services are given
+    /// no time, and how far it has got.
+    shutting: Option<Shutdown>,
+}
+
+struct Shutdown {
+    callers: Vec<usize>,
+    now: bool,
+    /// What the log said to ask about, and until when it is waited for,
+    /// once the services have stopped.
+    sync: Option<(u64, u64)>,
+    /// Everything stopped, written and synced: a caller is answered at once.
+    done: bool,
 }
 
 fn now() -> u64 {
@@ -211,6 +229,7 @@ impl Manager {
             running_name: Vec::new(),
             session_ready: 0,
             held: Vec::new(),
+            shutting: None,
         }
     }
 
@@ -513,11 +532,12 @@ impl Manager {
             }
             return;
         }
-        let again = match s.policy {
-            Policy::Always => true,
-            Policy::OnFailure => status != 0,
-            Policy::Never => false,
-        };
+        let again = self.shutting.is_none()
+            && match s.policy {
+                Policy::Always => true,
+                Policy::OnFailure => status != 0,
+                Policy::Never => false,
+            };
         if !again {
             s.state = if status == 0 { State::Done } else { State::Failed };
             if status != 0 {
@@ -550,6 +570,10 @@ impl Manager {
     /// is started, and the `run` lines and the session take their turns.
     fn settle(&mut self) {
         let t = now();
+        if self.shutting.is_some() {
+            self.wind_down(t);
+            return;
+        }
         for s in self.services.iter_mut().filter(|s| s.state == State::Starting) {
             let want = s.register.as_deref().unwrap_or(b"");
             if registered_as(s.tid).is_some_and(|(name, n)| &name[..n] == want) {
@@ -604,7 +628,7 @@ impl Manager {
         let t = now();
         let mut wait: Option<u64> = None;
         let mut sooner = |ns: u64| wait = Some(wait.map_or(ns, |w| w.min(ns)));
-        if self.services.iter().any(|s| s.state == State::Starting) {
+        if self.services.iter().any(|s| s.state == State::Starting) || self.shutting.as_ref().is_some_and(|s| s.sync.is_some() && !s.done) {
             sooner(LOOK_NS);
         }
         for s in self.services.iter().filter(|s| s.state == State::Restarting || (s.state == State::Stopping && !s.killed)) {
@@ -733,10 +757,30 @@ impl Manager {
                 }
                 self.give_text(msg, &kept[..n]);
             }
+            proto::TAG_STOP_ALL => {
+                if !may_control(msg.sender) {
+                    return refuse(msg.sender, proto::NOT_ALLOWED);
+                }
+                match self.shutting.as_mut() {
+                    Some(s) if s.done => reply(msg.sender, proto::TAG_OK, [0; 6]),
+                    Some(s) => s.callers.push(msg.sender),
+                    None => {
+                        println!("[init] Stopping the services");
+                        self.shutting = Some(Shutdown { callers: alloc::vec![msg.sender], now: msg.data[0] != 0, sync: None, done: false });
+                        // What waits, waits for good now.
+                        for s in self.services.iter_mut().filter(|s| matches!(s.state, State::Waiting | State::Restarting)) {
+                            s.state = State::Stopped;
+                        }
+                    }
+                }
+            }
             proto::TAG_START | proto::TAG_STOP | proto::TAG_RESTART => {
                 let Some(i) = self.named(msg) else { return refuse(msg.sender, proto::NO_SUCH) };
                 if !may_control(msg.sender) {
                     return refuse(msg.sender, proto::NOT_ALLOWED);
+                }
+                if self.shutting.is_some() {
+                    return refuse(msg.sender, proto::SHUTTING_DOWN);
                 }
                 match msg.tag {
                     proto::TAG_START => match self.start(i) {
@@ -747,6 +791,85 @@ impl Manager {
                 }
             }
             _ => refuse(msg.sender, proto::INVALID),
+        }
+    }
+
+    /// A step of a shutdown: the next rank of services stopped once the last
+    /// has gone, then the log written and the files synced, then whoever
+    /// asked answered.
+    fn wind_down(&mut self, t: u64) {
+        // Still stopping: anything not gone in time is ended.
+        for s in self.services.iter_mut().filter(|s| s.state == State::Stopping && !s.killed && s.due <= t) {
+            s.killed = true;
+            let _ = syscall::sys_task_kill(s.tid);
+        }
+        if self.services.iter().any(|s| s.state == State::Stopping) {
+            return;
+        }
+        let Some(shutting) = self.shutting.as_ref() else { return };
+        if shutting.done {
+            return;
+        }
+        let now_too = shutting.now;
+        // A service init can start again, and that is not the session, is
+        // stopped here; the rest are left to whoever is shutting down.
+        let stoppable = |s: &Service| !s.session && !matches!(s.program, Program::Boot);
+        let running: Vec<usize> = (0..self.services.len())
+            .filter(|&i| stoppable(&self.services[i]) && matches!(self.services[i].state, State::Up | State::Starting))
+            .collect();
+        if !running.is_empty() {
+            // Those nothing still running needs.
+            let rank: Vec<usize> = running
+                .iter()
+                .copied()
+                .filter(|&i| !running.iter().any(|&j| self.services[j].needs.contains(&self.services[i].name)))
+                .collect();
+            // A circle of needs is stopped all at once.
+            let rank = if rank.is_empty() { running } else { rank };
+            for i in rank {
+                let s = &mut self.services[i];
+                terminate(s.tid);
+                s.state = State::Stopping;
+                s.due = if now_too { t } else { t + STOP_NS };
+                s.killed = false;
+            }
+            return;
+        }
+        // Everything is stopped: the log written, and the files synced.
+        match self.shutting.as_ref().and_then(|s| s.sync) {
+            None => {
+                let mut asked = 0;
+                if self.logd != 0 {
+                    let mut reply = Message::empty();
+                    let msg = Message { sender: 0, tag: logd::TAG_SYNC, data: [0; 6] };
+                    if syscall::sys_call(self.logd, &msg, &mut reply).is_ok() && reply.tag == logd::TAG_OK {
+                        asked = reply.data[0];
+                    }
+                }
+                if let Some(s) = self.shutting.as_mut() {
+                    s.sync = Some((asked, t + STOP_NS));
+                }
+            }
+            Some((asked, until)) => {
+                let written = asked == 0 || {
+                    let mut reply = Message::empty();
+                    let msg = Message { sender: 0, tag: logd::TAG_SYNCED, data: [asked, 0, 0, 0, 0, 0] };
+                    syscall::sys_call(self.logd, &msg, &mut reply).is_err() || reply.data[0] != 0
+                };
+                if !written && t < until {
+                    return;
+                }
+                if self.vfs_tid != 0 {
+                    let _ = quark_rt::vfs::sync(self.vfs_tid);
+                }
+                println!("[init] The services are stopped");
+                if let Some(s) = self.shutting.as_mut() {
+                    for caller in s.callers.drain(..) {
+                        reply(caller, proto::TAG_OK, [0; 6]);
+                    }
+                    s.done = true;
+                }
+            }
         }
     }
 
@@ -787,7 +910,7 @@ impl Manager {
         }
         match s.state {
             State::Up | State::Starting => {
-                let _ = syscall::sys_sig_raise(s.tid, syscall::SIGTERM);
+                terminate(s.tid);
                 s.state = State::Stopping;
                 s.due = now() + STOP_NS;
                 s.killed = false;
@@ -918,6 +1041,17 @@ impl Manager {
         }
         out
     }
+}
+
+/// Ask the program `tid` is a task of to stop. Unix's SIGTERM, which a C
+/// program's handler is run for, and which ends at once a program that has
+/// said nothing about it; and the task signal a program written for this
+/// system is asked to stop with, which also ends a receive it is waiting
+/// in — a handler the kernel runs is run on the way out of the kernel, and
+/// a server waiting for its next request was never on its way out.
+fn terminate(tid: usize) {
+    let _ = syscall::sys_sig_raise(tid, syscall::SIGTERM);
+    let _ = syscall::sys_signal(tid, syscall::SIG_TERM);
 }
 
 /// Whether `tid` may stop and start services: it holds TaskMgmt over every

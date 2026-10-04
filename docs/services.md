@@ -106,6 +106,21 @@ writes to the console, which may be full; one writes the file, through the
 file server, which may itself be writing a line. It is not started again:
 what it holds is every service's descriptors, which nothing can re-point.
 
+## Shutting down
+
+`shutdown` asks init to stop the services first (`TAG_STOP_ALL`, for a
+caller holding TaskMgmt over every task): the ones nothing still running
+needs, then what they needed, a rank at a time, each sent SIGTERM and given
+five seconds — none, with `shutdown -f` — before it is ended. Then the log
+writes out what it holds and the files are synced, and only then is
+`shutdown` answered, and it goes on as it always did: everything else
+SIGTERMed, then ended, then the machine off. Before, everything was
+SIGTERMed at once, and a service that writes as it stops raced the file
+server it writes through. Nothing is started again once a shutdown has
+begun, and `svc start` is refused. What init stops is what it could start
+again; the rest — the core of the boot image, the session — is left to
+`shutdown`'s sweep.
+
 ## `/etc/init.conf`
 
 ```text

@@ -662,6 +662,11 @@ registered, and what is done when it ends. `svc` asks it, as `init`
   place plus one — and what is kept is a list by number: init's was 0xFFFF
   once, and the list grown to it, seven megabytes in one allocation, held the
   main thread long enough for every service's first line to wait on it.
+- **A shutdown stops the services in order before anything else**
+  (`TAG_STOP_ALL`): what nothing still running needs first, then what it
+  needed, then the log written and the files synced. Everything SIGTERMed at
+  once had a service that writes as it stops racing the file server it
+  writes through.
 - **The session waits for services still starting, five seconds at most.**
   A line printed after the login prompt pushes the prompt off the line it is
   waited for on, and `net` said it was ready a moment after the prompt on a
