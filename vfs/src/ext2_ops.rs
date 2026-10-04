@@ -570,7 +570,7 @@ pub fn truncate(e2: &mut Ext2State, ino: u32, size: u64) -> Result<(), u64> {
     let bs = e2.block_size as u64;
     if size < inode.size64() {
         let keep = ((size + bs - 1) / bs) as u32;
-        free_blocks_from(e2, &mut inode, keep)?;
+        free_blocks_from(e2, ino, &mut inode, keep)?;
         // The kept block's tail must read as zeros if the file grows again.
         if size % bs != 0 {
             let phys = ext2::block_map(e2, &inode, (size / bs) as u32)?;
@@ -715,7 +715,7 @@ fn release_inode(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, t: u32) ->
         // Its i_block is the target's text, not a map of blocks.
         inode.i_block = [0; 15];
     } else {
-        free_blocks_from(e2, inode, 0)?;
+        free_blocks_from(e2, ino, inode, 0)?;
     }
     inode.i_size = 0;
     inode.i_size_high = 0;
@@ -728,13 +728,13 @@ fn release_inode(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, t: u32) ->
 
 /// Free every block of `inode` from logical block `first` on, and whatever
 /// indirect or tree blocks then map nothing. `i_blocks` follows.
-pub fn free_blocks_from(e2: &mut Ext2State, inode: &mut Ext2Inode, first: u32) -> Result<(), u64> {
+pub fn free_blocks_from(e2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, first: u32) -> Result<(), u64> {
     let unit = e2.block_size / 512;
     if ext4::uses_extents(inode) {
         let freed = if first == 0 {
             ext4::free_tree(e2, inode)?
         } else {
-            ext4::truncate_root(e2, inode, first)?
+            ext4::truncate_tree(e2, ino, inode, first)?
         };
         inode.i_blocks = inode.i_blocks.saturating_sub(freed * unit);
         return Ok(());

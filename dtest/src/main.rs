@@ -3559,6 +3559,64 @@ fn slurp(vfs_tid: usize, path: &[u8], into: &mut [u8]) -> Result<usize, u64> {
     result
 }
 
+/// Two files written a block each in turn, so that each is in as many pieces
+/// as it has blocks: on ext4, a tree of extents past the inode — four
+/// pieces fit there — and past one block of them, which holds 340. Read
+/// back, cut short in the middle of the tree, and one of them left for the
+/// checker to look at when the machine has stopped.
+fn test_pieces() {
+    println!("pieces:");
+    let Some(vfs_tid) = nameserver::lookup(b"vfs") else {
+        check("find the file server", false);
+        return;
+    };
+    const BLOCKS: u32 = 400;
+    let a: &[u8] = b"/tmp/dtest-pieces";
+    let b: &[u8] = b"/tmp/dtest-pieces-b";
+    let mark = |file: u8, n: u32| -> [u8; 4096] {
+        let mut block = [0u8; 4096];
+        for (i, byte) in block.iter_mut().enumerate() {
+            *byte = (n as u8).wrapping_mul(31) ^ file ^ (i as u8);
+        }
+        block[..4].copy_from_slice(&n.to_le_bytes());
+        block[4] = file;
+        block
+    };
+    let open = |path: &[u8]| vfs::open_with(vfs_tid, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE).map(|o| o.handle);
+    let (Ok(ha), Ok(hb)) = (open(a), open(b)) else {
+        check("two files are made", false);
+        return;
+    };
+    let mut written = true;
+    for n in 0..BLOCKS {
+        for (h, file) in [(ha, b'a'), (hb, b'b')] {
+            written &= vfs::write(vfs_tid, h, &mark(file, n), n * 4096) == Ok(4096);
+        }
+    }
+    let _ = vfs::close(vfs_tid, hb);
+    check("two files are written a block each in turn, 400 blocks each", written);
+    let mut block = [0u8; 4096];
+    let read_back = |h: usize, file: u8, upto: u32, block: &mut [u8; 4096]| -> bool {
+        (0..upto).all(|n| vfs::read(vfs_tid, h, &mut block[..], n * 4096) == Ok(4096) && *block == mark(file, n))
+    };
+    check("and each reads back as it was written, every piece of it", read_back(ha, b'a', BLOCKS, &mut block));
+    check(
+        "it is cut short in the middle, and is that long",
+        vfs::truncate(vfs_tid, ha, 123 * 4096 + 100).is_ok()
+            && vfs::stat(vfs_tid, ha).is_ok_and(|(size, _)| size == 123 * 4096 + 100)
+            && read_back(ha, b'a', 123, &mut block),
+    );
+    check(
+        "and what is past the cut, written again, is new blocks",
+        (123..300).all(|n| vfs::write(vfs_tid, ha, &mark(b'c', n), n * 4096) == Ok(4096))
+            && read_back(ha, b'a', 123, &mut block)
+            && (123..300).all(|n| vfs::read(vfs_tid, ha, &mut block[..], n * 4096) == Ok(4096) && block == mark(b'c', n)),
+    );
+    let _ = vfs::close(vfs_tid, ha);
+    check("the other is removed", vfs::unlink(vfs_tid, b).is_ok());
+    // `/tmp/dtest-pieces` is left: the image's checker reads its tree.
+}
+
 /// Make a file hold exactly `bytes`.
 fn spill(vfs_tid: usize, path: &[u8], bytes: &[u8]) -> Result<(), u64> {
     let handle = vfs::open_with(vfs_tid, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE)?.handle;
@@ -8548,6 +8606,7 @@ pub extern "C" fn _start() -> ! {
         ("parts", test_parts),
         ("diskfiles", test_disk_files),
         ("mounts", test_mounts),
+        ("pieces", test_pieces),
         ("files", test_files),
         ("fifo", test_named_pipes),
         ("sync", test_sync),

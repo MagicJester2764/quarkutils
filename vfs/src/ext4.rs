@@ -516,3 +516,394 @@ fn store_root(inode: &mut Ext2Inode, root: &[u8; 60]) {
         inode.i_block[j] = read_u32(root, j * 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A tree past the inode
+// ---------------------------------------------------------------------------
+//
+// Four extents fit in the inode. A file in more pieces than that — written
+// a block here and a block there, on a disk that has been used — needs the
+// tree: the root becomes an index of blocks of extents, each holding as many
+// as the block has room for (340 in four kilobytes), and when the index in
+// the root is full too, the root's index goes into a block of its own and
+// the tree is a level deeper. Each block of the tree carries a checksum in
+// its last four bytes, seeded with its inode's, where the filesystem asks
+// for them. Until this, a file that needed a fifth piece could not be
+// written past it.
+
+/// A block of the tree, as it is being changed: the path down from the
+/// root holds one a level.
+static mut NODES: [[u8; 4096]; MAX_DEPTH as usize + 1] = [[0; 4096]; MAX_DEPTH as usize + 1];
+
+fn node(level: usize) -> &'static mut [u8; 4096] {
+    unsafe { &mut (*core::ptr::addr_of_mut!(NODES))[level] }
+}
+
+/// How many entries a block of the tree holds: what is left of it after the
+/// header, the checksum's four bytes at its end not counted.
+fn block_capacity(ext2: &Ext2State) -> u16 {
+    ((ext2.block_size as usize - EXTENT_HEADER_SIZE) / EXTENT_ENTRY_SIZE) as u16
+}
+
+fn put_u16(b: &mut [u8], off: usize, v: u16) {
+    b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn header_bytes(b: &mut [u8], entries: u16, max: u16, depth: u16) {
+    put_u16(b, 0, EXTENT_MAGIC);
+    put_u16(b, 2, entries);
+    put_u16(b, 4, max);
+    put_u16(b, 6, depth);
+    put_u32(b, 8, 0);
+}
+
+/// Read block `block` of the tree into `out`.
+fn read_node(ext2: &Ext2State, block: u32, out: &mut [u8; 4096]) -> Result<(), u64> {
+    read_block_bytes(ext2, block, 0, &mut out[..ext2.block_size as usize])
+}
+
+/// Write block `block` of the tree from `buf`, its checksum set where the
+/// filesystem keeps them.
+fn write_node(ext2: &Ext2State, ino: u32, inode: &Ext2Inode, block: u32, buf: &mut [u8; 4096]) -> Result<(), u64> {
+    let bs = ext2.block_size as usize;
+    if crate::csum::enabled(ext2) {
+        let tail = EXTENT_HEADER_SIZE + read_u16(buf, 4) as usize * EXTENT_ENTRY_SIZE;
+        if tail + 4 <= bs {
+            let seed = crate::csum::inode_seed(ext2, ino, inode.i_generation);
+            let sum = crate::csum::crc32c(seed, &buf[..tail]);
+            put_u32(buf, tail, sum);
+        }
+    }
+    for s in 0..ext2.sectors_per_block {
+        let disk = unsafe { core::slice::from_raw_parts_mut(crate::DISK_IO_BUF as *mut u8, 512) };
+        disk.copy_from_slice(&buf[(s * 512) as usize..(s * 512) as usize + 512]);
+        ext2.write_sector_abs(ext2.block_to_lba(block) + s).map_err(|_| ERR_IO)?;
+    }
+    Ok(())
+}
+
+/// The first logical block an entry covers: an extent's or an index's.
+fn first_of(e: &[u8]) -> u32 {
+    read_u32(e, 0)
+}
+
+fn index_entry(first: u32, child: u32) -> [u8; EXTENT_ENTRY_SIZE] {
+    let mut e = [0u8; EXTENT_ENTRY_SIZE];
+    put_u32(&mut e, 0, first);
+    put_u32(&mut e, 4, child);
+    e
+}
+
+fn leaf_entry(logical: u32, phys: u32) -> [u8; EXTENT_ENTRY_SIZE] {
+    let mut e = [0u8; EXTENT_ENTRY_SIZE];
+    put_u32(&mut e, 0, logical);
+    put_u16(&mut e, 4, 1);
+    put_u32(&mut e, 8, phys);
+    e
+}
+
+/// Put `e` in `buf`'s entries in logical order, if there is room: whether
+/// there was. A block that continues a leaf's extent, logically and on the
+/// disk, makes it longer instead.
+fn place(buf: &mut [u8], cap: u16, leaf: bool, e: &[u8; EXTENT_ENTRY_SIZE]) -> bool {
+    let entries = read_u16(buf, 2);
+    let logical = first_of(e);
+    if leaf {
+        // The extent before where it goes, made one longer.
+        let mut before = None;
+        for i in 0..entries as usize {
+            if first_of(&buf[EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE..]) <= logical {
+                before = Some(i);
+            }
+        }
+        if let Some(i) = before {
+            let off = EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE;
+            let raw = read_u16(buf, off + 4);
+            let start = ((read_u16(buf, off + 6) as u64) << 32) | read_u32(buf, off + 8) as u64;
+            let phys = read_u32(e, 8) as u64;
+            if raw < INIT_MAX_LEN - 1 && logical == read_u32(buf, off) + raw as u32 && phys == start + raw as u64 {
+                put_u16(buf, off + 4, raw + 1);
+                return true;
+            }
+        }
+    }
+    if entries >= cap {
+        return false;
+    }
+    let mut at = entries as usize;
+    while at > 0 && first_of(&buf[EXTENT_HEADER_SIZE + (at - 1) * EXTENT_ENTRY_SIZE..]) > logical {
+        at -= 1;
+    }
+    let from = EXTENT_HEADER_SIZE + at * EXTENT_ENTRY_SIZE;
+    let end = EXTENT_HEADER_SIZE + entries as usize * EXTENT_ENTRY_SIZE;
+    buf.copy_within(from..end, from + EXTENT_ENTRY_SIZE);
+    buf[from..from + EXTENT_ENTRY_SIZE].copy_from_slice(e);
+    put_u16(buf, 2, entries + 1);
+    true
+}
+
+/// A new block for the tree, counted in the inode's blocks.
+fn new_block(ext2: &mut Ext2State, inode: &mut Ext2Inode) -> Result<u32, u64> {
+    let b = ext2_alloc::alloc_block(ext2)?;
+    inode.i_blocks += ext2.block_size / 512;
+    Ok(b)
+}
+
+/// The root's entries, moved into a block of their own; the root an index
+/// of that one block, a level deeper. What makes room in the root.
+fn deepen(ext2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode) -> Result<(), u64> {
+    let mut root = root_bytes(inode);
+    let h = parse_header(&root)?;
+    if h.depth >= MAX_DEPTH - 1 {
+        return Err(ERR_NOT_FOUND);
+    }
+    let child = new_block(ext2, inode)?;
+    let buf = node(MAX_DEPTH as usize);
+    buf.fill(0);
+    header_bytes(buf, h.entries, block_capacity(ext2), h.depth);
+    let n = h.entries as usize * EXTENT_ENTRY_SIZE;
+    buf[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + n].copy_from_slice(&root[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + n]);
+    let first = if h.entries > 0 { first_of(&root[EXTENT_HEADER_SIZE..]) } else { 0 };
+    write_node(ext2, ino, inode, child, buf)?;
+    root[EXTENT_HEADER_SIZE..].fill(0);
+    header_bytes(&mut root, 1, ((60 - EXTENT_HEADER_SIZE) / EXTENT_ENTRY_SIZE) as u16, h.depth + 1);
+    root[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + EXTENT_ENTRY_SIZE].copy_from_slice(&index_entry(first, child));
+    store_root(inode, &root);
+    Ok(())
+}
+
+/// Record that logical block `logical` of inode `ino` is at `phys`, in a tree
+/// as deep as it has to be. What `extent_insert` does for a tree that is all
+/// root, for any tree.
+pub fn tree_insert(ext2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, logical: u32, phys: u32) -> Result<(), u64> {
+    // The common case, and the only one a small file meets: the root.
+    if parse_header(&root_bytes(inode))?.depth == 0 {
+        match extent_insert(inode, logical, phys) {
+            Err(ERR_NOT_FOUND) => deepen(ext2, ino, inode)?,
+            done => return done,
+        }
+    }
+    let e = leaf_entry(logical, phys);
+    // Down from the root, at each level the last entry that does not start
+    // past the block — or the first, for a block before them all.
+    let root = root_bytes(inode);
+    let depth = parse_header(&root)?.depth as usize;
+    let mut blocks = [0u32; MAX_DEPTH as usize + 1];
+    let mut at = [0usize; MAX_DEPTH as usize + 1];
+    node(0)[..60].copy_from_slice(&root);
+    for level in 0..depth {
+        let buf = node(level);
+        let entries = read_u16(buf, 2) as usize;
+        if entries == 0 {
+            return Err(ERR_IO);
+        }
+        let mut chosen = 0;
+        for i in 0..entries {
+            if first_of(&buf[EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE..]) <= logical {
+                chosen = i;
+            }
+        }
+        at[level] = chosen;
+        let off = EXTENT_HEADER_SIZE + chosen * EXTENT_ENTRY_SIZE;
+        let child = read_u32(buf, off + 4);
+        if child == 0 {
+            return Err(ERR_IO);
+        }
+        blocks[level + 1] = child;
+        read_node(ext2, child, node(level + 1))?;
+        if parse_header(&node(level + 1)[..])?.depth as usize != depth - level - 1 {
+            return Err(ERR_IO);
+        }
+    }
+
+    // Into the leaf, if it has room.
+    let cap = block_capacity(ext2);
+    let leaf = node(depth);
+    if place(leaf, cap, true, &e) {
+        write_node(ext2, ino, inode, blocks[depth], leaf)?;
+        return lower_bounds(ext2, ino, inode, &blocks, &at, depth, logical);
+    }
+
+    // A full leaf: split, and the new half's index into its parent, which
+    // may split in turn. A block past every extent the leaf has goes into a
+    // leaf of its own, which is what a file written from start to end
+    // wants; anything else, half the leaf moves.
+    let mut carry = e;
+    let mut is_leaf = true;
+    let mut level = depth;
+    loop {
+        let buf = node(level);
+        let entries = read_u16(buf, 2) as usize;
+        let sibling = new_block(ext2, inode)?;
+        let side = node(MAX_DEPTH as usize);
+        side.fill(0);
+        let node_depth = read_u16(buf, 6);
+        header_bytes(side, 0, cap, node_depth);
+        let last = first_of(&buf[EXTENT_HEADER_SIZE + (entries - 1) * EXTENT_ENTRY_SIZE..]);
+        if first_of(&carry) > last {
+            place(side, cap, is_leaf, &carry);
+        } else {
+            let half = entries / 2;
+            let from = EXTENT_HEADER_SIZE + half * EXTENT_ENTRY_SIZE;
+            let to = EXTENT_HEADER_SIZE + entries * EXTENT_ENTRY_SIZE;
+            side[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + (to - from)].copy_from_slice(&buf[from..to]);
+            put_u16(side, 2, (entries - half) as u16);
+            buf[from..to].fill(0);
+            put_u16(buf, 2, half as u16);
+            let goes_right = first_of(&carry) >= first_of(&side[EXTENT_HEADER_SIZE..]);
+            if goes_right {
+                place(side, cap, is_leaf, &carry);
+            } else {
+                place(buf, cap, is_leaf, &carry);
+            }
+        }
+        write_node(ext2, ino, inode, blocks[level], buf)?;
+        let side_first = first_of(&side[EXTENT_HEADER_SIZE..]);
+        write_node(ext2, ino, inode, sibling, side)?;
+        carry = index_entry(side_first, sibling);
+        is_leaf = false;
+        level -= 1;
+        if level == 0 {
+            // Into the root, or the root a level deeper first.
+            let mut root = root_bytes(inode);
+            if !place(&mut root, ((60 - EXTENT_HEADER_SIZE) / EXTENT_ENTRY_SIZE) as u16, false, &carry) {
+                deepen(ext2, ino, inode)?;
+                // The root's one entry is now the block its entries went to,
+                // which has room for this.
+                let moved = read_u32(&root_bytes(inode), EXTENT_HEADER_SIZE + 4);
+                let buf = node(1);
+                read_node(ext2, moved, buf)?;
+                place(buf, cap, false, &carry);
+                write_node(ext2, ino, inode, moved, buf)?;
+                return Ok(());
+            }
+            store_root(inode, &root);
+            return Ok(());
+        }
+        let parent = node(level);
+        if place(parent, cap, false, &carry) {
+            write_node(ext2, ino, inode, blocks[level], parent)?;
+            return Ok(());
+        }
+    }
+}
+
+/// A block put before every other in its leaf: the index entries above it
+/// that start after it start at it.
+fn lower_bounds(
+    ext2: &Ext2State,
+    ino: u32,
+    inode: &mut Ext2Inode,
+    blocks: &[u32],
+    at: &[usize],
+    depth: usize,
+    logical: u32,
+) -> Result<(), u64> {
+    for level in (0..depth).rev() {
+        let buf = node(level);
+        let off = EXTENT_HEADER_SIZE + at[level] * EXTENT_ENTRY_SIZE;
+        if read_u32(buf, off) <= logical {
+            break;
+        }
+        put_u32(buf, off, logical);
+        if level == 0 {
+            let mut root = [0u8; 60];
+            root.copy_from_slice(&buf[..60]);
+            store_root(inode, &root);
+        } else {
+            write_node(ext2, ino, inode, blocks[level], buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Free the blocks of inode `ino` from logical block `first` on, in a tree
+/// of any depth: each leaf cut short, each subtree past the cut freed
+/// whole, each block left with nothing in it freed, and a root left with
+/// nothing is a leaf again. How many blocks went, the tree's included.
+pub fn truncate_tree(ext2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, first: u32) -> Result<u32, u64> {
+    if parse_header(&root_bytes(inode))?.depth == 0 {
+        return truncate_root(ext2, inode, first);
+    }
+    let mut root = root_bytes(inode);
+    let (left, freed) = trim(ext2, ino, inode, &mut root[..], true, first, 0)?;
+    if left == 0 {
+        init_extent_root(inode);
+    } else {
+        store_root(inode, &root);
+    }
+    Ok(freed)
+}
+
+/// Cut the node in `buf` (the root's sixty bytes, or a block's) at `first`:
+/// how many entries it has left, and how many blocks went.
+fn trim(ext2: &mut Ext2State, ino: u32, inode: &mut Ext2Inode, buf: &mut [u8], in_root: bool, first: u32, guard: u16) -> Result<(u16, u32), u64> {
+    if guard > MAX_DEPTH {
+        return Err(ERR_IO);
+    }
+    let h = parse_header(buf)?;
+    let cap = if in_root { ((60 - EXTENT_HEADER_SIZE) / EXTENT_ENTRY_SIZE) as u16 } else { block_capacity(ext2) };
+    if h.entries > cap {
+        return Err(ERR_IO);
+    }
+    let mut kept = 0usize;
+    let mut freed = 0u32;
+    // Of an index, only the last entry that starts before the cut can hold
+    // anything past it: those before it are kept as they are, unread.
+    let cut_in = (0..h.entries as usize)
+        .filter(|&i| first_of(&buf[EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE..]) < first)
+        .last();
+    for i in 0..h.entries as usize {
+        let off = EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE;
+        let mut e = [0u8; EXTENT_ENTRY_SIZE];
+        e.copy_from_slice(&buf[off..off + EXTENT_ENTRY_SIZE]);
+        let starts = first_of(&e);
+        if h.depth != 0 && Some(i) != cut_in && starts < first {
+            // Wholly before the cut.
+        } else if h.depth == 0 {
+            let (block, len, start, uninit) = leaf_run(&e)?;
+            let keep = if block >= first { 0 } else { (first - block).min(len) };
+            for b in keep..len {
+                ext2_alloc::free_block(ext2, start + b)?;
+            }
+            freed += len - keep;
+            if keep == 0 {
+                continue;
+            }
+            let raw = if uninit { keep as u16 + INIT_MAX_LEN } else { keep as u16 };
+            put_u16(&mut e, 4, raw);
+        } else if starts >= first {
+            freed += free_entry(ext2, &e, h.depth, guard)?;
+            continue;
+        } else {
+            // The entry the cut falls in, or one wholly before it: its
+            // subtree is cut, and goes if nothing is left of it.
+            let child = read_u32(&e, 4);
+            let mut block = [0u8; 4096];
+            read_node(ext2, child, &mut block)?;
+            let (left, gone) = trim(ext2, ino, inode, &mut block[..ext2.block_size as usize], false, first, guard + 1)?;
+            freed += gone;
+            if left == 0 {
+                ext2_alloc::free_block(ext2, child)?;
+                freed += 1;
+                continue;
+            }
+            if gone > 0 {
+                write_node(ext2, ino, inode, child, &mut block)?;
+            }
+        }
+        let to = EXTENT_HEADER_SIZE + kept * EXTENT_ENTRY_SIZE;
+        buf[to..to + EXTENT_ENTRY_SIZE].copy_from_slice(&e);
+        kept += 1;
+    }
+    for i in kept..h.entries as usize {
+        let to = EXTENT_HEADER_SIZE + i * EXTENT_ENTRY_SIZE;
+        buf[to..to + EXTENT_ENTRY_SIZE].fill(0);
+    }
+    put_u16(buf, 2, kept as u16);
+    Ok((kept as u16, freed))
+}

@@ -486,7 +486,7 @@ pub fn create_dir_entry(
     zero_block(ext2, new_block)?;
 
     let logical = total_blocks;
-    crate::ext2::set_block_ptr(ext2, dir_inode, logical, new_block)?;
+    crate::ext2::set_block_ptr(ext2, dir_inode_num, dir_inode, logical, new_block)?;
     dir_inode.i_blocks += ext2.block_size / 512;
     dir_inode.i_size += bs;
 

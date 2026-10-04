@@ -1098,7 +1098,7 @@ pub fn write_file_data(
         if !covered {
             zero_block(ext2, new_block)?;
         }
-        if let Err(code) = set_block_ptr(ext2, inode, logical, new_block) {
+        if let Err(code) = set_block_ptr(ext2, inode_num, inode, logical, new_block) {
             // Nothing refers to it; leaving it allocated would leak it.
             let _ = crate::ext2_alloc::free_block(ext2, new_block);
             return Err(code);
@@ -1196,15 +1196,17 @@ pub fn zero_block(ext2: &Ext2State, block: u32) -> Result<(), u64> {
     Ok(())
 }
 
-/// Set a block pointer in the inode's block map (handles indirect allocation).
+/// Set a block pointer in inode `ino`'s block map (handles indirect
+/// allocation, and an extent tree of any depth).
 pub fn set_block_ptr(
     ext2: &mut Ext2State,
+    ino: u32,
     inode: &mut Ext2Inode,
     logical: u32,
     phys_block: u32,
 ) -> Result<(), u64> {
     if ext4::uses_extents(inode) {
-        return ext4::extent_insert(inode, logical, phys_block);
+        return ext4::tree_insert(ext2, ino, inode, logical, phys_block);
     }
 
     let ppb = ext2.ptrs_per_block();

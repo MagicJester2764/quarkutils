@@ -1440,10 +1440,7 @@ mounts`):
   Toolkits do call `resize`, so this is a real gap rather than a preference.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
   where Linux makes the target, and `linkat` cannot name its source by
-  descriptor (`AT_EMPTY_PATH`). FAT32 has no links.
-- FAT32 cannot rename anything or make a file longer except by writing to
-  it, and ext4 refuses to shorten a file whose extent tree has grown past
-  the inode.
+  descriptor (`AT_EMPTY_PATH`). FAT has no links.
 - A mapped file's pages stay cached until nothing maps the file any more, and
   the VFS pages 30 objects at once. A private writable mapping copies a page
   when it is first touched, read or write.

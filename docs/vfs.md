@@ -339,9 +339,8 @@ reply is its whole length. A path that is not a link is `INVALID_PATH`.
 
 Sets a writable handle's regular file to `size` bytes, which must fit in 32
 bits. Growing it adds a hole, which reads as zeroes and takes no blocks until
-it is written. ext4 shortens only files whose extent tree fits in the inode;
-that is `NOT_SUPPORTED`. FAT32 shortens a file and does not lengthen one
-(`NOT_SUPPORTED`). `OPEN_TRUNCATE` is the same operation to size 0.
+it is written. FAT has no holes: a file grown there is given clusters of
+zeroes. `OPEN_TRUNCATE` is the same operation to size 0.
 
 ### READDIR_BULK
 
