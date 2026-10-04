@@ -121,6 +121,12 @@ impl CapReq {
         CapReq { cap_type: syscall::CAP_TYPE_POWER, param0: 0, param1: 0 }
     }
 
+    /// Say how the network treats what comes in (`netctl filter`). A
+    /// session holds it if its account has the `network` right.
+    pub const fn net_admin() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_NET_ADMIN, param0: 0, param1: 0 }
+    }
+
     /// Be where memory is written out to when there is not enough of it
     /// (`OBJECT_SWAP`). For the one program a system starts to do that:
     /// whoever holds it is handed pages of every program's memory.

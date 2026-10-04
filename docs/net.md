@@ -118,6 +118,38 @@ is handed back cut short and not kept: nothing is asked again over TCP.
 answered from what was kept, failed]`. The old protocol's lookup
 (`TAG_DNS_RESOLVE`) is a question of type A put to it.
 
+## What it is doing, and what is let in
+
+`TAG_STATUS` (22) writes what the stack is doing, as text, into a buffer
+the caller lends for writing (`[its length]`): the card, its addresses,
+the ways out and the DNS servers; `lo`'s addresses; the resolver's
+counts; a line for each socket — what it is, where it is, where it goes
+and what state it is in; and the filter. The answer is `[written, how long
+it all was]`. Anybody may ask; `netctl` prints it.
+
+The **filter** is a list of rules about what comes in, the first that
+matches a packet deciding and a packet none matches let in. Every packet
+the card brings and every packet `lo` carries is asked about before the
+protocols see it, so a rule about a port is about a connection to it from
+anywhere, this machine included. `TAG_FILTER` (23) changes it, for a
+caller that offers the right to with the call (`SYS_CALL_OFFER` of a
+`NetAdmin` capability, type 15) — taken to be looked at, and let go of
+again; anybody else is refused (`EPERM`):
+
+| Op | Request | |
+|---|---|---|
+| 0 add | `[0, rule, first << 16 \| last port, address…]` | at the end |
+| 1 remove | `[1, n]` | rule `n`, counting from one |
+| 2 clear | `[2]` | every rule |
+
+A rule's word: 1, drop it (or else let it in); 2, from an address — the
+two words after the ports, as an address is said above, IPv6's if 4 is
+set too; the protocol in bits 8 to 15 (0 any, 1 ICMP of either family, 6
+TCP, 17 UDP); and the bits of the address that must match in bits 16 to
+23. Ports are this machine's, the ones a packet is for: all of them, 0 to
+65535, for every port. The answer is `[how many rules there are]`; 64 at
+most (`ENOSPC`), and a rule that is not one is `EINVAL`.
+
 ## Before sockets were descriptors
 
 Programs built before this spoke to the stack by tags of their own: a

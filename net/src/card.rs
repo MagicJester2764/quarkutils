@@ -3,22 +3,26 @@
 //!
 //! Asking costs a call to the driver, so it is asked only when there may be
 //! something: when the driver has said frames came, or now and then in case
-//! the saying was missed, until it answers that there is none.
+//! the saying was missed, until it answers that there is none. A frame the
+//! filter will not let in is not handed on.
 
 use quark_rt::nic;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
+
+use crate::filter;
 
 pub struct Card {
     pub link: nic::Link,
     /// Frames may have come since the driver was last asked.
     pub stirred: bool,
     frame: [u8; nic::FRAME],
+    filter: filter::Shared,
 }
 
 impl Card {
-    pub fn new(link: nic::Link) -> Card {
-        Card { link, stirred: true, frame: [0; nic::FRAME] }
+    pub fn new(link: nic::Link, filter: filter::Shared) -> Card {
+        Card { link, stirred: true, frame: [0; nic::FRAME], filter }
     }
 }
 
@@ -49,11 +53,16 @@ impl Device for Card {
         if !self.stirred {
             return None;
         }
-        let n = self.link.receive(&mut self.frame);
-        if n == 0 {
-            self.stirred = false;
-            return None;
-        }
+        let n = loop {
+            let n = self.link.receive(&mut self.frame);
+            if n == 0 {
+                self.stirred = false;
+                return None;
+            }
+            if self.filter.borrow_mut().admits_frame(&self.frame[..n]) {
+                break n;
+            }
+        };
         Some((Rx(&self.frame[..n]), Tx(&self.link)))
     }
 

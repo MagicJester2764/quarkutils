@@ -24,8 +24,10 @@
 //! little-endian words. A refusal is tag `u64::MAX` and Linux's errno.
 //! `docs/net.md` has every request's words.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use quark_rt::ipc::{Message, TAG_FD_READ};
 use quark_rt::syscall::{self, FD_READY_HANGUP, FD_READY_READ, FD_READY_WRITE};
 use smoltcp::iface::SocketHandle;
@@ -305,6 +307,23 @@ fn drop_strangers(net: &mut Stack, side: Side, h: SocketHandle, peer: Option<IpE
     let d = datagram(net, side, h);
     while d.peek().is_ok_and(|(_, meta)| meta.endpoint != peer) {
         let _ = d.recv();
+    }
+}
+
+/// An end of a connection as `netctl` writes one: `*` for any address, and
+/// IPv6's in brackets; `-` for none.
+pub fn write_end(out: &mut String, end: Option<(Option<IpAddress>, u16)>) {
+    match end {
+        None => out.push('-'),
+        Some((None, port)) => {
+            let _ = write!(out, "*:{}", port);
+        }
+        Some((Some(IpAddress::Ipv6(a)), port)) => {
+            let _ = write!(out, "[{}]:{}", a, port);
+        }
+        Some((Some(a), port)) => {
+            let _ = write!(out, "{}:{}", a, port);
+        }
     }
 }
 
@@ -1136,6 +1155,33 @@ impl Sockets {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A line for each socket: what it is, where it is, and where it goes
+    /// or what it waits for.
+    pub fn describe(&self, net: &mut Stack, out: &mut String) {
+        for s in self.table.iter().flatten() {
+            let _ = write!(out, "  {}{}  ", if s.kind == Kind::Stream { "tcp" } else { "udp" }, if s.v6 { "6" } else { "4" });
+            match (s.kind, s.socket) {
+                (Kind::Stream, Some((side, h))) => {
+                    let t = net.sockets(side).get::<tcp::Socket>(h);
+                    write_end(out, t.local_endpoint().map(|e| (Some(e.addr), e.port)));
+                    out.push_str("  ");
+                    write_end(out, t.remote_endpoint().map(|e| (Some(e.addr), e.port)));
+                    let _ = write!(out, "  {}", t.state());
+                }
+                _ => {
+                    write_end(out, s.local.map(|l| (l.addr, l.port)));
+                    if s.listen.is_some() {
+                        out.push_str("  listening");
+                    } else if let Some(p) = s.peer {
+                        out.push_str("  ");
+                        write_end(out, Some((Some(p.addr), p.port)));
+                    }
+                }
+            }
+            out.push('\n');
         }
     }
 

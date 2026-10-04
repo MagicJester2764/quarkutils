@@ -8,7 +8,7 @@
 //! must come back; a dozen connections to it at once, each its own; and a
 //! connection to this machine itself, 127.0.0.1, which a thread of this
 //! program listens for. Every call lends its buffer to the server rather than
-//! naming a page for it to map, which is why this asks for no capability.
+//! naming a page for it to map.
 //!
 //! Then sockets that are descriptors (`quark_rt::socket`), over this
 //! machine's own addresses: a stream — connected without waiting, accepted,
@@ -24,9 +24,15 @@
 //! what was kept. That one is example.com, which only the internet knows:
 //! a host that cannot reach it fails that check, and says so.
 //!
+//! And the filter: a rule that drops a port keeps a connection to it over
+//! 127.0.0.1 unanswered, the stack says so, and taking it out lets one in —
+//! which needs the right to run the network (`NetAdmin`), asked for here
+//! and held by root's session; and without it, the same change is refused.
+//!
 //! Exits 0 only if every check holds.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use quark_rt::manifest::CapReq;
 use quark_rt::socket::{self, Addr, Endpoint, Shutdown, TcpListener, TcpStream, UdpSocket};
 use quark_rt::{nameserver, net, println, syscall, thread};
 
@@ -48,6 +54,8 @@ const BULK: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 static mut OUT: [u8; CHUNK] = [0; CHUNK];
 static mut IN: [u8; CHUNK] = [0; CHUNK];
+
+quark_rt::manifest!([CapReq::net_admin()]);
 
 static mut FAILED: u32 = 0;
 
@@ -409,6 +417,52 @@ fn resolver(net_tid: usize) {
     check("a name asked again is answered from what was kept", answered && kept && same);
 }
 
+fn contains(text: &[u8], what: &[u8]) -> bool {
+    text.windows(what.len()).any(|w| w == what)
+}
+
+fn filtering(net_tid: usize) {
+    let Ok(listener) = TcpListener::bind_to(Endpoint::v4(LO4, 0)) else {
+        check("a listener to keep out", false);
+        return;
+    };
+    let port = listener.port();
+    let rule = net::Rule { drop: true, protocol: 6, ports: (port, port), from: None };
+    let added = net::filter_add(net_tid, &rule);
+    check("a holder of the right adds a rule that drops a port", added.is_ok());
+    let kept_out = TcpStream::connect_timeout(Endpoint::v4(LO4, port), 1_000_000_000);
+    check("and a connection to it over 127.0.0.1 is not answered", matches!(kept_out, Err(socket::Error::TimedOut)));
+    let mut text = [0u8; 4096];
+    let mut line = *b"drop tcp port 00000";
+    let mut digits = [0u8; 5];
+    let mut at = digits.len();
+    let mut n = port;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let len = 14 + digits.len() - at;
+    line[14..len].copy_from_slice(&digits[at..]);
+    let shown = net::status(net_tid, &mut text)
+        .is_ok_and(|(n, _)| contains(&text[..n], &line[..len]) && !contains(&text[..n], b" 0 dropped"));
+    check("which the stack says, with what it dropped", shown);
+    check("taking it out", added.is_ok_and(|n| net::filter_remove(net_tid, n).is_ok()));
+    let let_in = TcpStream::connect_timeout(Endpoint::v4(LO4, port), 2_000_000_000);
+    check("lets one in again", let_in.is_ok() && listener.accept_from().is_ok());
+    // Without the right: the same change asked for, and refused.
+    let me = syscall::sys_getpid() as usize;
+    for slot in 0..64 {
+        if syscall::sys_cap_read(me, slot).is_ok_and(|c| c.cap_type == syscall::CAP_TYPE_NET_ADMIN) {
+            let _ = syscall::sys_cap_delete(slot);
+        }
+    }
+    check("a program without the right is refused a change", net::filter_add(net_tid, &rule) == Err(1));
+}
+
 fn host_over_ipv6() {
     let stream = TcpStream::connect_timeout(Endpoint::v6(ECHO6, ECHO_PORT), 5_000_000_000);
     check("a connection to the host over IPv6, at fec0::2", stream.is_ok());
@@ -444,6 +498,7 @@ pub extern "C" fn _start() -> ! {
     over_ipv6();
     host_over_ipv6();
     resolver(net_tid);
+    filtering(net_tid);
     let failed = unsafe { FAILED };
     println!("nettest: {}", if failed == 0 { "ok" } else { "FAIL" });
     syscall::sys_exit_code(if failed == 0 { 0 } else { 1 });

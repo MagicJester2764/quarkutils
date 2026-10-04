@@ -4,7 +4,9 @@
 extern crate alloc;
 
 mod card;
+mod control;
 mod dns;
+mod filter;
 mod legacy;
 mod lo;
 mod ndp;
@@ -24,9 +26,10 @@ use quark_rt::{nameserver, nic, println, syscall};
 //
 // The protocols are smoltcp's (`stack`), unpatched; what is this server's is
 // the card under them (`card`), what routers say (`ndp`), the machine's
-// resolver (`resolver`), and what programs ask of them: sockets that are
-// descriptors (`sockets`), and the calls programs made before there were
-// (`legacy`).
+// resolver (`resolver`), what is let in (`filter`), what it is doing and
+// who may change that (`control`), and what programs ask of them: sockets
+// that are descriptors (`sockets`), and the calls programs made before
+// there were (`legacy`).
 //
 // In the drivers' band all the same, as it was then: in the servers' it
 // waited for `init`, which starts the system in the drivers' band, and had
@@ -164,6 +167,10 @@ pub extern "C" fn _start() -> ! {
             }
         } else if msg.tag == resolver::TAG_RESOLVER {
             resolver.counts(msg.sender);
+        } else if msg.tag == control::TAG_STATUS {
+            control::status(&mut net, &socks, &clients, &resolver, msg.sender, msg.data[0] as usize);
+        } else if msg.tag == control::TAG_FILTER {
+            control::change(&mut net, &msg);
         } else if msg.tag == sockets::TAG_SOCKET {
             // A socket closed a moment ago is gone before anything is asked
             // of another: what it had may be what is asked for.

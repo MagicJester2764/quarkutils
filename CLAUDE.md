@@ -1029,6 +1029,15 @@ sent out to be answered by nobody.
   without one not at all, RFC 2308), handing it out again with what is
   left of them. Only `lo` hears it: it answers this machine and nobody on
   the network.
+- **What comes in is asked about first** (`net/src/filter.rs`): a list of
+  rules, the first that matches deciding, on every frame the card brings
+  and every packet `lo` carries, before smoltcp sees either — so a rule
+  about a port is about connections to it from this machine too. It is
+  changed only by a caller that offers `NetAdmin` with the call, which the
+  stack takes, looks at and lets go of: the kernel never acts on that
+  type, and a session holds it when its account has the `network` right.
+  What the stack is doing — interfaces, ways out, sockets, the filter —
+  anybody may ask (`netctl`).
 - **`lo` says everything it has in one turn.** What `lo` sends it receives
   in the same poll, again and again until nothing is in flight: smoltcp's
   own loopback keeps its queue to itself, and a reset or an echo's answer

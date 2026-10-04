@@ -5,7 +5,8 @@
 //! the loop go on until a conversation the machine is having with itself
 //! has gone as far as it can: a packet one poll sends is received by the
 //! next, and what a poll's receiving answers — a reset, an echo's reply —
-//! would otherwise wait for a timer nobody set.
+//! would otherwise wait for a timer nobody set. A packet the filter will
+//! not let in is not received.
 
 use alloc::collections::VecDeque;
 use alloc::vec;
@@ -13,16 +14,19 @@ use alloc::vec::Vec;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
+use crate::filter;
+
 /// As large as an IP packet can say: a segment over `lo` is never cut up.
 const MTU: usize = 65535;
 
 pub struct Lo {
     queue: VecDeque<Vec<u8>>,
+    filter: filter::Shared,
 }
 
 impl Lo {
-    pub fn new() -> Lo {
-        Lo { queue: VecDeque::new() }
+    pub fn new(filter: filter::Shared) -> Lo {
+        Lo { queue: VecDeque::new(), filter }
     }
 
     /// Whether anything sent has not yet been received.
@@ -46,7 +50,12 @@ impl Device for Lo {
     }
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
-        self.queue.pop_front().map(|packet| (Rx(packet), Tx(&mut self.queue)))
+        loop {
+            let packet = self.queue.pop_front()?;
+            if self.filter.borrow_mut().admits(&packet) {
+                return Some((Rx(packet), Tx(&mut self.queue)));
+            }
+        }
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {

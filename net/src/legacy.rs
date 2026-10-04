@@ -11,8 +11,10 @@
 //! is not waiting any more; one that dies takes its connections with it.
 //! A name (`TAG_DNS_RESOLVE`) is the resolver's to look up.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 use smoltcp::iface::SocketHandle;
@@ -646,6 +648,27 @@ impl Clients {
         }
         if self.ping.as_ref().is_some_and(|p| p.tid == tid) {
             self.ping = None;
+        }
+    }
+
+    /// A line for each of the old protocol's streams and datagram ports.
+    pub fn describe(&self, net: &mut Stack, out: &mut String) {
+        for c in self.conns.iter().flatten() {
+            let t = net.sockets(c.side).get::<tcp::Socket>(c.socket);
+            out.push_str("  tcp4  ");
+            if c.twin.is_some() {
+                crate::sockets::write_end(out, Some((None, t.listen_endpoint().port)));
+                out.push_str("  listening");
+            } else {
+                crate::sockets::write_end(out, t.local_endpoint().map(|e| (Some(e.addr), e.port)));
+                out.push_str("  ");
+                crate::sockets::write_end(out, t.remote_endpoint().map(|e| (Some(e.addr), e.port)));
+                let _ = write!(out, "  {}", t.state());
+            }
+            let _ = writeln!(out, "  (task {}'s, by the old protocol)", c.owner);
+        }
+        for &(port, _, _) in &self.udp {
+            let _ = writeln!(out, "  udp4  *:{}  (by the old protocol)", port);
         }
     }
 

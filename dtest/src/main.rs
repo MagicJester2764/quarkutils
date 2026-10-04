@@ -4699,6 +4699,24 @@ fn test_auth() {
         "and neither the right to say who anybody is",
         handed(b"power tasks become", work) == Some((1, 3, 0)),
     );
+    let runs_network = |rights: &[u8], work: &mut [u8]| {
+        if !set_rights(v, NAME, Some(rights), work) {
+            return None;
+        }
+        let child = load_child(&[b"dchild", b"quit"])?;
+        let blessed = auth::bless(child.tid, NAME, b"", 0).is_ok();
+        let has = holds(child.tid, syscall::CAP_TYPE_NET_ADMIN);
+        child.discard();
+        blessed.then_some(has)
+    };
+    check(
+        "one that may run the network is handed the right to",
+        runs_network(b"network", work) == Some(1),
+    );
+    check(
+        "and one that may do the rest is not",
+        runs_network(b"power tasks become clock", work) == Some(0),
+    );
 
     check(
         "the accounts are taken away again",

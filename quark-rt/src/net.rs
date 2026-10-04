@@ -14,6 +14,8 @@ const TAG_TCP_SEND: u64 = 13;
 const TAG_TCP_RECV: u64 = 14;
 const TAG_TCP_CLOSE: u64 = 15;
 const TAG_RESOLVER: u64 = 21;
+const TAG_STATUS: u64 = 22;
+const TAG_FILTER: u64 = 23;
 const TAG_ERROR: u64 = u64::MAX;
 
 /// The most a datagram carries.
@@ -101,6 +103,84 @@ pub fn resolver_counts(net_tid: usize) -> Result<[u64; 4], u64> {
         return Err(reply.data[0]);
     }
     Ok([reply.data[0], reply.data[1], reply.data[2], reply.data[3]])
+}
+
+/// What the network stack is doing, as text, into `buf`: how much of it there
+/// was room for, and how long it all was.
+pub fn status(net_tid: usize, buf: &mut [u8]) -> Result<(usize, usize), u64> {
+    let msg = Message { sender: 0, tag: TAG_STATUS, data: [buf.len() as u64, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    if syscall::sys_call_lend_mut(net_tid, &msg, &mut reply, buf).is_err() {
+        return Err(1);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok((reply.data[0] as usize, reply.data[1] as usize))
+}
+
+/// A rule of the stack's filter: let in or drop what it is about — a
+/// protocol (0 any, 1 ICMP, 6 TCP, 17 UDP), this machine's ports, and where
+/// from: an address, IPv4's in its first four bytes, with how many bits of
+/// it must match and whether it is IPv6's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rule {
+    pub drop: bool,
+    pub protocol: u8,
+    pub ports: (u16, u16),
+    pub from: Option<([u8; 16], u8, bool)>,
+}
+
+impl Rule {
+    fn words(&self) -> [u64; 4] {
+        let mut flags = self.drop as u64 | (self.protocol as u64) << 8;
+        let (mut a0, mut a1) = (0, 0);
+        if let Some((addr, bits, v6)) = self.from {
+            flags |= 2 | if v6 { 4 } else { 0 } | (bits as u64) << 16;
+            a0 = u64::from_le_bytes(addr[..8].try_into().unwrap_or([0; 8]));
+            a1 = u64::from_le_bytes(addr[8..].try_into().unwrap_or([0; 8]));
+        }
+        [flags, (self.ports.0 as u64) << 16 | self.ports.1 as u64, a0, a1]
+    }
+}
+
+/// A change to the stack's filter, offering this program's right to run the
+/// network if it holds one — and asking without it if not, which the stack
+/// refuses (1, as EPERM). How many rules there are then.
+fn change_filter(net_tid: usize, data: [u64; 6]) -> Result<usize, u64> {
+    let msg = Message { sender: 0, tag: TAG_FILTER, data };
+    let mut reply = Message::empty();
+    let me = syscall::sys_getpid() as usize;
+    let right = (0..64).find(|&slot| {
+        syscall::sys_cap_read(me, slot).is_ok_and(|c| c.cap_type == syscall::CAP_TYPE_NET_ADMIN && c.valid)
+    });
+    let sent = match right {
+        Some(slot) => syscall::sys_call_offer(net_tid, &msg, &mut reply, slot),
+        None => syscall::sys_call(net_tid, &msg, &mut reply),
+    };
+    if sent.is_err() {
+        return Err(5);
+    }
+    if reply.tag == TAG_ERROR {
+        return Err(reply.data[0]);
+    }
+    Ok(reply.data[0] as usize)
+}
+
+/// Add a rule at the end of the filter.
+pub fn filter_add(net_tid: usize, rule: &Rule) -> Result<usize, u64> {
+    let w = rule.words();
+    change_filter(net_tid, [0, w[0], w[1], w[2], w[3], 0])
+}
+
+/// Take out rule `n`, counting from one.
+pub fn filter_remove(net_tid: usize, n: usize) -> Result<usize, u64> {
+    change_filter(net_tid, [1, n as u64, 0, 0, 0, 0])
+}
+
+/// Take out every rule.
+pub fn filter_clear(net_tid: usize) -> Result<usize, u64> {
+    change_filter(net_tid, [2, 0, 0, 0, 0, 0])
 }
 
 /// Send an ICMP echo request and wait for the reply.

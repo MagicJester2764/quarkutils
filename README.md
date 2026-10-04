@@ -83,7 +83,7 @@ su/  passwd/        Be somebody else for a while; change a password. Neither
 useradd/ userdel/ groupadd/ gpasswd/ id/
                     Who the users are, in Unix's files, by Unix's names.
 ls/ cat/ echo/ ps/ ping/ shutdown/ setfont/ date/ free/ lspci/ lsusb/
-fbmode/ play/ mixer/
+fbmode/ play/ mixer/ netctl/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.

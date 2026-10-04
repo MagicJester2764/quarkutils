@@ -28,6 +28,8 @@ quark_rt::manifest!([
     CapReq::clock(),
     // And to turn the machine off, for `shutdown`.
     CapReq::power(),
+    // And to say how the network treats what comes in, for `netctl`.
+    CapReq::net_admin(),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

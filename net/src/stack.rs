@@ -18,8 +18,10 @@
 //! time, with a socket listening again on each side after every one while
 //! there is room for another connection ([`Stack::refill`]).
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use quark_rt::{nic, println, syscall};
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, tcp};
@@ -27,6 +29,7 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr};
 
 use crate::card::Card;
+use crate::filter;
 use crate::lo::Lo;
 use crate::ndp::Ndp;
 
@@ -95,6 +98,8 @@ pub struct Stack {
     /// The DNS servers DHCP named.
     dns4: Vec<IpAddress>,
     pub ndp: Ndp,
+    /// What comes in, and what of it is let in: the card's and `lo`'s.
+    pub filter: filter::Shared,
     listens: Vec<Option<Listen>>,
     /// Streams let go of, still saying goodbye, and since when.
     retiring: Vec<(Side, SocketHandle, Instant)>,
@@ -102,14 +107,15 @@ pub struct Stack {
 
 impl Stack {
     pub fn new(link: nic::Link, mac: [u8; 6]) -> Stack {
-        let mut card = Card::new(link);
+        let filter = filter::new();
+        let mut card = Card::new(link, filter.clone());
         let mut seed = [0u8; 8];
         let _ = quark_rt::random::fill(&mut seed);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = u64::from_le_bytes(seed);
         let mut eth = Interface::new(config, &mut card, now());
 
-        let mut lo_dev = Lo::new();
+        let mut lo_dev = Lo::new(filter.clone());
         let mut lo_config = Config::new(HardwareAddress::Ip);
         lo_config.random_seed = u64::from_le_bytes(seed).rotate_left(17);
         let mut lo = Interface::new(lo_config, &mut lo_dev, now());
@@ -134,6 +140,7 @@ impl Stack {
             router: None,
             dns4: Vec::new(),
             ndp,
+            filter,
             listens: Vec::new(),
             retiring: Vec::new(),
         }
@@ -420,6 +427,31 @@ impl Stack {
         match side {
             Side::Eth => (&mut self.eth_sockets, self.eth.context()),
             Side::Lo => (&mut self.lo_sockets, self.lo.context()),
+        }
+    }
+
+    /// The card, its addresses, its ways out and its DNS servers, and `lo`'s
+    /// addresses, as `netctl` shows them.
+    pub fn describe(&self, out: &mut String) {
+        let m = self.mac;
+        let _ = writeln!(out, "eth0  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
+        for a in self.eth.ip_addrs() {
+            let _ = writeln!(out, "  {}", a);
+        }
+        let mut ways: Vec<IpAddress> = self.router.map(IpAddress::Ipv4).into_iter().collect();
+        ways.extend(self.ndp.router().map(IpAddress::Ipv6));
+        for (what, list) in [("way out by", ways), ("dns", self.dns())] {
+            if !list.is_empty() {
+                let _ = write!(out, "  {}", what);
+                for (i, a) in list.iter().enumerate() {
+                    let _ = write!(out, "{} {}", if i > 0 { "," } else { "" }, a);
+                }
+                out.push('\n');
+            }
+        }
+        let _ = writeln!(out, "lo");
+        for a in self.lo.ip_addrs() {
+            let _ = writeln!(out, "  {}", a);
         }
     }
 

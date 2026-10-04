@@ -2902,6 +2902,10 @@ pub const CAP_TYPE_SWAP: u64 = 13;
 pub const CAP_TYPE_PCI_DEVICE: u64 = 14;
 /// `PciDevice`'s param0 for every device.
 pub const PCI_ANY: u64 = 0xFFFF_FFFF;
+/// The right to say how the network treats what comes in. The kernel acts
+/// on it nowhere: the network stack is offered it with a call
+/// (`sys_call_offer`) and changes its filter only for a caller that could.
+pub const CAP_TYPE_NET_ADMIN: u64 = 15;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -3029,7 +3033,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 34;
+pub const ABI_VERSION_MINOR: u32 = 35;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

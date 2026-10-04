@@ -180,9 +180,11 @@ impl Rights {
     pub const BECOME: u32 = 4;
     /// Say what time it is.
     pub const CLOCK: u32 = 8;
+    /// Say how the network treats what comes in.
+    pub const NETWORK: u32 = 16;
     /// Everything a session can hold, the right to say who a task is among
     /// it: what user 0 has where nothing says otherwise.
-    pub const ALL: u32 = 0x8000_0000 | 15;
+    pub const ALL: u32 = 0x8000_0000 | 31;
 
     pub fn has(self, right: u32) -> bool {
         self.0 & right == right
@@ -194,6 +196,7 @@ impl Rights {
             b"tasks" => Self::TASKS,
             b"become" => Self::BECOME,
             b"clock" => Self::CLOCK,
+            b"network" => Self::NETWORK,
             b"all" => Self::ALL,
             _ => return None,
         })
@@ -201,12 +204,13 @@ impl Rights {
 }
 
 /// The names of the rights, in the order they are written.
-pub const RIGHT_NAMES: [(&[u8], u32); 5] = [
+pub const RIGHT_NAMES: [(&[u8], u32); 6] = [
     (b"all", Rights::ALL),
     (b"power", Rights::POWER),
     (b"tasks", Rights::TASKS),
     (b"become", Rights::BECOME),
     (b"clock", Rights::CLOCK),
+    (b"network", Rights::NETWORK),
 ];
 
 /// What `/etc/rights` gives `name`, whose id is `uid`.

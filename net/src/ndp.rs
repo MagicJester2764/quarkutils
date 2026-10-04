@@ -169,6 +169,11 @@ impl Ndp {
         }
     }
 
+    /// The router that is the way out, while one is.
+    pub fn router(&self) -> Option<Ipv6Address> {
+        self.router.map(|(r, _)| r)
+    }
+
     /// Ask every router to say what it has, if it is time to.
     fn solicit(&mut self, sockets: &mut SocketSet<'static>, now: Instant) {
         if self.heard || self.solicited >= SOLICITATIONS || now < self.next_solicit {
