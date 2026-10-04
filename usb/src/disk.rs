@@ -25,13 +25,18 @@ impl Disk {
         if offset + bytes > 4096 {
             return false;
         }
+        self.request(Request { write, lba, count, offset })
+    }
+
+    /// Hand `request` to the controller's thread and wait for it.
+    fn request(&mut self, request: Request) -> bool {
         let main = {
             let mut shared = SHARED.lock();
             let disk = &mut shared.disks[self.index];
             if !disk.present || disk.generation != self.generation {
                 return false;
             }
-            disk.request = Some(Request { write, lba, count, offset });
+            disk.request = Some(request);
             shared.main
         };
         if syscall::sys_notify(main, TOLD_DISK).is_err() {
@@ -54,6 +59,10 @@ impl Device for Disk {
 
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool {
         from.len() >= count as usize * SECTOR && self.ask(true, lba, count, from.as_ptr() as usize)
+    }
+
+    fn flush(&mut self) -> bool {
+        self.request(Request { write: true, lba: 0, count: 0, offset: 0 })
     }
 
     fn gone(&self) -> bool {

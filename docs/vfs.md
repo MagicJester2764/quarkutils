@@ -220,6 +220,13 @@ recorded, here and in every filesystem mounted here. A machine that stops
 before a commit has the filesystem as it was — whole, and without the last
 few pages — which is what the journal is for.
 
+Recorded means on the disk, and not only in the disk's own cache: a drive
+answers a write once it has the data, which may be in memory of its own, so
+the server asks the drive to write that out (`block::TAG_FLUSH`) wherever
+the order of two writes matters — before a transaction's commit block and
+after it, once its blocks are in place, and after a replay — and `SYNC`
+asks too.
+
 File data written a whole block at a time is not put through the journal at
 all: it goes straight to its block. A new block is one nothing names until
 the transaction that says so commits, so a crash leaves it nobody's. A

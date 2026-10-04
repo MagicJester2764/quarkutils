@@ -70,6 +70,8 @@ const ATA_CMD_READ_PIO: u8 = 0x20;
 const ATA_CMD_WRITE_PIO: u8 = 0x30;
 const ATA_CMD_WRITE_MULTIPLE: u8 = 0xC5;
 const ATA_CMD_SET_MULTIPLE: u8 = 0xC6;
+/// Write the drive's own cache out; done when it is lasting.
+const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
 
 /// The driver's own page, which every sector passes through on its way to or
 /// from a client's lent buffer.
@@ -319,7 +321,8 @@ fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
         }
     }
 
-    // Flush cache — wait for BSY to clear after write
+    // The drive has taken it: busy until it has, not until it is lasting,
+    // which is what `ata_flush` is for.
     ata_wait_not_busy();
 
     // Check for errors
@@ -329,6 +332,22 @@ fn ata_write_sectors(lba: u32, count: u32, buf: *const u8) -> bool {
     }
 
     true
+}
+
+/// Write the drive's cache out (FLUSH CACHE: twenty-eight bits of address
+/// are all this drives, so not the EXT form): whether it said it had.
+fn ata_flush() -> bool {
+    ata_wait_not_busy();
+    syscall::sys_ioport_write(reg(ATA_DRIVE_HEAD), 0xE0);
+    ata_400ns_delay();
+    syscall::sys_ioport_write(reg(ATA_COMMAND), ATA_CMD_FLUSH_CACHE);
+    ata_400ns_delay();
+    // A real drive can be a while about it: asleep between looks, not
+    // yielding, which in the drivers' band would let nothing below run.
+    while ata_read_status() & ATA_SR_BSY != 0 {
+        syscall::sleep_ns(100_000);
+    }
+    ata_read_status() & ATA_SR_ERR == 0
 }
 
 /// The drive on the primary channel, as a block device.
@@ -348,6 +367,10 @@ impl Device for Ata {
             return false;
         }
         ata_write_sectors(lba as u32, count, from.as_ptr())
+    }
+
+    fn flush(&mut self) -> bool {
+        ata_flush()
     }
 }
 

@@ -42,9 +42,14 @@ const DEVICE_SLOTS: usize = 2;
 
 const IN: u32 = 0;
 const OUT: u32 = 1;
+const FLUSH: u32 = 4;
 const STATUS_OK: u8 = 0;
 /// The device will not be written to.
 const READ_ONLY: u64 = 1 << 5;
+/// The device keeps what is written in a cache, and writes it out when it
+/// is asked to; without this it says nothing of a cache, and is taken to
+/// have written each write before it answered it.
+const CAN_FLUSH: u64 = 1 << 9;
 
 /// How long a request may take before the device is given up on.
 const PATIENCE: u64 = 30;
@@ -54,6 +59,7 @@ struct Blk {
     queue: virtio::Queue,
     sectors: u64,
     read_only: bool,
+    can_flush: bool,
     data: u64,
     request: u64,
 }
@@ -70,18 +76,25 @@ impl Blk {
         if offset + bytes > 4096 {
             return false;
         }
+        self.request(if write { OUT } else { IN }, lba, Some((self.data + offset as u64, bytes as u32, !write)))
+    }
+
+    /// Send a request of `kind` about `lba`, with data or without, and wait
+    /// for its answer: whether it went well.
+    fn request(&mut self, kind: u32, lba: u64, data: Option<(u64, u32, bool)>) -> bool {
         unsafe {
-            core::ptr::write_volatile(REQUEST_AT as *mut u32, if write { OUT } else { IN });
+            core::ptr::write_volatile(REQUEST_AT as *mut u32, kind);
             core::ptr::write_volatile((REQUEST_AT + 4) as *mut u32, 0);
             core::ptr::write_volatile((REQUEST_AT + 8) as *mut u64, lba);
             core::ptr::write_volatile((REQUEST_AT + 16) as *mut u8, 0xFF);
         }
-        let parts = [
-            (self.request, 16, false),
-            (self.data + offset as u64, bytes as u32, !write),
-            (self.request + 16, 1, true),
-        ];
-        if self.queue.add(&parts).is_none() {
+        let head = (self.request, 16, false);
+        let status = (self.request + 16, 1, true);
+        let added = match data {
+            Some(d) => self.queue.add(&[head, d, status]),
+            None => self.queue.add(&[head, status]),
+        };
+        if added.is_none() {
             return false;
         }
         self.queue.notify();
@@ -115,6 +128,10 @@ impl Disk for Blk {
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool {
         !self.read_only && from.len() >= count as usize * SECTOR && self.transfer(true, lba, count, from.as_ptr() as usize)
     }
+
+    fn flush(&mut self) -> bool {
+        !self.can_flush || self.request(FLUSH, 0, None)
+    }
 }
 
 /// A page of this program's own memory at `at`: where it is.
@@ -140,7 +157,7 @@ pub extern "C" fn _start() -> ! {
         Ok(device) => device,
         Err(why) => stop(why),
     };
-    let agreed = match device.accept(READ_ONLY) {
+    let agreed = match device.accept(READ_ONLY | CAN_FLUSH) {
         Ok(agreed) => agreed,
         Err(why) => stop(why),
     };
@@ -164,7 +181,8 @@ pub extern "C" fn _start() -> ! {
         device.irq,
         by
     );
-    let mut blk = Blk { device, queue, sectors, read_only, data, request };
+    let can_flush = agreed & CAN_FLUSH != 0;
+    let mut blk = Blk { device, queue, sectors, read_only, can_flush, data, request };
     match block::register_disk() {
         Some(name) => println!("[virtblk] Registered as {}.", core::str::from_utf8(&name).unwrap_or("a disk")),
         None => stop("disk0 to disk3 are all taken"),

@@ -543,6 +543,9 @@ pub fn recover(j: &mut Journal, ext2: &Ext2State) -> Result<(), u64> {
         end - 1
     );
     walk(j, ext2, Pass::Replay, end)?;
+    // What the replay wrote, lasting before the journal is said to be
+    // empty (`checkpoint_done`, next).
+    lasting(ext2)?;
 
     j.next_sequence = end;
     Ok(())
@@ -557,8 +560,10 @@ pub fn checkpoint_done(j: &mut Journal, ext2: &Ext2State) -> Result<(), u64> {
     j.sequence = j.next_sequence;
     write_super(j, ext2, 0, j.next_sequence)?;
     // Nothing outstanding, so nothing to recover. Cleared after the journal
-    // superblock, never before: the window where both say work is pending is
+    // superblock, never before — and after it is lasting, since a disk's
+    // cache keeps no order: the window where both say work is pending is
     // harmless, and the one where neither does would lose it.
+    lasting(ext2)?;
     crate::ext2::set_needs_recovery(ext2, false)
 }
 
@@ -781,6 +786,12 @@ pub fn commit(j: &mut Journal, ext2: &Ext2State) -> Result<bool, u64> {
     j.start = j.first;
     j.sequence = seq;
 
+    // Everything before the commit block lasting before it is written: a
+    // disk writes its cache out in whatever order suits it, and a commit
+    // that reached the platter before the blocks it commits replays
+    // whatever was there.
+    lasting(ext2)?;
+
     // The commit block. One write, and the transaction either happened or did
     // not.
     {
@@ -792,9 +803,18 @@ pub fn commit(j: &mut Journal, ext2: &Ext2State) -> Result<bool, u64> {
         let fs = j.map(ext2, block)?;
         write_fs_block(ext2, fs, JBLOCK_BUF)?;
     }
+    // And the commit itself lasting before anything it covers is written
+    // where it belongs: written over first and then lost, a block is
+    // neither its old self nor the new one the journal does not have.
+    lasting(ext2)?;
 
     j.next_sequence = seq.wrapping_add(1);
     Ok(true)
+}
+
+/// Make what has been written lasting: the disk's cache written out.
+fn lasting(ext2: &Ext2State) -> Result<(), u64> {
+    crate::disk::flush(ext2.disk_tid).map_err(|_| ERR_IO)
 }
 
 /// Set `needs_recovery` in the transaction's own copy of the superblock.
@@ -834,6 +854,8 @@ pub fn checkpoint(j: &mut Journal, ext2: &Ext2State) -> Result<(), u64> {
         write_fs_block(ext2, j.txn.blocks[i], txn_slot(i))?;
     }
     j.txn.count = 0;
+    // Where they belong, lasting, before the journal lets them go.
+    lasting(ext2)?;
     checkpoint_done(j, ext2)
 }
 

@@ -1825,6 +1825,11 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         // answered: here, and in every filesystem mounted here.
         TAG_SYNC => {
             commit_pending();
+            // On the disk, and not in its cache: what a journal's commit does
+            // for itself, done here for what has none — ext2's writes, FAT's.
+            if disk::flush(disk.disk_tid).is_err() {
+                println!("[vfs] the disk would not write out its cache");
+            }
             mounts::sync();
             reply_opened(sender, [0; 6]);
         }

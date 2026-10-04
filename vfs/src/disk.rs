@@ -88,6 +88,13 @@ pub fn write_many(disk_tid: usize, lba: u32, count: u32) -> Result<(), ()> {
     }
 }
 
+/// Make everything written to the volume lasting: the disk's own cache
+/// written out (`block::TAG_FLUSH`). Answered, a machine that loses power
+/// keeps all of it.
+pub fn flush(disk_tid: usize) -> Result<(), ()> {
+    block::flush(disk_tid, volume()).map_err(|_| ())
+}
+
 /// Write the sector at the start of `DISK_IO_BUF` to `lba` of the volume.
 pub fn write(disk_tid: usize, lba: u32) -> Result<(), ()> {
     let buf = unsafe { core::slice::from_raw_parts(DISK_IO_BUF as *const u8, 512) };

@@ -59,6 +59,13 @@ pub const TAG_WRITE_SECTORS: u64 = 8;
 /// words — what names it whichever disk it is on and whatever its driver is
 /// called (`root.cfg`'s `root partuuid`). Nought for a volume with none.
 pub const TAG_ID: u64 = 9;
+/// Make what was written to a volume lasting: `[_, volume]`, from its
+/// claimant. A disk keeps what it is given in a cache of its own and writes
+/// it out in its own order and its own time, and a machine that loses power
+/// loses what it had not; answered, everything written before is on the
+/// disk. What a journal is built on: its commit is written after what it
+/// commits is lasting, and before anything it covers is written over.
+pub const TAG_FLUSH: u64 = 10;
 
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
@@ -232,6 +239,14 @@ pub fn read(server: usize, volume: u64, lba: u64, buf: &mut [u8]) -> Result<(), 
 }
 
 /// Write whole sectors of a claimed volume, from `lba`, out of `buf`.
+/// Make what was written to `volume` lasting (`TAG_FLUSH`).
+pub fn flush(server: usize, volume: u64) -> Result<(), u64> {
+    let msg = Message { sender: 0, tag: TAG_FLUSH, data: [0, volume, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    syscall::sys_call(server, &msg, &mut reply).map_err(|_| ERR_UNKNOWN)?;
+    if reply.tag == TAG_OK { Ok(()) } else { Err(reply.data[0]) }
+}
+
 pub fn write(server: usize, volume: u64, lba: u64, buf: &[u8]) -> Result<(), u64> {
     let count = (buf.len() / SECTOR) as u64;
     if count == 0 || count > MAX_SECTORS as u64 || buf.len() % SECTOR != 0 {
@@ -258,6 +273,11 @@ pub trait Device {
     fn read(&mut self, lba: u64, count: u32, into: &mut [u8]) -> bool;
     /// Write `count` sectors at `lba` out of `from`.
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool;
+    /// Make everything written lasting: the device's own cache written out.
+    /// A device with none has nothing to do.
+    fn flush(&mut self) -> bool {
+        true
+    }
     /// Whether the disk has gone — a USB disk pulled out. Asked each time
     /// the server is woken, which its driver does to say so; the server's
     /// task ends there, and its name with it.
@@ -465,6 +485,9 @@ pub fn serve<D: Device>(dev: &mut D, page: usize) -> ! {
                     status(TAG_OK, count as u64)
                 }
             }
+            TAG_FLUSH if !known || volumes[volume].claimant != sender => status(TAG_ERROR, ERR_NOT_CLAIMANT),
+            TAG_FLUSH if !dev.flush() => status(TAG_ERROR, ERR_WRITE),
+            TAG_FLUSH => status(TAG_OK, 0),
             TAG_READ_SECTOR | TAG_READ_SECTORS | TAG_WRITE_SECTOR | TAG_WRITE_SECTORS => {
                 let single = msg.tag == TAG_READ_SECTOR || msg.tag == TAG_WRITE_SECTOR;
                 let n = if single { 1 } else { msg.data[2] };

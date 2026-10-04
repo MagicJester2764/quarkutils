@@ -66,6 +66,7 @@ const CSTS_FATAL: u32 = 2;
 const ADMIN_CREATE_SQ: u8 = 0x01;
 const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
+const IO_FLUSH: u8 = 0x00;
 const IO_WRITE: u8 = 0x01;
 const IO_READ: u8 = 0x02;
 /// What an identify is for: a namespace, the controller, the namespaces
@@ -214,6 +215,13 @@ impl Disk for Nvme {
 
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool {
         from.len() >= count as usize * SECTOR && self.transfer(true, lba, count, from.as_ptr() as usize)
+    }
+
+    /// The namespace's writes made lasting: a controller with no volatile
+    /// cache says so at once.
+    fn flush(&mut self) -> bool {
+        let id = self.io.submit(IO_FLUSH, self.nsid, 0, [0; 6]);
+        self.wait(true, id)
     }
 }
 

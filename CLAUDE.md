@@ -1117,6 +1117,16 @@ change here: it has found what reading the code did not.
 - **`/dev` is the server's, whatever the disk holds.** The lookup answers for
   the root's `dev` directory itself, so no path — through links, or relative —
   reaches the disk's copy, and nothing is made there.
+- **What the server says is on the disk is on the disk, not in the disk's
+  cache.** A drive answers a write once it has the data, which may be in
+  memory of its own; `block::TAG_FLUSH` asks it to write that out, and
+  every driver here answers it (`FLUSH CACHE`, its EXT form, NVMe's flush,
+  virtio's `T_FLUSH` where the device offers it, SCSI's `SYNCHRONIZE
+  CACHE`). The journal asks (`journal::lasting`) where its order matters:
+  before the commit block and after it, after the blocks are written in
+  place, between the superblock that says the journal is empty and the one
+  that says nothing needs recovering, and after a replay. `TAG_SYNC` asks
+  for everything.
 - **Paths are lent, never cut.** A path up to 4095 bytes travels in a buffer
   lent with the call, and a longer one is refused. The old requests carried
   paths in the message and truncated them, which opens a different file.

@@ -56,6 +56,7 @@ const INQUIRY: u8 = 0x12;
 const READ_CAPACITY: u8 = 0x25;
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2A;
+const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 const CBW_SIGNATURE: u32 = 0x4342_5355;
 const CSW_SIGNATURE: u32 = 0x5342_5355;
 /// Where in a disk's command page the status goes.
@@ -1108,6 +1109,16 @@ impl Usb {
     }
 
     fn disk_io(&mut self, slot: u8, r: Request) -> bool {
+        let Some(fi) = self.disk_function(slot) else { return false };
+        // No sectors: what was written made lasting. A stick that has no
+        // cache, and many have none, may not know the command at all; that
+        // is a stick with nothing to write out, and only a disk that has
+        // gone fails.
+        if r.count == 0 {
+            let command = [SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let _ = self.bot(slot, fi, &command, None);
+            return true;
+        }
         // READ(10) and WRITE(10) say a block's number in thirty-two bits.
         if r.lba + r.count as u64 > 1 << 32 {
             return false;
@@ -1116,7 +1127,6 @@ impl Usb {
         let count = (r.count as u16).to_be_bytes();
         let op = if r.write { WRITE_10 } else { READ_10 };
         let command = [op, 0, lba[0], lba[1], lba[2], lba[3], 0, count[0], count[1], 0];
-        let Some(fi) = self.disk_function(slot) else { return false };
         let Some(data) = self.devices[slot as usize].as_ref().and_then(|d| d.functions[fi].as_ref()?.data) else {
             return false;
         };

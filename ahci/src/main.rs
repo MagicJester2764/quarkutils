@@ -100,6 +100,8 @@ const IE_WANTED: u32 = (1 << 0) | IS_TASK_FILE_ERROR;
 const IDENTIFY: u8 = 0xEC;
 const READ_DMA_EXT: u8 = 0x25;
 const WRITE_DMA_EXT: u8 = 0x35;
+/// Write the disk's own cache out: no data, done when it is lasting.
+const FLUSH_CACHE_EXT: u8 = 0xEA;
 
 /// How long a command may take before the disk is given up on: tenths of
 /// a second.
@@ -164,12 +166,13 @@ impl Ahci {
 
     /// Run one command in slot 0: `command`, `count` sectors at `lba`, its
     /// data `bytes` long at physical `buf`, written to the disk if `write`.
+    /// A command with no data has no `bytes`.
     fn run(&self, command: u8, lba: u64, count: u32, buf: u64, bytes: u32, write: bool) -> bool {
         let page = PORT_AT;
         let table = self.page + TABLE as u64;
-        // The header: a command FIS five words long, written or read, one
-        // entry of where its data is.
-        write32(page + LIST, 5 | if write { 1 << 6 } else { 0 } | 1 << 16);
+        // The header: a command FIS five words long, written or read, and
+        // one entry of where its data is, if it has any.
+        write32(page + LIST, 5 | if write { 1 << 6 } else { 0 } | ((bytes != 0) as u32) << 16);
         write32(page + LIST + 4, 0);
         write32(page + LIST + 8, table as u32);
         write32(page + LIST + 12, (table >> 32) as u32);
@@ -186,10 +189,12 @@ impl Ahci {
             write8(t + i, b);
         }
         // Where its data is: one stretch, and an interrupt when it is done.
-        write32(t + 0x80, buf as u32);
-        write32(t + 0x84, (buf >> 32) as u32);
-        write32(t + 0x88, 0);
-        write32(t + 0x8C, (bytes - 1) | 1 << 31);
+        if bytes != 0 {
+            write32(t + 0x80, buf as u32);
+            write32(t + 0x84, (buf >> 32) as u32);
+            write32(t + 0x88, 0);
+            write32(t + 0x8C, (bytes - 1) | 1 << 31);
+        }
 
         let port = self.port;
         if !self.wait(10, || read32(port + P_TFD) & (TFD_BUSY | TFD_DRQ) == 0) {
@@ -259,6 +264,10 @@ impl Disk for Ahci {
 
     fn write(&mut self, lba: u64, count: u32, from: &[u8]) -> bool {
         from.len() >= count as usize * SECTOR && self.transfer(true, lba, count, from.as_ptr() as usize)
+    }
+
+    fn flush(&mut self) -> bool {
+        self.run(FLUSH_CACHE_EXT, 0, 0, 0, 0, false)
     }
 }
 

@@ -70,7 +70,7 @@ impl<T: Copy + Default, const N: usize> Queue<T, N> {
 }
 
 /// A read or a write a disk's thread asks for, of the page its sectors go
-/// through.
+/// through; or, with no sectors, that what was written be made lasting.
 #[derive(Clone, Copy, Default)]
 pub struct Request {
     pub write: bool,

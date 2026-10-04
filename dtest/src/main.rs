@@ -3230,12 +3230,17 @@ fn test_disks() {
         block::write(disk, 1, last - 1, &sector) == Err(block::ERR_NOT_CLAIMANT)
             && block::write(disk, 2, 0, &sector) == Err(block::ERR_NOT_CLAIMANT),
     );
+    check(
+        "nor make what was written to one lasting",
+        block::flush(disk, 1) == Err(block::ERR_NOT_CLAIMANT) && block::flush(disk, 2) == Err(block::ERR_NOT_CLAIMANT),
+    );
     check("the file server's is not anybody else's to claim", block::claim(disk, 2) == Err(block::ERR_BUSY));
     check(
         "nor is the whole disk, which is the same sectors",
         block::claim(disk, 0) == Err(block::ERR_BUSY),
     );
     check("a partition nobody has can be claimed", block::claim(disk, 1).is_ok());
+    check("and what is written to it made lasting, by its claimant", block::flush(disk, 1).is_ok());
     check(
         "and read: the EFI partition begins as a FAT filesystem does",
         block::read(disk, 1, 0, &mut sector).is_ok() && sector[510] == 0x55 && sector[511] == 0xAA,
