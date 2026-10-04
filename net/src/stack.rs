@@ -1,6 +1,7 @@
 //! The protocols, as smoltcp keeps them: two interfaces, each with the
-//! sockets that go through it, and what DHCP said; and the streams let go
-//! of that have not finished saying goodbye.
+//! sockets that go through it, and what DHCP said; and the two things about
+//! streams that are not one socket's — a port listened on, and a stream let
+//! go of that has not finished saying goodbye.
 //!
 //! `eth0` is the card. `lo` is what this machine says to itself: 127.0.0.1
 //! and ::1, and the card's own addresses too, so that a connection to the
@@ -8,15 +9,21 @@
 //! than sent out to be answered by nobody. A socket is in one interface's
 //! set or the other's, by where it is going ([`Stack::side_for`]); a
 //! listener is in both.
-
+//!
+//! A smoltcp socket listens for one connection and then is it, and it has
+//! no queue of connections half made: a second SYN while the only socket
+//! listening is answering the first is refused. So a port listened on is
+//! several sockets ([`Stack::listen`]), and packets are taken in one at a
+//! time, with a socket listening again on each side after every one while
+//! there is room for another connection ([`Stack::refill`]).
 
 use alloc::vec;
 use alloc::vec::Vec;
 use quark_rt::{nic, println, syscall};
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr};
 
 use crate::card::Card;
 use crate::lo::Lo;
@@ -38,9 +45,33 @@ const FALLBACK_DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 /// with itself stops when a receiver's buffer is full, and this is a bound
 /// on one that does not.
 const LO_TURNS: usize = 256;
+/// The most packets taken from the card in one poll: what is left is taken
+/// at the next, after whoever is waiting has been answered.
+const CARD_PACKETS: usize = 512;
+/// A stream's buffers, each way: what its window can be.
+pub const STREAM_BUF: usize = 64 * 1024;
+/// Data unacknowledged for this long, or a connection unanswered, is given
+/// up.
+pub const TCP_TIMEOUT: Duration = Duration::from_secs(60);
 /// A stream let go of that is still saying goodbye after this long goes
 /// anyway.
 const RETIRE_LIMIT: Duration = Duration::from_secs(60);
+
+/// A stream socket with the buffers and the timeout every stream has here.
+pub fn new_stream() -> tcp::Socket<'static> {
+    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; STREAM_BUF]), tcp::SocketBuffer::new(vec![0; STREAM_BUF]));
+    s.set_timeout(Some(TCP_TIMEOUT));
+    s
+}
+
+/// A port listened on: its sockets on both sides, listening or connected
+/// to and not yet taken.
+struct Listen {
+    local: IpListenEndpoint,
+    sockets: Vec<(Side, SocketHandle)>,
+    /// The most connections made, or being made, and not yet taken.
+    backlog: usize,
+}
 
 /// The time, as the protocols count it.
 pub fn now() -> Instant {
@@ -60,6 +91,7 @@ pub struct Stack {
     pub ipv4: Option<Ipv4Cidr>,
     pub router: Option<Ipv4Address>,
     pub dns: Vec<IpAddress>,
+    listens: Vec<Option<Listen>>,
     /// Streams let go of, still saying goodbye, and since when.
     retiring: Vec<(Side, SocketHandle, Instant)>,
 }
@@ -96,6 +128,7 @@ impl Stack {
             ipv4: None,
             router: None,
             dns: Vec::new(),
+            listens: Vec::new(),
             retiring: Vec::new(),
         }
     }
@@ -105,19 +138,112 @@ impl Stack {
         self.ipv4.is_some()
     }
 
-    /// Move the protocols on: what has come in, what is due to go out.
-    /// What `lo` sends it receives at once, until it has nothing in flight.
+    /// Move the protocols on: what has come in, a packet at a time, and what
+    /// is due to go out. What `lo` sends it receives at once, until it has
+    /// nothing in flight.
     pub fn poll(&mut self) {
         let t = now();
-        self.eth.poll(t, &mut self.card, &mut self.eth_sockets);
+        for _ in 0..CARD_PACKETS {
+            if matches!(self.eth.poll_ingress_single(t, &mut self.card, &mut self.eth_sockets), PollIngressSingleResult::None) {
+                break;
+            }
+            self.refill(Side::Eth);
+        }
+        self.eth.poll_egress(t, &mut self.card, &mut self.eth_sockets);
         for _ in 0..LO_TURNS {
-            self.lo.poll(t, &mut self.lo_dev, &mut self.lo_sockets);
+            while !matches!(self.lo.poll_ingress_single(t, &mut self.lo_dev, &mut self.lo_sockets), PollIngressSingleResult::None) {
+                self.refill(Side::Lo);
+            }
+            self.lo.poll_egress(t, &mut self.lo_dev, &mut self.lo_sockets);
             if self.lo_dev.is_empty() {
                 break;
             }
         }
         self.dhcp_events();
         self.sweep();
+    }
+
+    /// Listen at `local`, keeping up to `backlog` connections made and not
+    /// yet taken: an id for it, or nothing if smoltcp will not listen there.
+    pub fn listen(&mut self, local: IpListenEndpoint, backlog: usize) -> Option<usize> {
+        let mut l = Listen { local, sockets: Vec::new(), backlog: backlog.max(1) };
+        for side in [Side::Eth, Side::Lo] {
+            let mut t = new_stream();
+            if t.listen(local).is_err() {
+                for (side, h) in l.sockets {
+                    self.sockets(side).remove(h);
+                }
+                return None;
+            }
+            l.sockets.push((side, self.sockets(side).add(t)));
+        }
+        let id = match self.listens.iter().position(|l| l.is_none()) {
+            Some(id) => id,
+            None => {
+                self.listens.push(None);
+                self.listens.len() - 1
+            }
+        };
+        self.listens[id] = Some(l);
+        Some(id)
+    }
+
+    pub fn set_backlog(&mut self, id: usize, backlog: usize) {
+        if let Some(l) = self.listens.get_mut(id).and_then(|l| l.as_mut()) {
+            l.backlog = backlog.max(1);
+        }
+        self.refill(Side::Eth);
+        self.refill(Side::Lo);
+    }
+
+    /// Whether anything listens on `port`.
+    pub fn listening_on(&self, port: u16) -> bool {
+        self.listens.iter().flatten().any(|l| l.local.port == port)
+    }
+
+    /// The oldest connection made to listener `id` and not yet taken: its
+    /// socket, the caller's from now on. One reset before it was taken goes.
+    pub fn accept(&mut self, id: usize) -> Option<(Side, SocketHandle)> {
+        let mut taken = None;
+        let mut k = 0;
+        while let Some(&(side, h)) = self.listens.get(id)?.as_ref()?.sockets.get(k) {
+            match self.sockets(side).get::<tcp::Socket>(h).state() {
+                tcp::State::Listen | tcp::State::SynReceived => k += 1,
+                state => {
+                    self.listens[id].as_mut()?.sockets.remove(k);
+                    if matches!(state, tcp::State::Established | tcp::State::CloseWait) {
+                        taken = Some((side, h));
+                        break;
+                    }
+                    self.retire(side, h);
+                }
+            }
+        }
+        // Taking one may be room for another.
+        self.refill(Side::Eth);
+        self.refill(Side::Lo);
+        taken
+    }
+
+    /// Whether listener `id` has a connection to take.
+    pub fn pending(&self, id: usize) -> bool {
+        let Some(Some(l)) = self.listens.get(id) else { return false };
+        l.sockets.iter().any(|&(side, h)| {
+            let set = match side {
+                Side::Eth => &self.eth_sockets,
+                Side::Lo => &self.lo_sockets,
+            };
+            matches!(set.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+        })
+    }
+
+    /// Stop listening: the sockets listening go, and connections not yet
+    /// taken are reset.
+    pub fn unlisten(&mut self, id: usize) {
+        let Some(l) = self.listens.get_mut(id).and_then(|l| l.take()) else { return };
+        for (side, h) in l.sockets {
+            self.drop_stream(side, h);
+        }
     }
 
     /// A stream nobody wants: one listening goes now, and any other is reset
@@ -156,6 +282,37 @@ impl Stack {
                 self.retiring.swap_remove(k);
             } else {
                 k += 1;
+            }
+        }
+    }
+
+    /// After a packet has come in on `side`: every listener with room for
+    /// another connection has a socket of that side listening.
+    fn refill(&mut self, side: Side) {
+        let Stack { listens, eth_sockets, lo_sockets, .. } = self;
+        for l in listens.iter_mut().flatten() {
+            let mut listening = false;
+            let mut waiting = 0;
+            for &(s, h) in &l.sockets {
+                let set = match s {
+                    Side::Eth => &*eth_sockets,
+                    Side::Lo => &*lo_sockets,
+                };
+                match set.get::<tcp::Socket>(h).state() {
+                    tcp::State::Listen => listening |= s == side,
+                    _ => waiting += 1,
+                }
+            }
+            if listening || waiting >= l.backlog {
+                continue;
+            }
+            let mut t = new_stream();
+            if t.listen(l.local).is_ok() {
+                let set = match side {
+                    Side::Eth => &mut *eth_sockets,
+                    Side::Lo => &mut *lo_sockets,
+                };
+                l.sockets.push((side, set.add(t)));
             }
         }
     }

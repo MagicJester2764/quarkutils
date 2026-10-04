@@ -159,4 +159,85 @@ fn main() {
     println!("A sleep of 1500us took {}us", t0.elapsed().as_micros());
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
     println!("It is {}.{:09} seconds since 1970", since.as_secs(), since.subsec_nanos());
+
+    let wrong = network();
+    if wrong.is_empty() {
+        println!("std::net: ok");
+    } else {
+        println!("std::net: {}", wrong.join("; "));
+    }
+}
+
+/// The network, as std has it, over this machine's own addresses: what went
+/// wrong, if anything did.
+fn network() -> Vec<String> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::time::Duration;
+    let mut wrong = Vec::new();
+
+    // A stream: a thread accepts, reads to the end and answers in capitals.
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || -> std::io::Result<SocketAddr> {
+                let (mut s, from) = listener.accept()?;
+                let mut got = Vec::new();
+                s.read_to_end(&mut got)?;
+                s.write_all(&got.to_ascii_uppercase())?;
+                Ok(from)
+            });
+            let asked = (|| -> std::io::Result<(String, SocketAddr)> {
+                let mut c = TcpStream::connect(addr)?;
+                c.set_nodelay(true)?;
+                c.write_all(b"quark over lo")?;
+                c.shutdown(Shutdown::Write)?;
+                let mut back = String::new();
+                c.read_to_string(&mut back)?;
+                Ok((back, c.local_addr()?))
+            })();
+            match (asked, server.join()) {
+                (Ok((back, mine)), Ok(Ok(from))) if back == "QUARK OVER LO" && mine == from => {}
+                (a, s) => wrong.push(format!("a stream: {a:?}, {s:?}")),
+            }
+        }
+        Err(e) => wrong.push(format!("listening: {e}")),
+    }
+
+    // IPv6, with a time limit; and nobody there.
+    match TcpListener::bind("[::1]:0") {
+        Ok(listener) => {
+            let addr = listener.local_addr().unwrap();
+            let c = TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+            match (c, listener.accept()) {
+                (Ok(_), Ok((_, from))) if from.ip() == Ipv6Addr::LOCALHOST => {}
+                (c, a) => wrong.push(format!("IPv6: {c:?}, {a:?}")),
+            }
+        }
+        Err(e) => wrong.push(format!("listening on ::1: {e}")),
+    }
+    match TcpStream::connect("127.0.0.1:9") {
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {}
+        r => wrong.push(format!("nobody there: {r:?}")),
+    }
+
+    // Datagrams, waited for and not.
+    match (UdpSocket::bind("127.0.0.1:0"), UdpSocket::bind("127.0.0.1:0")) {
+        (Ok(a), Ok(b)) => {
+            let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+            let _ = b.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 16];
+            match (a.send_to(b"ping", ba), b.recv_from(&mut buf)) {
+                (Ok(4), Ok((4, from))) if from == aa && &buf[..4] == b"ping" => {}
+                (s, r) => wrong.push(format!("a datagram: {s:?}, {r:?}")),
+            }
+            let _ = b.set_nonblocking(true);
+            match b.recv_from(&mut buf) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                r => wrong.push(format!("nothing to receive: {r:?}")),
+            }
+        }
+        (a, b) => wrong.push(format!("datagram sockets: {a:?}, {b:?}")),
+    }
+    wrong
 }

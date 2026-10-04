@@ -1015,6 +1015,24 @@ sent out to be answered by nobody.
   in the same poll, again and again until nothing is in flight: smoltcp's
   own loopback keeps its queue to itself, and a reset or an echo's answer
   waited there for a timer nobody had set.
+- **A socket is a descriptor the stack serves** (`docs/net.md`): read and
+  written through the kernel with the task's buffer lent, polled by what
+  the stack says it is ready for, shared by `dup` and `fork`, and closed
+  when its last descriptor goes. A request about one names its cookie and
+  is believed only of a program that holds it (`SYS_FD_HOLDS`).
+  `quark_rt::socket` and Rust's std speak this; the tags
+  before it — a stream a task owned by a handle, a descriptor read forty
+  bytes a call — stay for programs built before.
+- **A port listened on is several sockets.** smoltcp's socket listens for
+  one connection and then is it, and keeps no queue of connections half
+  made, so a second SYN while the only socket listening answers the first
+  is refused. The stack takes packets in one at a time and, after every
+  one, has a socket of each side listening again for each listener with
+  room in its backlog (`Stack::refill`).
+- **A stream let go of says goodbye before it goes** (`Stack::retire`): its
+  FIN, or the reset for one closed with something unread, as Linux does,
+  and then it is taken out of its set — after a minute whether it has
+  finished or not, so a peer that never answers keeps nothing.
 
 ## Sound
 
