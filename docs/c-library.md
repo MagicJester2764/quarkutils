@@ -458,13 +458,50 @@ What is different:
 - **A full listener makes `connect` wait a little at a time**, and a socket
   marked non-blocking `EAGAIN`; it is a listener with sixteen connections
   waiting, whatever its backlog said.
-- **`shutdown` is not there**: a stream ends when its last descriptor
-  closes.
+- **`shutdown` is not there** for a local stream: it ends when its last
+  descriptor closes.
 - **`getsockname` and `getpeername` forget at `exec`**: the name is the file
   server's and the layer remembers it, so after an `exec` a socket is said
   to have none.
 - `setsockopt` takes the buffer sizes, the timeouts, `SO_REUSEADDR`,
   `SO_KEEPALIVE` and `SO_LINGER` and keeps none of them; any other option is
+  `ENOPROTOOPT`.
+
+### The network's
+
+A socket of `AF_INET` or `AF_INET6` — a stream (TCP) or datagrams (UDP) —
+is the network stack's (`docs/net.md`), and is what a program expects:
+every call above, `shutdown`, and on a datagram socket `sendto` and
+`recvfrom` with an address, `connect` to choose its one correspondent (or
+`AF_UNSPEC` to forget it), and `MSG_PEEK`, `MSG_WAITALL` and `MSG_TRUNC`. A
+socket of IPv6's family reaches IPv4 too, as `::ffff:a.b.c.d`, unless it
+asked for `IPV6_V6ONLY`. `poll` and `epoll` watch one by what the stack says
+it is ready for; a `connect` that may not wait is `EINPROGRESS`, and
+writable when it is done, with `SO_ERROR` saying how. `FIONREAD` says what a
+read would find: a stream's bytes, or the next datagram's length.
+`getaddrinfo` is musl's own: `/etc/hosts` first, which has `localhost`, and
+then the DNS server `/etc/resolv.conf` names, or 127.0.0.1.
+
+- **A call that waits, waits in a poll.** What the stack is asked it
+  answers at once, and where Linux's call would wait the layer waits for
+  the descriptor to be ready: so a signal ends it — `EINTR`, or made again
+  for a handler that asked (`SA_RESTART`), unless the socket has a timeout,
+  as on Linux — and `SO_RCVTIMEO` and `SO_SNDTIMEO` are how long it may,
+  `EAGAIN` after. A `read` and a `write` of a socket are its `recv` and
+  `send`, for the same reasons.
+- **What went wrong is said as Linux says it**: `ECONNREFUSED`;
+  `ETIMEDOUT` for a connection unanswered for a minute; `ECONNRESET` once,
+  to a reader, of one that was reset, and then the end; `EPIPE`, and
+  `SIGPIPE` unless `MSG_NOSIGNAL`, to a writer of one that has ended.
+- **A datagram is no larger than the way it leaves by**: 1472 bytes to
+  another machine over IPv4, 1452 over IPv6, 65507 to this one. Larger is
+  `EMSGSIZE`: nothing is cut into fragments.
+- **Options.** `SO_ERROR`, `SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`,
+  `SO_ACCEPTCONN`, `SO_KEEPALIVE`, `TCP_NODELAY` and `IPV6_V6ONLY` are the
+  stack's. The timeouts and `SO_REUSEADDR` are this program's: one given
+  the socket by another, or by `exec`, starts without them. The buffer
+  sizes, `SO_LINGER`, `SO_REUSEPORT`, `SO_BROADCAST`, the keep-alive
+  times, `IP_TOS` and `IP_TTL` are taken and not kept. Anything else is
   `ENOPROTOOPT`.
 
 ## Where things are
@@ -494,11 +531,12 @@ and much later. The ones a ported program is most likely to meet:
 thread's name, `sched_setaffinity`, and `epoll_wait` on anything but the
 descriptors the kernel can poll.
 
-`socket` of any family but the local one answers `EAFNOSUPPORT`, which is
-the answer a program has something to do about: there is no network for a
-C program yet. musl asks a name service daemon who a user is before it
-concludes nobody has the name, and takes that, or the local family's
-`ENOENT` for a daemon that is not there, for there being none.
+`socket` of a family but the local one and the network's answers
+`EAFNOSUPPORT`, and so does the network's on a machine with no network,
+which is the answer a program has something to do about. musl asks a name
+service daemon who a user is before it concludes nobody has the name, and
+takes the local family's `ENOENT`, for a daemon that is not there, for
+there being none.
 
 A program is linked statically unless it asks: `x86_64-quark-musl-gcc
 -dynamic` links it to `libc.so`, and `-fPIC -shared` makes a shared object

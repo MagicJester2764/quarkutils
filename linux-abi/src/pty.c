@@ -40,6 +40,7 @@
 #define TIOCGSID   0x5429
 #define TIOCGWINSZ 0x5413
 #define FIONREAD   0x541B
+#define FIONBIO    0x5421
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
 #define TIOCSPTLCK 0x40045431
@@ -257,9 +258,20 @@ long __quark_ioctl(long fd, unsigned long request, unsigned long arg) {
             }
         }
     }
+    case FIONBIO:
+        /* O_NONBLOCK, said the other way. */
+        if (!arg) {
+            return -LX_EFAULT;
+        }
+        __quark_fd_set_nonblock(fd, *(int *)arg != 0);
+        return 0;
     case FIONREAD: {
-        /* How much there is to read, of an inotify instance: its server
-           counts the bytes of events waiting. */
+        /* How much there is to read: of a socket of the network, what the
+           stack holds for it; of an inotify instance, the bytes of events
+           waiting, which its server counts. */
+        if (__quark_fd_is_net(fd)) {
+            return __quark_inet_pending(fd, (int *)arg);
+        }
         unsigned long n;
         if (quark_vfs_inotify_queued(fd, &n) == 0) {
             if (arg) {

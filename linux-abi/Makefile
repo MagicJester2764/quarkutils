@@ -18,7 +18,7 @@ CFLAGS  += $(EXTRA_CFLAGS)
 # protocol drift. Compiled here into an object of our own, though — building it
 # in place would have two Makefiles writing one path with their own flags, and
 # whichever ran last would decide what the other one linked.
-OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/clone.o \
+OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/inet.o src/clone.o \
            src/clone-entry.o src/vfs-client.o src/process.o src/pty.o \
            src/signal.o
 # Linked for its section rather than its symbols, so it cannot live in the

@@ -35,6 +35,7 @@
 #define UNKNOWN 0
 #define KERNELS 1 /* a pipe, a terminal, a stream, memory — or nothing */
 #define A_FILE  2
+#define A_NET   3 /* a socket of the network, which inet.c speaks for */
 
 static unsigned char kind[MAX_FDS];
 static unsigned short handle_of[MAX_FDS];
@@ -132,7 +133,37 @@ void __quark_fd_forget(long fd) {
     if (fd >= 0 && fd < MAX_FDS) {
         __atomic_store_n(&kind[fd], UNKNOWN, __ATOMIC_RELEASE);
         __quark_fd_set_nonblock(fd, 0);
+        __quark_inet_forget(fd);
     }
+}
+
+/* What `fd` is, asked once — whose it is, if anybody serves it — and noted
+   until it is forgotten. */
+static unsigned char what_is(long fd) {
+    unsigned char is = kind_of(fd);
+    if (is != UNKNOWN) {
+        return is;
+    }
+    unsigned long named[2];
+    if (__syscall2(SYS_FD_SERVED, (unsigned long)fd, (unsigned long)named) != QUARK_ERR) {
+        /* Only the file server's cookies are its handles, and not every one
+           of those: what is not a file is read through the kernel, as the
+           kernel's descriptors are. */
+        if (named[0] == quark_vfs() && !(named[1] & QUARK_VFS_NOT_A_FILE)) {
+            note_file(fd, named[1]);
+            return A_FILE;
+        }
+        if (named[0] == __quark_net(0)) {
+            __atomic_store_n(&kind[fd], A_NET, __ATOMIC_RELEASE);
+            return A_NET;
+        }
+    }
+    note_kernels(fd);
+    return KERNELS;
+}
+
+int __quark_fd_is_net(long fd) {
+    return fd >= 0 && fd < MAX_FDS && what_is(fd) == A_NET;
 }
 
 /* Whether `fd` is a file, and the server's handle for it if so. */
@@ -140,18 +171,7 @@ static int is_file(long fd, unsigned long *handle) {
     if (fd < 0 || fd >= MAX_FDS) {
         return 0;
     }
-    unsigned char is = kind_of(fd);
-    if (is == UNKNOWN) {
-        unsigned long h;
-        if (quark_vfs_handle(fd, &h) == 0) {
-            note_file(fd, h);
-            is = A_FILE;
-        } else {
-            note_kernels(fd);
-            is = KERNELS;
-        }
-    }
-    if (is != A_FILE) {
+    if (what_is(fd) != A_FILE) {
         return 0;
     }
     if (handle) {
@@ -764,6 +784,10 @@ long __quark_fstat(long fd, void *statbuf) {
         case QUARK_FD_KIND_POLLSET:
             st->st_mode = 0600; /* no type at all, which is what Linux says */
             break;
+        case QUARK_FD_KIND_SERVED:
+            /* Served, and not a file: a socket of the network is a socket. */
+            st->st_mode = __quark_fd_is_net(fd) ? 0140000 | 0777 : 020000 | 0666;
+            break;
         default:
             /* An endpoint — a service on the other end of a descriptor, which
                is what standard input is on a console that is no terminal. */
@@ -1228,6 +1252,9 @@ long __quark_read(long fd, void *buf, unsigned long n) {
     if (is_file(fd, &h)) {
         return n ? file_read(h, buf, n, QUARK_VFS_AT_POSITION) : 0;
     }
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_read(fd, buf, n);
+    }
     if (fd < 0 || fd >= MAX_FDS) {
         return -LX_EBADF;
     }
@@ -1316,6 +1343,9 @@ long __quark_write(long fd, const void *buf, unsigned long n) {
     unsigned long h;
     if (is_file(fd, &h)) {
         return n ? file_write(h, buf, n, QUARK_VFS_AT_POSITION) : 0;
+    }
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_write(fd, buf, n);
     }
     if (fd < 0 || fd >= MAX_FDS) {
         return -LX_EBADF;

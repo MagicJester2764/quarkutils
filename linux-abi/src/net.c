@@ -60,6 +60,8 @@ struct cmsghdr {
 
 
 #define AF_UNIX      1
+#define AF_INET      2
+#define AF_INET6     10
 #define SOCK_STREAM  1
 
 /* Linux's poll bits, which are not Quark's. */
@@ -228,6 +230,9 @@ static long control_fds(const struct msghdr *m, unsigned int *fds) {
 }
 
 long __quark_sendmsg(long fd, const void *msg, long flags) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_sendmsg(fd, msg, flags);
+    }
     /* Either the call or the descriptor may ask not to wait, and both mean the
        same thing to the kernel. */
     unsigned long fl = ((flags & MSG_DONTWAIT) || __quark_fd_is_nonblock(fd))
@@ -309,6 +314,9 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
 }
 
 long __quark_recvmsg(long fd, void *msg, long flags) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_recvmsg(fd, msg, flags);
+    }
     unsigned long fl = ((flags & MSG_DONTWAIT) || __quark_fd_is_nonblock(fd))
                            ? QUARK_DONTWAIT
                            : 0;
@@ -517,10 +525,13 @@ static void remember(char *slot, const char *path) {
 }
 
 long __quark_socket(long domain, long type, long protocol) {
-    /* Every other family is not supported, which is the answer a program
-       has something to do about: musl asks a name service daemon who a
-       user is, and takes the local family's ENOENT, or another's
-       EAFNOSUPPORT, for there being none. */
+    /* The network's families are the network stack's. Every other is not
+       supported, which is the answer a program has something to do about:
+       musl asks a name service daemon who a user is, and takes the local
+       family's ENOENT, or another's EAFNOSUPPORT, for there being none. */
+    if (domain == AF_INET || domain == AF_INET6) {
+        return __quark_inet_socket(domain, type, protocol);
+    }
     if (domain != AF_UNIX) {
         return -LX_EAFNOSUPPORT;
     }
@@ -543,6 +554,9 @@ long __quark_socket(long domain, long type, long protocol) {
 }
 
 long __quark_bind(long fd, const void *addr, unsigned long len) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_bind(fd, addr, len);
+    }
     char path[SUN_PATH];
     long bad = path_of(addr, len, path);
     if (bad) {
@@ -566,6 +580,9 @@ long __quark_bind(long fd, const void *addr, unsigned long len) {
 }
 
 long __quark_listen(long fd, long backlog) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_listen(fd, backlog);
+    }
     if (__syscall2(SYS_SOCKET_LISTEN, (unsigned long)fd, backlog < 0 ? 0 : (unsigned long)backlog) == QUARK_ERR) {
         /* A socket with no name, or one connected already. */
         return not_a_socket(fd, -LX_EINVAL, -LX_EINVAL);
@@ -599,6 +616,9 @@ static void unnamed(void *addr, unsigned int *len, const char *path) {
 }
 
 long __quark_accept(long fd, void *addr, unsigned int *len, long flags) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_accept(fd, addr, len, flags);
+    }
     unsigned long r;
     for (;;) {
         r = __syscall2(SYS_SOCKET_ACCEPT, (unsigned long)fd, __quark_fd_is_nonblock(fd) ? 1 : 0);
@@ -638,6 +658,9 @@ long __quark_accept(long fd, void *addr, unsigned int *len, long flags) {
 }
 
 long __quark_connect(long fd, const void *addr, unsigned long len) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_connect(fd, addr, len);
+    }
     char path[SUN_PATH];
     long bad = path_of(addr, len, path);
     if (bad) {
@@ -675,6 +698,9 @@ long __quark_connect(long fd, const void *addr, unsigned long len) {
 }
 
 long __quark_sockname(long fd, void *addr, unsigned int *len, int peer) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_name(fd, addr, len, peer);
+    }
     if (!addr || !len) {
         return -LX_EFAULT;
     }
@@ -694,6 +720,9 @@ long __quark_sockname(long fd, void *addr, unsigned int *len, int peer) {
 }
 
 long __quark_getsockopt(long fd, long level, long name, void *val, unsigned int *len) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_getsockopt(fd, level, name, val, len);
+    }
     unsigned long k = kind_of(fd);
     if (k == 0) {
         return -LX_EBADF;
@@ -754,6 +783,9 @@ long __quark_getsockopt(long fd, long level, long name, void *val, unsigned int 
 }
 
 long __quark_setsockopt(long fd, long level, long name, const void *val, unsigned long len) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_setsockopt(fd, level, name, val, len);
+    }
     unsigned long k = kind_of(fd);
     if (k == 0) {
         return -LX_EBADF;
@@ -790,6 +822,9 @@ long __quark_setsockopt(long fd, long level, long name, const void *val, unsigne
 /* send and recv are these, in musl: a message of one piece, with no address
    to give or be told for a stream that is connected. */
 long __quark_sendto(long fd, const void *buf, unsigned long len, long flags, const void *addr, unsigned long alen) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_sendto(fd, buf, len, flags, addr, alen);
+    }
     if (addr || alen) {
         return not_a_socket(fd, -LX_ENOTCONN, -LX_EISCONN);
     }
@@ -799,6 +834,9 @@ long __quark_sendto(long fd, const void *buf, unsigned long len, long flags, con
 }
 
 long __quark_recvfrom(long fd, void *buf, unsigned long len, long flags, void *addr, unsigned int *alen) {
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_recvfrom(fd, buf, len, flags, addr, alen);
+    }
     struct iovec v = {buf, len};
     struct msghdr m = {NULL, 0, &v, 1, NULL, 0, 0};
     long n = __quark_recvmsg(fd, &m, flags);
@@ -806,6 +844,17 @@ long __quark_recvfrom(long fd, void *buf, unsigned long len, long flags, void *a
         unnamed(addr, alen, fd >= 0 && fd < MAX_FDS ? connected_to[fd] : "");
     }
     return n;
+}
+
+/* A local stream cannot be half closed: the kernel's has no such state. */
+long __quark_shutdown(long fd, long how) {
+    if (how < 0 || how > 2) {
+        return -LX_EINVAL;
+    }
+    if (__quark_fd_is_net(fd)) {
+        return __quark_inet_shutdown(fd, how);
+    }
+    return not_a_socket(fd, -LX_ENOTCONN, -LX_EOPNOTSUPP);
 }
 
 long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *under) {

@@ -60,6 +60,7 @@ const OPT_TYPE: u64 = 5;
 const OPT_V6ONLY: u64 = 6;
 const OPT_RCVBUF: u64 = 7;
 const OPT_SNDBUF: u64 = 8;
+const OPT_PENDING: u64 = 10;
 
 /// Linux's families, types and protocols, as a C library says them.
 const AF_UNSPEC: u64 = 0;
@@ -402,11 +403,16 @@ impl Sockets {
         self.table.iter().flatten().filter(|s| s.space == space).count()
     }
 
-    /// An address given for socket `i`, which must be of its family.
-    fn address(&self, i: usize, famport: u64, a0: u64, a1: u64) -> Result<(IpAddress, u16), u64> {
-        let family = if self.table[i].as_ref().unwrap().v6 { AF_INET6 } else { AF_INET };
+    /// An address given for socket `i`, which must be of its family — or,
+    /// where it is to be sent to (`mapped`), IPv4's to a datagram socket of
+    /// IPv6's that has not asked for IPv6 alone, which reaches it as Linux
+    /// has it.
+    fn address(&self, i: usize, famport: u64, a0: u64, a1: u64, mapped: bool) -> Result<(IpAddress, u16), u64> {
+        let s = self.table[i].as_ref().unwrap();
+        let family = if s.v6 { AF_INET6 } else { AF_INET };
         match endpoint_of(famport, a0, a1) {
             Some((addr, port, f)) if f == family => Ok((addr, port)),
+            Some((addr, port, AF_INET)) if mapped && s.v6 && s.kind == Kind::Datagram && !s.v6only => Ok((addr, port)),
             _ => Err(EAFNOSUPPORT),
         }
     }
@@ -434,7 +440,7 @@ impl Sockets {
                 let to = if d[2] >> 16 == AF_UNSPEC {
                     None
                 } else {
-                    match self.address(i, d[2], d[3], d[4]) {
+                    match self.address(i, d[2], d[3], d[4], true) {
                         Ok((addr, port)) => Some(IpEndpoint::new(addr, port)),
                         Err(e) => return fail(tid, e),
                     }
@@ -506,7 +512,7 @@ impl Sockets {
     }
 
     fn bind(&mut self, net: &mut Stack, tid: usize, i: usize, famport: u64, a0: u64, a1: u64) {
-        let (addr, port) = match self.address(i, famport, a0, a1) {
+        let (addr, port) = match self.address(i, famport, a0, a1, false) {
             Ok(e) => e,
             Err(e) => return fail(tid, e),
         };
@@ -581,7 +587,7 @@ impl Sockets {
                 self.sock(i).peer = None;
                 return ok(tid, [0; 6]);
             }
-            let (addr, port) = match self.address(i, famport, a0, a1) {
+            let (addr, port) = match self.address(i, famport, a0, a1, true) {
                 Ok(e) => e,
                 Err(e) => return fail(tid, e),
             };
@@ -591,7 +597,7 @@ impl Sockets {
             self.sock(i).peer = Some(IpEndpoint::new(addr, port));
             return ok(tid, [0; 6]);
         }
-        let (addr, port) = match self.address(i, famport, a0, a1) {
+        let (addr, port) = match self.address(i, famport, a0, a1, false) {
             Ok(e) => e,
             Err(e) => return fail(tid, e),
         };
@@ -912,6 +918,22 @@ impl Sockets {
             (OPT_KEEPALIVE, false) => s.keepalive as u64,
             (OPT_NODELAY, false) => s.nodelay as u64,
             (OPT_V6ONLY, false) => s.v6only as u64,
+            // What a read would find: a stream's bytes, or the next
+            // datagram's length.
+            (OPT_PENDING, false) => match (s.kind, s.socket, s.lo) {
+                (Kind::Stream, Some((side, h)), _) => stream(net, side, h).recv_queue() as u64,
+                (Kind::Datagram, Some((_, eth)), Some(lo)) => {
+                    let peer = s.peer;
+                    [(Side::Eth, eth), (Side::Lo, lo)]
+                        .into_iter()
+                        .find_map(|(side, h)| {
+                            drop_strangers(net, side, h, peer);
+                            datagram(net, side, h).peek().ok().map(|(data, _)| data.len() as u64)
+                        })
+                        .unwrap_or(0)
+                }
+                _ => 0,
+            },
             (OPT_RCVBUF | OPT_SNDBUF, false) => (if stream_kind { STREAM_BUF } else { DATAGRAM_BUF }) as u64,
             // The buffers are what they are; asking for others is not wrong.
             (OPT_RCVBUF | OPT_SNDBUF, true) => 0,

@@ -1020,7 +1020,7 @@ sent out to be answered by nobody.
   the stack says it is ready for, shared by `dup` and `fork`, and closed
   when its last descriptor goes. A request about one names its cookie and
   is believed only of a program that holds it (`SYS_FD_HOLDS`).
-  `quark_rt::socket` and Rust's std speak this; the tags
+  `quark_rt::socket`, Rust's std and the C library speak this; the tags
   before it — a stream a task owned by a handle, a descriptor read forty
   bytes a call — stay for programs built before.
 - **A port listened on is several sockets.** smoltcp's socket listens for
@@ -1029,6 +1029,12 @@ sent out to be answered by nobody.
   is refused. The stack takes packets in one at a time and, after every
   one, has a socket of each side listening again for each listener with
   room in its backlog (`Stack::refill`).
+- **A C program's socket call never waits in the stack.** What the layer
+  asks (`linux-abi/src/inet.c`) the stack answers at once, and where Linux's
+  call would wait the layer waits in a poll of the descriptor — which a
+  signal ends, and SO_RCVTIMEO bounds. A call held by a server cannot be
+  ended by a signal (the kernel's *Known gaps*), so a request that waits is
+  for programs written for this system, which say so.
 - **A stream let go of says goodbye before it goes** (`Stack::retire`): its
   FIN, or the reset for one closed with something unread, as Linux does,
   and then it is taken out of its set — after a minute whether it has

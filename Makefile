@@ -187,6 +187,9 @@ rootfs:
 	@echo 'root:x:0:0:root:/home/root:/usr/bin/QSH.ELF' > rootfs/etc/passwd
 	@echo 'root:x:0:' > rootfs/etc/group
 	@echo 'root::0::::::' > rootfs/etc/shadow
+	@# This machine's own names, which a C library looks for before it asks
+	@# the network: there is no special case for "localhost" in musl.
+	@printf '127.0.0.1\tlocalhost\n::1\tlocalhost\n' > rootfs/etc/hosts
 
 install: all
 	@mkdir -p $(DESTDIR)/drivers $(DESTDIR)/boot $(DESTDIR)/usr/bin $(DESTDIR)/usr/lib/drivers $(DESTDIR)/etc
@@ -230,6 +233,7 @@ else
 endif
 	@cp rootfs/etc/passwd $(DESTDIR)/etc/PASSWD
 	@cp rootfs/etc/group $(DESTDIR)/etc/GROUP
+	@cp rootfs/etc/hosts $(DESTDIR)/etc/HOSTS
 	@# Hashes of passwords: root's alone to read.
 	@install -m 600 rootfs/etc/shadow $(DESTDIR)/etc/SHADOW
 	@# What the console is, to a program that asks: the entry is the console's

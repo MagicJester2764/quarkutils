@@ -2,8 +2,8 @@
 
 The contract between the network stack and its clients. `net` is the server
 (`net/src/sockets.rs` has its copy of the numbers below); `quark-rt`'s
-`socket` module is a client, with a copy of its own, and Rust's std is one
-through it. This document is the one they are checked against.
+`socket` module and the C library are clients, each with a copy of its own.
+This document is the one they are checked against.
 
 A client finds the server by looking up `net` with the nameserver, which
 also gives it the right to call it — which it needs to make a socket, and
@@ -47,7 +47,9 @@ the address as they are on the wire — IPv4's four first, and nought after —
 read as two little-endian words. A socket of IPv6's family (10) reaches
 IPv4 too, as `::ffff:a.b.c.d`, and says IPv4's addresses that way; one of
 IPv4's (2) is given IPv4's only. An address of the other family is refused
-with `EAFNOSUPPORT`.
+with `EAFNOSUPPORT` — but for IPv4's sent to, or connected to, by a datagram
+socket of IPv6's that has not asked for IPv6 alone, which is IPv4 in IPv6's
+clothes, as Linux has it.
 
 A reply's tag is `0`, or `u64::MAX` with Linux's errno in `data[0]`.
 
@@ -67,7 +69,9 @@ A reply's tag is `0`, or `u64::MAX` with Linux's errno in `data[0]`.
 Options: 1 the error not yet said, which asking takes (`SO_ERROR`); 2 keep
 alive; 3 send small writes at once (`TCP_NODELAY`); 4 listening; 5 the
 type; 6 IPv6 alone (`IPV6_V6ONLY`, before it is bound); 7 and 8 the
-receive and send buffers, which are what they are and say so.
+receive and send buffers, which are what they are and say so; 10, to be
+asked, what a read would find: a stream's bytes, or the next datagram's
+length (`FIONREAD`).
 
 A request that waits is held, with its reply, and answered after the turn
 of the stack's loop that brings what it waits for. A task in a call is in

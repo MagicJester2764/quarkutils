@@ -128,6 +128,7 @@ typedef unsigned long size_t;
 #define LX_eventfd2        290
 #define LX_pipe2           293
 #define LX_socketpair       53
+#define LX_shutdown         48
 #define LX_socket           41
 #define LX_connect          42
 #define LX_accept           43
@@ -2255,6 +2256,8 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         return __quark_sendmsg(a1, (const void *)a2, a3);
     case LX_recvmsg:
         return __quark_recvmsg(a1, (void *)a2, a3);
+    case LX_shutdown:
+        return __quark_shutdown(a1, a2);
     case LX_poll:
         return __quark_poll((void *)a1, a2, wait_ms((int)a3), NULL);
     case LX_ppoll: {

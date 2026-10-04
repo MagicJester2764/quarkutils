@@ -51,6 +51,10 @@
 #define LX_ENOTCONN 107
 #define LX_ETOOMANYREFS 109
 #define LX_ECONNREFUSED 111
+#define LX_EDOM       33
+#define LX_EMSGSIZE   90
+#define LX_ENETDOWN   100
+#define LX_EINPROGRESS 115
 
 /* How many descriptors a program has: as many as the kernel's table holds. */
 #define MAX_FDS 64
@@ -222,6 +226,31 @@ long __quark_pipe(int *fds, long flags);
 long __quark_socketpair(long domain, long type, long protocol, int *sv);
 long __quark_sendmsg(long fd, const void *msg, long flags);
 long __quark_recvmsg(long fd, void *msg, long flags);
+long __quark_shutdown(long fd, long how);
+
+/* Sockets of the network, IPv4's and IPv6's: inet.c. A descriptor is one
+   when the network stack serves it (`__quark_fd_is_net`, noted as whether
+   a descriptor is a file is), and the calls above hand such a one here. */
+unsigned long __quark_net(int again);
+int __quark_fd_is_net(long fd);
+void __quark_inet_forget(long fd);
+long __quark_inet_socket(long domain, long type, long protocol);
+long __quark_inet_bind(long fd, const void *addr, unsigned long len);
+long __quark_inet_listen(long fd, long backlog);
+long __quark_inet_connect(long fd, const void *addr, unsigned long len);
+long __quark_inet_accept(long fd, void *addr, unsigned int *len, long flags);
+long __quark_inet_name(long fd, void *addr, unsigned int *len, int peer);
+long __quark_inet_shutdown(long fd, long how);
+long __quark_inet_getsockopt(long fd, long level, long name, void *val, unsigned int *len);
+long __quark_inet_setsockopt(long fd, long level, long name, const void *val, unsigned long len);
+long __quark_inet_sendto(long fd, const void *buf, unsigned long len, long flags, const void *addr,
+                         unsigned long alen);
+long __quark_inet_recvfrom(long fd, void *buf, unsigned long len, long flags, void *addr, unsigned int *alen);
+long __quark_inet_sendmsg(long fd, const void *msg, long flags);
+long __quark_inet_recvmsg(long fd, void *msg, long flags);
+long __quark_inet_read(long fd, void *buf, unsigned long len);
+long __quark_inet_write(long fd, const void *buf, unsigned long len);
+long __quark_inet_pending(long fd, int *count);
 /* How long these two wait is in nanoseconds, and negative is for ever:
    `poll` and `epoll_wait` say milliseconds, `ppoll` and `pselect` a
    timespec, and the kernel keeps what any of them says to the nanosecond. */

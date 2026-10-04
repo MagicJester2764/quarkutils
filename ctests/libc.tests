@@ -51,3 +51,4 @@ unixtest
 inotifytest
 epolltest
 pthreadtest
+inettest
