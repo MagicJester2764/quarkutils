@@ -121,6 +121,34 @@ begun, and `svc start` is refused. What init stops is what it could start
 again; the rest — the core of the boot image, the session — is left to
 `shutdown`'s sweep.
 
+## The seat
+
+The console's keyboard, pointer and display are one person's at a time —
+the seat's (`quark_rt::seat`) — and the console's own, and init says
+whose. While nobody is logged in the seat is the session service's
+session, which holds the service and nothing else, or a shell's where the
+session is a shell and nobody logs in. A login asks for it
+(`TAG_SEAT`, `services::take_seat`) once it has begun its session and
+before it prompts, and init gives it to a caller that is a child of the
+session service and leads a session of its own: `login` under `getty`, or,
+on the console with no terminal, the child `login` starts for each login.
+Once the password is right the login says whose it is
+(`services::seat_user`) by naming the child `auth` has blessed, which it is
+about to start as the shell: init takes the user from that child, which
+must be the login's and in its session, and not from the login's word.
+When the login's program ends — watched by its space id, which no other
+program is given — the seat is the session service's again.
+
+init tells `fb` and `input` each time (`seat::TAG_SEAT`, believed from
+their parent only), before it answers: whoever had the seat is refused
+before the next prompt is drawn. They allow the console, which init names
+by its process id before it starts it — every program init starts begins a
+session of its own, so no session is the system's — the session the seat
+is for, and every program of the user logged in there. Anybody else is refused a claim, a line typed
+at the console — an end of file, read through a descriptor — and Ctrl-C's
+foreground, and is taken out of the line when the seat moves, as a
+claimant that died is.
+
 ## `/etc/init.conf`
 
 ```text

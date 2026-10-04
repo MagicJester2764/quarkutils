@@ -175,9 +175,17 @@ a terminal of a session they are not in.
 The exception is a holder of authority over every task, which a session of
 an account with the `tasks` right, or root's, is.
 
-This is true of a terminal and not of the plain console, which hands a
-typed line to whoever asks for one. A system with more than one user runs
-its sessions on a terminal (`session /usr/bin/getty` in `/etc/init.conf`).
+The console is its seat's: its keyboard, its pointer and its display, and
+on the console with no terminal a typed line too (`quark_rt::seat`). `input`
+and `fb` give them to the console, to the session a login began — from
+before it prompts — and, once somebody has logged in there, to every
+program of theirs; init says whose the seat is, and when the login ends
+nobody's program has it. So a program left running cannot take the keyboard out
+from under the next login, read a line the next person types at the
+console, or claim the display. What it had already mapped of the display it
+can still draw on, and on the console with no terminal it can still print:
+a system with more than one user runs its sessions on a terminal
+(`session /usr/bin/getty` in `/etc/init.conf`).
 
 ## The programs
 

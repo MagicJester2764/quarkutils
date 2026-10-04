@@ -577,7 +577,9 @@ name, given what its manifest asks for; `run <path> [arguments]` lines name
 programs to run to their end, in order, before anybody is let in — loading
 the console's font is the first use — and `session <path>` there names what
 it starts once the filesystem is up. With no such file that is `login`, on the console as it
-always was: standard input a message to `input`, output the console's pipe.
+always was: standard input a message to `input`, output the console's pipe —
+and there it starts a child for each login, which is the login, as a
+terminal's `getty` starts a `login` for each.
 A distribution that names `getty` gets a real terminal instead: `getty` asks
 the console for its pty (`TAG_TTY_OPEN`), opens the slave, and runs `login`
 with it as descriptors 0, 1 and 2, so that everything below has a tty —
@@ -591,10 +593,10 @@ Unix's seven fields or the five this began with, and starts any shell but
 Who the shell is, and what it holds, is not `login`'s to say: see *Users*.
 
 **`login` is what makes that a session**, in the sense job control needs —
-and each login is one. It begins a session (`sys_setsid`) and takes the
-terminal as the session's own (`sys_pty_set_session`), which gives the
-terminal a process group in front of it: `login`'s, in which whatever it
-starts begins. A shell that does nothing about groups — `qsh` — leaves it at
+and each login is one. It begins a session (`sys_setsid`), takes the seat
+for it (*Users*), and takes the terminal as the session's own
+(`sys_pty_set_session`), which gives the terminal a process group in front
+of it: `login`'s, in which whatever it starts begins. A shell that does nothing about groups — `qsh` — leaves it at
 that, and Ctrl-C is for the lot of them, as it always was. A shell with job
 control puts itself in a group of its own and in front, and each job after
 it. Three things follow:
@@ -721,11 +723,26 @@ session, crypt}`. What must not regress:
   anybody waiting for the name to appear. `auth` clears what a request lent
   it — a password — whichever way the request ends. `ctests/crypttest.c`
   holds the C library to reading what this writes.
-- **A terminal is its session's**, and a session is one login's: see
-  *Starting programs*. It holds only on a terminal. The plain console
-  (`input`) answers whoever asks it for a line, and has no notion of whose
-  it is: a system with more than one user runs its sessions on a terminal
-  (`session /usr/bin/getty`), as an installed one does.
+- **A terminal is its session's, and the console its seat's.** A session
+  is one login's: see *Starting programs*. On a terminal the kernel gives
+  the slave only to the session that has it. The console's keyboard,
+  pointer and display — and on the console with no terminal, a typed line —
+  are the seat's (`quark_rt::seat`): the console's, always; the session a
+  login began, from before it prompts; and once somebody has logged in
+  there, every program of theirs, whatever session it is in — a terminal's
+  shell under a compositor is in one of its own. init says whose it is
+  (`TAG_SEAT`), to a login the session service started and to nothing
+  else, and takes the user from the child `auth` blessed, not from the
+  login's word; when the login ends the seat is the session service's
+  session again, which holds nothing but the service. The console is named
+  by its process id, because no session is the system's: every program init
+  starts begins one of its own. `input` and `fb`
+  ask at every claim and every line, and when it moves take it from whoever
+  may no longer have it, as from a claimant that died. A new server that
+  hands out any of the three asks `Seat::allows`. On the console with no
+  terminal, what a program left running still holds of the console's pipe
+  it can still print on: a system with more than one user runs its sessions
+  on a terminal (`session /usr/bin/getty`), as an installed one does.
 - **`stat` needs no right to read the file.** `OPEN_ASK` is how it is asked
   (`vfs::lstat`, the C layer's `stat`, `access` and `statfs`). Without it a
   user's `ls -l /home` was an error for every home but their own. It was
@@ -740,6 +757,11 @@ session, crypt}`. What must not regress:
 
 `fb` is the framebuffer device: it owns the hardware the way `/dev/fb0`
 does, knows the mode, and decides who draws. It has no opinion about windows.
+
+Who may be a client is the seat's to say (*Users*): `fb` gives the display,
+and `input` the keyboard and the pointer, to the console and to whoever is
+logged in at it. A claim from anybody else is refused, and when somebody
+logs out what their programs claimed goes, as a claimant's that died does.
 
 Everything else is a client of it. `qtty` is the text console: it claims
 the display at boot and draws fullscreen — that is what the machine boots into,
@@ -1652,11 +1674,13 @@ mounts`):
   cursor of its own, if it were given the image and the positions in a way
   that never waits — which the damage notification, a word of tile bits,
   cannot carry.
-- **A seat is nobody's.** `input` and `fb` give the keyboard and the display
-  to whoever claims them, which is how `wm` runs; nothing ties a claim to
-  the session at the console, so a user's program can take the keyboard out
-  from under the next user's login. The terminal above them is the
-  session's (*Starting programs*); the devices under it are not.
+- **A seat takes back no mapping.** A program that mapped the framebuffer
+  while it had the display goes on drawing on it after the seat has moved:
+  it is told it has lost it and cannot claim it again, and that is all —
+  revoking a capability takes back no mapping made with it. It reads no
+  key. And on the console with no terminal, the console's pipe is drawn
+  whoever writes it: a program left running there can still print. The
+  terminal is the session's (*Starting programs*) and nobody else's.
 - **Users**: one id where Unix has three, no list of commands a user may run
   as another, no password ageing, no `groupdel` or `usermod`, sixteen-bit
   ids on disk. `docs/users.md` has the list and the reasons.

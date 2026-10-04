@@ -26,14 +26,22 @@
 //! the ones nothing still running needs, then what they needed, a rank at a
 //! time; then the log is written out and the files synced, and only then is
 //! the caller answered. Nothing is started again from then on.
+//!
+//! And init says whose the seat is — the console's keyboard, pointer and
+//! display (`quark_rt::seat`): the console's always, and the session
+//! service's while nobody is logged in; a login takes it for its session as
+//! it begins ([`Manager::take_seat`]) and says whose it is once somebody has
+//! logged in ([`Manager::seat_user`]), and when the login's program ends it
+//! is the session service's again. `fb` and `input` are told each time
+//! ([`Manager::tell_seat`]).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use quark_rt::ipc::{death_notice, Message, TID_ANY};
+use quark_rt::ipc::{death_notice, space_death_notice, Message, TID_ANY};
 use quark_rt::logd;
 use quark_rt::services::{self as proto, State};
-use quark_rt::{nameserver, println, spawn, syscall};
+use quark_rt::{nameserver, println, seat, spawn, syscall};
 
 use crate::{grant_caps_from_manifest, SPAWN_SCRATCH, VFS_IMAGE_BASE};
 
@@ -173,6 +181,16 @@ pub struct Manager {
     /// The machine is going down: who asked, whether the services are given
     /// no time, and how far it has got.
     shutting: Option<Shutdown>,
+    /// The login that has the seat. With none, it is the session service's.
+    seat: Option<SeatHolder>,
+}
+
+/// The login that has the seat: its program, by the id no other program is
+/// given; its session; and who logged in there, once somebody has.
+struct SeatHolder {
+    space: u64,
+    session: u64,
+    user: Option<u32>,
 }
 
 struct Shutdown {
@@ -230,6 +248,7 @@ impl Manager {
             session_ready: 0,
             held: Vec::new(),
             shutting: None,
+            seat: None,
         }
     }
 
@@ -483,6 +502,10 @@ impl Manager {
                 self.died(dead);
                 continue;
             }
+            if let Some(gone) = space_death_notice(&msg) {
+                self.program_gone(gone);
+                continue;
+            }
             if msg.sender == 0 {
                 continue;
             }
@@ -496,6 +519,79 @@ impl Manager {
         if ours {
             if let Ok((tid, status)) = syscall::sys_wait_for(tid) {
                 self.ended(tid, status);
+            }
+        }
+    }
+
+    /// A program init watched has no task left: the login that had the seat,
+    /// which is the session service's again. The id is never another
+    /// program's, so a notice that comes late names nobody since.
+    fn program_gone(&mut self, space: u64) {
+        if self.seat.as_ref().is_some_and(|s| s.space == space) {
+            self.seat = None;
+            self.tell_seat();
+        }
+    }
+
+    /// A login takes the seat for its session (`TAG_SEAT`), which `fb` and
+    /// `input` are told before it is answered: whoever had it is refused
+    /// before the prompt is drawn. Given to a child of the session service
+    /// that leads a session of its own, and to nobody else — a session that
+    /// could take it for itself could take the next person's keys for
+    /// whatever the last one left running. The session service is getty, or
+    /// on a console with no terminal `login`, which starts a child for each.
+    fn take_seat(&mut self, caller: usize) {
+        let parent = syscall::sys_task_info(caller).map_or(0, |(_, parent, _)| parent);
+        let by_session = parent != 0
+            && self.services.iter().any(|s| s.session && s.tid == parent && s.pid != 0 && syscall::sys_pid(parent) == Some(s.pid));
+        let pid = syscall::sys_pid(caller).unwrap_or(0);
+        let leads = pid != 0 && syscall::sys_getsid(pid) == Some(pid);
+        let space = syscall::sys_task_space(caller).unwrap_or(0);
+        if !by_session || !leads || space == 0 || syscall::sys_space_watch(space).is_err() {
+            return refuse(caller, proto::NOT_ALLOWED);
+        }
+        self.seat = Some(SeatHolder { space, session: pid, user: None });
+        self.tell_seat();
+        reply(caller, proto::TAG_OK, [0; 6]);
+    }
+
+    /// The login that has the seat says whose it is: the user `child` is — a
+    /// child of the login, in its session, which auth has said is somebody
+    /// and which it is about to start as their shell. The user comes from
+    /// the child and not from the login's word for it, and from then on
+    /// every program of theirs may have the seat, whatever session it is in.
+    fn seat_user(&mut self, caller: usize, child: usize) {
+        let space = syscall::sys_task_space(caller).unwrap_or(0);
+        let Some(holder) = self.seat.as_mut().filter(|s| space != 0 && s.space == space) else {
+            return refuse(caller, proto::NOT_ALLOWED);
+        };
+        let user = match syscall::sys_task_info(child) {
+            Ok((_, parent, uid)) if parent == caller && syscall::sys_pid(child).and_then(syscall::sys_getsid) == Some(holder.session) => uid,
+            _ => return refuse(caller, proto::NOT_ALLOWED),
+        };
+        holder.user = Some(user);
+        self.tell_seat();
+        reply(caller, proto::TAG_OK, [0; 6]);
+    }
+
+    /// Tell `fb` and `input` whose the seat is: the console's, by process id,
+    /// and a login's session and user — or with no login, the session
+    /// service's session. Each answers and then takes it from whoever may no
+    /// longer have it. Said before the console starts and once `input` has,
+    /// so that neither refuses the console its first claim.
+    pub fn tell_seat(&self) {
+        let pid = |name: &[u8]| self.find(name).map_or(0, |i| self.services[i].pid);
+        let (session, user) = match &self.seat {
+            Some(s) => (s.session, s.user),
+            None => (self.services.iter().find(|s| s.session && s.tid != 0).map_or(0, |s| s.pid), None),
+        };
+        let data = [session, user.is_some() as u64, user.unwrap_or(0) as u64, pid(b"console"), 0, 0];
+        let msg = Message { sender: 0, tag: seat::TAG_SEAT, data };
+        for name in [&b"fb"[..], b"input"] {
+            let Some(tid) = self.find(name).map(|i| self.services[i].tid).filter(|&t| t != 0) else { continue };
+            let mut answer = Message::empty();
+            if !matches!(syscall::sys_call_timeout(tid, &msg, &mut answer, 300), syscall::CallOutcome::Replied) {
+                println!("[init] {} was not told who has the seat", text(name));
             }
         }
     }
@@ -676,6 +772,10 @@ impl Manager {
         let started = info.start().is_ok();
         println!("[init] Started {} (TID {})", s.show(), tid);
         self.services[i] = s;
+        // Nobody is logged in yet: the seat is the session service's.
+        if self.services[i].session && self.seat.is_none() {
+            self.tell_seat();
+        }
         started
     }
 
@@ -774,6 +874,8 @@ impl Manager {
                     }
                 }
             }
+            proto::TAG_SEAT if msg.data[0] == 0 => self.take_seat(msg.sender),
+            proto::TAG_SEAT => self.seat_user(msg.sender, msg.data[0] as usize),
             proto::TAG_START | proto::TAG_STOP | proto::TAG_RESTART => {
                 let Some(i) = self.named(msg) else { return refuse(msg.sender, proto::NO_SUCH) };
                 if !may_control(msg.sender) {

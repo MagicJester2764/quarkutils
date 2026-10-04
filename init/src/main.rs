@@ -509,10 +509,11 @@ const FB_SLOT: usize = syscall::SLOT_ENDPOINT_EXTRA;
 /// And to the device manager, which it offers drivers to before anybody is
 /// let call it.
 const DEVMGR_SLOT: usize = 11;
-/// And to the log, which nobody else may call: the first empty slot from
-/// here. Every one below 16 is the kernel's or named here — the kernel
-/// starts init with its authorities in the first slots and a range of
-/// memory for each boot module after them, as many as there are.
+/// And to the log, which nobody else may call, and to `input`, which it tells
+/// whose the seat is: the first empty slot from here, for each. Every one
+/// below 16 is the kernel's or named here — the kernel starts init with its
+/// authorities in the first slots and a range of memory for each boot
+/// module after them, as many as there are.
 const LOGD_SLOTS_FROM: usize = 16;
 
 /// Give `tid` the right to call the nameserver.
@@ -762,6 +763,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                             let _ = syscall::sys_pipe_fd_set(my_tid, 2, pipe, true);
                         }
                         mgr.boot(b"console", info.tid, Program::Boot, Policy::Never, Some(b"console"), false);
+                        // The display is the seat's, and the console's always:
+                        // the framebuffer is told so before it is asked.
+                        mgr.tell_seat();
                         let _ = info.start();
                         println!("[init] Spawned console (TID {})", info.tid);
                         // The framebuffer device could not be given a stdout
@@ -1010,7 +1014,16 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize, mgr: 
                         }
                         let _ = spawn::set_args(&info, &[b"input"], &SPAWN_SCRATCH);
                         mgr.boot(b"input", info.tid, Program::Boot, Policy::Never, Some(b"input"), false);
+                        // init made it, so init may call it: the keyboard is
+                        // the seat's, and init says whose that is. Told
+                        // before anything can ask it for the keyboard.
+                        let me = syscall::sys_getpid() as usize;
+                        let slot = (LOGD_SLOTS_FROM..64).find(|&s| syscall::sys_cap_read(me, s).is_ok_and(|c| c.cap_type == 0));
+                        if !slot.is_some_and(|s| syscall::sys_cap_mint(s, syscall::CAP_TYPE_ENDPOINT, info.tid as u64, 0).is_ok()) {
+                            println!("[init] No capability to call input: nobody will have the keyboard");
+                        }
                         let _ = info.start();
+                        mgr.tell_seat();
                         println!("[init] Spawned input (TID {})", info.tid);
                     }
                     Err(()) => println!("[init] FAILED to spawn input"),

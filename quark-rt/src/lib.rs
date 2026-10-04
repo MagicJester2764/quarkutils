@@ -36,6 +36,7 @@ pub mod services;
 pub mod socket;
 pub mod sound;
 pub mod random;
+pub mod seat;
 pub mod vfs;
 pub mod usb;
 pub mod virtio;

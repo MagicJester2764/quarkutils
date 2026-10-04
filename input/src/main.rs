@@ -35,6 +35,16 @@
 //! makes a program a source: one that could make itself one could type into
 //! the console as whoever is logged in.
 //!
+//! **The keyboard is the seat's** (`quark_rt::seat`): a claim, a line and the
+//! foreground are for the console, and for the seat as init says it is — the
+//! session logged in at the console and every program of the user logged in
+//! there — and are refused to everybody else. When the seat moves,
+//! whoever may no longer have it is taken out of the stack as a claimant
+//! that died is, a reader waiting for a line is answered with nothing — an
+//! end of file, read through a descriptor — and what was typed and not yet
+//! read goes: it was the session before's. A program somebody left running
+//! when they logged out does not read the next person's password.
+//!
 //! Nobody holding the keyboard, keys are cooked as they are typed: the driver
 //! says when one arrives, this takes everything waiting, echoes it and edits
 //! the line, and a finished line waits here until somebody reads it. A reader
@@ -46,6 +56,7 @@
 use quark_rt::ipc::{death_notice, Message, TAG_NOTIFICATION, TAG_PING, TID_ANY};
 use quark_rt::manifest::CapReq;
 use quark_rt::nameserver;
+use quark_rt::seat::Seat;
 use quark_rt::{print, println, syscall};
 
 // Sets the foreground task so Ctrl-C reaches the right one.
@@ -221,6 +232,8 @@ struct Server {
     /// Who Ctrl-C interrupts, and who said so.
     foreground: usize,
     foreground_setter: usize,
+    /// Whose the keyboard is.
+    seat: Seat,
 }
 
 impl Server {
@@ -420,6 +433,42 @@ impl Server {
         }
     }
 
+    /// The seat has moved. Whoever may no longer have the keyboard is out of
+    /// the stack, a reader waiting for a line is answered with nothing, and
+    /// whatever was typed and not yet read is gone: it was typed for the
+    /// session before.
+    fn seat_moved(&mut self) {
+        let mut handed = false;
+        let mut i = 0;
+        while i < self.claims.depth {
+            let tid = self.claims.tids[i];
+            if self.seat.allows(tid) {
+                i += 1;
+            } else {
+                handed |= self.claims.remove(tid) == Some(true);
+            }
+        }
+        let mut i = 0;
+        while i < self.nreaders {
+            let tid = self.readers[i].0;
+            if self.seat.allows(tid) {
+                i += 1;
+            } else {
+                self.forget_reader(tid);
+                let _ = syscall::sys_reply(tid, &error());
+            }
+        }
+        if self.foreground != 0 && !self.seat.allows(self.foreground) {
+            self.foreground = 0;
+            self.foreground_setter = 0;
+        }
+        self.line_len = 0;
+        self.cooked.len = 0;
+        if handed {
+            self.handed_down();
+        }
+    }
+
     /// Only a task's own children, or itself, can be put in the foreground,
     /// and only whoever put a task there, or the task itself, takes it out.
     /// Anything more would let any program aim Ctrl-C at any other.
@@ -485,6 +534,7 @@ pub extern "C" fn _start() -> ! {
         claims: Claims { tids: [0; MAX_CLAIMANTS], depth: 0 },
         foreground: 0,
         foreground_setter: 0,
+        seat: Seat::new(),
     };
     // Whatever was typed before this server was listening.
     s.keys_waiting();
@@ -503,6 +553,11 @@ pub extern "C" fn _start() -> ! {
             s.task_died(dead);
             continue;
         }
+        if s.seat.moved(&msg) {
+            let _ = syscall::sys_reply(sender, &ok());
+            s.seat_moved();
+            continue;
+        }
         if sender == 0 {
             if msg.tag == TAG_NOTIFICATION {
                 // Ctrl-C comes with the keys, so there is only one thing to
@@ -516,6 +571,9 @@ pub extern "C" fn _start() -> ! {
         s.forget_reader(sender);
 
         let reply = match msg.tag {
+            // Nothing that waits for a key or a line is for a program outside
+            // the seat. Its line reads as an end of file.
+            TAG_READ | TAG_SET_FOREGROUND | TAG_INPUT_CLAIM if !s.seat.allows(sender) => error(),
             TAG_READ => {
                 let max = (msg.data[0] as usize).min(READ_MAX);
                 // One entry per task never fills a table as long as the

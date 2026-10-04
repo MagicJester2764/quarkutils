@@ -7,7 +7,9 @@
 //! shutdown ([`stop_all`]), are for a caller holding `TaskMgmt` over every
 //! task: init holds it too, and reads the caller's capabilities to see. A
 //! stop is answered once the service has gone. What a service has printed is
-//! [`log`]. `docs/services.md` says it whole; `svc` is the program.
+//! [`log`]. And a login takes the seat here ([`take_seat`]): which session
+//! the console's keyboard and display are for. `docs/services.md` says it
+//! whole; `svc` is the program.
 
 use crate::ipc::Message;
 use crate::{nameserver, syscall};
@@ -29,6 +31,14 @@ pub const TAG_LOG: u64 = 6;
 pub const TAG_STOP_ALL: u64 = 7;
 /// One, as text, into a lent buffer: what it is, what it needs, how it ended.
 pub const TAG_DESCRIBE: u64 = 8;
+/// The seat — the console's keyboard, pointer and display ([`crate::seat`])
+/// — for as long as the caller lives. `data[0]` 0: the caller's session takes
+/// it, for a login once it has begun its session and before it prompts;
+/// given to a child of the session service that leads a session of its own,
+/// and to nobody else. `data[0]` a task: it is the user that task is, for the
+/// login that has the seat once the password is right, of the child it is
+/// about to start as the user's shell.
+pub const TAG_SEAT: u64 = 9;
 
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
@@ -215,6 +225,23 @@ pub fn restart(init: usize, name: &[u8]) -> Result<(), u64> {
 /// have gone and what they wrote is on the disk. `now` gives them no time.
 pub fn stop_all(init: usize, now: bool) -> Result<(), u64> {
     let msg = Message { sender: 0, tag: TAG_STOP_ALL, data: [now as u64, 0, 0, 0, 0, 0] };
+    let mut reply = Message::empty();
+    syscall::sys_call(init, &msg, &mut reply).map_err(|_| NO_SUCH)?;
+    if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }
+}
+
+/// Take the seat for the caller's session: see [`TAG_SEAT`].
+pub fn take_seat(init: usize) -> Result<(), u64> {
+    seat(init, 0)
+}
+
+/// Say whose the seat is: the user child `tid` is. See [`TAG_SEAT`].
+pub fn seat_user(init: usize, tid: usize) -> Result<(), u64> {
+    seat(init, tid as u64)
+}
+
+fn seat(init: usize, word: u64) -> Result<(), u64> {
+    let msg = Message { sender: 0, tag: TAG_SEAT, data: [word, 0, 0, 0, 0, 0] };
     let mut reply = Message::empty();
     syscall::sys_call(init, &msg, &mut reply).map_err(|_| NO_SUCH)?;
     if reply.tag == TAG_ERROR { Err(reply.data[0]) } else { Ok(()) }

@@ -38,6 +38,14 @@
 //! console under a compositor under another compositor unwinds in that order.
 //! A claimant below the top that lets go or dies just leaves the line.
 //!
+//! **The display is the seat's** (`quark_rt::seat`): a claim is for the
+//! console, and for the seat as init says it is — the session logged in at
+//! the console and every program of the user logged in there — and is
+//! refused to everybody else. When the seat moves, whoever may no longer
+//! have the display leaves the line, as a claimant that died does, and one
+//! that was drawing is told it has lost it first. What it mapped stays
+//! mapped, as above: it is told, and can map nothing again.
+//!
 //! **A display can come from a driver.** A machine whose only display draws
 //! from memory — a virtio GPU — gives the bootloader no framebuffer, and this
 //! starts with none: a claim is taken, and the claimant waits for the
@@ -56,6 +64,7 @@
 //! framebuffer nothing is told, and nothing needs to be.
 
 use quark_rt::ipc::{death_notice, Message, TID_ANY};
+use quark_rt::seat::Seat;
 use quark_rt::{nameserver, println, syscall};
 
 // No capabilities here. The framebuffer's address is whatever mode the
@@ -242,6 +251,31 @@ fn hand_back() {
             return;
         }
         let _ = remove(tid);
+    }
+}
+
+/// The seat has moved: whoever may no longer have the display leaves the
+/// line, and if it was drawing it is told first, and the display is handed
+/// to whoever is next.
+fn seat_moved(seat: &Seat) {
+    let drawing = owner();
+    let lost = drawing != 0 && !seat.allows(drawing);
+    if lost {
+        take_back();
+    }
+    let mut gone = [0usize; MAX_CLAIMANTS];
+    let mut n = 0;
+    for c in line() {
+        if !seat.allows(c.tid) {
+            gone[n] = c.tid;
+            n += 1;
+        }
+    }
+    for &tid in &gone[..n] {
+        let _ = remove(tid);
+    }
+    if lost {
+        hand_back();
     }
 }
 
@@ -441,6 +475,7 @@ pub extern "C" fn _start() -> ! {
     if nameserver::register(b"fb").is_ok() {
         println!("[fb] Registered with nameserver.");
     }
+    let mut seat = Seat::new();
 
     loop {
         let mut msg = Message::empty();
@@ -468,6 +503,11 @@ pub extern "C" fn _start() -> ! {
             }
             continue;
         }
+        if seat.moved(&msg) {
+            let _ = syscall::sys_reply(sender, &ok());
+            seat_moved(&seat);
+            continue;
+        }
         // What a claimant drew, as tiles: for the driver to copy, if the
         // display has one. From the kernel, so from nobody in particular —
         // which costs a spurious copy at worst.
@@ -482,6 +522,7 @@ pub extern "C" fn _start() -> ! {
         let reply = match msg.tag {
             TAG_FB_INFO => mode_reply(),
 
+            TAG_FB_CLAIM if !seat.allows(sender) => error(),
             TAG_FB_CLAIM => claim(sender),
 
             TAG_FB_DRIVER => driver(sender),

@@ -15,6 +15,7 @@
 use quark_rt::accounts;
 use quark_rt::auth;
 use quark_rt::nameserver;
+use quark_rt::services;
 use quark_rt::session::{self, Refused, Session};
 use quark_rt::spawn::Scratch;
 use quark_rt::stdio::{read_line, read_secret};
@@ -58,28 +59,47 @@ pub extern "C" fn _start() -> ! {
     // terminal for it.
     let _ = syscall::sys_sig_action(syscall::SIGINT, syscall::SIG_IGNORE);
     let _ = syscall::sys_sig_action(syscall::SIGQUIT, syscall::SIG_IGNORE);
-    // On a terminal, this is a session: begun here, with the terminal taken
-    // as its own, and ended when this ends — which is after one login.
-    // Whoever logs in next is in another, and the kernel gives a terminal's
-    // slave to nobody outside the session that has it. A session that
-    // outlived its user is how the last user's program came to read the
-    // next one's password.
+    // A login is a session: begun here, with the terminal taken as its own
+    // on one, and ended when this ends — which is after one login. Whoever
+    // logs in next is in another, and the kernel gives a terminal's slave to
+    // nobody outside the session that has it, as `input` and `fb` give the
+    // console's keyboard and display to nobody outside the one that has the
+    // seat. A session that outlived its user is how the last user's program
+    // came to read the next one's password.
+    //
+    // On a terminal, getty starts one of these for each session. On the
+    // console with no terminal, init starts this, and this is what starts
+    // one for each: a child, which begins the session and is the login.
     let on_terminal = syscall::sys_pty_number(0).is_ok();
-    if on_terminal {
+    let init = services::manager();
+    let mut seated = false;
+    let me = syscall::sys_getpid() as usize;
+    let from_init = init.is_some() && syscall::sys_task_info(me).map_or(0, |(_, parent, _)| parent) == init.unwrap_or(0);
+    if !on_terminal && from_init {
+        one_child_each_login();
+    }
+    if on_terminal || from_init {
         let _ = syscall::sys_setsid();
-        let _ = syscall::sys_pty_set_session(0);
+        if on_terminal {
+            let _ = syscall::sys_pty_set_session(0);
+        }
+        // The seat, before anything is typed: init gives it to a login the
+        // session service started, and whoever had it is refused from now
+        // on. Refused it on the console, nothing typed would reach this.
+        seated = init.is_some_and(|init| services::take_seat(init).is_ok());
+        if !seated && !on_terminal {
+            println!("login: the console is not this login's");
+            syscall::sleep_ticks(500);
+            syscall::sys_exit_code(1);
+        }
     }
     let mut line_buf = [0u8; 64];
     let mut password = [0u8; quark_rt::crypt::MAX_PASSWORD + 2];
 
     // What the system says of itself to whoever is about to log in, if it
-    // says anything: /etc/issue. Once, and again after each session.
-    let mut greet = true;
+    // says anything: /etc/issue. Once a session.
+    show(vfs_tid, b"/etc/issue");
     loop {
-        if greet {
-            show(vfs_tid, b"/etc/issue");
-            greet = false;
-        }
         print!("login: ");
         let n = read_line(&mut line_buf);
         let typed = trim(&line_buf[..n]);
@@ -221,13 +241,19 @@ pub extern "C" fn _start() -> ! {
         // And what the system says to whoever has logged in: /etc/motd.
         show(vfs_tid, b"/etc/motd");
 
+        // The seat is the user's from now on, wherever their programs are —
+        // a terminal's shell under a compositor is in a session of its own.
+        // Said of the shell, which auth has said is them.
+        if seated {
+            let _ = services::seat_user(init.unwrap_or(0), info.tid);
+        }
+
         // Start shell and wait for it to exit
         if info.start().is_err() {
             println!("login: failed to start shell");
             info.discard();
             continue;
         }
-        greet = true;
 
         let _ = syscall::sys_wait();
 
@@ -240,14 +266,28 @@ pub extern "C" fn _start() -> ! {
         if let Some(group) = syscall::sys_getpgid(0) {
             let _ = syscall::sys_pty_set_front(0, group, true);
         }
-        // One login to a session. Whatever started this on a terminal
-        // starts another, which begins another session.
-        if on_terminal {
-            println!("");
-            syscall::sys_exit_code(0);
-        }
+        // One login to a session. Whatever started this starts another,
+        // which begins another session — and the console another login,
+        // as a terminal's getty does. Run by hand, in a session somebody
+        // already had, this logs in once and is done.
+        println!("");
+        syscall::sys_exit_code(0);
+    }
+}
 
-        println!(""); // blank line before next login prompt
+/// On the console with no terminal, as init's session service: a child for
+/// each login, one after another, each to begin a session of its own.
+/// Returns in each child, and never here.
+fn one_child_each_login() {
+    loop {
+        match syscall::sys_fork() {
+            Ok(0) => return,
+            Ok(child) => {
+                let _ = syscall::sys_wait_for(child);
+            }
+            // No room for another program just now.
+            Err(()) => syscall::sleep_ticks(100),
+        }
     }
 }
 

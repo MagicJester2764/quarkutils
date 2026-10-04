@@ -781,9 +781,66 @@ extern "C" fn linger() -> ! {
     }
 }
 
+/// How many of the seat's three things — the keyboard, the display, a line
+/// typed at the console — this program was refused. One it got is let go of
+/// again.
+fn seat_refused() -> u8 {
+    const TAG_INPUT_CLAIM: u64 = 0x200;
+    const TAG_INPUT_RELEASE: u64 = 0x201;
+    const TAG_READ: u64 = 1;
+    const TAG_FB_CLAIM: u64 = 2;
+    const TAG_FB_RELEASE: u64 = 3;
+    let ask = |tid: usize, tag: u64, ticks: u64| {
+        let mut reply = Message::empty();
+        match syscall::sys_call_timeout(tid, &Message { sender: 0, tag, data: [0; 6] }, &mut reply, ticks) {
+            syscall::CallOutcome::Replied => Some(reply.tag),
+            _ => None,
+        }
+    };
+    let mut refused = 0;
+    if let Some(input) = nameserver::lookup(b"input") {
+        match ask(input, TAG_INPUT_CLAIM, 100) {
+            Some(0) => {
+                let _ = ask(input, TAG_INPUT_RELEASE, 100);
+            }
+            _ => refused += 1,
+        }
+        // A line nobody has typed yet is waited for: still waiting after
+        // half a second is this program in the queue for the next one.
+        if ask(input, TAG_READ, 50) == Some(u64::MAX) {
+            refused += 1;
+        }
+    }
+    // A claim of the display offers a way to call the claimant back, and is
+    // lent the display in slot 2, which has to be empty for it.
+    if let Some(fb) = nameserver::lookup(b"fb") {
+        let me = syscall::sys_getpid() as usize;
+        let lent = 2;
+        if syscall::sys_cap_read(me, lent).is_ok_and(|c| c.cap_type == 0) {
+            let mut reply = Message::empty();
+            let claim = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
+            if syscall::sys_call_offer_self(fb, &claim, &mut reply).is_ok() && reply.tag == 0 {
+                let _ = ask(fb, TAG_FB_RELEASE, 100);
+                let _ = syscall::sys_cap_delete(lent);
+            } else {
+                refused += 1;
+            }
+        }
+    }
+    refused
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // In a session of its own: how many of the keyboard, the display and a
+    // line it is refused. Whether it may have them is whose it is.
+    if quark_rt::args::argv(1) == Some(&b"seat"[..]) {
+        if syscall::sys_setsid().is_err() {
+            syscall::sys_exit_code(255);
+        }
+        syscall::sys_exit_code(seat_refused() as i32);
+    }
     // Asked only to run: the parent is counting how many programs it can
     // start, not talking to this one.
     if quark_rt::args::argv(1) == Some(&b"quit"[..]) {
@@ -956,9 +1013,15 @@ pub extern "C" fn _start() -> ! {
         let mut line = *b"left behind, and refused the terminal N ways of 3\n";
         let at = line.iter().position(|&b| b == b'N').unwrap_or(0);
         line[at] = b'0' + refused;
+        // And the seat: the keyboard, the display and a line typed at the
+        // console are the next session's.
+        let mut seat = *b"and the seat N ways of 3\n";
+        let at = seat.iter().position(|&b| b == b'N').unwrap_or(0);
+        seat[at] = b'0' + seat_refused();
         if let Some(v) = nameserver::lookup_retry(b"vfs", 20) {
             if let Ok(o) = vfs::open_with(v, path, vfs::OPEN_CREATE | vfs::OPEN_TRUNCATE) {
                 let _ = vfs::write(v, o.handle, &line, 0);
+                let _ = vfs::write(v, o.handle, &seat, line.len() as u32);
                 let _ = vfs::close(v, o.handle);
             }
         }

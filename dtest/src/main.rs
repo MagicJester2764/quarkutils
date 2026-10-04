@@ -365,6 +365,27 @@ fn test_control(init: usize) {
     check("nor is a name nobody has", services::stop(init, b"no-such-service") == Err(services::NO_SUCH));
 }
 
+/// The keyboard, the display and a line typed at the console are the
+/// seat's: the user logged in at the console — who runs this — wherever
+/// their programs are, and nobody else.
+fn test_seat() {
+    println!("the seat:");
+    // Another user's program, in a session of its own: what somebody left
+    // running when they logged out is to whoever is at the console now.
+    if syscall::sys_get_uid().0 == 0 && holds_set_uid() {
+        let refused = run_as_user(&[b"dchild", b"seat"]);
+        check("another user's program is refused the keyboard, the display and a line", refused == Some(3));
+    }
+    // One of the user at the console, in a session of its own — a
+    // terminal's shell under a compositor is in one — is given all three.
+    let mine = load_child(&[b"dchild", b"seat"]).and_then(|child| {
+        let tid = child.tid;
+        child.start().ok()?;
+        wait_for(tid)
+    });
+    check("one of the user at the console, in a session of its own, has all three", mine == Some(0));
+}
+
 /// How a service is doing once `done` says so, or `ms` have passed.
 fn service_when(init: usize, name: &[u8], ms: u64, done: impl Fn(&quark_rt::services::Status) -> bool) -> Option<quark_rt::services::Status> {
     let mut last = None;
@@ -2346,16 +2367,16 @@ fn test_jobs() {
     let group = syscall::sys_getpgid(0);
     let session = syscall::sys_getsid(0);
     check("a program is in a process group and a session", group.is_some() && session.is_some());
-    // On a terminal, a session is one login's: begun when somebody logged
-    // in, over when they log out, and what they left running is then in a
-    // session the terminal is no longer the terminal of. For a long time the
-    // terminal's keeper led one session for as long as the machine was up,
-    // and everybody who ever logged in was in it. The keeper is what `init`
-    // starts; a login is what the keeper starts.
-    let on_terminal = syscall::sys_pty_number(0).is_ok() && syscall::sys_pty_session(0) == session;
+    // A session is one login's: begun when somebody logged in, over when
+    // they log out, and what they left running is then in a session the
+    // terminal is no longer the terminal of. For a long time the terminal's
+    // keeper led one session for as long as the machine was up, and
+    // everybody who ever logged in was in it; and on the console with no
+    // terminal everybody was in init's own. The keeper, or the console's
+    // `login`, is what `init` starts; a login is what that starts.
     let leader = (2..64).find(|&t| session.is_some() && syscall::sys_pid(t) == session);
     let a_logins = leader.is_some_and(|t| matches!(syscall::sys_task_info(t), Ok((_, parent, _)) if parent != INIT_TID));
-    check("a session on a terminal is one login's, and not the terminal's keeper's", !on_terminal || a_logins);
+    check("a session is one login's, and not what init started", a_logins);
 
     // A child that can be seen to be running: it writes a byte every
     // twentieth of a second.
@@ -9845,6 +9866,7 @@ pub extern "C" fn _start() -> ! {
         ("fds", test_fd_table),
         ("ipcfd", test_ipc_descriptor),
         ("services", test_services),
+        ("seat", test_seat),
         ("program", test_program_table),
         ("identity", test_identity),
         ("passwords", test_passwords),
