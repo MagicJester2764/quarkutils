@@ -61,7 +61,9 @@ void __quark_locks_forked(void) {
 #define EHDR_SIZE 64UL
 #define PHDR_SIZE 56UL
 #define PT_LOAD 1U
+#define PT_INTERP 3U
 #define PT_PHDR 6U
+#define ET_DYN 3
 #define MAX_SEGMENTS 8
 /* As `quark_rt::spawn`: a program may span a gigabyte from its first page to
    its last, which is what has to be free at the staging address. */
@@ -73,9 +75,10 @@ void __quark_locks_forked(void) {
    moved: clear of the heap, of the layer's anonymous arena and of anything a
    program is loaded at, and a terabyte apart because an image may be a
    gigabyte wide. `layout.h` asserts they are user addresses. */
-#define STAGE_ELF   QUARK_STAGE_ELF
-#define STAGE_STACK QUARK_STAGE_STACK
-#define STAGE_ARGS  QUARK_STAGE_ARGS
+#define STAGE_ELF    QUARK_STAGE_ELF
+#define STAGE_STACK  QUARK_STAGE_STACK
+#define STAGE_ARGS   QUARK_STAGE_ARGS
+#define STAGE_INTERP QUARK_STAGE_INTERP
 
 struct ehdr {
     unsigned char e_ident[16];
@@ -166,15 +169,17 @@ static int give(unsigned long cr3, unsigned long there, unsigned long here,
 
 /* Read the loadable segments, checked the way `quark_rt::spawn` checks them:
    in address order, apart, inside the file, and not spanning more than a
-   gigabyte. Returns how many, or -1. */
+   gigabyte. Each is where the file says plus `bias`: nought for a program,
+   which is not moved, and where this put an interpreter for that. Returns
+   how many, or -1. */
 static int read_segments(const struct phdr *ph, int phnum, unsigned long file_size,
-                         struct segment *out) {
+                         struct segment *out, unsigned long bias) {
     int n = 0;
     for (int i = 0; i < phnum; i++) {
         if (ph[i].p_type != PT_LOAD || ph[i].p_memsz == 0) {
             continue;
         }
-        unsigned long vaddr = ph[i].p_vaddr;
+        unsigned long vaddr = ph[i].p_vaddr + bias;
         unsigned long memsz = ph[i].p_memsz;
         unsigned long filesz = ph[i].p_filesz;
         unsigned long offset = ph[i].p_offset;
@@ -272,6 +277,178 @@ static void drop_stage(const struct segment *segs, int n, unsigned long base,
     }
 }
 
+/* Unmap what of an image was staged at `stage`. */
+static void unstage(const struct segment *segs, int n, unsigned long base, unsigned long stage) {
+    for (int i = 0; i < n; i++) {
+        unmap_stage(stage + (segs[i].first - base), (segs[i].end - segs[i].first) / PAGE_SIZE);
+    }
+}
+
+/* Stage an image read from `fd` at `stage`, laid out as the new program will
+   see it from `base`: two segments that share a page write into the same
+   staged page. 1, or 0 with nothing left staged. */
+static int stage_image(long fd, const struct segment *segs, int n, unsigned long base,
+                       unsigned long stage) {
+    unsigned long mapped = base;
+    for (int i = 0; i < n; i++) {
+        unsigned long start = segs[i].first > mapped ? segs[i].first : mapped;
+        if (start < segs[i].end &&
+            !map_stage(stage + (start - base), (segs[i].end - start) / PAGE_SIZE)) {
+            unstage(segs, i, base, stage);
+            return 0;
+        }
+        mapped = segs[i].end;
+        /* Fresh pages are zeroed, so the .bss past the file bytes is done. */
+        if (segs[i].filesz &&
+            __quark_pread(fd, (void *)(stage + (segs[i].vaddr - base)), segs[i].filesz,
+                          (long)segs[i].offset) != (long)segs[i].filesz) {
+            unstage(segs, i + 1, base, stage);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Move a staged image into the new address space. */
+static int give_image(unsigned long cr3, const struct segment *segs, int n, unsigned long base,
+                      unsigned long stage) {
+    int ok = 1;
+    unsigned long given = base;
+    for (int i = 0; i < n && ok; i++) {
+        unsigned long start = segs[i].first > given ? segs[i].first : given;
+        if (start >= segs[i].end) {
+            continue;
+        }
+        /* A last page the next segment begins in has to suit both, so it goes
+           on its own and writable if either wants it. */
+        int shared = (i + 1 < n) && segs[i + 1].first < segs[i].end;
+        unsigned long whole = shared ? segs[i].end - PAGE_SIZE : segs[i].end;
+        if (whole > start) {
+            ok = give(cr3, start, stage + (start - base), (whole - start) / PAGE_SIZE, segs[i].writable);
+        }
+        if (ok && shared) {
+            unsigned long last = segs[i].end - PAGE_SIZE;
+            int writable = 0;
+            for (int j = 0; j < n; j++) {
+                if (segs[j].writable && segs[j].first <= last && last < segs[j].end) {
+                    writable = 1;
+                }
+            }
+            ok = give(cr3, last, stage + (last - base), 1, writable);
+        }
+        given = segs[i].end;
+    }
+    return ok;
+}
+
+/* The auxiliary vector's keys, Linux's numbers. */
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_PAGESZ 6
+#define AT_BASE   7
+#define AT_FLAGS  8
+#define AT_ENTRY  9
+#define AT_UID    11
+#define AT_EUID   12
+#define AT_GID    13
+#define AT_EGID   14
+#define AT_HWCAP  16
+#define AT_SECURE 23
+#define AT_RANDOM 25
+
+/* Where in the stack's top page the count of arguments is, and where the
+   program begins with its stack pointer: eight bytes in, as a call leaves
+   one, and as `quark_rt::spawn::BLOCK_AT` puts it for a program a spawner
+   starts. musl's entry aligns it again for itself. */
+#define BLOCK_AT 8UL
+
+/* How long a C string is. */
+static unsigned long length(const char *s) {
+    unsigned long n = 0;
+    while (s[n]) {
+        n++;
+    }
+    return n;
+}
+
+/* The stack's top page, `page` here and `there` in the new program, as
+   Linux's kernel leaves it — what a C library's entry reads, and a dynamic
+   loader's, before it can call anything: from the bottom up, the number of
+   arguments, a pointer to each, a nought, a pointer to each variable of the
+   environment, a nought, and the auxiliary vector; at the top, sixteen
+   random bytes and below them the strings. As `quark_rt::spawn` builds it,
+   and for the same programs. An entry that would not fit is left off the
+   end, as on the argument page; whatever that page holds fits here. */
+static void build_stack_top(unsigned char *page, unsigned long there, char *const argv[],
+                            char *const envp[], unsigned long phnum, unsigned long entry,
+                            unsigned long interp_base) {
+    unsigned long random_at = PAGE_SIZE - 16;
+    __syscall3(SYS_GETRANDOM, (unsigned long)(page + random_at), 16, 0);
+    unsigned long ids = __syscall0(SYS_GET_UID);
+    unsigned long uid = ids >> 32, gid = ids & 0xFFFFFFFFUL;
+    unsigned int a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    const unsigned long aux[][2] = {
+        {phnum ? AT_PHDR : AT_PHNUM, phnum ? QUARK_ARGS_PAGE + QUARK_PHDRS_AT + 16 : 0},
+        {AT_PHENT, PHDR_SIZE},
+        {AT_PHNUM, phnum},
+        {AT_PAGESZ, PAGE_SIZE},
+        {AT_BASE, interp_base},
+        {AT_FLAGS, 0},
+        {AT_ENTRY, entry},
+        {AT_UID, uid},
+        {AT_EUID, uid},
+        {AT_GID, gid},
+        {AT_EGID, gid},
+        {AT_SECURE, 0},
+        {AT_HWCAP, d},
+        {AT_RANDOM, there + random_at},
+    };
+    unsigned long naux = sizeof aux / sizeof aux[0];
+
+    /* How many of each fit: words from the bottom, strings from the top. */
+    unsigned long words = 3 + 2 * (naux + 1);
+    unsigned long strings = PAGE_SIZE - random_at;
+    unsigned long count[2] = {0, 0};
+    for (int section = 0; section < 2; section++) {
+        char *const *list = section == 0 ? argv : envp;
+        for (unsigned long i = 0; list && list[i]; i++) {
+            unsigned long len = length(list[i]);
+            if (BLOCK_AT + (words + 1) * 8 + strings + len + 1 > PAGE_SIZE) {
+                break;
+            }
+            words++;
+            strings += len + 1;
+            count[section]++;
+        }
+    }
+
+    unsigned long *word = (unsigned long *)(page + BLOCK_AT);
+    unsigned long w = 0;
+    unsigned long top = random_at;
+    word[w++] = count[0];
+    for (int section = 0; section < 2; section++) {
+        char *const *list = section == 0 ? argv : envp;
+        for (unsigned long i = 0; i < count[section]; i++) {
+            unsigned long len = length(list[i]);
+            top -= len + 1;
+            for (unsigned long j = 0; j <= len; j++) {
+                page[top + j] = (unsigned char)list[i][j];
+            }
+            word[w++] = there + top;
+        }
+        word[w++] = 0;
+    }
+    for (unsigned long i = 0; i < naux; i++) {
+        word[w++] = aux[i][0];
+        word[w++] = aux[i][1];
+    }
+    word[w++] = AT_NULL;
+    word[w++] = 0;
+}
+
 /* Tell the kernel what this program is about to become: its arguments, each
    ended by a nought, as much of them as it keeps — what `ps` and `/proc`
    say it is. Said just before it becomes it; a kernel too old to keep it
@@ -346,83 +523,114 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     struct segment segs[MAX_SEGMENTS];
-    int n = read_segments(ph, eh.e_phnum, file_size, segs);
+    int n = read_segments(ph, eh.e_phnum, file_size, segs, 0);
     if (n < 0) {
         __quark_close(fd);
         return -LX_ENOEXEC;
     }
     unsigned long base = segs[0].first;
 
-    /* Stage the image where the program will see it, laid out as it will see
-       it: two segments that share a page write into the same staged page. */
-    unsigned long mapped = base;
-    for (int i = 0; i < n; i++) {
-        unsigned long start = segs[i].first > mapped ? segs[i].first : mapped;
-        if (start < segs[i].end) {
-            if (!map_stage(STAGE_ELF + (start - base), (segs[i].end - start) / PAGE_SIZE)) {
-                drop_stage(segs, i, base, 0, 0);
-                __quark_close(fd);
-                return -LX_ENOMEM;
-            }
+    /* A program built to use shared libraries names the loader that finds
+       them, and is started in it: a shared object, put at a random base in a
+       window of its own (`QUARK_INTERP_BASE`), and told where the program is.
+       One that is not there is the program not being runnable, as Linux
+       says it: no such file. */
+    struct segment isegs[MAX_SEGMENTS];
+    int in = 0;
+    long ifd = -1;
+    unsigned long interp_base = 0, ibase = 0, start_at = eh.e_entry;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        if (ph[i].p_type != PT_INTERP) {
+            continue;
         }
-        mapped = segs[i].end;
-        /* Fresh pages are zeroed, so the .bss past the file bytes is done. */
-        if (segs[i].filesz &&
-            __quark_pread(fd, (void *)(STAGE_ELF + (segs[i].vaddr - base)),
-                          segs[i].filesz, (long)segs[i].offset) != (long)segs[i].filesz) {
-            drop_stage(segs, i + 1, base, 0, 0);
+        char name[256];
+        if (ph[i].p_filesz == 0 || ph[i].p_filesz >= sizeof name ||
+            __quark_pread(fd, name, ph[i].p_filesz, (long)ph[i].p_offset) != (long)ph[i].p_filesz) {
             __quark_close(fd);
             return -LX_ENOEXEC;
         }
+        name[ph[i].p_filesz] = 0;
+        ifd = __quark_open(name, 0 /* O_RDONLY */, 0);
+        if (ifd < 0) {
+            __quark_close(fd);
+            return ifd;
+        }
+        struct ehdr ieh;
+        struct phdr iph[QUARK_MAX_PHDRS];
+        int good = __quark_pread(ifd, &ieh, sizeof ieh, 0) == (long)sizeof ieh &&
+                   ieh.e_ident[0] == 0x7F && ieh.e_ident[1] == 'E' && ieh.e_ident[2] == 'L' &&
+                   ieh.e_ident[3] == 'F' && ieh.e_type == ET_DYN && ieh.e_machine == 62 &&
+                   ieh.e_phentsize >= PHDR_SIZE && ieh.e_phnum > 0 && ieh.e_phnum <= QUARK_MAX_PHDRS;
+        for (int j = 0; good && j < ieh.e_phnum; j++) {
+            good = __quark_pread(ifd, &iph[j], PHDR_SIZE,
+                                 (long)(ieh.e_phoff + (unsigned long)j * ieh.e_phentsize)) == (long)PHDR_SIZE;
+        }
+        if (good) {
+            interp_base = QUARK_INTERP_BASE + __quark_random_pages(QUARK_INTERP_PAGES) * PAGE_SIZE;
+            unsigned long isize = (unsigned long)__quark_lseek(ifd, 0, 2 /* SEEK_END */);
+            in = read_segments(iph, ieh.e_phnum, isize, isegs, interp_base);
+            good = in > 0;
+        }
+        if (!good) {
+            __quark_close(ifd);
+            __quark_close(fd);
+            return -LX_ELIBBAD;
+        }
+        ibase = isegs[0].first;
+        start_at = interp_base + ieh.e_entry;
+        break;
+    }
+
+    /* Stage the image where the program will see it, laid out as it will see
+       it, and the interpreter's beside it. */
+    if (!stage_image(fd, segs, n, base, STAGE_ELF)) {
+        __quark_close(fd);
+        if (ifd >= 0) {
+            __quark_close(ifd);
+        }
+        return -LX_ENOMEM;
     }
     __quark_close(fd);
+    if (ifd >= 0) {
+        int staged = stage_image(ifd, isegs, in, ibase, STAGE_INTERP);
+        __quark_close(ifd);
+        if (!staged) {
+            unstage(segs, n, base, STAGE_ELF);
+            return -LX_ENOMEM;
+        }
+    }
 
+    /* Where the new program's stack ends: a random number of pages into the
+       two gigabytes below the highest it may reach. Its top page is what a C
+       program finds there when it starts, and its stack pointer is at the
+       bottom of that page. */
+    unsigned long stack_top = QUARK_STACK_TOP - __quark_random_pages(1UL << 19) * PAGE_SIZE;
     if (!map_stage(STAGE_STACK, STACK_PAGES)) {
+        unstage(isegs, in, ibase, STAGE_INTERP);
         drop_stage(segs, n, base, 0, 0);
         return -LX_ENOMEM;
     }
     if (!map_stage(STAGE_ARGS, 1)) {
+        unstage(isegs, in, ibase, STAGE_INTERP);
         drop_stage(segs, n, base, 1, 0);
         return -LX_ENOMEM;
     }
     build_args((unsigned char *)STAGE_ARGS, argv, envp, ph, eh.e_phnum);
+    build_stack_top((unsigned char *)(STAGE_STACK + (STACK_PAGES - 1) * PAGE_SIZE),
+                    stack_top - PAGE_SIZE, argv, envp, (unsigned long)eh.e_phnum, eh.e_entry,
+                    interp_base);
 
     unsigned long cr3 = __syscall0(SYS_ADDRSPACE_CREATE);
     if (cr3 == QUARK_ERR) {
+        unstage(isegs, in, ibase, STAGE_INTERP);
         drop_stage(segs, n, base, 1, 1);
         return -LX_ENOMEM;
     }
 
-    int ok = 1;
-    unsigned long given = base;
-    for (int i = 0; i < n && ok; i++) {
-        unsigned long start = segs[i].first > given ? segs[i].first : given;
-        if (start >= segs[i].end) {
-            continue;
-        }
-        /* A last page the next segment begins in has to suit both, so it goes
-           on its own and writable if either wants it. */
-        int shared = (i + 1 < n) && segs[i + 1].first < segs[i].end;
-        unsigned long whole = shared ? segs[i].end - PAGE_SIZE : segs[i].end;
-        if (whole > start) {
-            ok = give(cr3, start, STAGE_ELF + (start - base),
-                      (whole - start) / PAGE_SIZE, segs[i].writable);
-        }
-        if (ok && shared) {
-            unsigned long last = segs[i].end - PAGE_SIZE;
-            int writable = 0;
-            for (int j = 0; j < n; j++) {
-                if (segs[j].writable && segs[j].first <= last && last < segs[j].end) {
-                    writable = 1;
-                }
-            }
-            ok = give(cr3, last, STAGE_ELF + (last - base), 1, writable);
-        }
-        given = segs[i].end;
+    int ok = give_image(cr3, segs, n, base, STAGE_ELF);
+    if (ok && in > 0) {
+        ok = give_image(cr3, isegs, in, ibase, STAGE_INTERP);
     }
-    /* Where the new program's stack ends: a random number of pages into the
-       two gigabytes below the highest it may reach. */
-    unsigned long stack_top = QUARK_STACK_TOP - __quark_random_pages(1UL << 19) * PAGE_SIZE;
     if (ok) {
         ok = give(cr3, stack_top - STACK_PAGES * PAGE_SIZE, STAGE_STACK, STACK_PAGES, 1);
     }
@@ -433,6 +641,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
         /* Whatever was given belongs to the new space, and destroying it frees
            exactly that; whatever was not is still ours to unmap. */
         __syscall1(SYS_ADDRSPACE_DESTROY, cr3);
+        unstage(isegs, in, ibase, STAGE_INTERP);
         drop_stage(segs, n, base, 1, 1);
         return -LX_ENOMEM;
     }
@@ -440,7 +649,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     /* The last call this program makes. Everything above it was preparation
        that could fail and leave the caller as it was; this does not return. */
     say_name(argv);
-    __syscall3(SYS_EXEC_SPACE, cr3, eh.e_entry, stack_top);
+    __syscall3(SYS_EXEC_SPACE, cr3, start_at, stack_top - PAGE_SIZE + BLOCK_AT);
     /* Only reached if the kernel refused, which means the space is not the
        caller's or has a task in it — neither of which can be true here. */
     __syscall1(SYS_ADDRSPACE_DESTROY, cr3);

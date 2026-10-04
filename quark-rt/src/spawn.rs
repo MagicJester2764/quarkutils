@@ -17,6 +17,8 @@ pub const PAGE_SIZE: usize = 4096;
 
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const ET_DYN: u16 = 3;
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
 
@@ -54,6 +56,14 @@ const STACK_WINDOW_PAGES: usize = 1 << 19;
 /// megabytes.
 pub const STACK_PAGES: usize = 256;
 
+/// Where a program's interpreter — the dynamic loader a program built to
+/// use shared libraries names (`PT_INTERP`) — is put: a random number of
+/// pages into the terabyte from two terabytes up, clear of where programs
+/// are linked, their heaps, the C layer's arena, the stacks and `execve`'s
+/// staging. Mirrored as `QUARK_INTERP_BASE` in `quark/layout.h`.
+pub const INTERP_BASE: usize = 0x200_0000_0000;
+const INTERP_WINDOW_PAGES: usize = 1 << 28;
+
 /// The most address space a program may span, from its first loaded page to
 /// its last: a gigabyte. The image is built laid out as the child will see it,
 /// so this is what a spawner must leave free at `Scratch::elf`.
@@ -85,12 +95,17 @@ pub struct Scratch {
 #[derive(Clone, Copy)]
 pub struct Spawned {
     pub tid: usize,
+    /// Where the task starts: the program's entry, or its interpreter's.
     pub entry: u64,
     pub stack_top: u64,
     pub cr3: usize,
     /// The program's own header table, verbatim, for the argument page.
     phdrs: [u8; MAX_PHDRS * PHDR_SIZE],
     phnum: usize,
+    /// The program's own entry, which an interpreter is told (`AT_ENTRY`).
+    program_entry: u64,
+    /// Where the interpreter was put, or nought (`AT_BASE`).
+    interp_base: u64,
 }
 
 impl Spawned {
@@ -103,12 +118,20 @@ impl Spawned {
         cr3: 0,
         phdrs: [0; MAX_PHDRS * PHDR_SIZE],
         phnum: 0,
+        program_entry: 0,
+        interp_base: 0,
     };
 
     /// Run it. Nothing happens until this is called, which is what lets a
     /// caller wire capabilities, file descriptors and pipes first.
+    ///
+    /// The stack pointer starts where [`set_args_env`] put what a C program
+    /// reads there, [`BLOCK_AT`] into the stack's top page. The kernel takes
+    /// the value it is given down to sixteen and eight below that, as a call
+    /// would have left it, so it is given the next sixteen up.
     pub fn start(&self) -> Result<(), ()> {
-        syscall::sys_task_start(self.tid, self.entry, self.stack_top, self.cr3)
+        let rsp = self.stack_top - PAGE_SIZE as u64 + BLOCK_AT as u64 + 8;
+        syscall::sys_task_start(self.tid, self.entry, rsp, self.cr3)
     }
 
     /// Take back a child that will not be started after all: the task, and
@@ -194,6 +217,14 @@ impl Segment {
 /// teardown syscall that does not exist yet. The caller's scratch ranges are
 /// always emptied.
 pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
+    load_with(elf, None, scratch)
+}
+
+/// [`load`], and the interpreter the program names, if it names one
+/// ([`interpreter`]): a shared object, loaded at a random base in a window
+/// of its own ([`INTERP_BASE`]), which the task starts in and which is told
+/// where the program is.
+pub fn load_with(elf: &[u8], interp: Option<&[u8]>, scratch: &Scratch) -> Result<Spawned, ()> {
     if elf.len() < EHDR_SIZE || elf[0..4] != ELF_MAGIC {
         return Err(());
     }
@@ -232,6 +263,36 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
     let segs = &segs[..n];
     let base = segs[0].first;
 
+    // The interpreter, at its base: its segments are where it was linked,
+    // from nought, plus that.
+    let mut isegs = [Segment::EMPTY; MAX_SEGMENTS];
+    let mut ientry = 0;
+    let mut inum = 0;
+    let interp_base = match interp {
+        None => 0,
+        Some(i) => {
+            if i.len() < EHDR_SIZE || i[0..4] != ELF_MAGIC {
+                return Err(());
+            }
+            let ih = unsafe { &*(i.as_ptr() as *const Elf64Header) };
+            if ih.e_type != ET_DYN || (ih.e_phentsize as usize) < PHDR_SIZE {
+                return Err(());
+            }
+            inum = segments(i, ih.e_phoff as usize, ih.e_phentsize as usize, ih.e_phnum as usize, &mut isegs)
+                .ok_or(())?;
+            let at = INTERP_BASE + crate::layout::random_pages(INTERP_WINDOW_PAGES) * PAGE_SIZE;
+            for s in &mut isegs[..inum] {
+                s.first += at;
+                s.end += at;
+                s.vaddr += at;
+                s.vend += at;
+            }
+            ientry = at as u64 + ih.e_entry;
+            at
+        }
+    };
+    let isegs = &isegs[..inum];
+
     let cr3 = syscall::sys_addrspace_create()?;
     let Ok(tid) = syscall::sys_task_create_in(cr3 as u64) else {
         let _ = syscall::sys_addrspace_destroy(cr3);
@@ -240,14 +301,24 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
 
     // Where the child's stack ends, which is its own: chosen for it.
     let stack_top = STACK_TOP - crate::layout::random_pages(STACK_WINDOW_PAGES) * PAGE_SIZE;
+    // The program, then the interpreter, each built in the same scratch
+    // range and moved out of it before the next.
+    let ibase = isegs.first().map_or(0, |s| s.first);
     let loaded = build(elf, segs, base, scratch.elf)
         .and_then(|()| give_image(cr3, segs, base, scratch.elf))
+        .and_then(|()| match interp {
+            Some(i) => build(i, isegs, ibase, scratch.elf).and_then(|()| give_image(cr3, isegs, ibase, scratch.elf)),
+            None => Ok(()),
+        })
         .and_then(|()| give_stack(cr3, scratch.stack, stack_top));
     if loaded.is_err() {
         // What was not given is still ours. Left mapped it would be in the
         // way of the next load, which never maps over anything.
         for s in segs {
             release(scratch.elf + (s.first - base), (s.end - s.first) / PAGE_SIZE);
+        }
+        for s in isegs {
+            release(scratch.elf + (s.first - ibase), (s.end - s.first) / PAGE_SIZE);
         }
         release(scratch.stack, STACK_PAGES);
         // And the child that was being built, which nobody else can name:
@@ -259,7 +330,43 @@ pub fn load(elf: &[u8], scratch: &Scratch) -> Result<Spawned, ()> {
         return Err(());
     }
 
-    Ok(Spawned { tid, entry, stack_top: stack_top as u64, cr3, phdrs, phnum: kept })
+    Ok(Spawned {
+        tid,
+        entry: if inum > 0 { ientry } else { entry },
+        stack_top: stack_top as u64,
+        cr3,
+        phdrs,
+        phnum: kept,
+        program_entry: entry,
+        interp_base: interp_base as u64,
+    })
+}
+
+/// The interpreter `elf` names (`PT_INTERP`), if it names one: a path,
+/// without its nought.
+pub fn interpreter(elf: &[u8]) -> Option<&[u8]> {
+    if elf.len() < EHDR_SIZE || elf[0..4] != ELF_MAGIC {
+        return None;
+    }
+    let hdr = unsafe { &*(elf.as_ptr() as *const Elf64Header) };
+    let (phoff, phentsize) = (hdr.e_phoff as usize, hdr.e_phentsize as usize);
+    if phentsize < PHDR_SIZE {
+        return None;
+    }
+    (0..hdr.e_phnum as usize).find_map(|i| {
+        let at = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if at.checked_add(PHDR_SIZE)? > elf.len() {
+            return None;
+        }
+        let ph = unsafe { &*(elf.as_ptr().add(at) as *const Elf64Phdr) };
+        if ph.p_type != PT_INTERP {
+            return None;
+        }
+        let (from, len) = (ph.p_offset as usize, ph.p_filesz as usize);
+        let path = elf.get(from..from.checked_add(len)?)?;
+        let path = &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())];
+        (!path.is_empty()).then_some(path)
+    })
 }
 
 /// Read and check the loadable segments into `out`, returning how many there
@@ -364,11 +471,13 @@ fn give_image(cr3: usize, segs: &[Segment], base: usize, at: usize) -> Result<()
     Ok(())
 }
 
-/// Build the stack at `at` and move it into the child. Fresh memory is
-/// zeroed, which is all a stack needs.
+/// Build the stack at `at` and move all of it but its top page into the
+/// child. Fresh memory is zeroed, which is all a stack needs; the top page is
+/// [`set_args_env`]'s, which puts there what a C program finds on its stack
+/// when it starts.
 fn give_stack(cr3: usize, at: usize, top: usize) -> Result<(), ()> {
-    map_fresh(at, STACK_PAGES)?;
-    give(cr3, top - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES, true)
+    map_fresh(at, STACK_PAGES - 1)?;
+    give(cr3, top - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES - 1, true)
 }
 
 /// Map `pages` of fresh, zeroed memory at `at`, or nothing.
@@ -446,33 +555,57 @@ pub fn load_path(
     scratch: &Scratch,
     grant: impl FnOnce(&[u8], usize),
 ) -> Result<Spawned, ()> {
-    let (handle, size, _) = crate::vfs::open(vfs_tid, path).map_err(|_| ())?;
-    let size = size as usize;
-    let pages = size.div_ceil(PAGE_SIZE);
-    if pages == 0 || pages > MAX_IMAGE_PAGES || map_fresh(image_at, pages).is_err() {
-        let _ = crate::vfs::close(vfs_tid, handle);
-        return Err(());
+    let (image, pages) = read_image(vfs_tid, path, image_at, MAX_IMAGE_PAGES).ok_or(())?;
+
+    // A program built to use shared libraries names the loader that finds
+    // them, and is started in it: that file is read next, after the
+    // program in the same range.
+    let mut interp = None;
+    let mut interp_pages = 0;
+    if let Some(name) = interpreter(image) {
+        match read_image(vfs_tid, name, image_at + pages * PAGE_SIZE, MAX_IMAGE_PAGES - pages) {
+            Some((i, n)) => {
+                interp = Some(i);
+                interp_pages = n;
+            }
+            None => {
+                release(image_at, pages);
+                return Err(());
+            }
+        }
     }
 
-    let image = unsafe { core::slice::from_raw_parts_mut(image_at as *mut u8, size) };
+    let loaded = load_with(image, interp.as_deref(), scratch);
+    if let Ok(info) = loaded {
+        grant(image, info.tid);
+    }
+
+    // The child has pages of its own now; this was only ever a copy.
+    release(image_at, pages + interp_pages);
+    loaded
+}
+
+/// Read the file at `path` into fresh pages at `at`, at most `most` of
+/// them: the file, and how many pages it took. Nothing is left mapped if it
+/// cannot be read whole.
+fn read_image(vfs_tid: usize, path: &[u8], at: usize, most: usize) -> Option<(&'static mut [u8], usize)> {
+    let (handle, size, _) = crate::vfs::open(vfs_tid, path).ok()?;
+    let size = size as usize;
+    let pages = size.div_ceil(PAGE_SIZE);
+    if pages == 0 || pages > most || map_fresh(at, pages).is_err() {
+        let _ = crate::vfs::close(vfs_tid, handle);
+        return None;
+    }
+    let image = unsafe { core::slice::from_raw_parts_mut(at as *mut u8, size) };
     let read_whole = image.chunks_mut(PAGE_SIZE).enumerate().all(|(p, page)| {
         crate::vfs::read(vfs_tid, handle, page, (p * PAGE_SIZE) as u32) == Ok(page.len() as u32)
     });
     let _ = crate::vfs::close(vfs_tid, handle);
-
-    let result = if read_whole {
-        let loaded = load(image, scratch);
-        if let Ok(info) = loaded {
-            grant(image, info.tid);
-        }
-        loaded
-    } else {
-        Err(())
-    };
-
-    // The child has pages of its own now; this was only ever a copy.
-    release(image_at, pages);
-    result
+    if !read_whole {
+        release(at, pages);
+        return None;
+    }
+    Some((image, pages))
 }
 
 /// Write `args` and `env` into the child's argument page, read back by
@@ -527,6 +660,125 @@ pub fn set_args_env(
     // And what it was started as, which is what `ps` and `/proc` say it is.
     // A kernel too old to keep it says no, and that is all.
     let _ = syscall::sys_program_name_set(info.tid, args);
+    given.and_then(|()| stack_page(info, args, env, scratch))
+}
+
+/// The auxiliary vector's keys, Linux's numbers.
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
+const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+
+/// Where in the stack's top page the count of arguments is: eight bytes in,
+/// eight below a multiple of sixteen. That is where a task begins with its
+/// stack pointer — as a call leaves one, which is what the kernel makes of
+/// whatever it is told (`SYS_TASK_START`) and what a Rust entry point
+/// expects; a C library's entry aligns it again for itself.
+pub const BLOCK_AT: usize = 8;
+
+fn put_word(page: &mut [u8], i: usize, v: u64) {
+    let at = BLOCK_AT + i * 8;
+    page[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Write the stack's top page and move it into the child: what Linux's
+/// kernel leaves on a program's stack, which is what a C library's entry
+/// reads — and a dynamic loader's, which reads it before it can call
+/// anything at all. From the bottom of the page up: the number of
+/// arguments, a pointer to each, a nought, a pointer to each variable of the
+/// environment, a nought, and the auxiliary vector. At the top, sixteen
+/// random bytes (`AT_RANDOM`) and below them the strings. The task starts
+/// with its stack pointer at the count ([`Spawned::start`]).
+///
+/// Whatever the argument page holds fits, since the strings here are its
+/// bytes with a nought each where it has a length; an entry that would not
+/// is left off the end, as there. The program's headers are the copy on the
+/// argument page (`AT_PHDR`), whose `PT_PHDR` says it is there — so a
+/// dynamic loader works out that the program was not moved. The count is
+/// [`BLOCK_AT`] into the page, not at its bottom.
+fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) -> Result<(), ()> {
+    syscall::sys_mmap(scratch.stack, 1)?;
+    let page = unsafe { core::slice::from_raw_parts_mut(scratch.stack as *mut u8, PAGE_SIZE) };
+    let there = info.stack_top as usize - PAGE_SIZE;
+    let (uid, gid) = syscall::sys_get_tuid(info.tid).unwrap_or((0, 0));
+    let random_at = PAGE_SIZE - 16;
+    let _ = syscall::sys_getrandom(&mut page[random_at..]);
+    let mut aux = [
+        (AT_PHDR, (ARGS_PAGE_ADDR + PHDRS_AT + 16) as u64),
+        (AT_PHENT, PHDR_SIZE as u64),
+        (AT_PHNUM, info.phnum as u64),
+        (AT_PAGESZ, PAGE_SIZE as u64),
+        (AT_BASE, info.interp_base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, info.program_entry),
+        (AT_UID, uid as u64),
+        (AT_EUID, uid as u64),
+        (AT_GID, gid as u64),
+        (AT_EGID, gid as u64),
+        (AT_SECURE, 0),
+        (AT_HWCAP, core::arch::x86_64::__cpuid(1).edx as u64),
+        (AT_RANDOM, (there + random_at) as u64),
+    ];
+    // A program with too many headers to copy is told of none.
+    if info.phnum == 0 {
+        aux[0] = (AT_PHNUM, 0);
+    }
+
+    // How many of each fit: words from the bottom, strings from the top.
+    let mut words = 1 + 1 + 1 + 2 * (aux.len() + 1);
+    let mut strings = PAGE_SIZE - random_at;
+    let mut take = |list: &[&[u8]]| {
+        let mut n = 0;
+        for item in list {
+            if BLOCK_AT + (words + 1) * 8 + strings + item.len() + 1 > PAGE_SIZE {
+                break;
+            }
+            words += 1;
+            strings += item.len() + 1;
+            n += 1;
+        }
+        n
+    };
+    let nargs = take(args);
+    let nenv = take(env);
+
+    put_word(page, 0, nargs as u64);
+    let mut top = random_at;
+    let mut i = 1;
+    for list in [&args[..nargs], &env[..nenv]] {
+        for item in list {
+            top -= item.len() + 1;
+            page[top..top + item.len()].copy_from_slice(item);
+            page[top + item.len()] = 0;
+            put_word(page, i, (there + top) as u64);
+            i += 1;
+        }
+        put_word(page, i, 0);
+        i += 1;
+    }
+    for (key, value) in aux {
+        put_word(page, i, key);
+        put_word(page, i + 1, value);
+        i += 2;
+    }
+    put_word(page, i, AT_NULL);
+    put_word(page, i + 1, 0);
+
+    let given = give(info.cr3, there, scratch.stack, 1, true);
+    if given.is_err() {
+        release(scratch.stack, 1);
+    }
     given
 }
 

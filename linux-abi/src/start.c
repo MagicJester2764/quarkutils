@@ -1,14 +1,19 @@
-/* Handing musl the process it expects to wake up in.
+/* Handing musl the process it expects to wake up in — for a program built
+ * before Quark's loaders did that themselves.
  *
  * A Linux program starts with argc, argv, the environment and the auxiliary
  * vector laid out on its stack, and musl's `_start` passes the stack pointer
- * straight to `_start_c`. Quark starts a task at its entry point with a stack
- * and nothing else: the arguments are on a page the spawner mapped, in a
- * layout of its own.
+ * straight to `_start_c`. Quark started a task at its entry point with a
+ * stack and nothing else, the arguments on a page the spawner mapped, in a
+ * layout of its own, and musl's entry was patched to call this, which built
+ * the one musl reads out of the one Quark provided.
  *
- * So the two protocols are different and neither is going to change. This
- * builds the one musl reads out of the one Quark provides — the only part of
- * the port that is about processes rather than system calls.
+ * Now the loaders leave Linux's block on the stack (`quark_rt::spawn`'s
+ * `set_args_env`, and `execve` in process.c), because a dynamic loader
+ * cannot call anything before it has relocated itself; musl's entry reads
+ * the stack, and the signal entry is set by a constructor (syscall.c). This
+ * stays for the programs built before, which still call it, and still find
+ * the argument page mapped.
  */
 
 #include <quark/layout.h>

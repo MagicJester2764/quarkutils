@@ -257,6 +257,19 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   thread-local template through it, and without it every thread-local lands
   outside its block. So every spawner calls `set_args`, even with no
   arguments; a program reading an argument page that was never mapped faults.
+- **A program starts with what Linux leaves on a stack** — argc, argv, the
+  environment and the auxiliary vector, at the bottom of the stack's top
+  page and eight bytes in (`spawn::BLOCK_AT`), the strings and `AT_RANDOM`'s
+  bytes above them. `set_args_env` builds the page and gives it, so the
+  rule above is this one too; `execve` builds the same in C. A C library's
+  entry reads it, and a dynamic loader can read nothing else, since it can
+  call nothing until it has relocated itself. Eight in, because
+  `SYS_TASK_START` takes the stack pointer down to sixteen and eight below,
+  as a call leaves one, which is what a Rust entry point expects —
+  `Spawned::start` passes sixteen up; `SYS_EXEC_SPACE` takes it as given,
+  and `execve` passes eight. The first boot of this put every C program's
+  argc where it read `argv[0]`. The argument page stays: Rust reads it, and
+  so does a C program built before (`__quark_start_args`).
 - **C objects must put constructors in `.init_array`.** The cross compiler is
   configured `--enable-initfini-array`, and the user link script places the
   arrays and refuses `.ctors` outright, so an object carrying them has

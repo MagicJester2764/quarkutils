@@ -42,6 +42,7 @@
 #define LX_EFBIG    27
 #define LX_EPIPE    32
 #define LX_EBUSY    16
+#define LX_ELIBBAD  80
 
 /* How many descriptors a program has: as many as the kernel's table holds. */
 #define MAX_FDS 64

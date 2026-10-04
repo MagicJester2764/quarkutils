@@ -906,6 +906,20 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
 
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
+void __quark_sig_start(void);
+
+/* Where the kernel enters this program to run a signal's handler, and how a
+   call a signal cuts short is to be answered — before main, and before any
+   constructor of the program's own. A C library's entry reads what Linux
+   leaves on the stack, which is what every loader here leaves there now,
+   and calls nothing of Quark's; this file is in every C program, since every
+   call musl makes is made through it, so this runs in every one. A program
+   built when the entry built its own arguments (`__quark_start_args`) says
+   it twice, which is the same as once. */
+__attribute__((constructor(101))) static void quark_start(void) {
+    __quark_sig_start();
+}
+
 /* Every call musl makes arrives here. A handler runs wherever the kernel
    finds the program, on the way out of a call or an interrupt: nothing is
    left for this to do about one. */

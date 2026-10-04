@@ -41,6 +41,14 @@
 #define QUARK_STAGE_ELF   0x140000000000UL
 #define QUARK_STAGE_STACK 0x150000000000UL
 #define QUARK_STAGE_ARGS  0x160000000000UL
+/* And the interpreter a program names, when it names one. */
+#define QUARK_STAGE_INTERP 0x170000000000UL
+
+/* Where a program's interpreter — the dynamic loader a program built to
+   use shared libraries names — is put: a random number of pages into the
+   terabyte from here. Mirrors quark_rt::spawn::INTERP_BASE. */
+#define QUARK_INTERP_BASE  0x20000000000UL
+#define QUARK_INTERP_PAGES (1UL << 28)
 
 /* Where malloc looks for pages — a random number of pages into the first
    half of this, chosen when it first looks. Deliberately not the Rust
@@ -54,7 +62,10 @@ _Static_assert(QUARK_HEAP_START >= QUARK_USER_MIN, "heap is below PML4[1]");
 _Static_assert(QUARK_HEAP_LIMIT > QUARK_HEAP_START, "heap limit is below its start");
 _Static_assert(QUARK_PHDRS_AT == 3184, "program header offset disagrees with quark_rt::spawn");
 _Static_assert(QUARK_STACK_TOP < QUARK_USER_END, "stack top is not a user address");
-_Static_assert(QUARK_STAGE_ELF >= QUARK_USER_MIN && QUARK_STAGE_ARGS < QUARK_USER_END,
+_Static_assert(QUARK_STAGE_ELF >= QUARK_USER_MIN && QUARK_STAGE_INTERP < QUARK_USER_END,
                "exec staging is outside user space");
+_Static_assert(QUARK_INTERP_BASE >= QUARK_USER_MIN &&
+               QUARK_INTERP_BASE + QUARK_INTERP_PAGES * 4096 <= QUARK_STAGE_ELF,
+               "the interpreter's window is not clear of exec staging");
 
 #endif
