@@ -576,6 +576,25 @@ int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode) {
     return vfs_path_call(QUARK_VFS_TAG_MKNOD, base, path, &msg, &reply);
 }
 
+int quark_vfs_bind(unsigned long base, const char *path, long fd, unsigned long mode) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.data[1] = (unsigned long)fd;
+    msg.data[2] = mode;
+    return vfs_path_call(QUARK_VFS_TAG_BIND, base, path, &msg, &reply);
+}
+
+int quark_vfs_connect(unsigned long base, const char *path, long fd) {
+    struct quark_msg msg;
+    struct quark_msg reply;
+
+    zero(&msg, sizeof msg);
+    msg.data[1] = (unsigned long)fd;
+    return vfs_path_call(QUARK_VFS_TAG_CONNECT, base, path, &msg, &reply);
+}
+
 int quark_vfs_sync(void) {
     struct quark_msg msg;
     struct quark_msg reply;

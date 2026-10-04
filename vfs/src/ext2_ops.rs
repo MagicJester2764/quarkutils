@@ -112,20 +112,27 @@ pub fn create(
     Ok((ino, inode))
 }
 
-/// Make a named pipe: an inode that is a name, an owner and a mode, and no
-/// more. The pipe itself is the kernel's, made when the name is opened and
-/// gone when the last end of it is closed; nothing of it is on the disk.
+/// Make a named pipe, or a socket's name: an inode that is a name, an owner
+/// and a mode, and no more — which of the two, `mode`'s type bits say. The
+/// pipe itself is the kernel's, made when the name is opened and gone when
+/// the last end of it is closed, and so is the socket; nothing of either is
+/// on the disk. Answers with the inode's number.
 ///
 /// No blocks, and on a volume with extents no extent tree either: a special
 /// file's `i_block` is not a map of anything.
-pub fn make_fifo(
+pub fn make_special(
     e2: &mut Ext2State,
     base: u32,
     path: &[u8],
     uid: u32,
     gid: u32,
     mode: u16,
-) -> Result<(), u64> {
+) -> Result<u32, u64> {
+    let (kind, kind_type) = match mode & ext2::S_IFMT {
+        ext2::S_IFIFO => (ext2::S_IFIFO, ext2::FT_FIFO),
+        ext2::S_IFSOCK => (ext2::S_IFSOCK, ext2::FT_SOCK),
+        _ => return Err(ERR_PERMISSION),
+    };
     let (parent_path, name) = split_path(path)?;
     let (parent_ino, mut parent) = writable_dir(e2, base, parent_path, uid, gid)?;
     if ext2_dir::find_entry(e2, &parent, name)?.is_some() {
@@ -136,7 +143,7 @@ pub fn make_fifo(
 
     let t = ext2::now();
     let mut inode = Ext2Inode::empty();
-    inode.i_mode = ext2::S_IFIFO | (mode & 0o7777);
+    inode.i_mode = kind | (mode & 0o7777);
     inode.i_uid = uid as u16;
     inode.i_gid = gid as u16;
     inode.i_links_count = 1;
@@ -144,11 +151,11 @@ pub fn make_fifo(
     inode.i_ctime = t;
     inode.i_mtime = t;
     ext2::write_inode(e2, ino, &inode)?;
-    ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, ext2::FT_FIFO)?;
+    ext2_dir::create_dir_entry(e2, parent_ino, &mut parent, name, ino, kind_type)?;
     parent.i_mtime = t;
     parent.i_ctime = t;
     ext2::write_inode(e2, parent_ino, &parent)?;
-    Ok(())
+    Ok(ino)
 }
 
 /// What SETATTR asks for: `which` says which of the rest to use.

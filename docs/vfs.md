@@ -146,6 +146,8 @@ Every request below that takes a handle takes either kind.
 | 33 | `RETIRE` | — | — | — |
 | 34 | `PATH_OF` | `[handle]` | 4096 bytes to fill | `[len]` |
 | 35 | `SYNC` | — | — | — |
+| 36 | `BIND` | `[path_len, descriptor, mode]` | path | `[id]` |
+| 37 | `CONNECT` | `[path_len, descriptor]` | path | — |
 
 28 to 30 are *Mounts*, below; 31 to 34 are what one file server says to
 another, and a client that says them is refused.
@@ -520,6 +522,36 @@ mounted read-only: nothing is written to the disk.
 Opened any other way — without `DESCRIPTOR`, or for neither reading nor
 writing — a named pipe is an inode to ask about: `STAT` answers, and a read
 finds it empty.
+
+### BIND, CONNECT and local sockets
+
+A local socket is the kernel's, and its name is this server's, as a named
+pipe's is: an inode whose mode says it is a socket (`0o140000`), with a
+name, an owner and a mode, and no blocks. The kernel knows a listening
+socket by this server and a key, which is the inode's number.
+
+`BIND` makes the name, at the path, with the permission bits in `data[2]` —
+the caller's umask already taken off — and has the kernel know the caller's
+socket `data[1]` by it (`SYS_SOCKET_BIND`). A name that is taken is `EXISTS`,
+which is Linux's `EADDRINUSE`; so is one an earlier socket still listens at
+by an inode number given out again, as `BUSY`. If `data[1]` is not a socket
+that is nothing yet the name is taken back and the answer is
+`INVALID_HANDLE`. The reply's word is the inode's number.
+
+`CONNECT` connects the caller's socket `data[1]` to whatever listens at the
+path (`SYS_SOCKET_CONNECT`), symbolic links followed. The caller must be
+able to write to the name, as on Linux. A name that is not a socket's, or
+one nothing listens at, is `NO_PEER` — `ECONNREFUSED`; a listener with as
+many connections waiting as it has room for is `WOULD_BLOCK`; a socket
+that cannot be connected — connected already, or named — is
+`INVALID_HANDLE`. The connection is the kernel's from then on, and this
+server sees none of it.
+
+`UNLINK` removes a socket's name like any other, and the listener goes on
+listening, reachable by nobody new; a new `BIND` at the path makes a new
+name. A FAT filesystem has no sockets, and neither does a mounted one
+(`NOT_SUPPORTED`): the kernel would know the listener by the mount's
+server, and a connector is calling this one.
 
 ### Devices
 

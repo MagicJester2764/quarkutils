@@ -43,6 +43,14 @@
 #define LX_EPIPE    32
 #define LX_EBUSY    16
 #define LX_ELIBBAD  80
+#define LX_ENOTSOCK 88
+#define LX_ENOPROTOOPT 92
+#define LX_EPROTONOSUPPORT 93
+#define LX_EADDRINUSE 98
+#define LX_EISCONN  106
+#define LX_ENOTCONN 107
+#define LX_ETOOMANYREFS 109
+#define LX_ECONNREFUSED 111
 
 /* How many descriptors a program has: as many as the kernel's table holds. */
 #define MAX_FDS 64
@@ -104,6 +112,17 @@ long __quark_timer_gettime(long id, void *curr_value);
 long __quark_timer_getoverrun(long id);
 long __quark_timer_delete(long id);
 long __quark_signalfd(long fd, const unsigned long *mask, unsigned long size, long flags);
+long __quark_vfs_errno(int code);
+long __quark_socket(long domain, long type, long protocol);
+long __quark_bind(long fd, const void *addr, unsigned long len);
+long __quark_listen(long fd, long backlog);
+long __quark_accept(long fd, void *addr, unsigned int *len, long flags);
+long __quark_connect(long fd, const void *addr, unsigned long len);
+long __quark_sockname(long fd, void *addr, unsigned int *len, int peer);
+long __quark_getsockopt(long fd, long level, long name, void *val, unsigned int *len);
+long __quark_setsockopt(long fd, long level, long name, const void *val, unsigned long len);
+long __quark_sendto(long fd, const void *buf, unsigned long len, long flags, const void *addr, unsigned long alen);
+long __quark_recvfrom(long fd, void *buf, unsigned long len, long flags, void *addr, unsigned int *alen);
 long __quark_sigaltstack(const void *ss, void *old);
 /* As the program starts: where the kernel enters it to run a handler. */
 void __quark_sig_start(void);

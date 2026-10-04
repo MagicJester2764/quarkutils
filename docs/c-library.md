@@ -371,6 +371,50 @@ in the C library chooses a routine by what the processor has, musl having
 no such mechanism for a static program; a library that does its own
 choosing (pixman, zlib-ng) finds them.
 
+## Sockets
+
+A socket of the local family (`AF_UNIX`, `SOCK_STREAM`) is what a program
+expects: `socket`, `bind`, `listen`, `accept` and `accept4`, `connect`,
+`getsockname` and `getpeername`, `send`, `recv`, `sendto` and `recvfrom` on
+a connected one, `sendmsg` and `recvmsg`, and `socketpair`. A name is a
+file — the file server makes it at `bind`, `ls -l` shows it, `unlink`
+removes it — and `connect` needs to be able to write to it, as on Linux.
+Connected, a socket is a stream, the same as a pair's: `poll`, `epoll` and
+non-blocking reads and writes treat it so, and a listener is readable
+while a connection waits.
+
+**What comes with a message.** `SCM_RIGHTS` carries up to 32 descriptors a
+message, from as many control messages as there are; a receive takes as
+many as its control buffer has room for, in the order they were sent. They
+are not tied to the bytes: a receive that reads a message's first byte can
+take its descriptors, and may take the next message's as well — which is
+what libwayland, libdbus and xcb each expect, gathering them in order.
+`SO_PEERCRED` says who is at the other end: for a pair, the program that
+made it; for a connection, the listener as it was when it listened and the
+connector as it was when it connected. A receiver that set `SO_PASSCRED`
+is given `SCM_CREDENTIALS` with every message, saying the same; a sender
+may put its own credentials in one, and only its own (`EPERM`).
+
+What is different:
+
+- **Only a stream.** `SOCK_DGRAM` and `SOCK_SEQPACKET` are
+  `EPROTONOSUPPORT`, and a name in the abstract namespace (a nought first)
+  is `EINVAL`.
+- **A name is on the root filesystem.** In a mounted one — a `tmpfs` on
+  `/run`, say — `bind` and `connect` are `EOPNOTSUPP`, as a named pipe there
+  is: the kernel would know the listener by the mount's server.
+- **A full listener makes `connect` wait a little at a time**, and a socket
+  marked non-blocking `EAGAIN`; it is a listener with sixteen connections
+  waiting, whatever its backlog said.
+- **`shutdown` is not there**: a stream ends when its last descriptor
+  closes.
+- **`getsockname` and `getpeername` forget at `exec`**: the name is the file
+  server's and the layer remembers it, so after an `exec` a socket is said
+  to have none.
+- `setsockopt` takes the buffer sizes, the timeouts, `SO_REUSEADDR`,
+  `SO_KEEPALIVE` and `SO_LINGER` and keeps none of them; any other option is
+  `ENOPROTOOPT`.
+
 ## Where things are
 
 A program's stack, what `malloc` gives and what `mmap` gives with no
@@ -398,12 +442,11 @@ and much later. The ones a ported program is most likely to meet:
 `fstatat`), and `epoll_wait` on anything but the descriptors the layer can
 poll.
 
-`socket` is the exception: it answers `EAFNOSUPPORT`, for every family.
-There are no sockets to be bound or connected by name — a local stream is
-made as a pair (`socketpair`) — and "that family is not supported" is the
-answer a program has something to do about. musl asks a name service daemon
-who a user is before it concludes nobody has the name, and takes this for
-"there is no daemon".
+`socket` of any family but the local one answers `EAFNOSUPPORT`, which is
+the answer a program has something to do about: there is no network for a
+C program yet. musl asks a name service daemon who a user is before it
+concludes nobody has the name, and takes that, or the local family's
+`ENOENT` for a daemon that is not there, for there being none.
 
 A program is linked statically unless it asks: `x86_64-quark-musl-gcc
 -dynamic` links it to `libc.so`, and `-fPIC -shared` makes a shared object

@@ -125,6 +125,17 @@ typedef unsigned long size_t;
 #define LX_pipe2           293
 #define LX_socketpair       53
 #define LX_socket           41
+#define LX_connect          42
+#define LX_accept           43
+#define LX_sendto           44
+#define LX_recvfrom         45
+#define LX_bind             49
+#define LX_listen           50
+#define LX_getsockname      51
+#define LX_getpeername      52
+#define LX_setsockopt       54
+#define LX_getsockopt       55
+#define LX_accept4          288
 #define LX_fadvise64       221
 #define LX_getpid           39
 #define LX_getppid         110
@@ -2031,7 +2042,29 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
        found. Told "no such call" it reported that instead, and `id nobody`
        said the function was not implemented. */
     case LX_socket:
-        return -LX_EAFNOSUPPORT;
+        return __quark_socket(a1, a2, a3);
+    case LX_bind:
+        return __quark_bind(a1, (const void *)a2, (unsigned long)a3);
+    case LX_listen:
+        return __quark_listen(a1, a2);
+    case LX_accept:
+        return __quark_accept(a1, (void *)a2, (unsigned int *)a3, 0);
+    case LX_accept4:
+        return __quark_accept(a1, (void *)a2, (unsigned int *)a3, a4);
+    case LX_connect:
+        return __quark_connect(a1, (const void *)a2, (unsigned long)a3);
+    case LX_getsockname:
+        return __quark_sockname(a1, (void *)a2, (unsigned int *)a3, 0);
+    case LX_getpeername:
+        return __quark_sockname(a1, (void *)a2, (unsigned int *)a3, 1);
+    case LX_getsockopt:
+        return __quark_getsockopt(a1, a2, a3, (void *)a4, (unsigned int *)a5);
+    case LX_setsockopt:
+        return __quark_setsockopt(a1, a2, a3, (const void *)a4, (unsigned long)a5);
+    case LX_sendto:
+        return __quark_sendto(a1, (const void *)a2, (unsigned long)a3, a4, (const void *)a5, (unsigned long)a6);
+    case LX_recvfrom:
+        return __quark_recvfrom(a1, (void *)a2, (unsigned long)a3, a4, (void *)a5, (unsigned int *)a6);
     case LX_sendmsg:
         return __quark_sendmsg(a1, (const void *)a2, a3);
     case LX_recvmsg:

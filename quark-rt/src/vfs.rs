@@ -31,6 +31,8 @@ const TAG_STATFS: u64 = 14;
 const TAG_SEEK: u64 = 24;
 const TAG_SETATTR: u64 = 25;
 const TAG_MKNOD: u64 = 26;
+const TAG_BIND: u64 = 36;
+const TAG_CONNECT: u64 = 37;
 const TAG_DEVCTL: u64 = 27;
 const TAG_ATTACH: u64 = 28;
 const TAG_DETACH: u64 = 29;
@@ -317,6 +319,20 @@ pub fn open_end(vfs_tid: usize, path: &[u8], flags: u64, mode: u32) -> Result<(u
 pub fn mkfifo(vfs_tid: usize, path: &[u8], mode: u32) -> Result<(), u64> {
     let words = [0, (S_IFIFO | (mode & 0o7777)) as u64, 0, 0, 0, 0];
     call_with_path(vfs_tid, TAG_MKNOD, path, words).map(|_| ())
+}
+
+/// Name local socket `fd` (`syscall::sys_socket_local`) at `path`, which
+/// must be free, with permission bits `mode`: the server makes the name, and
+/// the kernel knows the socket by it. A name that is taken is `ERR_EXISTS`.
+pub fn bind_local(vfs_tid: usize, path: &[u8], fd: usize, mode: u32) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_BIND, path, [0, fd as u64, (mode & 0o7777) as u64, 0, 0, 0]).map(|_| ())
+}
+
+/// Connect local socket `fd` to whatever listens at `path`: `ERR_NO_PEER`
+/// if nothing does, `ERR_WOULD_BLOCK` if it has as many waiting as it has
+/// room for.
+pub fn connect_local(vfs_tid: usize, path: &[u8], fd: usize) -> Result<(), u64> {
+    call_with_path(vfs_tid, TAG_CONNECT, path, [0, fd as u64, 0, 0, 0, 0]).map(|_| ())
 }
 
 /// The server's handle behind descriptor `fd`, if it is one of `vfs_tid`'s.

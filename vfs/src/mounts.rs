@@ -631,7 +631,8 @@ fn crossing(sender: usize, msg: &Message) -> bool {
     let found = match msg.tag {
         TAG_OPEN => one(msg.data[1] & OPEN_NOFOLLOW == 0, true),
         TAG_CHDIR => one(true, true),
-        TAG_MKDIR | TAG_MKNOD | TAG_UNLINK | TAG_RMDIR | TAG_READLINK => one(false, true),
+        TAG_MKDIR | TAG_MKNOD | TAG_UNLINK | TAG_RMDIR | TAG_READLINK | TAG_BIND => one(false, true),
+        TAG_CONNECT => one(true, true),
         TAG_SETATTR if len != 0 => one(msg.data[2] == 0, true),
         TAG_ATTACH | TAG_DETACH => one(true, false),
         TAG_RENAME | TAG_LINK => return two(sender, msg),
@@ -677,8 +678,10 @@ fn crossing(sender: usize, msg: &Message) -> bool {
             return true;
         }
         // A named pipe's ends are kept by the kernel for the server its name
-        // is in, and a descriptor for one there could not be given here.
-        TAG_MKNOD => {
+        // is in, and a descriptor for one there could not be given here. A
+        // socket's name is the same: the kernel would know the listener by
+        // that server, and the connector is calling this one.
+        TAG_MKNOD | TAG_BIND | TAG_CONNECT => {
             error_reply(sender, ERR_NOT_SUPPORTED);
             return true;
         }

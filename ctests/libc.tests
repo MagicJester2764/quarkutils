@@ -47,3 +47,4 @@ layouttest
 sigqueuetest
 ptimertest
 signalfdtest
+unixtest

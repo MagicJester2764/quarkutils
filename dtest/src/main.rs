@@ -949,6 +949,113 @@ fn test_socketpair() {
 
 const PASSED_AT: usize = 0x96_0000_0000;
 
+/// Local sockets: who is at the other end of a stream, several descriptors
+/// in one message, and a socket found by a name.
+fn test_local_sockets() {
+    println!("local sockets:");
+    let me = syscall::sys_pid_self() as u32;
+    let (uid, gid) = syscall::sys_get_uid();
+    let Ok((a, b)) = syscall::sys_socketpair() else {
+        check("a pair", false);
+        return;
+    };
+    check("each end of a pair says its maker is at the other", syscall::sys_socket_peer(b) == Ok((me, uid, gid)));
+
+    // Several descriptors in one send, and taken as there is room.
+    let mut mems = [0u32; 3];
+    for m in mems.iter_mut() {
+        *m = syscall::sys_memfd_create(1).unwrap_or(0) as u32;
+    }
+    check("three descriptors go with one send", syscall::sys_fd_send_many(a, b"x", &mems) == Ok(1));
+    let mut got = [0u32; 2];
+    let mut buf = [0u8; 4];
+    let first = syscall::sys_fd_recv_many(b, &mut buf, &mut got);
+    let firsts = got;
+    let mut rest = [0u32; 4];
+    let _ = syscall::sys_fd_send(a, b"y", None);
+    let second = syscall::sys_fd_recv_many(b, &mut buf, &mut rest);
+    let memory = |fd: u32| syscall::sys_fd_kind(fd as usize).is_some_and(|(kind, _)| kind == 10);
+    check(
+        "a receive takes as many as it has room for, and the next takes the rest",
+        first == Ok((1, 2)) && second == Ok((1, 1)) && memory(firsts[0]) && memory(firsts[1]) && memory(rest[0]),
+    );
+    for fd in firsts.iter().chain(&rest[..1]).chain(mems.iter()) {
+        let _ = syscall::sys_fd_close(*fd as usize);
+    }
+    let mut many = [0u32; 33];
+    let spare = syscall::sys_memfd_create(1).unwrap_or(0) as u32;
+    for fd in many.iter_mut() {
+        *fd = spare;
+    }
+    check("thirty-three in one send are refused", syscall::sys_fd_send_many(a, b"z", &many).is_err());
+    let _ = syscall::sys_fd_close(spare as usize);
+    let _ = syscall::sys_fd_close(a);
+    let _ = syscall::sys_fd_close(b);
+
+    // A socket by a name.
+    let v = nameserver::lookup(b"vfs").unwrap_or(0);
+    const NAME: &[u8] = b"/tmp/dtest.sock";
+    let _ = vfs::unlink(v, NAME);
+    let listener = syscall::sys_socket_local().unwrap_or(usize::MAX);
+    check(
+        "a local socket is nothing yet: not read, not written, said to be one",
+        syscall::sys_fd_kind(listener).is_some_and(|(kind, _)| kind == 14) && syscall::sys_fd_read_nb(listener, &mut buf) == u64::MAX,
+    );
+    check("it is named by the file server", vfs::bind_local(v, NAME, listener, 0o700).is_ok());
+    let other = syscall::sys_socket_local().unwrap_or(usize::MAX);
+    check("and a name that is taken is refused", vfs::bind_local(v, NAME, other, 0o700) == Err(vfs::ERR_EXISTS));
+    check(
+        "a name nothing listens at is no peer",
+        vfs::connect_local(v, NAME, other) == Err(vfs::ERR_NO_PEER),
+    );
+    check("named, it listens", syscall::sys_socket_listen(listener, 4).is_ok());
+    check("with nothing waiting, an accept that may not wait says so", syscall::sys_socket_accept(listener, false) == Ok(None));
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let mine = syscall::sys_socket_local().unwrap_or(usize::MAX);
+            let ok = vfs::connect_local(v, NAME, mine).is_ok()
+                && syscall::sys_fd_kind(mine).is_some_and(|(kind, _)| kind == 4)
+                && syscall::sys_socket_peer(mine) == Ok((me, uid, gid))
+                && syscall::sys_fd_send(mine, b"hello", None) == Ok(5);
+            syscall::sys_exit_program(if ok { 7 } else { 8 });
+        }
+        Ok(child) => {
+            let child_pid = syscall::sys_pid(child).unwrap_or(0) as u32;
+            let ended = wait_for(child);
+            let mut poll = [syscall::PollFd::new(listener, syscall::POLL_READABLE)];
+            let waiting = syscall::sys_poll(&mut poll, 0) == Ok(1);
+            let accepted = syscall::sys_socket_accept(listener, true);
+            let conn = accepted.ok().flatten().unwrap_or(usize::MAX);
+            let mut said = [0u8; 8];
+            let n = syscall::sys_fd_read(conn, &mut said);
+            check(
+                "a program that connects by the name is told who listens, and is connected",
+                ended == Some(7),
+            );
+            check("the listener is readable while a connection waits", waiting);
+            check(
+                "and accepting gives a stream from it, which says who connected and has what it wrote",
+                n == 5 && &said[..5] == b"hello" && syscall::sys_socket_peer(conn) == Ok((child_pid, uid, gid)),
+            );
+            let _ = syscall::sys_fd_close(conn);
+        }
+        Err(()) => check("fork", false),
+    }
+    check(
+        "a socket can ask to be told who sent what it receives",
+        syscall::sys_socket_passcred(listener, Some(true)) == Ok(false) && syscall::sys_socket_passcred(listener, None) == Ok(true),
+    );
+    let _ = syscall::sys_fd_close(listener);
+    let late = syscall::sys_socket_local().unwrap_or(usize::MAX);
+    check(
+        "once the listener is closed, its name is no peer",
+        vfs::connect_local(v, NAME, late) == Err(vfs::ERR_NO_PEER),
+    );
+    let _ = syscall::sys_fd_close(late);
+    let _ = syscall::sys_fd_close(other);
+    let _ = vfs::unlink(v, NAME);
+}
+
 fn test_fd_passing() {
     println!("descriptor passing:");
     let (a, b) = match syscall::sys_socketpair() {
@@ -9130,6 +9237,7 @@ pub extern "C" fn _start() -> ! {
         ("memfd", test_memfd),
         ("socketpair", test_socketpair),
         ("passing", test_fd_passing),
+        ("local", test_local_sockets),
         ("leak", test_no_leak),
         ("pollset", test_pollset),
         ("wake", test_wake_latency),

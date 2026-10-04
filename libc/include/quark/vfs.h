@@ -42,6 +42,8 @@
 #define QUARK_VFS_TAG_MKNOD   26
 #define QUARK_VFS_TAG_DEVCTL  27
 #define QUARK_VFS_TAG_SYNC    35
+#define QUARK_VFS_TAG_BIND    36
+#define QUARK_VFS_TAG_CONNECT 37
 /* QUARK_VFS_TAG_DEVCTL's operations: have a disk's driver read its partition
    table again. */
 #define QUARK_VFS_DEVCTL_RESCAN 1UL
@@ -269,6 +271,10 @@ int quark_vfs_open_fd(unsigned long base, const char *path, unsigned long flags,
    is what to wait on — 0 if somebody holds the other end, and otherwise the
    number SYS_PIPE_PEER takes to wait for it to be opened. */
 int quark_vfs_mknod(unsigned long base, const char *path, unsigned long mode);
+/* Name local socket `fd` at `path`, which must be free, with the permission
+   bits `mode`; and connect `fd` to whatever listens at `path`. */
+int quark_vfs_bind(unsigned long base, const char *path, long fd, unsigned long mode);
+int quark_vfs_connect(unsigned long base, const char *path, long fd);
 /* Have everything written so far be on its disk before returning. */
 int quark_vfs_sync(void);
 /* Ask something of the device an open handle is: QUARK_VFS_DEVCTL_*. */

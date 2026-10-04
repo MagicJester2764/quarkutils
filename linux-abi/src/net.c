@@ -5,13 +5,16 @@
  * `struct msghdr` into a pointer and a length, a `cmsghdr` into one descriptor
  * number, a `struct pollfd` array into Quark's.
  *
- * The one piece of judgement is SCM_RIGHTS carrying more than one descriptor.
- * Quark's send takes one, Wayland sends one per message, and silently
- * delivering the first of three would be found somewhere else entirely — so
- * more than one is refused.
+ * A message carries as many descriptors as the kernel's stream takes at once
+ * (32), from every SCM_RIGHTS it has, and a receive takes as many as the
+ * caller has room for. Credentials (SCM_CREDENTIALS) go to a receiver that
+ * asked for them (SO_PASSCRED): who is at the other end, which is what the
+ * kernel knows of a stream (SO_PEERCRED). And a socket of the local family
+ * can have a name: the file server gives it one, and connects one to it.
  */
 
 #include <quark/syscall.h>
+#include <quark/vfs.h>
 
 #include "abi.h"
 
@@ -43,6 +46,12 @@ struct cmsghdr {
 
 #define SOL_SOCKET  1
 #define SCM_RIGHTS  1
+#define SCM_CREDENTIALS 2
+#define MSG_CTRUNC  0x8
+
+/* The most descriptors one message carries: what the kernel's stream takes
+   in one send (QUARK_FD_MANY). */
+#define FDS_AT_ONCE 32
 
 /* The message flags that change what a call does here: do not wait, and do
  * not raise SIGPIPE at a stream nobody is reading. */
@@ -169,26 +178,53 @@ long __quark_socketpair(long domain, long type, long protocol, int *sv) {
     return 0;
 }
 
-/* The single descriptor a control message carries, or -1. */
-static long control_fd(const struct msghdr *m, int *too_many) {
-    *too_many = 0;
+/* A control message's length, rounded up as the next one begins. */
+#define CMSG_ALIGN(n) (((n) + 7) & ~7UL)
+
+/* Who sent a message, as Linux's struct ucred says it. */
+struct lx_ucred {
+    int pid;
+    unsigned int uid;
+    unsigned int gid;
+};
+
+/* The descriptors a message's control part carries, from every SCM_RIGHTS
+   in it, into `fds`: how many, or a negative errno — too many for one send
+   is ETOOMANYREFS, and credentials that are not the sender's own EPERM. */
+static long control_fds(const struct msghdr *m, unsigned int *fds) {
     if (!m->msg_control || m->msg_controllen < sizeof(struct cmsghdr)) {
-        return -1;
+        return 0;
     }
-    const struct cmsghdr *c = m->msg_control;
-    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) {
-        return -1;
+    const char *at = m->msg_control;
+    const char *end = at + m->msg_controllen;
+    long n = 0;
+    while (at + sizeof(struct cmsghdr) <= end) {
+        const struct cmsghdr *c = (const struct cmsghdr *)at;
+        if (c->cmsg_len < sizeof(struct cmsghdr) || at + c->cmsg_len > end) {
+            return -LX_EINVAL;
+        }
+        const char *data = at + sizeof(struct cmsghdr);
+        unsigned long payload = c->cmsg_len - sizeof(struct cmsghdr);
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+            for (unsigned long i = 0; i + sizeof(int) <= payload; i += sizeof(int)) {
+                if (n == FDS_AT_ONCE) {
+                    return -LX_ETOOMANYREFS;
+                }
+                fds[n++] = (unsigned int)*(const int *)(data + i);
+            }
+        } else if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+            /* A sender may say only who it is: the receiver is told that
+               anyway, by the kernel. */
+            const struct lx_ucred *cr = (const struct lx_ucred *)data;
+            unsigned long ids = __syscall0(SYS_GET_UID);
+            if (payload < sizeof *cr || cr->pid != (int)__syscall0(SYS_PID) ||
+                cr->uid != (unsigned int)(ids >> 32) || cr->gid != (unsigned int)ids) {
+                return -LX_EPERM;
+            }
+        }
+        at += CMSG_ALIGN(c->cmsg_len);
     }
-    unsigned long payload = c->cmsg_len - sizeof(struct cmsghdr);
-    if (payload < sizeof(int)) {
-        return -1;
-    }
-    if (payload > sizeof(int)) {
-        *too_many = 1;
-        return -1;
-    }
-    const int *fds = (const int *)((const char *)c + sizeof(struct cmsghdr));
-    return fds[0];
+    return n;
 }
 
 long __quark_sendmsg(long fd, const void *msg, long flags) {
@@ -201,12 +237,10 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
     if (!m) {
         return -LX_EFAULT;
     }
-    int too_many = 0;
-    long pass = control_fd(m, &too_many);
-    if (too_many) {
-        /* Refusing is better than delivering the first and losing the rest,
-           which would be found somewhere else entirely. */
-        return -LX_EINVAL;
+    unsigned int pass[FDS_AT_ONCE];
+    long npass = control_fds(m, pass);
+    if (npass < 0) {
+        return npass;
     }
 
     long total = 0;
@@ -215,11 +249,11 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
         if (v->iov_len == 0) {
             continue;
         }
-        /* The descriptor rides with the first piece that carries bytes, so it
-           is queued before anything the peer can read. */
-        unsigned long attach = (total == 0 && pass >= 0) ? (unsigned long)pass : QUARK_ERR;
-        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd,
-                                     (unsigned long)v->iov_base, v->iov_len, attach, fl);
+        /* The descriptors ride with the first piece that carries bytes, so
+           they are queued before anything the peer can read. */
+        unsigned long many = (total == 0 && npass > 0) ? QUARK_FD_MANY | (unsigned long)npass << 8 : 0;
+        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd, (unsigned long)v->iov_base, v->iov_len,
+                                     many ? (unsigned long)pass : QUARK_ERR, fl | many);
         /* Cut short by a signal with nothing sent, the descriptor included:
            sent again, or EINTR, as the handler asked. */
         long cut = quark_cut_short(w, 1);
@@ -246,7 +280,14 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
                 }
                 return -LX_EPIPE;
             }
-            return -LX_EIO;
+            if (QUARK_FD_KIND(k) == QUARK_FD_KIND_LOCAL) {
+                return -LX_ENOTCONN;
+            }
+            if (QUARK_FD_KIND(k) != QUARK_FD_KIND_STREAM) {
+                return -LX_ENOTSOCK;
+            }
+            /* Room for the bytes, and none for the descriptors. */
+            return npass > 0 ? -LX_ETOOMANYREFS : -LX_EIO;
         }
         if (w == QUARK_WOULD_BLOCK) {
             return total ? total : -LX_EAGAIN;
@@ -256,12 +297,12 @@ long __quark_sendmsg(long fd, const void *msg, long flags) {
             break;
         }
     }
-    /* A control message with no data still has to hand the descriptor over. */
-    if (total == 0 && pass >= 0) {
-        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd, 0, 0,
-                                     (unsigned long)pass, fl);
+    /* A control message with no data still has to hand the descriptors over. */
+    if (total == 0 && npass > 0) {
+        unsigned long w = __syscall5(SYS_FD_SEND, (unsigned long)fd, 0, 0, (unsigned long)pass,
+                                     fl | QUARK_FD_MANY | (unsigned long)npass << 8);
         if (w == QUARK_ERR) {
-            return -LX_EIO;
+            return -LX_ETOOMANYREFS;
         }
     }
     return total;
@@ -276,29 +317,34 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
         return -LX_EFAULT;
     }
 
-    /* Where a received descriptor should land. Linux hands back a number it
-       chose, and so does Quark when asked with QUARK_ANY_FD — which is the
-       only workable answer, because this layer cannot see the kernel's half
-       of the table and probing for a free slot would mean reading, and
-       reading is the thing recvmsg must do exactly once. */
-    int room = m->msg_control && m->msg_controllen >= sizeof(struct cmsghdr) + sizeof(int);
+    /* What the control part has room for: who sent it, if the socket asked
+       to be told (SO_PASSCRED), and then as many descriptors as fit. The
+       kernel takes as many as there are and that room — up to 32 — and
+       puts each in the lowest free slot from 3. */
+    unsigned long space = m->msg_control ? m->msg_controllen : 0;
+    int creds = space >= sizeof(struct cmsghdr) &&
+                __syscall3(SYS_SOCKET_OPTION, (unsigned long)fd, 0, ~0UL) == 1;
+    unsigned long creds_space = sizeof(struct cmsghdr) + CMSG_ALIGN(sizeof(struct lx_ucred));
+    unsigned long left = creds ? (space >= creds_space ? space - creds_space : 0) : space;
+    unsigned long room = left > sizeof(struct cmsghdr) ? (left - sizeof(struct cmsghdr)) / sizeof(int) : 0;
+    if (room > FDS_AT_ONCE) {
+        room = FDS_AT_ONCE;
+    }
 
     long total = 0;
-    long landed_at = -1;
+    unsigned int landed[FDS_AT_ONCE];
+    unsigned long nlanded = 0;
     for (unsigned long i = 0; i < m->msg_iovlen; i++) {
         struct iovec *v = &m->msg_iov[i];
         if (v->iov_len == 0) {
             continue;
         }
-        /* Only the first read may collect a descriptor: one control message
-           carries one, and a later piece asking for another would take the
-           next sender's. */
-        unsigned long at = (total == 0 && room && landed_at < 0)
-                               ? QUARK_ANY_FD
-                               : QUARK_ERR;
-        unsigned long r = __syscall5(SYS_FD_RECV, (unsigned long)fd,
-                                     (unsigned long)v->iov_base, v->iov_len, at, fl);
-        /* Cut short by a signal with nothing taken, a descriptor included. */
+        /* Only the first read may collect descriptors: a later piece asking
+           would take the next message's before its bytes. */
+        unsigned long many = (total == 0 && room > 0) ? QUARK_FD_MANY | room << 8 : 0;
+        unsigned long r = __syscall5(SYS_FD_RECV, (unsigned long)fd, (unsigned long)v->iov_base, v->iov_len,
+                                     many ? (unsigned long)landed : QUARK_ERR, fl | many);
+        /* Cut short by a signal with nothing taken, descriptors included. */
         long cut = quark_cut_short(r, 1);
         if (cut > 0) {
             i--;
@@ -311,7 +357,14 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
             return cut;
         }
         if (r == QUARK_ERR) {
-            return total ? total : -LX_EIO;
+            if (total) {
+                break;
+            }
+            unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+            return k == QUARK_ERR ? -LX_EBADF
+                   : QUARK_FD_KIND(k) == QUARK_FD_KIND_LOCAL ? -LX_ENOTCONN
+                   : QUARK_FD_KIND(k) != QUARK_FD_KIND_STREAM ? -LX_ENOTSOCK
+                                                              : -LX_EIO;
         }
         if (r == QUARK_WOULD_BLOCK) {
             /* Nothing there. A caller that loops until this happens -- which
@@ -323,11 +376,13 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
             m->msg_controllen = 0;
             return -LX_EAGAIN;
         }
-        if (r >> 32) {
-            landed_at = (long)(r >> 32) - 1;
-            /* Whatever arrived, the number now names it: a file as easily as
-               memory. */
-            __quark_fd_forget(landed_at);
+        if (many) {
+            nlanded = r >> 32;
+            /* Whatever arrived, each number now names it: a file as easily
+               as memory. */
+            for (unsigned long k = 0; k < nlanded; k++) {
+                __quark_fd_forget((long)landed[k]);
+            }
         }
         unsigned long n = r & 0xFFFFFFFF;
         total += (long)n;
@@ -335,21 +390,422 @@ long __quark_recvmsg(long fd, void *msg, long flags) {
             break;
         }
     }
-    int got_fd = landed_at >= 0;
-    long want_at = landed_at;
 
-    if (got_fd) {
-        struct cmsghdr *c = m->msg_control;
-        c->cmsg_len = sizeof(struct cmsghdr) + sizeof(int);
+    char *at = m->msg_control;
+    unsigned long used = 0;
+    m->msg_flags = 0;
+    if (creds) {
+        if (space < creds_space) {
+            m->msg_flags |= MSG_CTRUNC;
+        } else {
+            unsigned int who[3] = {0, 0, 0};
+            __syscall2(SYS_SOCKET_PEER, (unsigned long)fd, (unsigned long)who);
+            struct cmsghdr *c = (struct cmsghdr *)at;
+            c->cmsg_len = sizeof(struct cmsghdr) + sizeof(struct lx_ucred);
+            c->cmsg_level = SOL_SOCKET;
+            c->cmsg_type = SCM_CREDENTIALS;
+            struct lx_ucred *cr = (struct lx_ucred *)(at + sizeof(struct cmsghdr));
+            cr->pid = (int)who[0];
+            cr->uid = who[1];
+            cr->gid = who[2];
+            used = creds_space;
+        }
+    }
+    if (nlanded) {
+        struct cmsghdr *c = (struct cmsghdr *)(at + used);
+        c->cmsg_len = sizeof(struct cmsghdr) + nlanded * sizeof(int);
         c->cmsg_level = SOL_SOCKET;
         c->cmsg_type = SCM_RIGHTS;
-        *(int *)((char *)c + sizeof(struct cmsghdr)) = (int)want_at;
-        m->msg_controllen = c->cmsg_len;
-    } else {
-        m->msg_controllen = 0;
+        int *fds = (int *)(at + used + sizeof(struct cmsghdr));
+        for (unsigned long k = 0; k < nlanded; k++) {
+            fds[k] = (int)landed[k];
+        }
+        used += CMSG_ALIGN(c->cmsg_len);
     }
-    m->msg_flags = 0;
+    m->msg_controllen = used;
     return total;
+}
+
+/* ------------------------------------------------------------------------ */
+/* A socket of the local family, by a name.                                 */
+/* ------------------------------------------------------------------------ */
+
+/* A local socket that is nothing yet is the kernel's (SYS_SOCKET). The file
+   server gives one a name — an inode whose mode says it is a socket — and
+   connects one to whatever listens at a name, having decided by the name's
+   owner and mode whether this program may. Connected, it is a stream, as a
+   pair's is, and everything a stream does it does. A name in the abstract
+   namespace, and a socket of any other kind than a stream, are refused. */
+#define LX_SOCK_NONBLOCK 04000
+#define LX_SOCK_CLOEXEC  02000000
+#define LX_SO_TYPE       3
+#define LX_SO_ERROR      4
+#define LX_SO_SNDBUF     7
+#define LX_SO_RCVBUF     8
+#define LX_SO_PASSCRED   16
+#define LX_SO_PEERCRED   17
+#define LX_SO_RCVTIMEO   20
+#define LX_SO_SNDTIMEO   21
+#define LX_SO_ACCEPTCONN 30
+#define LX_SO_PROTOCOL   38
+#define LX_SO_DOMAIN     39
+#define SUN_PATH         108
+
+struct lx_sockaddr_un {
+    unsigned short sun_family;
+    char sun_path[SUN_PATH];
+};
+
+/* What this program named its sockets and connected them to, for
+   getsockname and getpeername: the names are the file server's, and the
+   kernel keeps neither. Forgotten at exec, as a C library's memory is. */
+static char named_as[MAX_FDS][SUN_PATH];
+static char connected_to[MAX_FDS][SUN_PATH];
+
+static unsigned long kind_of(long fd) {
+    unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
+    return k == QUARK_ERR ? 0 : QUARK_FD_KIND(k);
+}
+
+/* Why a call on `fd` that wanted a socket was refused, by what it is. */
+static long not_a_socket(long fd, long if_local, long if_stream) {
+    switch (kind_of(fd)) {
+    case 0: return -LX_EBADF;
+    case QUARK_FD_KIND_LOCAL: return if_local;
+    case QUARK_FD_KIND_STREAM: return if_stream;
+    default: return -LX_ENOTSOCK;
+    }
+}
+
+/* The path in a local address, NUL-ended into `path`, or a negative errno:
+   a name in the abstract namespace (a nought first), or none at all, is
+   EINVAL. */
+static long path_of(const void *addr, unsigned long len, char *path) {
+    const struct lx_sockaddr_un *a = addr;
+    if (!a) {
+        return -LX_EFAULT;
+    }
+    if (len <= sizeof a->sun_family || a->sun_family != AF_UNIX) {
+        return -LX_EINVAL;
+    }
+    unsigned long n = len - sizeof a->sun_family;
+    if (n > SUN_PATH) {
+        n = SUN_PATH;
+    }
+    unsigned long i = 0;
+    while (i < n && a->sun_path[i]) {
+        path[i] = a->sun_path[i];
+        i++;
+    }
+    if (i == 0) {
+        return -LX_EINVAL;
+    }
+    if (i == SUN_PATH) {
+        return -LX_ENAMETOOLONG;
+    }
+    path[i] = 0;
+    return 0;
+}
+
+static void remember(char *slot, const char *path) {
+    unsigned long i = 0;
+    while (path && path[i] && i < SUN_PATH - 1) {
+        slot[i] = path[i];
+        i++;
+    }
+    slot[i] = 0;
+}
+
+long __quark_socket(long domain, long type, long protocol) {
+    /* Every other family is not supported, which is the answer a program
+       has something to do about: musl asks a name service daemon who a
+       user is, and takes the local family's ENOENT, or another's
+       EAFNOSUPPORT, for there being none. */
+    if (domain != AF_UNIX) {
+        return -LX_EAFNOSUPPORT;
+    }
+    if ((type & 0xF) != SOCK_STREAM || protocol != 0) {
+        return -LX_EPROTONOSUPPORT;
+    }
+    unsigned long fd = __syscall1(SYS_SOCKET, 0);
+    if (fd == QUARK_ERR) {
+        return -LX_EMFILE;
+    }
+    if (type & LX_SOCK_NONBLOCK) {
+        __quark_fd_set_nonblock((long)fd, 1);
+    }
+    if (type & LX_SOCK_CLOEXEC) {
+        __syscall3(SYS_FD_FLAGS, fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+    }
+    named_as[fd][0] = 0;
+    connected_to[fd][0] = 0;
+    return (long)fd;
+}
+
+long __quark_bind(long fd, const void *addr, unsigned long len) {
+    char path[SUN_PATH];
+    long bad = path_of(addr, len, path);
+    if (bad) {
+        return bad;
+    }
+    unsigned long mask = __syscall1(SYS_UMASK, ~0UL);
+    int err = quark_vfs_bind(0, path, fd, 0777 & ~mask);
+    if (err == QUARK_VFS_EXISTS || err == QUARK_VFS_BUSY) {
+        return -LX_EADDRINUSE;
+    }
+    if (err == QUARK_VFS_INVALID_HANDLE) {
+        return not_a_socket(fd, -LX_EINVAL, -LX_EINVAL);
+    }
+    if (err) {
+        return __quark_vfs_errno(err);
+    }
+    if (fd >= 0 && fd < MAX_FDS) {
+        remember(named_as[fd], path);
+    }
+    return 0;
+}
+
+long __quark_listen(long fd, long backlog) {
+    if (__syscall2(SYS_SOCKET_LISTEN, (unsigned long)fd, backlog < 0 ? 0 : (unsigned long)backlog) == QUARK_ERR) {
+        /* A socket with no name, or one connected already. */
+        return not_a_socket(fd, -LX_EINVAL, -LX_EINVAL);
+    }
+    return 0;
+}
+
+/* An address of the local family with no name: what a connector that never
+   bound is, as Linux says it. */
+static void unnamed(void *addr, unsigned int *len, const char *path) {
+    if (!addr || !len) {
+        return;
+    }
+    struct lx_sockaddr_un a;
+    a.sun_family = AF_UNIX;
+    unsigned long n = 0;
+    while (path && path[n] && n < SUN_PATH - 1) {
+        a.sun_path[n] = path[n];
+        n++;
+    }
+    unsigned int full = (unsigned int)(sizeof a.sun_family + (n ? n + 1 : 0));
+    if (n) {
+        a.sun_path[n] = 0;
+    }
+    unsigned int copy = *len < full ? *len : full;
+    const char *from = (const char *)&a;
+    for (unsigned int i = 0; i < copy; i++) {
+        ((char *)addr)[i] = from[i];
+    }
+    *len = full;
+}
+
+long __quark_accept(long fd, void *addr, unsigned int *len, long flags) {
+    unsigned long r;
+    for (;;) {
+        r = __syscall2(SYS_SOCKET_ACCEPT, (unsigned long)fd, __quark_fd_is_nonblock(fd) ? 1 : 0);
+        long cut = quark_cut_short(r, 1);
+        if (cut < 0) {
+            return cut;
+        }
+        if (!cut) {
+            break;
+        }
+    }
+    if (r == QUARK_WOULD_BLOCK) {
+        return -LX_EAGAIN;
+    }
+    if (r == QUARK_ERR) {
+        /* Not listening; or listening, with nowhere to put a connection. */
+        long why = not_a_socket(fd, -LX_EINVAL, -LX_EINVAL);
+        if (why == -LX_EINVAL && __syscall3(SYS_SOCKET_OPTION, (unsigned long)fd, 0, ~0UL) != QUARK_ERR &&
+            kind_of(fd) == QUARK_FD_KIND_LOCAL) {
+            return -LX_EMFILE;
+        }
+        return why;
+    }
+    if (flags & LX_SOCK_NONBLOCK) {
+        __quark_fd_set_nonblock((long)r, 1);
+    }
+    if (flags & LX_SOCK_CLOEXEC) {
+        __syscall3(SYS_FD_FLAGS, r, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
+    }
+    __quark_fd_forget((long)r);
+    if (r < MAX_FDS) {
+        remember(named_as[r], fd >= 0 && fd < MAX_FDS ? named_as[fd] : "");
+        connected_to[r][0] = 0;
+    }
+    unnamed(addr, len, "");
+    return (long)r;
+}
+
+long __quark_connect(long fd, const void *addr, unsigned long len) {
+    char path[SUN_PATH];
+    long bad = path_of(addr, len, path);
+    if (bad) {
+        return bad;
+    }
+    for (;;) {
+        int err = quark_vfs_connect(0, path, fd);
+        if (!err) {
+            break;
+        }
+        if (err == QUARK_VFS_NO_PEER) {
+            return -LX_ECONNREFUSED;
+        }
+        if (err == QUARK_VFS_INVALID_HANDLE) {
+            return not_a_socket(fd, -LX_EINVAL, -LX_EISCONN);
+        }
+        if (err != QUARK_VFS_WOULD_BLOCK) {
+            return __quark_vfs_errno(err);
+        }
+        /* The listener has as many waiting as it has room for. A socket that
+           may not wait says so; one that may waits, as Linux's does, a
+           little at a time, and a handler that runs ends the wait. */
+        if (__quark_fd_is_nonblock(fd)) {
+            return -LX_EAGAIN;
+        }
+        unsigned long slept = __syscall3(SYS_SIG_WAIT, 0, quark_span(10000000UL), 0);
+        if (quark_cut_short(slept, 0) < 0) {
+            return -LX_EINTR;
+        }
+    }
+    if (fd >= 0 && fd < MAX_FDS) {
+        remember(connected_to[fd], path);
+    }
+    return 0;
+}
+
+long __quark_sockname(long fd, void *addr, unsigned int *len, int peer) {
+    if (!addr || !len) {
+        return -LX_EFAULT;
+    }
+    unsigned long k = kind_of(fd);
+    if (k == 0) {
+        return -LX_EBADF;
+    }
+    if (k != QUARK_FD_KIND_LOCAL && k != QUARK_FD_KIND_STREAM) {
+        return -LX_ENOTSOCK;
+    }
+    if (peer && k != QUARK_FD_KIND_STREAM) {
+        return -LX_ENOTCONN;
+    }
+    const char *path = fd < MAX_FDS ? (peer ? connected_to[fd] : named_as[fd]) : "";
+    unnamed(addr, len, path);
+    return 0;
+}
+
+long __quark_getsockopt(long fd, long level, long name, void *val, unsigned int *len) {
+    unsigned long k = kind_of(fd);
+    if (k == 0) {
+        return -LX_EBADF;
+    }
+    if (k != QUARK_FD_KIND_LOCAL && k != QUARK_FD_KIND_STREAM) {
+        return -LX_ENOTSOCK;
+    }
+    if (!val || !len) {
+        return -LX_EFAULT;
+    }
+    if (level != SOL_SOCKET) {
+        return -LX_ENOPROTOOPT;
+    }
+    int answer;
+    switch (name) {
+    case LX_SO_PEERCRED: {
+        unsigned int who[3];
+        if (k != QUARK_FD_KIND_STREAM || __syscall2(SYS_SOCKET_PEER, (unsigned long)fd, (unsigned long)who) != 0) {
+            return -LX_ENOTCONN;
+        }
+        struct lx_ucred cr = {(int)who[0], who[1], who[2]};
+        unsigned int copy = *len < sizeof cr ? *len : (unsigned int)sizeof cr;
+        for (unsigned int i = 0; i < copy; i++) {
+            ((char *)val)[i] = ((const char *)&cr)[i];
+        }
+        *len = copy;
+        return 0;
+    }
+    case LX_SO_PASSCRED:
+        answer = __syscall3(SYS_SOCKET_OPTION, (unsigned long)fd, 0, ~0UL) == 1;
+        break;
+    case LX_SO_TYPE: answer = SOCK_STREAM; break;
+    case LX_SO_DOMAIN: answer = AF_UNIX; break;
+    case LX_SO_PROTOCOL: answer = 0; break;
+    case LX_SO_ERROR: answer = 0; break;
+    case LX_SO_ACCEPTCONN: answer = 0; break;
+    case LX_SO_SNDBUF:
+    case LX_SO_RCVBUF: answer = 4096; break;
+    case LX_SO_RCVTIMEO:
+    case LX_SO_SNDTIMEO: {
+        /* No timeout: a timeval of noughts. */
+        unsigned int copy = *len < 16 ? *len : 16;
+        for (unsigned int i = 0; i < copy; i++) {
+            ((char *)val)[i] = 0;
+        }
+        *len = copy;
+        return 0;
+    }
+    default:
+        return -LX_ENOPROTOOPT;
+    }
+    if (*len < sizeof(int)) {
+        return -LX_EINVAL;
+    }
+    *(int *)val = answer;
+    *len = sizeof(int);
+    return 0;
+}
+
+long __quark_setsockopt(long fd, long level, long name, const void *val, unsigned long len) {
+    unsigned long k = kind_of(fd);
+    if (k == 0) {
+        return -LX_EBADF;
+    }
+    if (k != QUARK_FD_KIND_LOCAL && k != QUARK_FD_KIND_STREAM) {
+        return -LX_ENOTSOCK;
+    }
+    if (level != SOL_SOCKET) {
+        return -LX_ENOPROTOOPT;
+    }
+    switch (name) {
+    case LX_SO_PASSCRED:
+        if (!val || len < sizeof(int)) {
+            return -LX_EINVAL;
+        }
+        return __syscall3(SYS_SOCKET_OPTION, (unsigned long)fd, 0, *(const int *)val ? 1 : 0) == QUARK_ERR
+                   ? -LX_EINVAL
+                   : 0;
+    /* Taken and not kept: the buffers are a stream's own, and nothing here
+       times a socket out. */
+    case LX_SO_SNDBUF:
+    case LX_SO_RCVBUF:
+    case LX_SO_RCVTIMEO:
+    case LX_SO_SNDTIMEO:
+    case 2:  /* SO_REUSEADDR */
+    case 9:  /* SO_KEEPALIVE */
+    case 13: /* SO_LINGER */
+        return 0;
+    default:
+        return -LX_ENOPROTOOPT;
+    }
+}
+
+/* send and recv are these, in musl: a message of one piece, with no address
+   to give or be told for a stream that is connected. */
+long __quark_sendto(long fd, const void *buf, unsigned long len, long flags, const void *addr, unsigned long alen) {
+    if (addr || alen) {
+        return not_a_socket(fd, -LX_ENOTCONN, -LX_EISCONN);
+    }
+    struct iovec v = {(void *)buf, len};
+    struct msghdr m = {NULL, 0, &v, 1, NULL, 0, 0};
+    return __quark_sendmsg(fd, &m, flags);
+}
+
+long __quark_recvfrom(long fd, void *buf, unsigned long len, long flags, void *addr, unsigned int *alen) {
+    struct iovec v = {buf, len};
+    struct msghdr m = {NULL, 0, &v, 1, NULL, 0, 0};
+    long n = __quark_recvmsg(fd, &m, flags);
+    if (n >= 0 && addr && alen) {
+        unnamed(addr, alen, fd >= 0 && fd < MAX_FDS ? connected_to[fd] : "");
+    }
+    return n;
 }
 
 long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *under) {

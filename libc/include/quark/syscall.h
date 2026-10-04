@@ -225,6 +225,7 @@
 #define QUARK_FD_KIND_SOCKET     11UL
 #define QUARK_FD_KIND_SERVED     12UL
 #define QUARK_FD_KIND_SIGNALS    13UL
+#define QUARK_FD_KIND_LOCAL      14UL
 /* A named pipe. A server gives a client an end of the pipe a key names, and
    whoever was given one waits here for the other end to be opened, with the
    number that came with it. */
@@ -242,6 +243,17 @@
 #define SYS_USAGE           124
 #define SYS_NICE            125
 #define SYS_CPU_LIMIT       126
+/* 0xB0  sockets: a local socket by a name — one that is nothing yet; a
+   server names one a client holds, or connects it to what listens at a
+   name; listen; accept; who is at the other end; whether to be told who
+   sent what. */
+#define SYS_SOCKET          178
+#define SYS_SOCKET_BIND     179
+#define SYS_SOCKET_LISTEN   180
+#define SYS_SOCKET_CONNECT  181
+#define SYS_SOCKET_ACCEPT   182
+#define SYS_SOCKET_PEER     183
+#define SYS_SOCKET_OPTION   184
 #define SYS_ABI_VERSION     240
 
 /* What the kernel returns for "no". Not an errno: each call says what it
@@ -256,6 +268,10 @@
 /* SYS_FD_SEND and SYS_FD_RECV flags. QUARK_DONTWAIT is MSG_DONTWAIT: return
    QUARK_WOULD_BLOCK rather than parking. */
 #define QUARK_DONTWAIT      1UL
+/* And QUARK_FD_MANY: the fourth argument is an array of descriptors, u32s,
+   as many as bits 8 to 15 of the flags say — to send, or room for those
+   received, and a receive answers (how many << 32) | bytes. */
+#define QUARK_FD_MANY       2UL
 #define QUARK_WOULD_BLOCK   ((unsigned long)0xFFFFFFFEUL)
 
 /* What a wait answers when a signal ended it; a sleep (SYS_RECV_TIMEOUT on

@@ -80,6 +80,11 @@ pub const TAG_RETIRE: u64 = 33;
 pub const TAG_PATH_OF: u64 = 34;
 /// Have everything that was written be on the disk before answering.
 pub const TAG_SYNC: u64 = 35;
+/// Name a local socket the caller holds: make its inode, and have the
+/// kernel know the socket by it.
+pub const TAG_BIND: u64 = 36;
+/// Connect a local socket the caller holds to whatever listens at a name.
+pub const TAG_CONNECT: u64 = 37;
 pub const TAG_OK: u64 = 0;
 pub const TAG_ERROR: u64 = u64::MAX;
 

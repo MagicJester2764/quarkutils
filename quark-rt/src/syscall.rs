@@ -360,6 +360,13 @@ pub const SYS_PTIMER: u64 = 151;
 // --- 0xB0  sockets ---
 pub const SYS_SOCK_FD: u64 = 176;
 pub const SYS_SOCK_INFO: u64 = 177;
+pub const SYS_SOCKET: u64 = 178;
+pub const SYS_SOCKET_BIND: u64 = 179;
+pub const SYS_SOCKET_LISTEN: u64 = 180;
+pub const SYS_SOCKET_CONNECT: u64 = 181;
+pub const SYS_SOCKET_ACCEPT: u64 = 182;
+pub const SYS_SOCKET_PEER: u64 = 183;
+pub const SYS_SOCKET_OPTION: u64 = 184;
 
 // --- 0xA0  kernel debug console ---
 pub const SYS_WRITE: u64 = 160;
@@ -1682,6 +1689,121 @@ pub fn sys_fd_recv_nb(
 /// installed there — or at any free slot if `at` is [`ANY_FD`].
 ///
 /// Returns the byte count, and which descriptor arrived if one did.
+/// Send `buf` down stream `fd` with `fds` passed along — all of them or
+/// none, at most 32 — queued before the bytes. How many bytes went.
+pub fn sys_fd_send_many(fd: usize, buf: &[u8], fds: &[u32]) -> Result<usize, ()> {
+    let flags = 2 | (fds.len().min(255) as u64) << 8;
+    match unsafe { syscall5(SYS_FD_SEND, fd as u64, buf.as_ptr() as u64, buf.len() as u64, fds.as_ptr() as u64, flags) } {
+        u64::MAX => Err(()),
+        n => Ok((n & 0xFFFF_FFFF) as usize),
+    }
+}
+
+/// Receive into `buf` from stream `fd`, and as many descriptors as were sent
+/// and `fds` has room for, each installed in the lowest free slot from 3:
+/// how many bytes, and how many descriptors `fds` now begins with.
+pub fn sys_fd_recv_many(fd: usize, buf: &mut [u8], fds: &mut [u32]) -> Result<(usize, usize), ()> {
+    let flags = 2 | (fds.len().min(255) as u64) << 8;
+    match unsafe {
+        syscall5(SYS_FD_RECV, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, fds.as_mut_ptr() as u64, flags)
+    } {
+        u64::MAX => Err(()),
+        r => Ok(((r & 0xFFFF_FFFF) as usize, (r >> 32) as usize)),
+    }
+}
+
+/// A local socket that is nothing yet: to be named and listened on, or
+/// connected by a name — which a file server does (`vfs::bind_local`).
+pub fn sys_socket_local() -> Result<usize, ()> {
+    match unsafe { syscall1(SYS_SOCKET, 0) } {
+        u64::MAX => Err(()),
+        fd => Ok(fd as usize),
+    }
+}
+
+/// Why a server's [`sys_socket_bind`] named nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotNamed {
+    /// Another socket has the name.
+    Taken,
+    /// Not a task calling the caller, or not a socket that is nothing yet.
+    NotOne,
+}
+
+/// A server names a local socket that `client`, which is calling it, holds
+/// as `fd`: by `key`, a number of the server's.
+pub fn sys_socket_bind(client: usize, fd: usize, key: u64) -> Result<(), NotNamed> {
+    match unsafe { syscall3(SYS_SOCKET_BIND, client as u64, fd as u64, key) } {
+        0 => Ok(()),
+        1 => Err(NotNamed::Taken),
+        _ => Err(NotNamed::NotOne),
+    }
+}
+
+/// Why a server's [`sys_socket_connect`] connected nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotConnected {
+    /// Nothing listens at the name.
+    Nobody,
+    /// What does has as many waiting as it has room for.
+    Full,
+    /// Not a task calling the caller, or not a socket that is nothing yet.
+    NotOne,
+}
+
+/// A server connects a local socket that `client`, which is calling it,
+/// holds as `fd`, to whatever listens at `key`.
+pub fn sys_socket_connect(client: usize, fd: usize, key: u64) -> Result<(), NotConnected> {
+    match unsafe { syscall3(SYS_SOCKET_CONNECT, client as u64, fd as u64, key) } {
+        0 => Ok(()),
+        1 => Err(NotConnected::Nobody),
+        0xFFFF_FFFE => Err(NotConnected::Full),
+        _ => Err(NotConnected::NotOne),
+    }
+}
+
+/// Named socket `fd` listens, with room for `backlog` connections waiting
+/// (at most 16).
+pub fn sys_socket_listen(fd: usize, backlog: usize) -> Result<(), ()> {
+    match unsafe { syscall2(SYS_SOCKET_LISTEN, fd as u64, backlog as u64) } {
+        0 => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Take a connection waiting on listener `fd`, waiting for one unless
+/// `wait` is false: its descriptor. `Ok(None)` if there was none and it was
+/// not to wait.
+pub fn sys_socket_accept(fd: usize, wait: bool) -> Result<Option<usize>, ()> {
+    match unsafe { syscall2(SYS_SOCKET_ACCEPT, fd as u64, if wait { 0 } else { 1 }) } {
+        0xFFFF_FFFE => Ok(None),
+        n if n < 0xFFFF_FFFD => Ok(Some(n as usize)),
+        _ => Err(()),
+    }
+}
+
+/// Who is at the other end of stream `fd`: process id, user, group.
+pub fn sys_socket_peer(fd: usize) -> Result<(u32, u32, u32), ()> {
+    let mut who = [0u32; 3];
+    match unsafe { syscall2(SYS_SOCKET_PEER, fd as u64, who.as_mut_ptr() as u64) } {
+        0 => Ok((who[0], who[1], who[2])),
+        _ => Err(()),
+    }
+}
+
+/// Whether socket `fd` asks to be told who sent what it receives; with
+/// `set`, that it does or does not. What it was.
+pub fn sys_socket_passcred(fd: usize, set: Option<bool>) -> Result<bool, ()> {
+    let how = match set {
+        Some(on) => on as u64,
+        None => u64::MAX,
+    };
+    match unsafe { syscall3(SYS_SOCKET_OPTION, fd as u64, 0, how) } {
+        u64::MAX => Err(()),
+        was => Ok(was != 0),
+    }
+}
+
 pub fn sys_fd_recv(
     fd: usize,
     buf: &mut [u8],
@@ -2793,7 +2915,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 30;
+pub const ABI_VERSION_MINOR: u32 = 31;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

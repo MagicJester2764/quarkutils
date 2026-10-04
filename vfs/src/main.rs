@@ -1670,7 +1670,7 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
     if unsafe { FS_TYPE } != FsType::Ext2 && get_sender_uid_gid(sender).0 != 0 {
         let changes = match msg.tag {
             TAG_WRITE | TAG_MKDIR | TAG_MKNOD | TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK
-            | TAG_SYMLINK | TAG_TRUNCATE | TAG_SETATTR => true,
+            | TAG_SYMLINK | TAG_TRUNCATE | TAG_SETATTR | TAG_BIND => true,
             TAG_OPEN => msg.data[1] & (OPEN_CREATE | OPEN_TRUNCATE | OPEN_WRITE | OPEN_APPEND) != 0,
             _ => false,
         };
@@ -1712,6 +1712,8 @@ fn dispatch(disk: &DiskState, sender: usize, msg: &Message) {
         TAG_WRITE => deferred(|| handle_write(disk, sender, msg)),
         TAG_MKDIR => transacted(|| handle_mkdir(disk, sender, msg)),
         TAG_MKNOD => transacted(|| handle_mknod(sender, msg)),
+        TAG_BIND => transacted(|| handle_bind(sender, msg)),
+        TAG_CONNECT => handle_connect(sender, msg),
         TAG_UNLINK | TAG_RMDIR | TAG_RENAME | TAG_LINK | TAG_SYMLINK => {
             transacted(|| handle_namespace(disk, sender, msg))
         }
@@ -2587,12 +2589,86 @@ fn handle_mknod(sender: usize, msg: &Message) {
     } else {
         let (uid, gid) = get_sender_uid_gid(sender);
         base_of(sender, msg.data[5]).and_then(|base| {
-            ext2_ops::make_fifo(ext2_state_mut(), base, path, uid, gid, mode)
+            ext2_ops::make_special(ext2_state_mut(), base, path, uid, gid, mode)
         })
     };
     match made {
-        Ok(()) => reply_opened(sender, [0; 6]),
+        Ok(_) => reply_opened(sender, [0; 6]),
         Err(code) => error_reply(sender, code),
+    }
+}
+
+/// Name a local socket the caller holds (`data[1]`, its descriptor): make
+/// the socket's inode at the path, with the permission bits in `data[2]`,
+/// and have the kernel know the socket by the inode's number. A name that
+/// is taken is `EXISTS`, which is Linux's `EADDRINUSE`; a descriptor that is
+/// not a socket that is nothing yet takes the name back with it.
+fn handle_bind(sender: usize, msg: &Message) {
+    let path = match protocol::lent_path(sender, 0, msg.data[0] as usize, 0) {
+        Ok(p) => p,
+        Err(code) => return error_reply(sender, code),
+    };
+    let mode = ext2::S_IFSOCK | (msg.data[2] as u16 & 0o7777);
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let base = match base_of(sender, msg.data[5]) {
+        Ok(b) => b,
+        Err(code) => return error_reply(sender, code),
+    };
+    let made = if unsafe { FS_TYPE } != FsType::Ext2 {
+        Err(ERR_NOT_SUPPORTED)
+    } else if ext2_state().read_only {
+        Err(ERR_READ_ONLY)
+    } else if lexically_refused(path) {
+        Err(ERR_PERMISSION)
+    } else {
+        ext2_ops::make_special(ext2_state_mut(), base, path, uid, gid, mode)
+    };
+    let ino = match made {
+        Ok(ino) => ino,
+        Err(code) => return error_reply(sender, code),
+    };
+    match syscall::sys_socket_bind(sender, msg.data[1] as usize, ino as u64) {
+        Ok(()) => reply_opened(sender, [ino as u64, 0, 0, 0, 0, 0]),
+        Err(why) => {
+            let _ = ext2_ops::unlink(ext2_state_mut(), base, path, uid, gid);
+            error_reply(sender, if why == syscall::NotNamed::Taken { ERR_BUSY } else { ERR_INVALID_HANDLE })
+        }
+    }
+}
+
+/// Connect a local socket the caller holds (`data[1]`) to whatever listens
+/// at the path: a socket's name the caller may write to, as on Linux. A name
+/// that is not a socket's, or one nothing listens at, is `NO_PEER` —
+/// `ECONNREFUSED`; a listener with no room for another is `WOULD_BLOCK`.
+fn handle_connect(sender: usize, msg: &Message) {
+    let path = match protocol::lent_path(sender, 0, msg.data[0] as usize, 0) {
+        Ok(p) => p,
+        Err(code) => return error_reply(sender, code),
+    };
+    if unsafe { FS_TYPE } != FsType::Ext2 {
+        return error_reply(sender, ERR_NO_PEER);
+    }
+    let base = match base_of(sender, msg.data[5]) {
+        Ok(b) => b,
+        Err(code) => return error_reply(sender, code),
+    };
+    let (uid, gid) = get_sender_uid_gid(sender);
+    let (ino, inode) = match ext2_dir::resolve(ext2_state(), base, path, uid, gid, true) {
+        Ok(ext2_dir::Found::Inode(ino, inode, _)) => (ino, inode),
+        Ok(_) => return error_reply(sender, ERR_NO_PEER),
+        Err(code) => return error_reply(sender, code),
+    };
+    if !inode.is_socket() {
+        return error_reply(sender, ERR_NO_PEER);
+    }
+    if !ext2::check_permission(&inode, uid, gid, 2) {
+        return error_reply(sender, ERR_PERMISSION);
+    }
+    match syscall::sys_socket_connect(sender, msg.data[1] as usize, ino as u64) {
+        Ok(()) => reply_opened(sender, [0; 6]),
+        Err(syscall::NotConnected::Nobody) => error_reply(sender, ERR_NO_PEER),
+        Err(syscall::NotConnected::Full) => error_reply(sender, ERR_WOULD_BLOCK),
+        Err(syscall::NotConnected::NotOne) => error_reply(sender, ERR_INVALID_HANDLE),
     }
 }
 

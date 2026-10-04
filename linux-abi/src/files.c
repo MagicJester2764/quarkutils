@@ -88,6 +88,11 @@ static long vfs_errno(int code) {
     }
 }
 
+/* The file server's answer as an errno: for net.c's local sockets too. */
+long __quark_vfs_errno(int code) {
+    return vfs_errno(code);
+}
+
 static void bytes_zero(void *p, unsigned long n) {
     unsigned char *b = p;
     while (n--) {
