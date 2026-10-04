@@ -610,6 +610,37 @@ struct BootContext {
     vfs_spawn: Option<Spawned>,
     /// The device manager, if the boot image had one.
     devmgr_tid: usize,
+    /// The network stack, if the boot image had one.
+    net_tid: usize,
+}
+
+/// How long the session waits for the network to say it is ready.
+const NET_WAIT_MS: u64 = 5_000;
+
+/// Wait, `NET_WAIT_MS` at most, for task `tid` to have registered `net`:
+/// asked of the nameserver by task, which grants nothing. The network says
+/// it is ready on the console before it registers, and a line printed after
+/// the login prompt pushes the prompt off the line it is read from; on a
+/// machine whose card's driver comes up late — virtio's, behind an IOMMU —
+/// it was.
+fn wait_for_net(tid: usize) {
+    const TAG_LOOKUP_TID: u64 = 3;
+    let began = syscall::sys_clock();
+    while syscall::sys_clock() - began < NET_WAIT_MS * 1_000_000 {
+        let msg = Message { sender: 0, tag: TAG_LOOKUP_TID, data: [tid as u64, 0, 0, 0, 0, 0] };
+        let mut reply = Message::empty();
+        if syscall::sys_call(nameserver::NAMESERVER_TID, &msg, &mut reply).is_ok()
+            && reply.tag == 0
+            && reply.data[3] == 3
+            && reply.data[0].to_le_bytes()[..3] == *b"net"
+        {
+            return;
+        }
+        if syscall::sys_task_info(tid).map_or(true, |(state, _, _)| state == 3) {
+            return;
+        }
+        syscall::sleep_ms(20);
+    }
 }
 
 /// Offer the driver in `image`, called `name`, to the device manager, which
@@ -642,7 +673,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     let rootfs_pages = (rootfs_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if syscall::sys_map_phys(rootfs_phys, BOOT_IMG_BASE, rootfs_pages).is_err() {
         println!("[init] Failed to map boot image");
-        return BootContext { console_pipe: 0, input_tid: 0, vfs_spawn: None, devmgr_tid: 0 };
+        return BootContext { console_pipe: 0, input_tid: 0, vfs_spawn: None, devmgr_tid: 0, net_tid: 0 };
     }
 
     let rootfs = unsafe { core::slice::from_raw_parts(BOOT_IMG_BASE as *const u8, rootfs_size) };
@@ -805,6 +836,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
     // which come later — and offer every driver to the device manager.
     let mut spawned_tids = [0usize; 32];
     let mut spawned_count = 0usize;
+    let mut net_tid: usize = 0;
     for i in 0..count {
         let e = &entries[i];
 
@@ -857,6 +889,9 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
                     if spawned_count < 32 {
                         spawned_tids[spawned_count] = tid;
                         spawned_count += 1;
+                    }
+                    if &e.name[0..8] == b"NET     " {
+                        net_tid = tid;
                     }
                     let base_len = e.name[0..8].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
                     let mut lbuf = [0u8; 8];
@@ -1007,7 +1042,7 @@ fn load_essentials_from_boot_image(rootfs_phys: usize, rootfs_size: usize) -> Bo
         }
     }
 
-    BootContext { console_pipe, input_tid, vfs_spawn, devmgr_tid }
+    BootContext { console_pipe, input_tid, vfs_spawn, devmgr_tid, net_tid }
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,7 +1408,11 @@ pub extern "C" fn _start() -> ! {
                 DeferredTasks::new()
             };
 
-            // Phase 4: Start non-essential programs
+            // Phase 4: Start non-essential programs, once the network has
+            // said it is ready, if there is one.
+            if ctx.net_tid != 0 {
+                wait_for_net(ctx.net_tid);
+            }
             println!("[init] All programs loaded. Starting deferred tasks.");
             deferred.start_sequentially();
 

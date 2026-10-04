@@ -121,13 +121,14 @@ pub extern "C" fn _start() -> ! {
         net.fallback();
     }
 
-    if nameserver::register(b"net").is_ok() {
-        println!("[net] Registered with nameserver.");
-    } else {
-        println!("[net] Failed to register with nameserver.");
-    }
+    // Said before it registers, and nothing after: the session waits for
+    // this to have registered, and a line printed after the login prompt
+    // pushes the prompt off its line.
     let ip = net.ipv4_word().to_be_bytes();
     println!("[net] IP {}.{}.{}.{} — ready.", ip[0], ip[1], ip[2], ip[3]);
+    if nameserver::register(b"net").is_err() {
+        println!("[net] Failed to register with nameserver.");
+    }
 
     loop {
         net.poll();

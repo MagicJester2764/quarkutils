@@ -1091,6 +1091,10 @@ sent out to be answered by nobody.
   10.0.2.99 the gateway's answer expired and could not be asked for again —
   nothing beyond the machine answered a ping until they had gone. The card
   asks about one address a second, IPv6's neighbours included.
+- **The session waits for the network to say it is ready** (`init`, five
+  seconds at most), and `net` says so before it registers and nothing
+  after: on the IOMMU machine, whose card's driver comes up late, the ready
+  line came after the login prompt and pushed it off its line, every run.
 
 ## Sound
 
