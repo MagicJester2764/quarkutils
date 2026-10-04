@@ -21,12 +21,14 @@
 //! A datagram for an address on the network that nothing answers "who has
 //! it?" for waits at the head of its socket's queue for an answer, and
 //! smoltcp sends a socket's queue in order: one for nobody held up every
-//! datagram behind it, to anybody, for good. So every datagram the card's
-//! sockets queue goes through [`Stack::send_datagram`], which keeps what is
-//! queued where; a socket that has sent nothing for [`STUCK`] has its queue
-//! let go of, and the address at its head is given up for [`GIVEN_UP`] —
-//! what is sent there meanwhile is dropped where it is sent, as a datagram
-//! may be, and what is sent anywhere else goes.
+//! datagram behind it, to anybody, for good — and its asking again every
+//! second took the card's one question a second, so that once another
+//! neighbour's answer expired it was never asked for again. So every
+//! datagram the card's sockets queue goes through [`Stack::send_datagram`],
+//! which keeps what is queued where; a socket that has sent nothing for
+//! [`STUCK`] has its queue let go of, and the address at its head is given
+//! up for [`GIVEN_UP`] — what is sent there meanwhile is dropped where it is
+//! sent, and what is sent anywhere else goes.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;

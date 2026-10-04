@@ -1067,7 +1067,12 @@ sent out to be answered by nobody.
   smoltcp sends a socket's queue in order: a fuzzer's datagram for an
   address on the network that nothing answers for held up everything behind
   it, to anybody, for good, and an echo request did the same to every ping
-  after it. So every datagram the card's sockets queue goes through the
+  after it. Worse, the stuck socket asked "who has it?" again every second,
+  and smoltcp asks about one address a second for the whole card: once the
+  gateway's answer expired, a minute later, it was never asked about again,
+  and nothing beyond the machine could be reached — the hostile sweep's
+  `nettest`, ten minutes after the fuzzer, timed out every time. So every
+  datagram the card's sockets queue goes through the
   stack, which keeps account of what is queued where; a socket that sends
   nothing for three seconds has its queue let go of, and the address at its
   head is given up for thirty — what is sent there meanwhile is dropped where
