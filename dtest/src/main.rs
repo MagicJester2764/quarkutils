@@ -152,6 +152,66 @@ fn test_fd_table() {
     }
 }
 
+/// A descriptor whose reads and writes are calls to a server names the task
+/// it was set to, not the number: once that task is gone, the next task given
+/// its number is not reached through it. The log every service writes to is
+/// one of these, and so is every session's standard input.
+fn test_ipc_descriptor() {
+    println!("an IPC descriptor:");
+    const FD: usize = 62;
+    const TAG: u64 = 0x7E57;
+    let me = syscall::sys_getpid() as usize;
+    let Some(first) = load_child(&[b"dchild", b"echo"]) else {
+        check("started a child to name", false);
+        return;
+    };
+    let gone = first.tid;
+    let _ = first.start();
+    check("a descriptor set to a child", syscall::sys_fd_set(me, FD, gone, TAG).is_ok());
+    check(
+        "is an IPC descriptor, to somebody",
+        syscall::sys_fd_kind(FD) == Some((1, false)),
+    );
+    // Through it, while it is there: answered.
+    check("a write through it is a call it answers", syscall::sys_fd_write(FD, b"hello") == 5);
+    let _ = syscall::sys_task_kill(gone);
+    let _ = syscall::sys_wait_for(gone);
+    // Another child with the same number: a task is given the lowest number
+    // free, so children are made — and kept, so that each takes the next —
+    // until one has it.
+    let mut others = [0usize; 8];
+    let mut made = 0;
+    let mut again = None;
+    while made < others.len() {
+        let Some(next) = load_child(&[b"dchild", b"echo"]) else { break };
+        let _ = next.start();
+        if next.tid == gone {
+            again = Some(next.tid);
+            break;
+        }
+        others[made] = next.tid;
+        made += 1;
+    }
+    for &tid in &others[..made] {
+        let _ = syscall::sys_task_kill(tid);
+        let _ = syscall::sys_wait_for(tid);
+    }
+    let Some(again) = again else {
+        check("a child given the number again", false);
+        let _ = syscall::sys_fd_close(FD);
+        return;
+    };
+    check("says its task has gone", syscall::sys_fd_kind(FD) == Some((1, true)));
+    let wrote = syscall::sys_fd_write(FD, b"stolen");
+    check("a write through it reaches nobody", wrote == 0 || wrote == u64::MAX);
+    let mut buf = [0u8; 8];
+    let read = syscall::sys_fd_read(FD, &mut buf);
+    check("and nor does a read", read == u64::MAX);
+    let _ = syscall::sys_task_kill(again);
+    let _ = syscall::sys_wait_for(again);
+    let _ = syscall::sys_fd_close(FD);
+}
+
 static SHARE_GO: sync::Semaphore = sync::Semaphore::new(0);
 static SHARE_DONE: sync::Semaphore = sync::Semaphore::new(0);
 static SHARE_SAW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -9563,6 +9623,7 @@ pub extern "C" fn _start() -> ! {
         ("physical", test_physical_authority),
         ("close", test_close),
         ("fds", test_fd_table),
+        ("ipcfd", test_ipc_descriptor),
         ("program", test_program_table),
         ("identity", test_identity),
         ("passwords", test_passwords),
