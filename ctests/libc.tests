@@ -10,6 +10,7 @@ linuxtest
 packettest
 futextest
 fdleak
+pipepoll
 filetest
 dirtest
 threadfile
