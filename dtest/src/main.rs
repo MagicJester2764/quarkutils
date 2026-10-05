@@ -5602,6 +5602,35 @@ fn test_mounts() {
         );
     }
 
+    // More block groups than the file server once kept, 128: a root of four
+    // gigabytes in blocks of 1 KiB has 512, and the first block given out
+    // past its first gigabyte stopped the root's server. Groups of 256
+    // blocks make 256 of them on this disk, and a file of 40 MiB has blocks
+    // past the 128th.
+    check("a filesystem of 256 block groups is mounted", {
+        run(b"mkfs.ext2", &[b"-q", b"-F", b"-b", b"1024", b"-g", b"256", b"-O", b"^resize_inode", dev]) == Some(0)
+            && run(b"mount", &[dev, at]) == Some(0)
+    });
+    let past: &[u8] = b"/tmp/dtest-mnt/past-the-128th";
+    let mut page = [0u8; 4096];
+    let written = vfs::open_with(vfs_tid, past, vfs::OPEN_CREATE).is_ok_and(|o| {
+        let all = (0..10240u32).all(|i| {
+            page.fill((i % 251) as u8);
+            vfs::write(vfs_tid, o.handle, &page, i * 4096) == Ok(4096)
+        });
+        let _ = vfs::close(vfs_tid, o.handle);
+        all
+    });
+    let last = 10239u32;
+    let read_back = vfs::open(vfs_tid, past).is_ok_and(|(h, _, _)| {
+        let same = vfs::read(vfs_tid, h, &mut page, last * 4096) == Ok(4096)
+            && page.iter().all(|&b| b == (last % 251) as u8);
+        let _ = vfs::close(vfs_tid, h);
+        same
+    });
+    check("a file of 40 MiB is written past its 128th group, and read back", written && read_back);
+    check("and it is unmounted", run(b"umount", &[at]) == Some(0));
+
     // A server that goes.
     check("a filesystem is mounted", {
         run(b"mkfs.ext2", &[b"-q", b"-F", dev]) == Some(0) && run(b"mount", &[dev, at]) == Some(0)

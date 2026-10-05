@@ -99,7 +99,7 @@ pub fn create(
         // The new directory's ".." is a link to its parent.
         parent.i_links_count += 1;
         let group = (ino - 1) / e2.inodes_per_group;
-        e2.bgd_table[group as usize].bg_used_dirs_count += 1;
+        e2.bgd_mut(group)?.bg_used_dirs_count += 1;
         ext2::flush_bgd(e2, group)?;
     }
 
@@ -646,7 +646,7 @@ fn drop_dir(e2: &mut Ext2State, ino: u32, dir: &mut Ext2Inode, t: u32) -> Result
     dir.i_links_count = 0;
     dir.i_ctime = t;
     let group = (ino - 1) / e2.inodes_per_group;
-    let used = &mut e2.bgd_table[group as usize].bg_used_dirs_count;
+    let used = &mut e2.bgd_mut(group)?.bg_used_dirs_count;
     *used = used.saturating_sub(1);
     ext2::flush_bgd(e2, group)?;
     if handles::inode_is_open(ino) {

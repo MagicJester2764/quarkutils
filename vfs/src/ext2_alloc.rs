@@ -11,7 +11,7 @@ use crate::{DISK_IO_BUF, ERR_IO, ERR_NO_SPACE};
 
 /// Allocate a free block. Returns the block number.
 pub fn alloc_block(ext2: &mut Ext2State) -> Result<u32, u64> {
-    for group in 0..ext2.num_block_groups {
+    for group in 0..ext2.groups() {
         let bgd = &ext2.bgd_table[group as usize];
         if bgd.bg_free_blocks_count == 0 {
             continue;
@@ -86,7 +86,7 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
     let byte_idx = (block_in_group / 8) as usize;
     let bit = block_in_group % 8;
 
-    let bitmap_block = ext2.block32(ext2.bgd_table[group as usize].bg_block_bitmap)?;
+    let bitmap_block = ext2.block32(ext2.bgd(group)?.bg_block_bitmap)?;
     let sector_in_bitmap = (byte_idx / 512) as u32;
     let byte_in_sector = byte_idx % 512;
 
@@ -97,7 +97,7 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
     buf[byte_in_sector] &= !(1 << bit);
     ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
 
-    ext2.bgd_table[group as usize].bg_free_blocks_count += 1;
+    ext2.bgd_mut(group)?.bg_free_blocks_count += 1;
     ext2.free_blocks_count += 1;
 
     flush_bgd(ext2, group)?;
@@ -115,7 +115,7 @@ pub fn free_block(ext2: &mut Ext2State, block: u32) -> Result<(), u64> {
 
 /// Allocate a free inode. Returns the inode number (1-based).
 pub fn alloc_inode(ext2: &mut Ext2State) -> Result<u32, u64> {
-    for group in 0..ext2.num_block_groups {
+    for group in 0..ext2.groups() {
         let bgd = &ext2.bgd_table[group as usize];
         if bgd.bg_free_inodes_count == 0 {
             continue;
@@ -190,7 +190,7 @@ pub fn free_inode(ext2: &mut Ext2State, inode_num: u32) -> Result<(), u64> {
     let byte_idx = (inode_in_group / 8) as usize;
     let bit = inode_in_group % 8;
 
-    let bitmap_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_bitmap)?;
+    let bitmap_block = ext2.block32(ext2.bgd(group)?.bg_inode_bitmap)?;
     let sector_in_bitmap = (byte_idx / 512) as u32;
     let byte_in_sector = byte_idx % 512;
 
@@ -201,7 +201,7 @@ pub fn free_inode(ext2: &mut Ext2State, inode_num: u32) -> Result<(), u64> {
     buf[byte_in_sector] &= !(1 << bit);
     ext2.write_sector_abs(abs_lba).map_err(|_| ERR_IO)?;
 
-    ext2.bgd_table[group as usize].bg_free_inodes_count += 1;
+    ext2.bgd_mut(group)?.bg_free_inodes_count += 1;
     ext2.free_inodes_count += 1;
 
     flush_bgd(ext2, group)?;

@@ -282,7 +282,14 @@ impl BlockGroupDesc {
 // Ext2 filesystem state
 // ---------------------------------------------------------------------------
 
-const MAX_BLOCK_GROUPS: usize = 128;
+/// How many block groups' descriptors are kept: every group of a disk as
+/// big as a sector number of 32 bits reaches, 2 TiB, in blocks of 4 KiB —
+/// or of 128 GiB in blocks of 1 KiB, which is what ExplOSion makes. It was
+/// 128: a root of 4 GiB in blocks of 1 KiB has 512 groups, and the first
+/// block given out past its first gigabyte stopped the server. A filesystem
+/// with more is used as far as the table goes (`groups`), and a block or an
+/// inode past that is an I/O error (`bgd`), not a stop.
+const MAX_BLOCK_GROUPS: usize = 16384;
 
 pub struct Ext2State {
     pub disk_tid: usize,
@@ -326,6 +333,22 @@ impl Ext2State {
     /// Does this filesystem use extents rather than the block pointer array?
     pub fn is_ext4(&self) -> bool {
         self.feature_incompat & crate::ext4::INCOMPAT_EXTENTS != 0
+    }
+
+    /// The block groups this can use: every one, up to as many as are kept.
+    pub fn groups(&self) -> u32 {
+        self.num_block_groups.min(MAX_BLOCK_GROUPS as u32)
+    }
+
+    /// Group `group`'s descriptor: an I/O error for a group that is not
+    /// kept, or that the filesystem has not got.
+    pub fn bgd(&self, group: u32) -> Result<&BlockGroupDesc, u64> {
+        if group < self.groups() { Ok(&self.bgd_table[group as usize]) } else { Err(ERR_IO) }
+    }
+
+    /// As [`bgd`](Self::bgd), to change.
+    pub fn bgd_mut(&mut self, group: u32) -> Result<&mut BlockGroupDesc, u64> {
+        if group < self.groups() { Ok(&mut self.bgd_table[group as usize]) } else { Err(ERR_IO) }
     }
 }
 
@@ -756,11 +779,7 @@ fn inode_location(ext2: &Ext2State, inode_num: u32) -> Result<(u32, usize), u64>
     }
     let group = (inode_num - 1) / ext2.inodes_per_group;
     let index = (inode_num - 1) % ext2.inodes_per_group;
-    if group as usize >= MAX_BLOCK_GROUPS {
-        return Err(ERR_IO);
-    }
-
-    let inode_table_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_table)?;
+    let inode_table_block = ext2.block32(ext2.bgd(group)?.bg_inode_table)?;
     let byte_offset = index * ext2.inode_size as u32;
     let block = inode_table_block + byte_offset / ext2.block_size;
     let offset_in_block = byte_offset % ext2.block_size;
@@ -780,11 +799,7 @@ pub fn read_inode(ext2: &Ext2State, inode_num: u32) -> Result<Ext2Inode, u64> {
     let group = (inode_num - 1) / ext2.inodes_per_group;
     let index = (inode_num - 1) % ext2.inodes_per_group;
 
-    if group as usize >= MAX_BLOCK_GROUPS {
-        return Err(ERR_IO);
-    }
-
-    let inode_table_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_table)?;
+    let inode_table_block = ext2.block32(ext2.bgd(group)?.bg_inode_table)?;
     let byte_offset = index * ext2.inode_size as u32;
     let block_offset = byte_offset / ext2.block_size;
     let offset_in_block = byte_offset % ext2.block_size;
@@ -825,7 +840,7 @@ pub fn write_inode(ext2: &Ext2State, inode_num: u32, inode: &Ext2Inode) -> Resul
     let group = (inode_num - 1) / ext2.inodes_per_group;
     let index = (inode_num - 1) % ext2.inodes_per_group;
 
-    let inode_table_block = ext2.block32(ext2.bgd_table[group as usize].bg_inode_table)?;
+    let inode_table_block = ext2.block32(ext2.bgd(group)?.bg_inode_table)?;
     let byte_offset = index * ext2.inode_size as u32;
     let block_offset = byte_offset / ext2.block_size;
     let offset_in_block = byte_offset % ext2.block_size;
@@ -1424,7 +1439,7 @@ pub fn flush_bgd(ext2: &mut Ext2State, group: u32) -> Result<(), u64> {
     // Read-modify-write.
     raw_read_sector(ext2.disk_tid, abs_lba).map_err(|_| ERR_IO)?;
     let buf = unsafe { core::slice::from_raw_parts_mut(DISK_IO_BUF as *mut u8, 512) };
-    ext2.bgd_table[group as usize].write_to_bytes(buf, bgd_offset_in_sector, ext2.desc_size);
+    ext2.bgd(group)?.write_to_bytes(buf, bgd_offset_in_sector, ext2.desc_size);
 
     // Copy the descriptor out to checksum it: refreshing the bitmap checksums
     // reads sectors, which overwrites the very buffer it sits in.

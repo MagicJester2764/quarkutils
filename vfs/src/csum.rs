@@ -210,7 +210,7 @@ pub fn refresh_bitmaps(ext2: &mut Ext2State, group: u32, desc: &mut [u8]) -> Res
         return Ok(());
     }
 
-    let bgd = ext2.bgd_table[group as usize];
+    let bgd = *ext2.bgd(group)?;
     let block_bytes = (ext2.blocks_per_group / 8) as usize;
     let inode_bytes = (ext2.inodes_per_group / 8) as usize;
 
