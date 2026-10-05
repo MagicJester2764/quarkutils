@@ -1544,6 +1544,54 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
          * `g_cond_wait_until` and musl's `sem_timedwait` are built out of,
          * and glib's thread pool is built out of that. */
         long op = a2 & 0x7f;
+        /* FUTEX_WAIT_BITSET and FUTEX_WAKE_BITSET — what Rust's standard
+           library waits and wakes with — are FUTEX_WAIT and FUTEX_WAKE but
+           for two things. The time is a deadline, on CLOCK_MONOTONIC or with
+           FUTEX_CLOCK_REALTIME on the clock that says the date, and is turned
+           into how long from now. And a waker wakes only the waiters whose
+           bits it shares: here every waiter and waker shares all of them, and
+           a waiter woken that Linux would have left asleep looks at its word
+           and waits again, which a futex's user has to be ready for anyway.
+           Refused as not implemented, a wait came straight back, and every
+           thread of a Rust program waiting for a lock, a channel or a
+           condition went round its loop as fast as it could. */
+        struct lx_timespec left;
+        if (op == 9 || op == 10) {
+            if ((unsigned int)a6 == 0) {
+                return -LX_EINVAL;
+            }
+            if (op == 10) {
+                op = 1;
+            } else {
+                op = 0;
+                if (a4) {
+                    const struct lx_timespec *at = (const struct lx_timespec *)a4;
+                    unsigned long deadline =
+                        quark_nanos((unsigned long)at->tv_sec, (unsigned long)at->tv_nsec);
+                    unsigned long now = (a2 & 256) ? __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL) : quark_now();
+                    unsigned long rest = deadline > now ? deadline - now : 0;
+                    left.tv_sec = (long)(rest / 1000000000UL);
+                    left.tv_nsec = (long)(rest % 1000000000UL);
+                    a4 = (long)&left;
+                }
+            }
+        }
+        /* FUTEX_REQUEUE moves waiters from one word to wait on another, so
+           that they wait for a lock rather than all wake to fight for it.
+           Here it wakes them instead, as many as it would have woken and
+           moved: each finds its word changed and goes to wait where it was
+           to be moved to, which is what a futex's user does with a wake it
+           did not expect. musl's condition variables hand each waiter a
+           broadcast woke on to the next this way; refused, the first woke
+           and the rest slept on for good. */
+        if (op == 3) {
+            if ((int)a3 < 0 || (int)a4 < 0) {
+                return -LX_EINVAL;
+            }
+            unsigned long woken = __syscall2(SYS_FUTEX_WAKE, (unsigned long)a1,
+                                             (unsigned long)(int)a3 + (unsigned long)(int)a4);
+            return woken == QUARK_ERR ? -LX_EINVAL : (long)woken;
+        }
         if (op == 0) {
             unsigned long r;
             if (a4) {
