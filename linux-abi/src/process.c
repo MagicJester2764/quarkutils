@@ -368,12 +368,6 @@ static int give_image(unsigned long cr3, const struct segment *segs, int n, unsi
 #define AT_SECURE 23
 #define AT_RANDOM 25
 
-/* Where in the stack's top page the count of arguments is, and where the
-   program begins with its stack pointer: eight bytes in, as a call leaves
-   one, and as `quark_rt::spawn::BLOCK_AT` puts it for a program a spawner
-   starts. musl's entry aligns it again for itself. */
-#define BLOCK_AT 8UL
-
 /* How long a C string is. */
 static unsigned long length(const char *s) {
     unsigned long n = 0;
@@ -383,19 +377,56 @@ static unsigned long length(const char *s) {
     return n;
 }
 
-/* The stack's top page, `page` here and `there` in the new program, as
-   Linux's kernel leaves it — what a C library's entry reads, and a dynamic
-   loader's, before it can call anything: from the bottom up, the number of
-   arguments, a pointer to each, a nought, a pointer to each variable of the
-   environment, a nought, and the auxiliary vector; at the top, sixteen
-   random bytes and below them the strings. As `quark_rt::spawn` builds it,
-   and for the same programs. An entry that would not fit is left off the
-   end, as on the argument page; whatever that page holds fits here. */
-static void build_stack_top(unsigned char *page, unsigned long there, char *const argv[],
-                            char *const envp[], unsigned long phnum, unsigned long entry,
-                            unsigned long interp_base, unsigned long linux) {
-    unsigned long random_at = PAGE_SIZE - 16;
-    __syscall3(SYS_GETRANDOM, (unsigned long)(page + random_at), 16, 0);
+/* The most a program's arguments and environment may take where it starts:
+   the strings, the pointers to them and the auxiliary vector, at the top of
+   its stack. It is musl's ARG_MAX, and what Linux allowed before it let a
+   quarter of the stack's limit. More is refused (E2BIG), as Linux refuses
+   it, so that the caller can do it another way — rustc writes a linker's
+   arguments to a file. It was one page, and what did not fit was left off:
+   cargo's rustc started cc with most of its environment gone, and with it
+   where the compiler was installed. */
+#define ARGS_PAGES 32UL
+
+/* The auxiliary vector's entries, its last nought pair not counted. */
+#define NAUX 15UL
+
+/* What `argv` and `envp` take at the top of a stack: their strings, sixteen
+   random bytes, and a word for the count, each pointer, each list's nought
+   and each auxiliary pair. More than ARGS_PAGES can hold — sixteen to spare
+   for where the words begin — is ~0. */
+static unsigned long args_size(char *const argv[], char *const envp[]) {
+    unsigned long bytes = 16 + (3 + 2 * (NAUX + 1)) * 8;
+    for (int section = 0; section < 2; section++) {
+        char *const *list = section == 0 ? argv : envp;
+        for (unsigned long i = 0; list && list[i]; i++) {
+            bytes += length(list[i]) + 1 + 8;
+            if (bytes + 16 > ARGS_PAGES * PAGE_SIZE) {
+                return ~0UL;
+            }
+        }
+    }
+    return bytes;
+}
+
+/* The top of the stack, as Linux's kernel leaves it — what a C library's
+   entry reads, and a dynamic loader's, before it can call anything. `top`
+   is the stack's end in the new program and `staged` where that end is
+   here. From `block` up: the number of arguments, a pointer to each, a
+   nought, a pointer to each variable of the environment, a nought, and the
+   auxiliary vector; above them the strings, and at the top sixteen random
+   bytes. `block` is eight below a multiple of sixteen: where the program
+   begins with its stack pointer, as a call leaves one, and as
+   `quark_rt::spawn` puts it for a program a spawner starts. musl's entry
+   aligns it again for itself. As many pages as that takes, args_size
+   having said it fits; where it begins is the answer. */
+static unsigned long build_stack_top(unsigned char *staged, unsigned long top,
+                                     char *const argv[], char *const envp[],
+                                     unsigned long phnum, unsigned long entry,
+                                     unsigned long interp_base, unsigned long linux) {
+    /* The staged address of an address in the new program's stack. */
+#define HERE(a) (staged - (top - (a)))
+    unsigned long random_at = top - 16;
+    __syscall3(SYS_GETRANDOM, (unsigned long)HERE(random_at), 16, 0);
     unsigned long ids = __syscall0(SYS_GET_UID);
     unsigned long uid = ids >> 32, gid = ids & 0xFFFFFFFFUL;
     unsigned int a, b, c, d;
@@ -414,50 +445,48 @@ static void build_stack_top(unsigned char *page, unsigned long there, char *cons
         {AT_EGID, gid},
         {AT_SECURE, 0},
         {AT_HWCAP, d},
-        {AT_RANDOM, there + random_at},
+        {AT_RANDOM, random_at},
         {QUARK_AT_LINUX, linux},
     };
-    unsigned long naux = sizeof aux / sizeof aux[0];
+    _Static_assert(sizeof aux / sizeof aux[0] == NAUX, "NAUX is the auxiliary vector's length");
 
-    /* How many of each fit: words from the bottom, strings from the top. */
-    unsigned long words = 3 + 2 * (naux + 1);
-    unsigned long strings = PAGE_SIZE - random_at;
     unsigned long count[2] = {0, 0};
+    unsigned long strings = 0;
     for (int section = 0; section < 2; section++) {
         char *const *list = section == 0 ? argv : envp;
         for (unsigned long i = 0; list && list[i]; i++) {
-            unsigned long len = length(list[i]);
-            if (BLOCK_AT + (words + 1) * 8 + strings + len + 1 > PAGE_SIZE) {
-                break;
-            }
-            words++;
-            strings += len + 1;
+            strings += length(list[i]) + 1;
             count[section]++;
         }
     }
+    unsigned long words = 3 + count[0] + count[1] + 2 * (NAUX + 1);
+    unsigned long block = ((random_at - strings - words * 8 - 8) & ~15UL) + 8;
 
-    unsigned long *word = (unsigned long *)(page + BLOCK_AT);
+    unsigned long *word = (unsigned long *)HERE(block);
     unsigned long w = 0;
-    unsigned long top = random_at;
+    unsigned long str = random_at;
     word[w++] = count[0];
     for (int section = 0; section < 2; section++) {
         char *const *list = section == 0 ? argv : envp;
         for (unsigned long i = 0; i < count[section]; i++) {
             unsigned long len = length(list[i]);
-            top -= len + 1;
+            str -= len + 1;
+            unsigned char *at = HERE(str);
             for (unsigned long j = 0; j <= len; j++) {
-                page[top + j] = (unsigned char)list[i][j];
+                at[j] = (unsigned char)list[i][j];
             }
-            word[w++] = there + top;
+            word[w++] = str;
         }
         word[w++] = 0;
     }
-    for (unsigned long i = 0; i < naux; i++) {
+    for (unsigned long i = 0; i < NAUX; i++) {
         word[w++] = aux[i][0];
         word[w++] = aux[i][1];
     }
     word[w++] = AT_NULL;
     word[w++] = 0;
+#undef HERE
+    return block;
 }
 
 /* Tell the kernel what this program is about to become: its arguments, each
@@ -487,6 +516,9 @@ static void say_name(char *const argv[]) {
 long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     if (!path || !path[0]) {
         return -LX_ENOENT;
+    }
+    if (args_size(argv, envp) == ~0UL) {
+        return -LX_E2BIG;
     }
 
     /* The file first, and every check it can fail, before an address space
@@ -646,9 +678,9 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
         return -LX_ENOMEM;
     }
     build_args((unsigned char *)STAGE_ARGS, argv, envp, ph, eh.e_phnum, moved);
-    build_stack_top((unsigned char *)(STAGE_STACK + (STACK_PAGES - 1) * PAGE_SIZE),
-                    stack_top - PAGE_SIZE, argv, envp, (unsigned long)eh.e_phnum, entry,
-                    interp_base, linux);
+    unsigned long block = build_stack_top((unsigned char *)(STAGE_STACK + STACK_PAGES * PAGE_SIZE),
+                                          stack_top, argv, envp, (unsigned long)eh.e_phnum, entry,
+                                          interp_base, linux);
 
     unsigned long cr3 = __syscall0(SYS_ADDRSPACE_CREATE);
     if (cr3 == QUARK_ERR) {
@@ -679,7 +711,7 @@ long __quark_execve(const char *path, char *const argv[], char *const envp[]) {
     /* The last call this program makes. Everything above it was preparation
        that could fail and leave the caller as it was; this does not return. */
     say_name(argv);
-    __syscall3(SYS_EXEC_SPACE, cr3, start_at, stack_top - PAGE_SIZE + BLOCK_AT);
+    __syscall3(SYS_EXEC_SPACE, cr3, start_at, block);
     /* Only reached if the kernel refused, which means the space is not the
        caller's or has a task in it — neither of which can be true here. */
     __syscall1(SYS_ADDRSPACE_DESTROY, cr3);

@@ -55,6 +55,13 @@ const STACK_WINDOW_PAGES: usize = 1 << 19;
 /// space — see the note there for why it is this size and not eight
 /// megabytes.
 pub const STACK_PAGES: usize = 256;
+/// The top of a child's stack that holds what a C program finds there when
+/// it starts ([`set_args_env`]): 128 KiB, musl's `ARG_MAX`, as the C
+/// library's `execve` allows. The count and the pointers begin at its
+/// bottom, which is where the child's stack pointer starts whatever the
+/// arguments are, and the strings end at its top. It was one page, and what
+/// did not fit was left off; a list that does not fit is refused now.
+pub const ARGS_PAGES: usize = 32;
 
 /// Where a program's interpreter — the dynamic loader a program built to
 /// use shared libraries names (`PT_INTERP`) — is put: a random number of
@@ -153,11 +160,12 @@ impl Spawned {
     /// caller wire capabilities, file descriptors and pipes first.
     ///
     /// The stack pointer starts where [`set_args_env`] put what a C program
-    /// reads there, [`BLOCK_AT`] into the stack's top page. The kernel takes
-    /// the value it is given down to sixteen and eight below that, as a call
-    /// would have left it, so it is given the next sixteen up.
+    /// reads there, [`BLOCK_AT`] into the stack's top [`ARGS_PAGES`]. The
+    /// kernel takes the value it is given down to sixteen and eight below
+    /// that, as a call would have left it, so it is given the next sixteen
+    /// up.
     pub fn start(&self) -> Result<(), ()> {
-        let rsp = self.stack_top - PAGE_SIZE as u64 + BLOCK_AT as u64 + 8;
+        let rsp = self.stack_top - (ARGS_PAGES * PAGE_SIZE) as u64 + BLOCK_AT as u64 + 8;
         syscall::sys_task_start(self.tid, self.entry, rsp, self.cr3)
     }
 
@@ -516,13 +524,13 @@ fn give_image(cr3: usize, segs: &[Segment], base: usize, at: usize) -> Result<()
     Ok(())
 }
 
-/// Build the stack at `at` and move all of it but its top page into the
-/// child. Fresh memory is zeroed, which is all a stack needs; the top page is
-/// [`set_args_env`]'s, which puts there what a C program finds on its stack
-/// when it starts.
+/// Build the stack at `at` and move all of it but its top [`ARGS_PAGES`]
+/// into the child. Fresh memory is zeroed, which is all a stack needs; the
+/// top is [`set_args_env`]'s, which puts there what a C program finds on its
+/// stack when it starts.
 fn give_stack(cr3: usize, at: usize, top: usize) -> Result<(), ()> {
-    map_fresh(at, STACK_PAGES - 1)?;
-    give(cr3, top - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES - 1, true)
+    map_fresh(at, STACK_PAGES - ARGS_PAGES)?;
+    give(cr3, top - STACK_PAGES * PAGE_SIZE, at, STACK_PAGES - ARGS_PAGES, true)
 }
 
 /// Map `pages` of fresh, zeroed memory at `at`, or nothing.
@@ -725,11 +733,11 @@ const AT_HWCAP: u64 = 16;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 
-/// Where in the stack's top page the count of arguments is: eight bytes in,
-/// eight below a multiple of sixteen. That is where a task begins with its
-/// stack pointer — as a call leaves one, which is what the kernel makes of
-/// whatever it is told (`SYS_TASK_START`) and what a Rust entry point
-/// expects; a C library's entry aligns it again for itself.
+/// Where in the stack's top [`ARGS_PAGES`] the count of arguments is: eight
+/// bytes in, eight below a multiple of sixteen. That is where a task begins
+/// with its stack pointer — as a call leaves one, which is what the kernel
+/// makes of whatever it is told (`SYS_TASK_START`) and what a Rust entry
+/// point expects; a C library's entry aligns it again for itself.
 pub const BLOCK_AT: usize = 8;
 
 fn put_word(page: &mut [u8], i: usize, v: u64) {
@@ -737,28 +745,25 @@ fn put_word(page: &mut [u8], i: usize, v: u64) {
     page[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Write the stack's top page and move it into the child: what Linux's
-/// kernel leaves on a program's stack, which is what a C library's entry
-/// reads — and a dynamic loader's, which reads it before it can call
-/// anything at all. From the bottom of the page up: the number of
-/// arguments, a pointer to each, a nought, a pointer to each variable of the
-/// environment, a nought, and the auxiliary vector. At the top, sixteen
-/// random bytes (`AT_RANDOM`) and below them the strings. The task starts
-/// with its stack pointer at the count ([`Spawned::start`]).
+/// Write the stack's top [`ARGS_PAGES`] and move them into the child: what
+/// Linux's kernel leaves on a program's stack, which is what a C library's
+/// entry reads — and a dynamic loader's, which reads it before it can call
+/// anything at all. From [`BLOCK_AT`] up: the number of arguments, a
+/// pointer to each, a nought, a pointer to each variable of the
+/// environment, a nought, and the auxiliary vector. At the very top,
+/// sixteen random bytes (`AT_RANDOM`), and below them the strings. The task
+/// starts with its stack pointer at the count ([`Spawned::start`]).
 ///
-/// Whatever the argument page holds fits, since the strings here are its
-/// bytes with a nought each where it has a length; an entry that would not
-/// is left off the end, as there. The program's headers are the copy on the
-/// argument page (`AT_PHDR`), whose `PT_PHDR` says it is there — so a
-/// dynamic loader works out that the program was not moved. The count is
-/// [`BLOCK_AT`] into the page, not at its bottom.
+/// All of it or none: a list that does not fit is refused, as Linux refuses
+/// one past its limit (E2BIG), where it used to be left off the end. The
+/// program's headers are the copy on the argument page (`AT_PHDR`), whose
+/// `PT_PHDR` says it is there — so a dynamic loader works out that the
+/// program was not moved.
 fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) -> Result<(), ()> {
-    syscall::sys_mmap(scratch.stack, 1)?;
-    let page = unsafe { core::slice::from_raw_parts_mut(scratch.stack as *mut u8, PAGE_SIZE) };
-    let there = info.stack_top as usize - PAGE_SIZE;
+    let span = ARGS_PAGES * PAGE_SIZE;
+    let there = info.stack_top as usize - span;
     let (uid, gid) = syscall::sys_get_tuid(info.tid).unwrap_or((0, 0));
-    let random_at = PAGE_SIZE - 16;
-    let _ = syscall::sys_getrandom(&mut page[random_at..]);
+    let random_at = span - 16;
     let mut aux = [
         (AT_PHDR, (ARGS_PAGE_ADDR + PHDRS_AT + 16) as u64),
         (AT_PHENT, PHDR_SIZE as u64),
@@ -781,49 +786,41 @@ fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) 
         aux[0] = (AT_PHNUM, 0);
     }
 
-    // How many of each fit: words from the bottom, strings from the top.
-    let mut words = 1 + 1 + 1 + 2 * (aux.len() + 1);
-    let mut strings = PAGE_SIZE - random_at;
-    let mut take = |list: &[&[u8]]| {
-        let mut n = 0;
-        for item in list {
-            if BLOCK_AT + (words + 1) * 8 + strings + item.len() + 1 > PAGE_SIZE {
-                break;
-            }
-            words += 1;
-            strings += item.len() + 1;
-            n += 1;
-        }
-        n
-    };
-    let nargs = take(args);
-    let nenv = take(env);
+    // Whether it all fits: words from the bottom, strings from the top.
+    let words = 3 + args.len() + env.len() + 2 * (aux.len() + 1);
+    let strings: usize = args.iter().chain(env.iter()).map(|item| item.len() + 1).sum();
+    if BLOCK_AT + words * 8 + strings > random_at {
+        return Err(());
+    }
 
-    put_word(page, 0, nargs as u64);
+    map_fresh(scratch.stack, ARGS_PAGES)?;
+    let block = unsafe { core::slice::from_raw_parts_mut(scratch.stack as *mut u8, span) };
+    let _ = syscall::sys_getrandom(&mut block[random_at..]);
+    put_word(block, 0, args.len() as u64);
     let mut top = random_at;
     let mut i = 1;
-    for list in [&args[..nargs], &env[..nenv]] {
+    for list in [args, env] {
         for item in list {
             top -= item.len() + 1;
-            page[top..top + item.len()].copy_from_slice(item);
-            page[top + item.len()] = 0;
-            put_word(page, i, (there + top) as u64);
+            block[top..top + item.len()].copy_from_slice(item);
+            block[top + item.len()] = 0;
+            put_word(block, i, (there + top) as u64);
             i += 1;
         }
-        put_word(page, i, 0);
+        put_word(block, i, 0);
         i += 1;
     }
     for (key, value) in aux {
-        put_word(page, i, key);
-        put_word(page, i + 1, value);
+        put_word(block, i, key);
+        put_word(block, i + 1, value);
         i += 2;
     }
-    put_word(page, i, AT_NULL);
-    put_word(page, i + 1, 0);
+    put_word(block, i, AT_NULL);
+    put_word(block, i + 1, 0);
 
-    let given = give(info.cr3, there, scratch.stack, 1, true);
+    let given = give(info.cr3, there, scratch.stack, ARGS_PAGES, true);
     if given.is_err() {
-        release(scratch.stack, 1);
+        release(scratch.stack, ARGS_PAGES);
     }
     given
 }

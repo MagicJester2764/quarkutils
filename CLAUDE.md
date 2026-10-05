@@ -258,18 +258,27 @@ The kernel's own — paging, ownership of frames, what ring 0 may touch — are 
   outside its block. So every spawner calls `set_args`, even with no
   arguments; a program reading an argument page that was never mapped faults.
 - **A program starts with what Linux leaves on a stack** — argc, argv, the
-  environment and the auxiliary vector, at the bottom of the stack's top
-  page and eight bytes in (`spawn::BLOCK_AT`), the strings and `AT_RANDOM`'s
-  bytes above them. `set_args_env` builds the page and gives it, so the
-  rule above is this one too; `execve` builds the same in C. A C library's
-  entry reads it, and a dynamic loader can read nothing else, since it can
-  call nothing until it has relocated itself. Eight in, because
-  `SYS_TASK_START` takes the stack pointer down to sixteen and eight below,
-  as a call leaves one, which is what a Rust entry point expects —
-  `Spawned::start` passes sixteen up; `SYS_EXEC_SPACE` takes it as given,
-  and `execve` passes eight. The first boot of this put every C program's
-  argc where it read `argv[0]`. The argument page stays: Rust reads it, and
-  so does a C program built before (`__quark_start_args`).
+  environment and the auxiliary vector, eight below a multiple of sixteen,
+  the strings and `AT_RANDOM`'s bytes above them, at the top of its stack:
+  as much of it as that takes up to 128 KiB (`spawn::ARGS_PAGES`,
+  `ARGS_PAGES` in `process.c`, musl's `ARG_MAX`), and a list that would take
+  more is refused (E2BIG) — never cut short. It was one page, and what did
+  not fit was left off without a word: cargo gives rustc kilobytes of
+  environment, rustc gives the linker that and a long command line, and cc
+  started without most of its environment could not find where it was
+  installed (`ctests/bigargs.c`; `dtest environment`). `set_args_env`
+  builds it at the bottom of the stack's top `ARGS_PAGES` (`BLOCK_AT` in),
+  so that `Spawned::start` knows where without being told; `execve` builds
+  it just below the strings. A C library's entry reads it, and a dynamic
+  loader can read nothing else, since it can call nothing until it has
+  relocated itself. Eight below sixteen, because `SYS_TASK_START` takes
+  the stack pointer down to sixteen and eight below, as a call leaves one,
+  which is what a Rust entry point expects — `Spawned::start` passes
+  sixteen up; `SYS_EXEC_SPACE` takes it as given, and `execve` passes it as
+  it is. The first boot of this put every C program's argc where it read
+  `argv[0]`. The argument page stays one page: Rust reads it, and so does
+  a C program built before (`__quark_start_args`) — and what does not fit
+  there is still left off it, for them.
 - **C objects must put constructors in `.init_array`.** The cross compiler is
   configured `--enable-initfini-array`, and the user link script places the
   arrays and refuses `.ctors` outright, so an object carrying them has

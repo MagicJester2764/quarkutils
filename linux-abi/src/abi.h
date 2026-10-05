@@ -8,6 +8,7 @@
 #define LX_ENOENT    2
 #define LX_EBADF     9
 #define LX_ENOMEM   12
+#define LX_E2BIG     7
 #define LX_ENOEXEC   8
 #define LX_EFAULT   14
 #define LX_EINVAL   22

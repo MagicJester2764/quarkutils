@@ -2798,6 +2798,29 @@ fn test_poll() {
 
 fn test_environment() {
     println!("environment:");
+    // A C program a spawner starts with more than a page of arguments finds
+    // every one of them on its stack: bigargs checks what it was given. A
+    // spawner left off whatever did not fit the stack's top page, without a
+    // word.
+    let mut words = [[0u8; 21]; 400];
+    let mut args: [&[u8]; 404] = [b""; 404];
+    args[..4].copy_from_slice(&[b"bigargs", b"child", b"400", b"0"]);
+    for (i, word) in words.iter_mut().enumerate() {
+        word[..9].copy_from_slice(b"argument-");
+        for (d, at) in [1000, 100, 10, 1].iter().zip(9..13) {
+            word[at] = b'0' + (i / d % 10) as u8;
+        }
+        word[13..].copy_from_slice(b"-xxxxxxx");
+    }
+    for (slot, word) in args[4..].iter_mut().zip(words.iter()) {
+        *slot = word;
+    }
+    let ended = load_program(b"/usr/bin/bigargs", b"/usr/bin/BIGARGS.ELF", &args).and_then(|child| {
+        let tid = child.tid;
+        child.start().ok()?;
+        wait_for(tid)
+    });
+    check("a C program spawned with 400 arguments finds every one on its stack", ended == Some(0));
     // What the shell puts in every program's environment.
     check("HOME is set", quark_rt::args::getenv(b"HOME").is_some());
     check(
