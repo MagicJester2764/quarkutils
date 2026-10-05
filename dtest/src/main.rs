@@ -125,8 +125,8 @@ fn test_close() {
 
 fn test_fd_table() {
     println!("descriptor table:");
-    // Eight pipes is the per-task limit, which gives sixteen ends — enough to
-    // prove the table is deeper than the eight entries it used to have.
+    // Eight pipes give sixteen ends — enough to prove the table is deeper
+    // than the eight entries it used to have.
     let mut wired = 0;
     for i in 0..8 {
         let r = 3 + i * 2;
@@ -147,6 +147,23 @@ fn test_fd_table() {
     );
 
     for i in 0..wired {
+        let _ = syscall::sys_fd_close(3 + i * 2);
+        let _ = syscall::sys_fd_close(4 + i * 2);
+    }
+
+    // As many pipes as a build holds: cargo running four jobs has two for
+    // each job's output and one for its jobserver, and a program could
+    // have eight — cargo could not start its fourth rustc, and said it was
+    // out of descriptors.
+    let mut held = 0;
+    for i in 0..20 {
+        if own_pipe(3 + i * 2, 4 + i * 2).is_err() {
+            break;
+        }
+        held += 1;
+    }
+    check("a program holds twenty pipes at once", held == 20);
+    for i in 0..held {
         let _ = syscall::sys_fd_close(3 + i * 2);
         let _ = syscall::sys_fd_close(4 + i * 2);
     }

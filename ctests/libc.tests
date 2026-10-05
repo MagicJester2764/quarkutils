@@ -9,6 +9,7 @@ pietest
 linuxtest
 packettest
 futextest
+fdleak
 filetest
 dirtest
 threadfile
