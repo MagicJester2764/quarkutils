@@ -9252,6 +9252,18 @@ fn test_pressure() {
     println!("        {} pages are out now, {} before", syscall::sys_swap_room().1, used);
     check("and its memory is back when it has gone", free_after + 512 >= free);
 
+    // Four threads at once, where it runs short: one that waited for memory
+    // for a page another was given meanwhile goes on with the page.
+    let want = (free_after.saturating_sub(kept_back) + over) * 512 / 513;
+    let mut text = [0u8; 20];
+    let pages = decimal(want, &mut text);
+    let crowd = run(b"dchild", &[b"crowd", pages]);
+    check(
+        "four threads that touch the same new pages where memory runs short all go on",
+        crowd.is_some_and(|code| code >= 0),
+    );
+    check("and every page has all four's marks", crowd == Some(0));
+
     let _ = syscall::sys_munmap(OUT_AT, OUT_SPAN);
     for fd in 3..7 {
         let _ = syscall::sys_fd_close(fd);

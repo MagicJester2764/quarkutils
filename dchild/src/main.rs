@@ -356,6 +356,49 @@ fn touch() -> i32 {
     !whole as i32
 }
 
+/// `crowd`: the new pages four threads walk at once, and how many.
+const CROWD_AT: usize = 0xBA_0000_0000;
+static CROWD_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Add one to the first word of every page, in order.
+fn walk_crowd() {
+    for page in 0..CROWD_PAGES.load(Ordering::Relaxed) {
+        let word = unsafe { &*((CROWD_AT + page * 4096) as *const AtomicU64) };
+        word.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn crowd_walker() -> ! {
+    walk_crowd();
+    syscall::sys_exit_code(0);
+}
+
+/// Four threads walk the same new pages, each adding one to a word in
+/// every page, over more memory than the machine has free. Where it runs
+/// short the first to get there waits for memory, and the others catch it
+/// up and wait for the same page. The first to be given memory has the
+/// page; the others are to find it there when they look again — and were
+/// told nothing was promised there, and the program ended.
+fn crowd(pages: usize) -> i32 {
+    if pages == 0 || syscall::sys_map_anon(CROWD_AT, pages, false).is_err() {
+        return 2;
+    }
+    CROWD_PAGES.store(pages, Ordering::Relaxed);
+    let mut threads = [0usize; 3];
+    for slot in threads.iter_mut() {
+        match thread::spawn_with_stack(crowd_walker, 4) {
+            Ok(t) => *slot = t.tid(),
+            Err(()) => return 2,
+        }
+    }
+    walk_crowd();
+    for tid in threads {
+        let _ = syscall::sys_wait_for(tid);
+    }
+    let marked = (0..pages).all(|page| unsafe { core::ptr::read_volatile((CROWD_AT + page * 4096) as *const u64) } == 4);
+    !marked as i32
+}
+
 static TALLY: sync::Mutex<u64> = sync::Mutex::new(0);
 static LOOSE: AtomicU64 = AtomicU64::new(0);
 const EACH: u64 = 20_000;
@@ -1075,6 +1118,9 @@ pub extern "C" fn _start() -> ! {
     }
     if quark_rt::args::argv(1) == Some(&b"touch"[..]) {
         syscall::sys_exit_program(touch());
+    }
+    if quark_rt::args::argv(1) == Some(&b"crowd"[..]) {
+        syscall::sys_exit_program(crowd(quark_rt::args::argv(2).map_or(0, number)));
     }
     if quark_rt::args::argv(1) == Some(&b"count"[..]) {
         syscall::sys_exit_program(count());
