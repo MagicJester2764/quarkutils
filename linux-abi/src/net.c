@@ -149,11 +149,13 @@ static void pair_flags(unsigned long a, unsigned long b, long flags) {
 long __quark_pipe(int *fds, long flags) {
     /* O_CLOEXEC marks both ends to close when the program becomes another
        (SYS_FD_FLAGS, which SYS_EXEC_SPACE honours). It said once that
-       nothing could, and musl's posix_spawn, which hears how the exec went
-       by reading a pipe whose writing end an exec closes, waited instead for
-       every program it started to end. O_NONBLOCK is honoured: both ends are
-       recorded as non-blocking, and the read and write paths use the calls
-       that answer EAGAIN. */
+       nothing could. A program asking for it is making a pipe for one child
+       — Rust's standard library and glib make every child's output so —
+       and unmarked, the pipe went on into every other program started
+       meanwhile, and its reader waited for an end of file while any of
+       them ran. O_NONBLOCK is honoured: both ends are recorded as
+       non-blocking, and the read and write paths use the calls that answer
+       EAGAIN. */
     if (!fds) {
         return -LX_EFAULT;
     }

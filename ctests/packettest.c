@@ -7,9 +7,11 @@
  * every such start — cargo's of rustc among them.
  *
  * And SOCK_CLOEXEC and pipe2's O_CLOEXEC mark what they make to close when
- * the program becomes another. pipe2 did not, and musl's posix_spawn, which
- * hears how its child's exec went by reading a pipe the exec closes, waited
- * for every program it started to end before it returned.
+ * the program becomes another. pipe2 did not: a pipe made for one child's
+ * output went on into every program started meanwhile, and its reader
+ * waited for an end of file while any of them ran. (posix_spawn marks its
+ * own pipe with fcntl, and returns while its program runs either way: that
+ * check is here for posix_spawn's sake, not pipe2's.)
  *
  * Exits 0 only if every check holds.
  */
@@ -50,8 +52,13 @@ int main(int argc, char **argv)
     }
 
     int sv[2];
-    check("a pair of SOCK_SEQPACKET is made",
-          socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == 0);
+    int made = socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == 0;
+    check("a pair of SOCK_SEQPACKET is made", made);
+    if (!made) {
+        /* Nothing else here can be asked of a pair that is not there. */
+        printf("packettest: FAILED\n");
+        return 1;
+    }
     char buf[64];
     check("two writes are two messages",
           write(sv[0], "one", 3) == 3 && write(sv[0], "three", 5) == 5 &&
