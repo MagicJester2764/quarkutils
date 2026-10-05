@@ -3558,6 +3558,23 @@ fn test_locks() {
 const LAZY: usize = 0xA0_0000_0000;
 const LAZY_PAGES: usize = 262_144;
 
+/// Where the object read twice is mapped, and how many pages it has: half
+/// as many again as the kernel's cache of objects' pages once held.
+const CACHED_AT: usize = 0xBA_0000_0000;
+const CACHED_PAGES: usize = 12288;
+static CACHE_READ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Read every page of the object at `CACHED_AT`, and then every page again.
+extern "C" fn cache_reader() -> ! {
+    for _ in 0..2 {
+        for page in 0..CACHED_PAGES {
+            unsafe { core::ptr::read_volatile((CACHED_AT + page * 4096) as *const u8) };
+        }
+    }
+    CACHE_READ.store(true, core::sync::atomic::Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
 fn test_memory() {
     println!("memory on demand:");
     let (free0, charged0) = syscall::sys_mem_info();
@@ -3668,6 +3685,49 @@ fn test_memory() {
         matches!(kept, Some((true, syscall::OBJECT_RELEASE_LATER, _))),
     );
     check("and is released once that program has gone", matches!(kept, Some((true, _, 0))));
+
+    // An object read twice, page by page, through a mapping: its pager is
+    // asked for each page once. The kernel kept 8192 pages of objects, and
+    // every page past them took back one a program was using — rustc maps
+    // its own code, two hundred megabytes of it, and building the kernel on
+    // Quark read six gigabytes from the disk in twenty minutes and did not
+    // finish. On a machine of 256 MiB or more, where the cache holds this.
+    let (frames, _) = syscall::sys_mem_total();
+    if frames >= 65536 {
+        use core::sync::atomic::Ordering;
+        use quark_rt::ipc::{self, Message, TID_ANY};
+        const CACHED_SLOT: usize = 49;
+        let bytes = (CACHED_PAGES * 4096) as u64;
+        let asked = syscall::sys_object_create(0xCAC4E, bytes, CACHED_SLOT).ok().and_then(|id| {
+            syscall::sys_object_map(CACHED_SLOT, CACHED_AT, CACHED_PAGES, 0, 0).ok()?;
+            let reader = thread::spawn_with_stack(cache_reader, 8).ok()?;
+            let mut asked = 0;
+            let mut msg = Message::empty();
+            let start = syscall::sys_ticks();
+            while !CACHE_READ.load(Ordering::SeqCst) && syscall::sys_ticks() - start < 6000 {
+                if syscall::sys_recv_timeout(TID_ANY, &mut msg, 5).is_ok() && msg.tag == ipc::TAG_PAGE_IN {
+                    asked += 1;
+                    let _ = syscall::sys_reply(msg.sender, &Message::empty());
+                }
+            }
+            if !CACHE_READ.load(Ordering::SeqCst) {
+                let _ = syscall::sys_task_kill(reader.tid());
+            }
+            let _ = reader.join();
+            for at in (0..CACHED_PAGES).step_by(256) {
+                let _ = syscall::sys_munmap(CACHED_AT + at * 4096, 256);
+            }
+            // The object's last page unmapped is said to its pager, here.
+            while syscall::sys_recv_timeout(TID_ANY, &mut msg, 20).is_ok() && msg.tag != ipc::TAG_OBJECT_IDLE {}
+            let _ = syscall::sys_object_ctl(id, syscall::OBJECT_RELEASE, 0, 0);
+            Some(asked)
+        });
+        let _ = syscall::sys_cap_delete(CACHED_SLOT);
+        check(
+            "an object of 48 MiB read twice through a mapping is asked of its pager once a page",
+            asked == Some(CACHED_PAGES),
+        );
+    }
 }
 
 fn test_random() {
