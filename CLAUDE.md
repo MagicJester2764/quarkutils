@@ -189,12 +189,14 @@ measured after one fork that is not counted: the first task the kernel
 makes room for costs it room it then keeps. `dtest pressure` is about
 memory given back when there is not enough: it needs `swapd` running
 (`start /usr/bin/swapd /var/swap 16` in `/etc/init.conf`) and makes one
-check without it and twenty-four with. Most of it asks for what the
+check without it and twenty-six with. Most of it asks for what the
 kernel otherwise does only when it must — a program may give up pages of
 its own (`sys_page_out`) — because which pages a machine short of memory
 takes is not something a check can count on; the last of it is the thing
-itself, a program that wants more than there is, and takes about ten
-seconds on a disk driven a word at a time. `dtest handlers` is about the
+itself, a program that wants more than there is (`dchild fill`), and then
+four threads of one that touch the same new pages where memory runs short,
+and wait for it together (`dchild crowd`): each takes about ten seconds on
+a disk driven a word at a time. `dtest handlers` is about the
 kernel running a handler: in a program that is computing, in the thread it
 was meant for, on a stack of its own, for a fault, and ending every kind of
 wait — each with a handler of its own (`quark_rt::signal::handle`), where
