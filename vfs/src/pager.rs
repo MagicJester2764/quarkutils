@@ -18,10 +18,13 @@ use crate::handles::FsFileData;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 
-/// CSpace slots this server keeps object capabilities in, and the one it
-/// mints a client's copy in before granting it.
-const FIRST_SLOT: usize = 32;
-const LAST_SLOT: usize = 61;
+/// CSpace slots this server keeps object capabilities in — one for each file
+/// that is mapped, so this is how many can be at once: 192. They were the
+/// thirty from 32 to 61 of a CSpace of 64, and rustc maps more than thirty
+/// files at once to build an archive. And the one it mints a client's copy
+/// in before granting it.
+const FIRST_SLOT: usize = 64;
+const LAST_SLOT: usize = 255;
 const SCRATCH_SLOT: usize = 62;
 
 #[derive(Clone, Copy)]

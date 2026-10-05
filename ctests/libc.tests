@@ -12,6 +12,7 @@ futextest
 fdleak
 pipepoll
 bigargs
+manymaps
 filetest
 dirtest
 threadfile
