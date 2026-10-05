@@ -5608,7 +5608,7 @@ fn test_mounts() {
     // blocks make 256 of them on this disk, and a file of 40 MiB has blocks
     // past the 128th.
     check("a filesystem of 256 block groups is mounted", {
-        run(b"mkfs.ext2", &[b"-q", b"-F", b"-b", b"1024", b"-g", b"256", b"-O", b"^resize_inode", dev]) == Some(0)
+        run(b"mkfs.ext2", &[b"-q", b"-F", b"-b1024", b"-g256", b"-O^resize_inode", dev]) == Some(0)
             && run(b"mount", &[dev, at]) == Some(0)
     });
     let past: &[u8] = b"/tmp/dtest-mnt/past-the-128th";

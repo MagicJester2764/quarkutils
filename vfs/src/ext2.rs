@@ -326,8 +326,14 @@ pub struct Ext2State {
     /// checksum lives there, so a new inode that claims none gets only half a
     /// checksum — which is valid, and less than the filesystem asked for.
     pub want_extra_isize: u16,
-    pub bgd_table: [BlockGroupDesc; MAX_BLOCK_GROUPS],
 }
+
+/// Every kept group's descriptor. Beside the state rather than in it: the
+/// state begins with sizes that are not nought, so it is in the program's
+/// image, and 640 KiB of noughts there did not fit the boot image this
+/// server is started from before there is a root. A file server serves one
+/// filesystem, so there is one table, as there is one state.
+static mut BGD_TABLE: [BlockGroupDesc; MAX_BLOCK_GROUPS] = [BlockGroupDesc::empty(); MAX_BLOCK_GROUPS];
 
 impl Ext2State {
     /// Does this filesystem use extents rather than the block pointer array?
@@ -343,12 +349,20 @@ impl Ext2State {
     /// Group `group`'s descriptor: an I/O error for a group that is not
     /// kept, or that the filesystem has not got.
     pub fn bgd(&self, group: u32) -> Result<&BlockGroupDesc, u64> {
-        if group < self.groups() { Ok(&self.bgd_table[group as usize]) } else { Err(ERR_IO) }
+        if group < self.groups() {
+            Ok(unsafe { &(*core::ptr::addr_of!(BGD_TABLE))[group as usize] })
+        } else {
+            Err(ERR_IO)
+        }
     }
 
     /// As [`bgd`](Self::bgd), to change.
     pub fn bgd_mut(&mut self, group: u32) -> Result<&mut BlockGroupDesc, u64> {
-        if group < self.groups() { Ok(&mut self.bgd_table[group as usize]) } else { Err(ERR_IO) }
+        if group < self.groups() {
+            Ok(unsafe { &mut (*core::ptr::addr_of_mut!(BGD_TABLE))[group as usize] })
+        } else {
+            Err(ERR_IO)
+        }
     }
 }
 
@@ -377,7 +391,6 @@ impl Ext2State {
             read_only: false,
             csum_seed: 0,
             want_extra_isize: 0,
-            bgd_table: [BlockGroupDesc::empty(); MAX_BLOCK_GROUPS],
         }
     }
 
@@ -730,7 +743,7 @@ pub fn read_state(ext2: &mut Ext2State) -> Result<(), ()> {
         let block = bgd_block + (off / block_size) as u32;
         let in_block = off % block_size;
         read_block_bytes(ext2, block, in_block, &mut desc[..desc_size]).map_err(|_| ())?;
-        ext2.bgd_table[g] = BlockGroupDesc::from_bytes(&desc, 0, desc_size);
+        *ext2.bgd_mut(g as u32).map_err(|_| ())? = BlockGroupDesc::from_bytes(&desc, 0, desc_size);
     }
     Ok(())
 }
