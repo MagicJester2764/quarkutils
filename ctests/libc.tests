@@ -60,3 +60,4 @@ inotifytest
 epolltest
 pthreadtest
 inettest
+cowstress
