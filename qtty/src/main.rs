@@ -516,6 +516,21 @@ fn adopt_mode(reply: &Message) -> bool {
             CELL_BG.copy_within(drop * stride..(drop + rows) * stride, 0);
             ROW -= drop;
         }
+        // What is outside the grid now is nothing. Left as it was, a size
+        // bigger again showed it: the rows the move above had copied up,
+        // and the ends of lines too wide for this one — a prompt with an
+        // old command after it, which a program reading the screen, and
+        // anybody typing, took for the command line.
+        for row in 0..MAX_CELL_ROWS {
+            let from = row * MAX_CELL_COLS + if row < rows { COLS } else { 0 };
+            let to = (row + 1) * MAX_CELL_COLS;
+            CELL_CH[from..to].fill(0);
+            CELL_FG[from..to].fill(0);
+            CELL_BG[from..to].fill(0);
+        }
+        if COLS > 0 && COL >= COLS {
+            COL = COLS - 1;
+        }
         ROWS = rows;
         // The pixel layout may have changed with the mode; the attributes
         // have not.
