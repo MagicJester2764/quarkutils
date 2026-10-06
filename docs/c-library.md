@@ -507,21 +507,24 @@ then the DNS server `/etc/resolv.conf` names — nothing writes one — or
 
 ## Where things are
 
-A program's stack, what `malloc` gives and what `mmap` gives with no
-address asked for are each somewhere else every time the program runs: a
-random number of pages into a window of their own, chosen by `execve` for
-the stack and by the C layer, the first time it is wanted, for the rest. A
-forked child is in its parent's places. A mapping smaller than two
-gigabytes never crosses a multiple of two gigabytes: pixman's stress test
-turns bit 31 of an image's address over, adds to it and turns it back,
-which is the address only while the image does not. A program's code is where it was
-linked: nothing is built to be loaded anywhere (PIE). The libraries of a
-program linked `-dynamic` are wherever its loader maps them, out of the same
-arena, and the loader itself — `libc.so` — a random number of pages into a
-terabyte of its own. `mmap` with an address and `MAP_FIXED` puts the mapping
-there, over whatever was; `MAP_FIXED_NOREPLACE` is refused (`EEXIST`) where
-something is, and an address below where programs live (512 GiB) is refused.
-An address asked for without either is still only a hint, and ignored.
+A program's stack, what `malloc` gives and what `mmap` gives with no address
+asked for are each somewhere else every time the program runs: a random
+number of pages into a window of their own, chosen by `execve` for the stack
+and by the C layer, the first time it is wanted, for the rest. A forked
+child is in its parent's places. A mapping smaller than two gigabytes never
+crosses a multiple of two gigabytes: pixman's stress test turns bit 31 of an
+image's address over, adds to it and turns it back, which is the address
+only while the image does not. A program's code is where it was linked,
+unless it was linked to be put anywhere — a PIE, as `-dynamic -fPIE -pie`
+makes one here and as a program built for Linux usually is — when its loader
+puts it a random number of pages into a terabyte of its own; nothing of the
+system's own is built so. The libraries of a program linked `-dynamic` are
+wherever its loader maps them, out of the same arena, and the loader itself
+— `libc.so` — a random number of pages into a terabyte of its own. `mmap`
+with an address and `MAP_FIXED` puts the mapping there, over whatever was;
+`MAP_FIXED_NOREPLACE` is refused (`EEXIST`) where something is, and an
+address below where programs live (512 GiB) is refused. An address asked for
+without either is still only a hint, and ignored.
 
 ## What is refused
 

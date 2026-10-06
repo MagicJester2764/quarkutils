@@ -152,6 +152,10 @@ copy linked before the link script changed went on being installed.
 toolchain's specs name the archive by path, so a stale one is linked into every
 musl program silently, and the symptom is a bug you already fixed still
 happening. After changing it, relink whatever C programs you are testing.
+A program linked to `libc.so` relinks nothing: it has the copy of the layer
+that `../quark-toolchain`'s `build-musl.sh` last put in the shared object,
+so build the layer position-independent (`make -C linux-abi pic`) and that
+again.
 
 Its objects, and `libc`'s, are built again when *any* header changes
 (`$(OBJS): $(HEADERS)` in both Makefiles). The system calls are inline
@@ -169,10 +173,12 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 828 checks made from
-user space through the ABI — four of them of registers only some processors
-have, and not made where there are none — with a recap of what failed before
-the count. A
+`dtest` is the kernel's test suite as much as this tree's: 1024 checks made
+from user space through the ABI on a machine with nothing more to ask about
+— four of them of registers only some processors have, and not made where
+there are none — and more on one with more, below: 1061 on the machine
+ExplOSion tests on, which has `swapd` and `edu`. A recap of what failed
+comes before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
 the part about what a second processor changes, and passes on one. `dtest
@@ -224,7 +230,12 @@ needs an IOMMU between it and memory as well (QEMU's `intel-iommu`, on its
 q35 chipset): eight checks more — that it copies between its driver's pages
 and not to or from a page of `dtest`'s, that what its driver gives back it
 no longer reaches, that the kernel counts what it stopped, and whose a
-device is. Without an IOMMU it says so and checks nothing.
+device is. Without an IOMMU it says so and checks nothing. `dtest usb` asks
+a USB controller what is plugged into it: eleven checks where there is one
+with a keyboard, a mouse and a disk in it, none where there is none.
+`dtest display` makes three checks of any display and three more of one a
+driver can make another size (a virtio GPU); `dtest sound` one with no
+sound card and eighteen with one.
 `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service.
@@ -1479,21 +1490,21 @@ The rules that got it there, and that a further port should follow:
 ## Shared libraries
 
 A C program linked `-dynamic` (the musl wrapper's flag, in
-`../quark-toolchain`) names an interpreter, `/usr/lib/ld-musl-x86_64.so.1`
-— a link to `libc.so`, which is musl and the C layer in one shared object
-and is its own dynamic loader, as on Linux. Both loaders here read the
-name (`spawn::interpreter`, and `execve`), load that file too, at a random
-base in a terabyte of its own (`spawn::INTERP_BASE`, `QUARK_INTERP_BASE`),
-start the task in it, and tell it where the program is (`AT_BASE`,
-`AT_ENTRY`, `AT_PHDR` — the copy on the argument page, whose `PT_PHDR` says
-it is there, so the loader computes that the program was not moved). The
-loader maps each library through `mmap`, which places a mapping exactly
-where it is told now (`MAP_FIXED`, and `MAP_FIXED_NOREPLACE`) and steps
-the arena past one it places ahead of where the arena has got to.
-`dlopen` works in such a program. `ctests/dltest.c` is the proof: linked
-to `libdltwo.so`, opening `libdlone.so` by path and by name, and finding a
-function, a datum, a constructor that ran, a thread-local that is each
-thread's own, and one errno.
+`../quark-toolchain`) names an interpreter, `/usr/lib/ld-musl-x86_64.so.1` —
+`libc.so` by another name, a copy or a link as a distribution lays it out,
+which is musl and the C layer in one shared object and is its own dynamic
+loader, as on Linux. Both loaders here read the name (`spawn::interpreter`,
+and `execve`), load that file too, at a random base in a terabyte of its own
+(`spawn::INTERP_BASE`, `QUARK_INTERP_BASE`), start the task in it, and tell
+it where the program is (`AT_BASE`, `AT_ENTRY`, `AT_PHDR` — the copy on the
+argument page, whose `PT_PHDR` says it is there, so the loader computes that
+the program was not moved). The loader maps each library through `mmap`,
+which places a mapping exactly where it is told now (`MAP_FIXED`, and
+`MAP_FIXED_NOREPLACE`) and steps the arena past one it places ahead of where
+the arena has got to. `dlopen` works in such a program. `ctests/dltest.c` is
+the proof: linked to `libdltwo.so`, opening `libdlone.so` by path and by
+name, and finding a function, a datum, a constructor that ran, a
+thread-local that is each thread's own, and one errno.
 
 Static is still the default, and everything else here is static. A program
 built before any of this reads its arguments from the argument page, which
@@ -1663,16 +1674,17 @@ mounts`):
   must watch it with `sys_task_watch` and forget it on death. Otherwise it
   treats whatever takes the TID next as the same client.
 - **Memory is written out slowly, to a file that grows.** `swapd` writes a
-  page a call through the file server, which journals it, to a disk driven a
-  word at a time: about a hundred pages a second in a virtual machine. Its
-  file is made empty and takes room as pages are written, the lowest numbers
-  first, so it is as long as the most that was ever out at once; on a full
-  disk a page that cannot be written stays in memory, which is right and is
-  also a machine that is still short. Nothing stops it or takes its file
-  away while the machine is on: ended, the pages it held are gone, and a
-  program that touches one ends with a bus error. A partition of its own,
-  pages written several at a time, and a disk driver that does not copy
-  through a port are each of them faster and none is here.
+  page a call through the file server, which journals it: `dtest pressure`
+  takes half a minute where the disk is IDE's, driven a word at a time, and
+  six to twelve seconds where the device copies for itself (NVMe, AHCI,
+  virtio), in a virtual machine. Its file is made empty and takes room as
+  pages are written, the lowest numbers first, so it is as long as the most
+  that was ever out at once; on a full disk a page that cannot be written
+  stays in memory, which is right and is also a machine that is still short.
+  Nothing stops it or takes its file away while the machine is on: ended,
+  the pages it held are gone, and a program that touches one ends with a bus
+  error. A partition of its own and pages written several at a time are each
+  faster, and neither is here.
 - Focus is a single stack with little policy: Tab cycles, a new window takes it,
   and a click raises the one under the pointer. Keyboard focus and pointer focus
   are tracked separately, as Wayland requires, but there is no follow-mouse and
@@ -1761,7 +1773,7 @@ mounts`):
   where Linux makes the target, and `linkat` cannot name its source by
   descriptor (`AT_EMPTY_PATH`). FAT has no links.
 - A mapped file's pages stay cached until nothing maps the file any more, and
-  the VFS pages 30 objects at once. A private writable mapping copies a page
+  the VFS pages 192 objects at once. A private writable mapping copies a page
   when it is first touched, read or write.
 - `mprotect` says yes and does nothing: a mapping is made with the protection
   it will keep, so a program that maps read-only and then asks for write gets
@@ -1787,13 +1799,18 @@ mounts`):
   everybody, and 128 for any one program. A pipe, a terminal and a stream all
   say they are a character device to `fstat`: nothing tells the layer what
   kind a kernel descriptor is.
-- **No OpenGL, no D-Bus.** GTK starts without either and says so: the
-  session bus cannot be reached, and GSK draws through cairo. GTK is static,
-  so `g_module_symbol` still complains about a NULL module twice: `dlopen`
-  works only in a program linked `-dynamic`. Each is a real absence rather
-  than a stub, and each is a thing a bigger application may ask for and not get.
-- **A shared library is C's alone.** libstdc++ is static and nothing builds a
-  C++ shared object (no crtbeginS); the Rust runtime is static. A program
+- **No OpenGL.** GTK starts without it and says so, and GSK draws through
+  cairo. Nor is there a session bus unless the session asks for one: D-Bus
+  is a distribution's to stage, and a session started without a bus —
+  `dbus-run-session` starts one — has GTK say that it cannot be reached.
+  GTK is static, so `g_module_symbol` still complains about a NULL module
+  twice: `dlopen` works only in a program linked `-dynamic`. Each is a real
+  absence rather than a stub, and each is a thing a bigger application may
+  ask for and not get.
+- **A shared library built here is C's alone.** libstdc++ is static and
+  nothing builds a C++ shared object (no crtbeginS); the Rust runtime is
+  static. A program built for Linux brings its own — rustc's
+  `librustc_driver` — and is loaded with it like any other. A program
   that is not on the root filesystem's `/usr/lib` names its libraries by
   path or by `LD_LIBRARY_PATH`, and nothing caches where libraries are.
 - **Quark has no dma-buf**, and the Linux uapi headers copied wholesale into
