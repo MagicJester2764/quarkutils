@@ -173,10 +173,10 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 1024 checks made
+`dtest` is the kernel's test suite as much as this tree's: 1025 checks made
 from user space through the ABI on a machine with nothing more to ask about
 — four of them of registers only some processors have, and not made where
-there are none — and more on one with more, below: 1061 on the machine
+there are none — and more on one with more, below: 1062 on the machine
 ExplOSion tests on, which has `swapd` and `edu`. A recap of what failed
 comes before the count. A
 check that times out or is refused says which. It is run on one processor
@@ -233,7 +233,7 @@ no longer reaches, that the kernel counts what it stopped, and whose a
 device is. Without an IOMMU it says so and checks nothing. `dtest usb` asks
 a USB controller what is plugged into it: eleven checks where there is one
 with a keyboard, a mouse and a disk in it, none where there is none.
-`dtest display` makes three checks of any display and three more of one a
+`dtest display` makes four checks of any display and three more of one a
 driver can make another size (a virtio GPU); `dtest sound` one with no
 sound card and eighteen with one.
 `runtests <list>` runs the
