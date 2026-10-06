@@ -873,6 +873,47 @@ fn seat_refused() -> u8 {
     refused
 }
 
+/// `yieldrace`'s hog: counts for as long as it is let.
+static RACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RACE_STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn race_hog() -> ! {
+    while !RACE_STOP.load(Ordering::Relaxed) {
+        RACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// `yieldrace N`: what `dtest usage`'s yield check looks at, N times — a
+/// thread that computes, and this one sleeping a millisecond, reading the
+/// count, yielding, and reading it again. How many times it had not moved
+/// at once, and how many it had not within ten milliseconds.
+fn yield_race(rounds: u64) -> (u64, u64) {
+    RACE_STOP.store(false, Ordering::Relaxed);
+    let Ok(hog) = thread::spawn_with_stack(race_hog, 4) else { return (u64::MAX, u64::MAX) };
+    syscall::sleep_ns(10_000_000);
+    let (mut still, mut long) = (0, 0);
+    for _ in 0..rounds {
+        syscall::sleep_ns(1_000_000);
+        let counted = RACE_COUNT.load(Ordering::Relaxed);
+        syscall::sys_yield();
+        if RACE_COUNT.load(Ordering::Relaxed) <= counted {
+            still += 1;
+            let since = syscall::sys_clock();
+            while RACE_COUNT.load(Ordering::Relaxed) <= counted {
+                if syscall::sys_clock().wrapping_sub(since) > 10_000_000 {
+                    long += 1;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    RACE_STOP.store(true, Ordering::Relaxed);
+    let _ = syscall::sys_wait_for(hog.tid());
+    (still, long)
+}
+
 /// The framebuffer device, for `band`'s second task; and that task's word
 /// that its claim and its release are over.
 static BAND_FB: AtomicUsize = AtomicUsize::new(0);
@@ -966,6 +1007,12 @@ fn band_while_called() -> i32 {
 pub extern "C" fn _start() -> ! {
     // In a session of its own: how many of the keyboard, the display and a
     // line it is refused. Whether it may have them is whose it is.
+    if quark_rt::args::argv(1) == Some(&b"yieldrace"[..]) {
+        let rounds = quark_rt::args::argv(2).and_then(|a| core::str::from_utf8(a).ok()?.parse().ok()).unwrap_or(1000);
+        let (still, long) = yield_race(rounds);
+        println!("yieldrace: the count had not moved {} times of {}, {} within ten milliseconds", still, rounds, long);
+        syscall::sys_exit_code(0);
+    }
     // Called by a server, and asking for its band for a task it makes.
     if quark_rt::args::argv(1) == Some(&b"band"[..]) {
         syscall::sys_exit_code(band_while_called());

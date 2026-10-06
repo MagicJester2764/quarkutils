@@ -9499,7 +9499,23 @@ fn test_usage() {
     syscall::sleep_ns(100 * MS);
     let counted = HOG_COUNT.load(Ordering::Relaxed);
     syscall::sys_yield();
-    let passed = HOG_COUNT.load(Ordering::Relaxed) > counted;
+    // On several processors the other is on one of its own, and whether it
+    // has counted by the moment of the read is a matter of where that
+    // processor is: at the kernel's door, with its tick, while this one had
+    // the kernel, it has not — a few times in a thousand. There it is given
+    // ten milliseconds, which is all a yield promises it; on one processor
+    // the yield is the only way it runs, and it has by the time this does.
+    let several = syscall::sys_cpus().0 > 1;
+    let since = syscall::sys_clock();
+    let passed = loop {
+        if HOG_COUNT.load(Ordering::Relaxed) > counted {
+            break true;
+        }
+        if !several || syscall::sys_clock().wrapping_sub(since) > 10 * MS {
+            break false;
+        }
+        core::hint::spin_loop();
+    };
     HOG_STOP.store(true, Ordering::Relaxed);
     let hogged = hog.map(|t| t.join()).is_ok();
     check("a task that yields lets another of its band go first", hogged && passed);
