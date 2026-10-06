@@ -7250,6 +7250,20 @@ fn test_display() {
             })
         }),
     );
+    // The device calls whoever has the display to say it has lost it, and
+    // waits: meanwhile that program runs in the device's band. A task it
+    // makes then is its own to fill, but not with that band, which is only
+    // lent (dchild band).
+    let band = load_child(&[b"dchild", b"band"]).and_then(|child| {
+        let tid = child.tid;
+        child.start().ok()?;
+        wait_for(tid)
+    });
+    if band == Some(2) {
+        println!("        the display could not be had: nothing to ask of a program it is taken from");
+    } else {
+        check("a program a server is calling gives what it starts no band but its own", band == Some(0));
+    }
     if !mode.driven {
         println!("  (the bootloader's framebuffer: one size, nothing to ask)");
         return;

@@ -873,11 +873,103 @@ fn seat_refused() -> u8 {
     refused
 }
 
+/// The framebuffer device, for `band`'s second task; and that task's word
+/// that its claim and its release are over.
+static BAND_FB: AtomicUsize = AtomicUsize::new(0);
+static BAND_DONE: AtomicBool = AtomicBool::new(false);
+
+/// `band`'s second task: it claims the display, so that the framebuffer
+/// device calls the task that had it, and lets go. The display is lent in
+/// the program's slot 2, which both tasks have: emptied again at once, so
+/// that the display can be handed back to the first.
+extern "C" fn band_claimant() -> ! {
+    let fb = BAND_FB.load(Ordering::Relaxed);
+    let mut reply = Message::empty();
+    let claim = Message { sender: 0, tag: 2, data: [0; 6] };
+    if syscall::sys_call_offer_self(fb, &claim, &mut reply).is_ok() && reply.tag == 0 {
+        let _ = syscall::sys_cap_delete(2);
+        let release = Message { sender: 0, tag: 3, data: [0; 6] };
+        let _ = syscall::sys_call(fb, &release, &mut reply);
+    }
+    BAND_DONE.store(true, Ordering::Release);
+    syscall::sys_exit_code(0);
+}
+
+/// Whether a task this program makes and does not start may be put in the
+/// servers' band: what `band` asks while a server is calling it.
+fn may_give_server_band() -> bool {
+    let Ok(cr3) = syscall::sys_addrspace_create() else { return false };
+    let Ok(child) = syscall::sys_task_create_in(cr3 as u64) else {
+        let _ = syscall::sys_addrspace_destroy(cr3);
+        return false;
+    };
+    let given = syscall::sys_task_priority(child, syscall::PRIO_SERVER).is_ok();
+    let _ = syscall::sys_task_kill(child);
+    let _ = syscall::sys_wait_for(child);
+    let _ = syscall::sys_addrspace_destroy(cr3);
+    given
+}
+
+/// `band`: an ordinary program that has the display, called by the
+/// framebuffer device to say it has lost it — and so running, while the
+/// device waits, in the device's band — makes a task and asks for that band
+/// for it. 0 if it is refused, as it is to anything in the ordinary band; 1
+/// if it is given; 2 if the device never called.
+fn band_while_called() -> i32 {
+    const TAG_FB_CLAIM: u64 = 2;
+    const TAG_FB_RELEASE: u64 = 3;
+    const TAG_FB_LOST: u64 = 0x100;
+    const TAG_FB_GAINED: u64 = 0x101;
+    const LEASE: usize = 2;
+    let Some(fb) = nameserver::lookup(b"fb") else { return 2 };
+    let me = syscall::sys_getpid() as usize;
+    if !syscall::sys_cap_read(me, LEASE).is_ok_and(|c| c.cap_type == 0) {
+        return 2;
+    }
+    let mut reply = Message::empty();
+    let claim = Message { sender: 0, tag: TAG_FB_CLAIM, data: [0; 6] };
+    if syscall::sys_call_offer_self(fb, &claim, &mut reply).is_err() || reply.tag != 0 {
+        return 2;
+    }
+    BAND_FB.store(fb, Ordering::Relaxed);
+    let claimant = thread::spawn_with_stack(band_claimant, 4);
+    // Answer the device: that the display has gone, and that it is back.
+    let mut outcome = 2;
+    let mut back = claimant.is_err();
+    let started = syscall::sys_clock();
+    while !back && syscall::sys_clock().wrapping_sub(started) < 10_000_000_000 {
+        let mut msg = Message::empty();
+        if syscall::sys_recv_timeout(TID_ANY, &mut msg, syscall::ns(100_000_000)).is_err() || msg.sender != fb {
+            continue;
+        }
+        if msg.tag == TAG_FB_LOST {
+            if outcome == 2 {
+                outcome = may_give_server_band() as i32;
+            }
+            let _ = syscall::sys_cap_delete(LEASE);
+        } else if msg.tag == TAG_FB_GAINED {
+            back = true;
+        }
+        let _ = syscall::sys_reply(fb, &Message::empty());
+    }
+    if let Ok(t) = claimant {
+        let _ = syscall::sys_wait_for(t.tid());
+    }
+    let release = Message { sender: 0, tag: TAG_FB_RELEASE, data: [0; 6] };
+    let _ = syscall::sys_call(fb, &release, &mut reply);
+    let _ = syscall::sys_cap_delete(LEASE);
+    outcome
+}
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
     // In a session of its own: how many of the keyboard, the display and a
     // line it is refused. Whether it may have them is whose it is.
+    // Called by a server, and asking for its band for a task it makes.
+    if quark_rt::args::argv(1) == Some(&b"band"[..]) {
+        syscall::sys_exit_code(band_while_called());
+    }
     if quark_rt::args::argv(1) == Some(&b"seat"[..]) {
         if syscall::sys_setsid().is_err() {
             syscall::sys_exit_code(255);
