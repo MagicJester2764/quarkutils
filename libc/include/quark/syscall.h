@@ -254,6 +254,16 @@
    answers how many, or QUARK_FUTEX_CHANGED. */
 #define SYS_FUTEX_REQUEUE   237
 #define QUARK_FUTEX_CHANGED 0xFFFFFFFEUL
+/* How one task is scheduled: arg0 the op — 0 how nice (20 + it), 1 make it
+   as nice as arg2, 2 put it in class arg2 (0 ordinary, 1 FIFO, 2 round-robin)
+   at real-time priority arg3, 3 its class, (class << 8) | priority — and
+   arg1 the task, 0 for the caller. Entering a real-time class takes the
+   right to (QUARK_CAP_REALTIME). */
+#define SYS_SCHED           238
+#define QUARK_SCHED_NICE      0
+#define QUARK_SCHED_SET_NICE  1
+#define QUARK_SCHED_SET_CLASS 2
+#define QUARK_SCHED_CLASS     3
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215

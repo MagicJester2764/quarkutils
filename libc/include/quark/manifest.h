@@ -27,6 +27,8 @@
 #define QUARK_CAP_SET_UID    6UL
 #define QUARK_CAP_CLOCK      11UL
 #define QUARK_CAP_POWER      12UL
+/* Run a thread in a real-time class, SCHED_FIFO or SCHED_RR. */
+#define QUARK_CAP_REALTIME   16UL
 
 /* Each request is three words: what kind, and up to two parameters. */
 #define QUARK_CAP_IOPORT_RANGE(first, last) QUARK_CAP_IOPORT, (first), (last)

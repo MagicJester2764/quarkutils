@@ -42,6 +42,7 @@ quark_rt::manifest!([
     CapReq::clock(),
     CapReq::power(),
     CapReq::net_admin(),
+    CapReq::realtime(),
 ]);
 
 /// The slot a capability is made in before it is handed over.
@@ -331,6 +332,9 @@ fn bless(vfs_tid: usize, sender: usize, msg: &Message, text: &mut [u8; 512]) -> 
     }
     if may.has(Rights::NETWORK) {
         give(child, syscall::CAP_TYPE_NET_ADMIN, 0, 0);
+    }
+    if may.has(Rights::REALTIME) {
+        give(child, syscall::CAP_TYPE_REALTIME, 0, 0);
     }
     if may.has(Rights::ALL) {
         give(child, syscall::CAP_TYPE_PHYS_ALLOC, 64, 0);

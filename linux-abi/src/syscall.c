@@ -54,6 +54,13 @@ typedef unsigned long size_t;
 #define LX_mknod           133
 #define LX_getpriority     140
 #define LX_setpriority     141
+#define LX_sched_setparam  142
+#define LX_sched_getparam  143
+#define LX_sched_setscheduler 144
+#define LX_sched_getscheduler 145
+#define LX_sched_get_priority_max 146
+#define LX_sched_get_priority_min 147
+#define LX_sched_rr_get_interval 148
 #define LX_setrlimit       160
 #define LX_sync            162
 #define LX_reboot          169
@@ -1106,6 +1113,26 @@ static long set_user(long id, int for_good) {
     return r;
 }
 
+/* Whether `who` is a thread of this program by its id, a task's: what a
+   Linux call that takes a thread means by a number. This process's own id
+   is the process — what a program that passes getpid() means — whatever
+   task has the same number. */
+static int own_thread(unsigned long who) {
+    if (who == 0 || who == (unsigned long)__quark_getpid()) {
+        return 0;
+    }
+    unsigned long its = __syscall1(SYS_TASK_SPACE, who);
+    return its != QUARK_ERR && its == __syscall1(SYS_TASK_SPACE, __syscall0(SYS_GETPID));
+}
+
+/* The task a scheduling call names: nought, or this process's own id, is
+   the calling thread (Linux's would be the process's first, which is the
+   caller in all but a thread that asks by the process); anything else is a
+   thread's id. */
+static unsigned long sched_task(long who) {
+    return who == 0 || who == __quark_getpid() ? 0 : (unsigned long)who;
+}
+
 static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a6);
 
 long __quark_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6);
@@ -1441,14 +1468,19 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return (long)count;
     }
-    /* How nice a process is, which the kernel keeps for the program. The raw
-       call answers 20 less it, as Linux's does, and the C library takes it
-       back. One process, or this one for a group or a user of nought. */
+    /* How nice a thread or a process is. The raw call answers 20 less it,
+       as Linux's does, and the C library takes it back. Nice is a task's,
+       as Linux's is a thread's: a `who` of nought is the calling thread, and
+       a thread of this program by its id is that thread (SYS_SCHED); any
+       other is a process, every thread of it (SYS_NICE). A group or a user
+       of nought is this process. */
     case LX_getpriority: {
         if (a1 != 0 && a2 != 0) {
             return -LX_EINVAL;
         }
-        unsigned long r = __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, QUARK_ERR);
+        unsigned long r = a1 == 0 && (a2 == 0 || own_thread((unsigned long)a2))
+            ? __syscall4(SYS_SCHED, QUARK_SCHED_NICE, (unsigned long)a2, 0, 0)
+            : __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, QUARK_ERR);
         return r > 39 ? -LX_ESRCH : 40 - (long)r;
     }
     case LX_setpriority: {
@@ -1456,8 +1488,72 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             return -LX_EINVAL;
         }
         long nice = a3 < -20 ? -20 : a3 > 19 ? 19 : a3;
-        unsigned long r = __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, (unsigned long)nice);
+        unsigned long r = a1 == 0 && (a2 == 0 || own_thread((unsigned long)a2))
+            ? __syscall4(SYS_SCHED, QUARK_SCHED_SET_NICE, (unsigned long)a2, (unsigned long)nice, 0)
+            : __syscall2(SYS_NICE, a1 == 0 ? (unsigned long)a2 : 0, (unsigned long)nice);
         return r == QUARK_NOT_ALLOWED ? -LX_EACCES : r > 39 ? -LX_ESRCH : 0;
+    }
+    /* A thread's class and real-time priority. musl's pthread_setschedparam,
+       pthread_getschedparam and pthread_setschedprio ask by the thread's
+       id, which is its task's, and a thread made with an explicit policy
+       asks for itself as it starts; musl's sched_setscheduler and the rest
+       for a process answer ENOSYS without asking, which is musl's choice.
+       Ordinary, FIFO and round-robin only: a policy the kernel has not got,
+       or SCHED_RESET_ON_FORK, is EINVAL rather than quietly something else. */
+    case LX_sched_setscheduler:
+    case LX_sched_setparam: {
+        const int *param = (const int *)(n == LX_sched_setscheduler ? a3 : a2);
+        if (!param || a1 < 0) {
+            return -LX_EINVAL;
+        }
+        unsigned long task = sched_task(a1);
+        long policy = a2;
+        if (n == LX_sched_setparam) {
+            unsigned long now = __syscall4(SYS_SCHED, QUARK_SCHED_CLASS, task, 0, 0);
+            if (now > 0xFFFF) {
+                return -LX_ESRCH;
+            }
+            policy = (long)(now >> 8);
+        }
+        int priority = *param;
+        if (policy < 0 || policy > 2 || (policy == 0 ? priority != 0 : priority < 1 || priority > 99)) {
+            return -LX_EINVAL;
+        }
+        unsigned long r = __syscall4(SYS_SCHED, QUARK_SCHED_SET_CLASS, task, (unsigned long)policy,
+                                     (unsigned long)priority);
+        return r == QUARK_NOT_ALLOWED ? -LX_EPERM : r == QUARK_ERR ? -LX_ESRCH : 0;
+    }
+    case LX_sched_getscheduler:
+    case LX_sched_getparam: {
+        if (a1 < 0 || (n == LX_sched_getparam && !a2)) {
+            return -LX_EINVAL;
+        }
+        unsigned long now = __syscall4(SYS_SCHED, QUARK_SCHED_CLASS, sched_task(a1), 0, 0);
+        if (now > 0xFFFF) {
+            return -LX_ESRCH;
+        }
+        if (n == LX_sched_getscheduler) {
+            return (long)(now >> 8);
+        }
+        *(int *)a2 = (int)(now & 0xFF);
+        return 0;
+    }
+    case LX_sched_get_priority_max:
+    case LX_sched_get_priority_min:
+        if (a1 == 1 || a1 == 2) {
+            return n == LX_sched_get_priority_max ? 99 : 1;
+        }
+        return a1 == 0 || a1 == 3 || a1 == 5 ? 0 : -LX_EINVAL;
+    /* A round-robin thread's turn among its equals: a hundred milliseconds,
+       whoever asks about. */
+    case LX_sched_rr_get_interval: {
+        if (!a2) {
+            return -LX_EFAULT;
+        }
+        long *ts = (long *)a2;
+        ts[0] = 0;
+        ts[1] = 100000000;
+        return 0;
     }
     case LX_sched_yield:
         __syscall0(SYS_YIELD);

@@ -27,15 +27,17 @@ use quark_rt::{args, nameserver, println, syscall, vfs};
 // The same authority the shell has, because this does what the shell does:
 // start programs and give them what their manifests ask for. And the rights
 // a session may hold, where the session these are run from holds them: to
-// set the clock, for the test of the clock, and to run the network, for
-// nettest's checks of the filter. A right asked for by nothing here is given
-// to no test, and a test of what only a holder may do fails.
+// set the clock, for the test of the clock, to run the network, for
+// nettest's checks of the filter, and to run a thread in a real-time class,
+// for rtsched's. A right asked for by nothing here is given to no test, and
+// a test of what only a holder may do fails.
 quark_rt::manifest!([
     CapReq::task_mgmt(0),
     CapReq::phys_alloc(64),
     CapReq::set_uid(),
     CapReq::clock(),
     CapReq::net_admin(),
+    CapReq::realtime(),
 ]);
 
 /// Where a program's image is read to before it is loaded. Freed each time.

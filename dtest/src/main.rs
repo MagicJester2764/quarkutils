@@ -10180,7 +10180,7 @@ fn test_objects() {
     println!("objects:");
     let mut fds = [0usize; 300];
     // Made until there are `want`, or one is refused: how many.
-    let mut make = |want: usize, fds: &mut [usize; 300], one: &mut dyn FnMut() -> Option<usize>| {
+    let make = |want: usize, fds: &mut [usize; 300], one: &mut dyn FnMut() -> Option<usize>| {
         let mut n = 0;
         while n < want {
             let Some(fd) = one() else { break };

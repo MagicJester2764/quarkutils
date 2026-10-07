@@ -294,15 +294,60 @@ fn usage(whose: u64, of: u64) -> Result<Usage, ()> {
     Ok(Usage { user_ns: out[0], system_ns: out[1], voluntary: out[2], involuntary: out[3] })
 }
 
-/// How nice process `pid` (0 for this one) is, -20 to 19, set to `nice`
-/// unless that is `None`: the share of its band it has while it and another
-/// are both computing. Anybody may be nicer; to be less nice takes
-/// `TaskMgmt`. Answers with how nice it was.
+/// How nice process `pid` (0 for this one) is, -20 to 19 — its first task —
+/// and with `nice`, every task of it made that nice: the share of its band
+/// each has while it and another are both computing. Anybody may be nicer;
+/// to be less nice takes `TaskMgmt`. Answers with how nice it was. One task
+/// alone is [`sys_sched_set_nice`].
 pub fn sys_nice(pid: u64, nice: Option<i64>) -> Result<i64, Refused> {
     let new = nice.map_or(u64::MAX, |n| n as u64);
     match unsafe { syscall2(SYS_NICE, pid, new) } {
         ret @ 0..=39 => Ok(ret as i64 - 20),
         ret => Err(refusal(ret)),
+    }
+}
+
+/// A task's scheduling class (`sys_sched_set_class`): ordinary, and the two
+/// real-time ones, by Linux's numbers.
+pub const SCHED_OTHER: u8 = 0;
+pub const SCHED_FIFO: u8 = 1;
+pub const SCHED_RR: u8 = 2;
+
+/// How nice task `tid` (0 for the caller) is, -20 to 19.
+pub fn sys_sched_nice(tid: usize) -> Result<i64, Refused> {
+    match unsafe { syscall4(SYS_SCHED, 0, tid as u64, 0, 0) } {
+        ret @ 0..=39 => Ok(ret as i64 - 20),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// Make task `tid` (0 for the caller) as nice as `nice`, -20 to 19: one task,
+/// where [`sys_nice`] says it of every task of a program. A task of this
+/// program, or one `sys_nice` would let it say this of; to be less nice
+/// takes `TaskMgmt`.
+pub fn sys_sched_set_nice(tid: usize, nice: i64) -> Result<(), Refused> {
+    match unsafe { syscall4(SYS_SCHED, 1, tid as u64, nice as u64, 0) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// Put task `tid` (0 for the caller) in class `policy` at real-time priority
+/// `priority`: 1 to 99 for [`SCHED_FIFO`] and [`SCHED_RR`], 0 for
+/// [`SCHED_OTHER`]. Within its band a real-time task runs before every
+/// ordinary one, and entering a real-time class takes `RealTime`.
+pub fn sys_sched_set_class(tid: usize, policy: u8, priority: u8) -> Result<(), Refused> {
+    match unsafe { syscall4(SYS_SCHED, 2, tid as u64, policy as u64, priority as u64) } {
+        0 => Ok(()),
+        ret => Err(refusal(ret)),
+    }
+}
+
+/// Task `tid`'s class and real-time priority (0 for the caller).
+pub fn sys_sched_class(tid: usize) -> Option<(u8, u8)> {
+    match unsafe { syscall4(SYS_SCHED, 3, tid as u64, 0, 0) } {
+        ret if ret <= 0xFFFF => Some(((ret >> 8) as u8, ret as u8)),
+        _ => None,
     }
 }
 
@@ -425,6 +470,9 @@ pub const SYS_FD_LIMIT: u64 = 235;
 pub const SYS_TASK_NEXT: u64 = 236;
 /// Wake some of a futex word's waiters and move the rest to another word.
 pub const SYS_FUTEX_REQUEUE: u64 = 237;
+/// How one task is scheduled: its niceness, and its class — ordinary, or
+/// real-time FIFO or round-robin at a priority.
+pub const SYS_SCHED: u64 = 238;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -2989,6 +3037,9 @@ pub const PCI_ANY: u64 = 0xFFFF_FFFF;
 /// on it nowhere: the network stack is offered it with a call
 /// (`sys_call_offer`) and changes its filter only for a caller that could.
 pub const CAP_TYPE_NET_ADMIN: u64 = 15;
+/// The right to put a task in a real-time class (`sys_sched_set_class`).
+/// Leaving one takes nothing.
+pub const CAP_TYPE_REALTIME: u64 = 16;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -3125,7 +3176,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 2;
+pub const ABI_VERSION_MINOR: u32 = 3;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///
