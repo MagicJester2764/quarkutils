@@ -38,6 +38,7 @@ timertest
 shelltest
 cxxtest
 polltest
+pollmany
 fifotest
 jobtest
 spawntest

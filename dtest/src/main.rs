@@ -1615,12 +1615,14 @@ fn test_local_sockets() {
     for fd in firsts.iter().chain(&rest[..1]).chain(mems.iter()) {
         let _ = syscall::sys_fd_close(*fd as usize);
     }
-    let mut many = [0u32; 33];
+    // As many as the count can say go in one send; thirty-three were
+    // refused. What is sent and never taken goes with the stream.
+    let mut many = [0u32; 255];
     let spare = syscall::sys_memfd_create(1).unwrap_or(0) as u32;
     for fd in many.iter_mut() {
         *fd = spare;
     }
-    check("thirty-three in one send are refused", syscall::sys_fd_send_many(a, b"z", &many).is_err());
+    check("255 in one send go", syscall::sys_fd_send_many(a, b"z", &many) == Ok(1));
     let _ = syscall::sys_fd_close(spare as usize);
     let _ = syscall::sys_fd_close(a);
     let _ = syscall::sys_fd_close(b);
@@ -10041,8 +10043,10 @@ fn test_thousand_threads() {
 /// What a program makes, made when it makes it: as many of each kind as its
 /// descriptors and the machine's memory allow. Each was a table for the
 /// whole machine — sixteen counters, sixteen timers, thirty-two signal
-/// descriptors, 256 pipes (64 a program) and 256 shared regions — and a
-/// fifth task waiting on one counter was refused.
+/// descriptors, 256 pipes (64 a program), 256 shared regions, eight
+/// terminals, thirty-two local sockets and sixty-four streams — a fifth task
+/// waiting on one counter was refused, and a poll set, `poll`, a stream's
+/// descriptors in flight and a send of several each stopped at thirty-two.
 fn test_objects() {
     println!("objects:");
     let mut fds = [0usize; 300];
@@ -10092,6 +10096,130 @@ fn test_objects() {
     for fd in 100..100 + 2 * pipes {
         let _ = syscall::sys_fd_close(fd);
     }
+
+    // Terminals, a master each. There were eight for the machine, and the
+    // console's sessions had some of them.
+    let n = make(50, &mut fds, &mut || syscall::sys_pty_create().ok());
+    check("a program makes 50 terminals", n == 50);
+    close(&fds[..n]);
+
+    // Local sockets, each named by the file server and listening. There were
+    // thirty-two, named or not.
+    let v = nameserver::lookup(b"vfs").unwrap_or(0);
+    let mut name = *b"/tmp/dtest-objects.000";
+    let at = name.len() - 3;
+    let number = |name: &mut [u8; 22], i: usize| {
+        name[at..].copy_from_slice(&[b'0' + (i / 100) as u8, b'0' + (i / 10 % 10) as u8, b'0' + (i % 10) as u8]);
+    };
+    let (mut made, mut named, mut listening) = (0, 0, 0);
+    while listening < 100 {
+        let Ok(fd) = syscall::sys_socket_local() else { break };
+        fds[made] = fd;
+        made += 1;
+        number(&mut name, listening);
+        let _ = vfs::unlink(v, &name);
+        if vfs::bind_local(v, &name, fd, 0o700).is_err() {
+            break;
+        }
+        named += 1;
+        if syscall::sys_socket_listen(fd, 4).is_err() {
+            break;
+        }
+        listening += 1;
+    }
+    check("and 100 listening local sockets", listening == 100);
+    close(&fds[..made]);
+    for i in 0..named {
+        number(&mut name, i);
+        let _ = vfs::unlink(v, &name);
+    }
+
+    // Streams, two descriptors each. There were sixty-four.
+    let mut ends = [0usize; 400];
+    let mut streams = 0;
+    while streams < 200 {
+        let Ok((a, b)) = syscall::sys_socketpair() else { break };
+        ends[2 * streams] = a;
+        ends[2 * streams + 1] = b;
+        streams += 1;
+    }
+    check("and 200 streams", streams == 200);
+    close(&ends[..2 * streams]);
+
+    // A poll set watching 500 counters, and `poll` of 200 of them: in each,
+    // the one that is ready is the one reported. A set had room for 32
+    // watches and `poll` took 32 entries.
+    let mut counters = [0usize; 500];
+    let mut n = 0;
+    while n < counters.len() {
+        let fd = unsafe { syscall::syscall2(syscall::SYS_EVENT_CREATE, 0, 0) };
+        if fd == u64::MAX {
+            break;
+        }
+        counters[n] = fd as usize;
+        n += 1;
+    }
+    let set = syscall::sys_pollset_create();
+    let watched = set.is_ok_and(|set| {
+        counters[..n].iter().enumerate().all(|(i, &fd)| syscall::sys_pollset_add(set, fd, syscall::POLL_READABLE, i as u64).is_ok())
+    });
+    let mut ready = [syscall::Ready::empty(); 8];
+    let reported = n == 500
+        && watched
+        && syscall::sys_fd_write(counters[377], &1u64.to_le_bytes()) == 8
+        && set.is_ok_and(|set| syscall::sys_pollset_wait(set, &mut ready, 50) == Ok(1))
+        && ready[0].token == 377;
+    check("a poll set watching 500 descriptors reports the one that is ready", reported);
+    if let Ok(set) = set {
+        let _ = syscall::sys_fd_close(set);
+    }
+    let mut polled = [syscall::PollFd::new(0, 0); 200];
+    for (p, &fd) in polled.iter_mut().zip(&counters[..n.min(200)]) {
+        *p = syscall::PollFd::new(fd, syscall::POLL_READABLE);
+    }
+    let one = n >= 200
+        && syscall::sys_fd_write(counters[150], &1u64.to_le_bytes()) == 8
+        && syscall::sys_poll(&mut polled, 50) == Ok(1)
+        && polled.iter().enumerate().all(|(i, p)| (p.revents & syscall::POLL_READABLE != 0) == (i == 150));
+    check("`poll` of 200 descriptors", one);
+    close(&counters[..n]);
+
+    // Descriptors in flight on a stream: a hundred sends of one each, before
+    // any is taken, and then a hundred in one send, taken by one receive.
+    // There was room for 32 a direction, and 32 a send.
+    let pair = syscall::sys_socketpair();
+    let passed = unsafe { syscall::syscall2(syscall::SYS_EVENT_CREATE, 0, 0) } as usize;
+    let (mut sent, mut got) = (0, 0);
+    if let Ok((a, b)) = pair {
+        while sent < 100 && syscall::sys_fd_send_nb(a, b"d", Some(passed)) == Ok(Some(1)) {
+            sent += 1;
+        }
+        let mut byte = [0u8; 1];
+        while got < sent {
+            let Ok(Some((1, Some(fd)))) = syscall::sys_fd_recv_nb(b, &mut byte, Some(syscall::ANY_FD)) else { break };
+            let _ = syscall::sys_fd_close(fd);
+            got += 1;
+        }
+    }
+    check("a stream carries 100 descriptors in flight", sent == 100 && got == 100);
+    let mut many = [passed as u32; 100];
+    let at_once = pair.is_ok_and(|(a, b)| {
+        let mut byte = [0u8; 1];
+        let ok = syscall::sys_fd_send_many(a, b"m", &many) == Ok(1)
+            && syscall::sys_fd_recv_many(b, &mut byte, &mut many) == Ok((1, 100));
+        if ok {
+            for &fd in &many {
+                let _ = syscall::sys_fd_close(fd as usize);
+            }
+        }
+        ok
+    });
+    check("and 100 in one send, taken by one receive", at_once);
+    if let Ok((a, b)) = pair {
+        let _ = syscall::sys_fd_close(a);
+        let _ = syscall::sys_fd_close(b);
+    }
+    let _ = syscall::sys_fd_close(passed);
 
     // Eight tasks waiting on one counter, which a write of eight to it — a
     // counter that is a semaphore, so that each takes one — wakes, all of
