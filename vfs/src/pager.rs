@@ -11,20 +11,24 @@
 //! derives narrower ones for the programs that map them. Those take CSpace
 //! slots, which is what bounds how many files can be mapped at once.
 
+use crate::blocks::Blocks;
 use crate::ext2;
 use crate::protocol::*;
+use alloc::vec::Vec;
 use crate::{error_reply, ext2_state, get_handle, reply_opened, CLIENT_BUF, PAGE_SIZE};
 use crate::handles::FsFileData;
 use quark_rt::ipc::Message;
 use quark_rt::syscall;
 
 /// CSpace slots this server keeps object capabilities in — one for each file
-/// that is mapped, so this is how many can be at once: 192. They were the
-/// thirty from 32 to 61 of a CSpace of 64, and rustc maps more than thirty
-/// files at once to build an archive. And the one it mints a client's copy
-/// in before granting it.
+/// that is mapped, the one in slot `FIRST_SLOT + i` for the mapping in place
+/// `i` of the table — so this is how many can be at once: the 1,024 objects
+/// the kernel lets a pager have. They were the thirty from 32 to 61 of a
+/// CSpace of 64, then 192 to slot 255 of one of 256, and rustc maps more
+/// than thirty files at once to build an archive. And the one it mints a
+/// client's copy in before granting it.
 const FIRST_SLOT: usize = 64;
-const LAST_SLOT: usize = 255;
+const MAX_MAPPED: usize = 1024;
 const SCRATCH_SLOT: usize = 62;
 
 #[derive(Clone, Copy)]
@@ -41,11 +45,22 @@ struct Mapped {
 /// Whether any object is owed a release.
 static mut OWED: bool = false;
 
-const MAX_MAPPED: usize = LAST_SLOT - FIRST_SLOT + 1;
-static mut MAPPED: [Option<Mapped>; MAX_MAPPED] = [None; MAX_MAPPED];
+/// What is mapped, room made as it is wanted.
+static mut MAPPED: Blocks<Option<Mapped>> = Blocks::new(MAX_MAPPED);
 
-fn table() -> &'static mut [Option<Mapped>; MAX_MAPPED] {
+fn table() -> &'static mut Blocks<Option<Mapped>> {
     unsafe { &mut *core::ptr::addr_of_mut!(MAPPED) }
+}
+
+/// What is mapped now, taken out to be gone through while the table
+/// changes: on the heap, where a thousand of them are no trouble. Nothing,
+/// with no memory for it — what is asked of each is asked again later.
+fn snapshot(keep: impl Fn(&Mapped) -> bool) -> Vec<Mapped> {
+    let mut out = Vec::new();
+    if out.try_reserve(table().len()).is_ok() {
+        out.extend(table().iter().flatten().filter(|m| keep(m)).copied());
+    }
+    out
 }
 
 /// A page of this server's own, to copy cached pages through.
@@ -100,8 +115,7 @@ pub fn owed() -> bool {
 /// then, or has gone.
 pub fn retry() {
     unsafe { OWED = false };
-    let again: [Option<Mapped>; MAX_MAPPED] = core::array::from_fn(|i| table()[i].filter(|m| m.owed));
-    for m in again.into_iter().flatten() {
+    for m in snapshot(|m| m.owed) {
         idle(m.inode, m.id);
     }
 }
@@ -112,25 +126,28 @@ fn object_for(inode: u32, bytes: u64) -> Result<Mapped, u64> {
         return Ok(m);
     }
     // Full: whatever nothing maps any more can go now, notice or not.
-    if table().iter().all(|e| e.is_some()) {
-        let ids: [u64; MAX_MAPPED] = core::array::from_fn(|i| table()[i].map_or(0, |m| m.id));
-        for id in ids {
-            if let Some(ino) = try_release(id) {
+    if table().len() == MAX_MAPPED && table().iter().all(|e| e.is_some()) {
+        for m in snapshot(|_| true) {
+            if let Some(ino) = try_release(m.id) {
                 crate::settle(&[ino]);
             }
         }
     }
-    let Some(index) = table().iter().position(|e| e.is_none()) else {
-        return Err(ERR_TOO_MANY_OPEN);
-    };
-    for slot in FIRST_SLOT..=LAST_SLOT {
-        if table().iter().flatten().any(|m| m.slot == slot) {
+    // A place nothing is in, made if there is none, and its slot. A slot
+    // something else was granted into is refused; try the next place.
+    for index in 0..MAX_MAPPED {
+        if index >= table().len() && !table().grow_to(index, || None) {
+            break;
+        }
+        if table().get(index).is_none_or(|e| e.is_some()) {
             continue;
         }
-        // A slot something else was granted into is refused; try the next.
+        let slot = FIRST_SLOT + index;
         if let Ok(id) = syscall::sys_object_create(inode as u64, bytes, slot) {
             let m = Mapped { inode, id, slot, owed: false };
-            table()[index] = Some(m);
+            if let Some(e) = table().get_mut(index) {
+                *e = Some(m);
+            }
             return Ok(m);
         }
     }
@@ -270,8 +287,7 @@ pub fn clean() {
     if ext2_state().read_only {
         return;
     }
-    let mapped: [Option<Mapped>; MAX_MAPPED] = *table();
-    for m in mapped.into_iter().flatten() {
+    for m in snapshot(|_| true) {
         if let Err(code) = write_back(m.inode, m.id) {
             quark_rt::println!("[vfs] could not write back inode {} ({})", m.inode, code);
         }

@@ -1300,6 +1300,14 @@ first namespace of an NVMe controller, `virtblk` for a virtio disk.
   is a disk nobody can format. And a handle remembers its driver as a
   program, not as a task or a name: a RAM disk is killed and another takes
   both.
+- **The VFS's tables grow, and a record never moves** (`vfs/src/blocks.rs`):
+  handles, what each was opened on, working directories and mapped files
+  are made a block of 256 at a time as they are wanted, to a ceiling each
+  table names, and nothing in them is copied somewhere bigger — a request
+  holds one handle while it opens another, and a table that reallocated
+  would leave it holding what was left behind. A list nobody holds into
+  (the orphans) is a `Vec`; and nothing the size of a table goes on the
+  stack: a snapshot to walk while the table changes is taken on the heap.
 - **Writing a disk is slow here, and it is the emulator.** The ATA driver
   writes with programmed I/O, and under a hypervisor every write to the
   data port is a trap: about 0.8 MB a second, however the data is sent.
@@ -1774,8 +1782,9 @@ mounts`):
   where Linux makes the target, and `linkat` cannot name its source by
   descriptor (`AT_EMPTY_PATH`). FAT has no links.
 - A mapped file's pages stay cached until nothing maps the file any more, and
-  the VFS pages 192 objects at once. A private writable mapping copies a page
-  when it is first touched, read or write.
+  the VFS pages 1,024 objects at once — what the kernel lets a pager have.
+  A private writable mapping copies a page when it is first touched, read or
+  write.
 - `mprotect` says yes and does nothing: a mapping is made with the protection
   it will keep, so a program that maps read-only and then asks for write gets
   a mapping that still faults on the write — and a shared library's
@@ -1799,8 +1808,10 @@ mounts`):
 - A program has as many descriptors as its limit, files included — 1,024 to
   start, raised as far as 65,536; the C layer keeps what it knows of each
   in a record made the first time it is spoken of (`linux-abi/src/fdside.c`).
-  The VFS has 512 handles for
-  everybody, and 128 for any one program. A pipe, a terminal and a stream all
+  The VFS has 16,384 handles for
+  everybody, made as they are wanted, and 4,096 for any one program that
+  holds them without descriptors (a descriptor's are bounded by the
+  program's limit). A pipe, a terminal and a stream all
   say they are a character device to `fstat`: nothing tells the layer what
   kind a kernel descriptor is.
 - **No OpenGL.** GTK starts without it and says so, and GSK draws through

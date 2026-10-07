@@ -24,14 +24,18 @@
 //! the last of them is. The server keeps nothing per program for it and
 //! watches nobody: the kernel says when the last descriptor has gone.
 
+use crate::blocks::Blocks;
+use alloc::vec::Vec;
 use quark_rt::syscall;
 
-/// Handles for the whole system.
-pub const MAX_OPEN_FILES: usize = 512;
-/// Handles one program may hold: a quarter, so that one program opening files
-/// in a loop cannot stop every other program opening any. Comfortably above
-/// the hundred `dtest files` opens at once, which is the most anything here
-/// asks for.
+/// Handles for the whole system: a table that grows as it is wanted, a
+/// handle eighty bytes. There were 512, for every program there was.
+pub const MAX_OPEN_FILES: usize = 16_384;
+/// Handles one program may hold without descriptors: a quarter, so that one
+/// program opening files in a loop cannot stop every other program opening
+/// any. A descriptor's handle is not counted here: a program holds no more
+/// of those than its descriptor table has room for, and the kernel keeps
+/// that.
 pub const MAX_PER_PROGRAM: usize = MAX_OPEN_FILES / 4;
 
 pub enum FsFileData {
@@ -117,12 +121,9 @@ impl OpenFile {
     }
 }
 
-static mut TABLE: [OpenFile; MAX_OPEN_FILES] = {
-    const EMPTY: OpenFile = OpenFile::empty();
-    [EMPTY; MAX_OPEN_FILES]
-};
+static mut TABLE: Blocks<OpenFile> = Blocks::new(MAX_OPEN_FILES);
 
-fn table() -> &'static mut [OpenFile; MAX_OPEN_FILES] {
+fn table() -> &'static mut Blocks<OpenFile> {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLE) }
 }
 
@@ -148,10 +149,14 @@ pub fn alloc(file: OpenFile) -> Option<usize> {
         gone(&file);
         return None;
     }
-    t[i] = file;
-    t[i].in_use = true;
+    let Some(f) = t.get_mut(i) else {
+        gone(&file);
+        return None;
+    };
+    *f = file;
+    f.in_use = true;
     if by_fd {
-        t[i].owner = 0;
+        f.owner = 0;
     }
     Some(i)
 }
@@ -175,7 +180,12 @@ fn room_for(file: &OpenFile) -> Option<usize> {
             return None;
         }
     }
-    t.iter().position(|f| !f.in_use)
+    // A handle that has been given back, or room for another.
+    if let Some(i) = t.iter().position(|f| !f.in_use) {
+        return Some(i);
+    }
+    let i = t.len();
+    t.grow_to(i, OpenFile::empty).then_some(i)
 }
 
 /// Program `space`'s handle `handle`, if it is one.
@@ -262,22 +272,26 @@ pub fn close(handle: usize, space: u64) -> Option<u32> {
     Some(ino)
 }
 
-/// Close every handle program `space` held. The inodes they named are written
-/// to `closed`, and their number returned.
-pub fn close_all(space: u64, closed: &mut [u32; MAX_OPEN_FILES]) -> usize {
-    let mut n = 0;
+/// Close every handle program `space` held. The inodes they named are
+/// returned.
+pub fn close_all(space: u64) -> Vec<u32> {
+    let mut closed = Vec::new();
     for (i, f) in table().iter_mut().enumerate() {
         if f.in_use && f.owner == space {
-            closed[n] = f.inode_num();
+            let ino = f.inode_num();
             gone(f);
             *f = OpenFile::empty();
-            crate::inotify::closed_handle(i, closed[n]);
-            n += 1;
+            crate::inotify::closed_handle(i, ino);
+            // An inode that could not be remembered is settled when the next
+            // handle on it closes, or at the next start.
+            if closed.try_reserve(1).is_ok() {
+                closed.push(ino);
+            }
             // The program is going, so whoever waited through it is too.
             while crate::locks::drop_handle(i).is_some() {}
         }
     }
-    n
+    closed
 }
 
 /// What locks on `file` are keyed by: its inode, or for a file with none,
@@ -322,13 +336,12 @@ pub fn inode_is_open(ino: u32) -> bool {
             || crate::pager::holds(ino))
 }
 
-/// Inodes whose last name went while a handle or a working directory still
-/// named them. Each is held by one of those, so there can never be more than
-/// the two tables hold.
-const MAX_ORPHANS: usize = MAX_OPEN_FILES + crate::cwd::MAX_PROGRAMS;
-static mut ORPHANS: [u32; MAX_ORPHANS] = [0; MAX_ORPHANS];
+/// Inodes whose last name went while a handle, a working directory or a
+/// mapping still named them. Each is held by one of those, so there are
+/// never more than they hold between them.
+static mut ORPHANS: Vec<u32> = Vec::new();
 
-fn orphans() -> &'static mut [u32; MAX_ORPHANS] {
+fn orphans() -> &'static mut Vec<u32> {
     unsafe { &mut *core::ptr::addr_of_mut!(ORPHANS) }
 }
 
@@ -336,8 +349,10 @@ pub fn add_orphan(ino: u32) {
     if is_orphan(ino) {
         return;
     }
-    if let Some(slot) = orphans().iter_mut().find(|o| **o == 0) {
-        *slot = ino;
+    // With no memory to remember it, it is on the disk's own orphan list
+    // still, and freed at the next start.
+    if orphans().try_reserve(1).is_ok() {
+        orphans().push(ino);
     }
 }
 
@@ -346,7 +361,5 @@ pub fn is_orphan(ino: u32) -> bool {
 }
 
 pub fn forget_orphan(ino: u32) {
-    for o in orphans().iter_mut().filter(|o| **o == ino) {
-        *o = 0;
-    }
+    orphans().retain(|&o| o != ino);
 }

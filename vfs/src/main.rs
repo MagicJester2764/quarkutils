@@ -3,6 +3,9 @@
 #![allow(dead_code)]
 #![allow(static_mut_refs)]
 
+extern crate alloc;
+
+pub mod blocks;
 pub mod ext2;
 pub mod ext2_alloc;
 pub mod ext2_dir;
@@ -2889,11 +2892,10 @@ fn grant_waiters() {
 
 /// A program has gone: its handles go with it.
 fn client_died(space: u64) {
-    let mut closed = [0u32; handles::MAX_OPEN_FILES];
-    let n = handles::close_all(space, &mut closed);
+    let closed = handles::close_all(space);
     locks::drop_space(space);
     grant_waiters();
-    settle(&closed[..n]);
+    settle(&closed);
     if let cwd::Where::Inode(ino) = cwd::forget(space) {
         settle(&[ino]);
     }

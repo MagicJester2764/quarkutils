@@ -132,7 +132,8 @@ static mut WATCHING: usize = 0;
 static mut COOKIE: u32 = 0;
 /// Some instance has events its readers have not been given.
 static mut STIRRED: bool = false;
-static mut OPENED: [Opened; MAX_OPEN_FILES] = [NOT_OPENED; MAX_OPEN_FILES];
+/// What each handle was opened on, as it grows with the handles' table.
+static mut OPENED: crate::blocks::Blocks<Opened> = crate::blocks::Blocks::new(MAX_OPEN_FILES);
 
 fn instances() -> &'static mut [Instance; MAX_INSTANCES] {
     unsafe { &mut *core::ptr::addr_of_mut!(INSTANCES) }
@@ -142,7 +143,7 @@ fn watches() -> &'static mut [Watch; MAX_WATCHES] {
     unsafe { &mut *core::ptr::addr_of_mut!(WATCHES) }
 }
 
-fn opened_as() -> &'static mut [Opened; MAX_OPEN_FILES] {
+fn opened_as() -> &'static mut crate::blocks::Blocks<Opened> {
     unsafe { &mut *core::ptr::addr_of_mut!(OPENED) }
 }
 
@@ -593,18 +594,22 @@ pub fn attrib(ino: u32, dir: u32) {
 /// Handle `handle` was opened on `ino`, found in directory `dir`, to write or
 /// not: IN_OPEN, and what is done through it from now on is said of it.
 pub fn opened(handle: usize, ino: u32, dir: u32, is_dir: bool, write: bool) {
-    if handle < MAX_OPEN_FILES {
-        opened_as()[handle] = Opened { ino, dir, is_dir, write };
+    // With no room to remember it by, what is done through it is not said
+    // of it: the open is, below, and the rest is quiet.
+    if opened_as().grow_to(handle, || NOT_OPENED) {
+        if let Some(o) = opened_as().get_mut(handle) {
+            *o = Opened { ino, dir, is_dir, write };
+        }
     }
     changed(ino, dir, is_dir, IN_OPEN);
 }
 
 /// `mask` was done through `handle`, which is open on `ino`.
 pub fn touched(handle: usize, ino: u32, mask: u32) {
-    if !watching() || handle >= MAX_OPEN_FILES || ino == 0 {
+    if !watching() || ino == 0 {
         return;
     }
-    let o = opened_as()[handle];
+    let Some(o) = opened_as().get(handle).copied() else { return };
     if o.ino == ino {
         changed(ino, o.dir, o.is_dir, mask);
     }
@@ -612,11 +617,8 @@ pub fn touched(handle: usize, ino: u32, mask: u32) {
 
 /// `handle`, which was open on `ino`, has closed.
 pub fn closed_handle(handle: usize, ino: u32) {
-    if handle >= MAX_OPEN_FILES {
-        return;
-    }
-    let o = opened_as()[handle];
-    opened_as()[handle] = NOT_OPENED;
+    let Some(slot) = opened_as().get_mut(handle) else { return };
+    let o = core::mem::replace(slot, NOT_OPENED);
     if o.ino == ino && ino != 0 {
         changed(ino, o.dir, o.is_dir, if o.write { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE });
     }

@@ -8,11 +8,15 @@
 //! A program nobody gave a directory is at `/`, and needs no entry. Programs
 //! are named by their address space's id, like the handles they hold.
 
+use crate::blocks::Blocks;
 use crate::protocol::MAX_PATH;
+use alloc::boxed::Box;
+use core::alloc::Layout;
 use quark_rt::syscall;
 
-/// As many programs as there can be tasks.
-pub const MAX_PROGRAMS: usize = 64;
+/// As many programs as there can be tasks: a table that grows as programs
+/// are given directories. There were sixty-four.
+pub const MAX_PROGRAMS: usize = 32_768;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Where {
@@ -23,27 +27,40 @@ pub enum Where {
     Path(usize),
 }
 
+/// A program's entry: a few words, and for a FAT32 directory the path, in a
+/// block of its own made the first time the entry needs one and kept with
+/// it — what [`get`] hands out stays where it is. It was four kilobytes of
+/// path in every entry, for directories that are almost always ext2's.
 struct Entry {
     space: u64,
     at: Where,
-    path: [u8; MAX_PATH + 1],
+    path: Option<Box<[u8; MAX_PATH + 1]>>,
 }
 
-static mut TABLE: [Entry; MAX_PROGRAMS] = {
-    const EMPTY: Entry = Entry { space: 0, at: Where::Root, path: [0; MAX_PATH + 1] };
-    [EMPTY; MAX_PROGRAMS]
-};
+fn empty() -> Entry {
+    Entry { space: 0, at: Where::Root, path: None }
+}
 
-fn table() -> &'static mut [Entry; MAX_PROGRAMS] {
+static mut TABLE: Blocks<Entry> = Blocks::new(MAX_PROGRAMS);
+
+fn table() -> &'static mut Blocks<Entry> {
     unsafe { &mut *core::ptr::addr_of_mut!(TABLE) }
+}
+
+/// Room for a FAT32 path, made where it is to stay, or `None` with no memory.
+fn path_room() -> Option<Box<[u8; MAX_PATH + 1]>> {
+    unsafe {
+        let at = alloc::alloc::alloc_zeroed(Layout::new::<[u8; MAX_PATH + 1]>());
+        (!at.is_null()).then(|| Box::from_raw(at as *mut [u8; MAX_PATH + 1]))
+    }
 }
 
 /// Where program `space` is, and for a FAT32 path, the path.
 pub fn get(space: u64) -> (Where, &'static [u8]) {
     match table().iter().find(|e| e.space != 0 && e.space == space) {
-        Some(e) => match e.at {
-            Where::Path(len) => (e.at, &e.path[..len]),
-            at => (at, b"/"),
+        Some(e) => match (e.at, e.path.as_deref()) {
+            (Where::Path(len), Some(path)) => (e.at, &path[..len]),
+            (at, _) => (at, b"/"),
         },
         None => (Where::Root, b"/"),
     }
@@ -57,18 +74,29 @@ pub fn set(space: u64, to: Where, path: &[u8]) -> Result<Where, u64> {
     }
     let t = table();
     let found = t.iter().position(|e| e.space == space);
-    let old = found.map_or(Where::Root, |i| t[i].at);
+    let old = found.and_then(|i| t.get(i)).map_or(Where::Root, |e| e.at);
     if to == Where::Root {
-        if let Some(i) = found {
-            t[i].space = 0;
-            t[i].at = Where::Root;
+        if let Some(e) = found.and_then(|i| t.get_mut(i)) {
+            e.space = 0;
+            e.at = Where::Root;
         }
         return Ok(old);
     }
     let i = match found {
         Some(i) => i,
         None => {
-            let i = t.iter().position(|e| e.space == 0).ok_or(crate::ERR_TOO_MANY_OPEN)?;
+            // An entry given back, or room for another.
+            let free = t.iter().position(|e| e.space == 0);
+            let i = match free {
+                Some(i) => i,
+                None => {
+                    let i = t.len();
+                    if !t.grow_to(i, empty) {
+                        return Err(crate::ERR_TOO_MANY_OPEN);
+                    }
+                    i
+                }
+            };
             // Told when the program goes, so its directory is let go. A
             // program that has gone already is in no directory, and is
             // never said to go again.
@@ -78,12 +106,20 @@ pub fn set(space: u64, to: Where, path: &[u8]) -> Result<Where, u64> {
             i
         }
     };
-    let e = &mut t[i];
+    let Some(e) = t.get_mut(i) else {
+        return Err(crate::ERR_TOO_MANY_OPEN);
+    };
+    if let Where::Path(len) = to {
+        if e.path.is_none() {
+            e.path = path_room();
+        }
+        let Some(room) = e.path.as_deref_mut() else {
+            return Err(crate::ERR_TOO_MANY_OPEN);
+        };
+        room[..len].copy_from_slice(&path[..len]);
+    }
     e.space = space;
     e.at = to;
-    if let Where::Path(len) = to {
-        e.path[..len].copy_from_slice(&path[..len]);
-    }
     Ok(old)
 }
 
