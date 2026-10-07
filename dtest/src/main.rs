@@ -10040,6 +10040,51 @@ fn test_thousand_threads() {
     );
 }
 
+/// A program's capability space grows: a thousand capabilities held at once,
+/// in slots far past the 256 a space had, each what was put there; the
+/// slots below them where they were; a forked child with all of them; and a
+/// slot past the most a space can have refused.
+fn test_cap_space() {
+    println!("capability space:");
+    let me = syscall::sys_getpid() as usize;
+    const FROM: usize = 300;
+    let endpoint = |slot: usize| syscall::sys_cap_read(me, slot).ok().filter(|c| c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.valid);
+    let nameserver = endpoint(syscall::SLOT_ENDPOINT);
+    let mut minted = 0;
+    while minted < 1000 && syscall::sys_cap_mint(FROM + minted, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok() {
+        minted += 1;
+    }
+    let mine = endpoint(FROM);
+    let all = (0..minted).all(|i| endpoint(FROM + i).is_some_and(|c| Some(c) == mine));
+    check("a program holds 1,000 capabilities", minted == 1000 && mine.is_some() && all);
+    check(
+        "and its space says it has room for them",
+        syscall::sys_cap_room(me).is_some_and(|room| room >= FROM + minted && room <= 65_536),
+    );
+    check(
+        "and what it held below them is where it was",
+        nameserver.is_some() && endpoint(syscall::SLOT_ENDPOINT) == nameserver,
+    );
+    match syscall::sys_fork() {
+        Ok(0) => {
+            let child = syscall::sys_getpid() as usize;
+            let same = (0..minted).all(|i| {
+                syscall::sys_cap_read(child, FROM + i).is_ok_and(|c| c.cap_type == syscall::CAP_TYPE_ENDPOINT && c.valid)
+            });
+            syscall::sys_exit_program(if minted == 1000 && same { 7 } else { 8 });
+        }
+        Ok(child) => check("and a forked child holds them too", wait_for(child) == Some(7)),
+        Err(()) => check("fork", false),
+    }
+    check(
+        "a slot past the most a space can have is refused",
+        syscall::sys_cap_mint(65_536, syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_err(),
+    );
+    for i in 0..minted {
+        let _ = syscall::sys_cap_delete(FROM + i);
+    }
+}
+
 /// What a program makes, made when it makes it: as many of each kind as its
 /// descriptors and the machine's memory allow. Each was a table for the
 /// whole machine — sixteen counters, sixteen timers, thirty-two signal
@@ -10502,6 +10547,7 @@ pub extern "C" fn _start() -> ! {
         ("usage", test_usage),
         ("smp", test_smp),
         ("objects", test_objects),
+        ("caps", test_cap_space),
         ("stackguard", test_stack_guard),
     ];
     let only = quark_rt::args::argv(1);

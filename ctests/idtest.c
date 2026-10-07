@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <quark/manifest.h>
+#include <quark/syscall.h>
 
 /* What lets a program say who it is. It is given only what it asks for, and
    only what whoever starts it holds: started by a user, this gets nothing. */
@@ -79,6 +80,36 @@ static int for_good(void) {
     return ok;
 }
 
+/* Root, holding the right to say who it is far up its capabilities as well
+   as where it was given it: becoming somebody for good gives up every one.
+   The C library looked through the first sixty-four slots, and a space has
+   had 256 since, and grows now. A bit for each thing that is then so. */
+static int kept_far_up(void) {
+    static const unsigned long far[2] = { 200, 2000 };
+    unsigned long me = __syscall0(SYS_GETPID);
+    int ok = 0, minted = 0, left = 0;
+    for (int i = 0; i < 2; i++) {
+        minted += __syscall4(SYS_CAP_MINT, far[i], QUARK_CAP_TYPE_SET_UID, 0, 0) == 0;
+    }
+    if (minted == 2) {
+        ok |= 1;
+    }
+    if (setuid(70) == 0) {
+        for (int i = 0; i < 2; i++) {
+            unsigned long cap[4];
+            left += __syscall3(SYS_CAP_READ, me, far[i], (unsigned long)cap) != QUARK_ERR &&
+                    cap[0] == QUARK_CAP_TYPE_SET_UID;
+        }
+        if (left == 0) {
+            ok |= 2;
+        }
+    }
+    if (setuid(0) == -1 && errno == EPERM) {
+        ok |= 4;
+    }
+    return ok;
+}
+
 /* Root, becoming somebody for a while: `seteuid` leaves the way back. */
 static int for_a_while(void) {
     int ok = 0;
@@ -131,6 +162,7 @@ int main(void) {
     check("a child is in them too", in_a_child(in_three) == 0);
 
     check("root becomes somebody, in a group and in groups besides, for good", in_a_child(for_good) == 63);
+    check("and gives up the right to say who it is wherever it held it", in_a_child(kept_far_up) == 7);
     check("or for a while, and comes back, and then for good", in_a_child(for_a_while) == 31);
     check("and is still root itself", getuid() == 0 && setgroups((size_t)had, was) == 0);
     return failed ? 1 : 0;

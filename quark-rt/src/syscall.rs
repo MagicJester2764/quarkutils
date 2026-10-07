@@ -3000,6 +3000,15 @@ pub fn sys_cap_read(tid: usize, slot: usize) -> Result<CapInfo, ()> {
     Ok(CapInfo { cap_type: out[0], param0: out[1], param1: out[2], valid: out[3] != 0 })
 }
 
+/// How many slots `tid`'s capability space has room for — every slot past
+/// that is empty — as [`sys_cap_read`]'s call answers it: what a walk of all
+/// of them goes to.
+pub fn sys_cap_room(tid: usize) -> Option<usize> {
+    let mut out = [0u64; 4];
+    let ret = unsafe { syscall3(SYS_CAP_READ, tid as u64, 0, out.as_mut_ptr() as u64) };
+    (ret != u64::MAX).then_some(ret as usize)
+}
+
 /// A destination slot meaning "wherever it fits", for [`sys_cap_grant_any`]
 /// and [`sys_cap_take_any`]. The kernel picks a slot from 16 up and says which.
 pub const ANY_SLOT: usize = usize::MAX - 1;

@@ -1079,8 +1079,16 @@ static long set_identity(unsigned long how, int shift, long id) {
  * real and saved ids alone) and given up at one it would not. */
 static void forget_set_uid(void) {
     unsigned long me = __syscall0(SYS_GETPID);
-    for (unsigned long slot = 0; slot < QUARK_CSPACE_SLOTS; slot++) {
-        unsigned long cap[4];
+    /* Every slot the space has room for, as the kernel says: past them all
+       are empty. It looked at sixty-four, of a space of 256 that grows now,
+       and kept a right it had promised to give up wherever it was past the
+       first sixty-four. Never fewer than a space starts with. */
+    unsigned long cap[4];
+    unsigned long room = __syscall3(SYS_CAP_READ, me, 0, (unsigned long)cap);
+    if (room == QUARK_ERR || room < QUARK_CSPACE_FIRST) {
+        room = QUARK_CSPACE_FIRST;
+    }
+    for (unsigned long slot = 0; slot < room; slot++) {
         if (__syscall3(SYS_CAP_READ, me, slot, (unsigned long)cap) != QUARK_ERR && cap[3] &&
             cap[0] == QUARK_CAP_TYPE_SET_UID) {
             __syscall1(SYS_CAP_DELETE, slot);

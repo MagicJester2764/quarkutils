@@ -191,11 +191,17 @@
 #define QUARK_OBJECT_SHARED 2UL
 #define QUARK_OBJECT_EXEC   4UL
 #define SYS_CAP_DELETE      84
+/* Make a capability in the caller's own slot arg0, of kind arg1 with
+   parameters arg2 and arg3: within one it holds of that kind. */
+#define SYS_CAP_MINT        80
 /* What one slot of a task's capabilities holds: arg0 a task, arg1 the slot,
    arg2 four words for its kind, its two parameters and whether it is live.
-   A task may read its own. */
+   A task may read its own. It answers how many slots the space has room
+   for: every slot past that is empty. */
 #define SYS_CAP_READ        92
-#define QUARK_CSPACE_SLOTS  64UL
+/* A space's room before anything has been written in it, and the least a
+   walk of its slots looks at. */
+#define QUARK_CSPACE_FIRST  256UL
 /* The kind that lets its holder say who a task is. */
 #define QUARK_CAP_TYPE_SET_UID 6UL
 
