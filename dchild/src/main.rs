@@ -265,6 +265,19 @@ extern "C" fn among_thousand() -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// `pipehog`: pipes until it is refused, and how many said. Each is a pipe
+/// made and never given a descriptor, so it is bounded by nothing but what
+/// the kernel has: 0 if that was more than the 64 a program was allowed, 1
+/// if not. They go with it, when it ends.
+fn pipe_hog() -> i32 {
+    let mut made = 0usize;
+    while made < 1_000_000 && syscall::sys_pipe_create().is_ok() {
+        made += 1;
+    }
+    println!("pipehog: {} pipes, and then refused", made);
+    if made > 64 { 0 } else { 1 }
+}
+
 /// `threadhog`: threads until it is refused, each asleep until it is told
 /// to go, and how many said. A program without TaskMgmt may have 4,096
 /// tasks, itself one of them: 0 if it had that many, 1 if not.
@@ -1355,6 +1368,9 @@ pub extern "C" fn _start() -> ! {
     }
     if quark_rt::args::argv(1) == Some(&b"thousand"[..]) {
         syscall::sys_exit_program(thousand());
+    }
+    if quark_rt::args::argv(1) == Some(&b"pipehog"[..]) {
+        syscall::sys_exit_program(pipe_hog());
     }
     if quark_rt::args::argv(1) == Some(&b"tlb"[..]) {
         syscall::sys_exit_program(tlb());

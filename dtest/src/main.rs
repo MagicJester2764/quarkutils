@@ -10017,6 +10017,117 @@ fn test_thousand_threads() {
     );
 }
 
+/// What a program makes, made when it makes it: as many of each kind as its
+/// descriptors and the machine's memory allow. Each was a table for the
+/// whole machine — sixteen counters, sixteen timers, thirty-two signal
+/// descriptors, 256 pipes (64 a program) and 256 shared regions — and a
+/// fifth task waiting on one counter was refused.
+fn test_objects() {
+    println!("objects:");
+    let mut fds = [0usize; 300];
+    // Made until there are `want`, or one is refused: how many.
+    let mut make = |want: usize, fds: &mut [usize; 300], one: &mut dyn FnMut() -> Option<usize>| {
+        let mut n = 0;
+        while n < want {
+            let Some(fd) = one() else { break };
+            fds[n] = fd;
+            n += 1;
+        }
+        n
+    };
+    let close = |fds: &[usize]| {
+        for &fd in fds {
+            let _ = syscall::sys_fd_close(fd);
+        }
+    };
+    let n = make(200, &mut fds, &mut || {
+        let fd = unsafe { syscall::syscall2(syscall::SYS_EVENT_CREATE, 0, 0) };
+        (fd != u64::MAX).then_some(fd as usize)
+    });
+    check("a program makes 200 eventfds", n == 200);
+    close(&fds[..n]);
+    let n = make(200, &mut fds, &mut || syscall::sys_timer_create().ok());
+    check("and 200 timerfds", n == 200);
+    close(&fds[..n]);
+    let n = make(100, &mut fds, &mut || syscall::sys_signal_fd(1 << 11).ok());
+    check("and 100 signalfds", n == 100);
+    close(&fds[..n]);
+    let n = make(300, &mut fds, &mut || syscall::sys_memfd_create(1).ok());
+    check("and 300 shared-memory regions", n == 300);
+    close(&fds[..n]);
+    // Pipes, each end a descriptor: from 100 up, out of everything's way
+    // and inside the 1,024 a program may have.
+    let me = syscall::sys_getpid() as usize;
+    let mut pipes = 0;
+    while pipes < 300 {
+        let Ok(h) = syscall::sys_pipe_create() else { break };
+        let (r, w) = (100 + 2 * pipes, 101 + 2 * pipes);
+        if syscall::sys_pipe_fd_set(me, r, h, false).is_err() || syscall::sys_pipe_fd_set(me, w, h, true).is_err() {
+            break;
+        }
+        pipes += 1;
+    }
+    check("and 300 pipes", pipes == 300);
+    for fd in 100..100 + 2 * pipes {
+        let _ = syscall::sys_fd_close(fd);
+    }
+
+    // Eight tasks waiting on one counter, which a write of eight to it — a
+    // counter that is a semaphore, so that each takes one — wakes, all of
+    // them. The fifth was refused, and its read came back at once.
+    use core::sync::atomic::Ordering::SeqCst;
+    let fd = unsafe { syscall::syscall2(syscall::SYS_EVENT_CREATE, 0, 1) };
+    OBJECTS_FD.store(fd as usize, SeqCst);
+    OBJECTS_READ.store(0, SeqCst);
+    let mut readers = [0usize; 8];
+    let mut started = 0;
+    while fd != u64::MAX && started < 8 {
+        let Ok(t) = thread::spawn_with_stack(counter_reader, 4) else { break };
+        readers[started] = t.tid();
+        started += 1;
+    }
+    // Long enough for each to have read and be waiting; one refused has
+    // given up by now, and says so.
+    syscall::sleep_ticks(20);
+    let early = OBJECTS_READ.load(SeqCst);
+    let woke = fd != u64::MAX
+        && syscall::sys_fd_write(fd as usize, &8u64.to_le_bytes()) == 8
+        && (0..100).any(|_| OBJECTS_READ.load(SeqCst) == 8 || {
+            syscall::sleep_ticks(1);
+            false
+        });
+    check("eight tasks wait on one counter, and all eight are woken", started == 8 && early == 0 && woke);
+    for &tid in &readers[..started] {
+        let _ = wait_for(tid);
+    }
+    if fd != u64::MAX {
+        let _ = syscall::sys_fd_close(fd as usize);
+    }
+
+    // A program that makes pipes until it is refused is refused — by the
+    // machine's memory and its table, past the 64 it was allowed — and the
+    // machine goes on: a program started afterwards runs.
+    check("a program making pipes until refused is refused, past 64", run(b"dchild", &[b"pipehog"]) == Some(0));
+    check(
+        "and a program started afterwards runs, and makes a thread",
+        matches!(run(b"dchild", &[b"together"]), Some(bits) if bits & !3 == 0),
+    );
+}
+
+/// The counter the eight wait on, and how many have read one from it.
+static OBJECTS_FD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static OBJECTS_READ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// One of the eight: a read that waits, counted if it got its one.
+extern "C" fn counter_reader() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let mut got = [0u8; 8];
+    if syscall::sys_fd_read(OBJECTS_FD.load(SeqCst), &mut got) == 8 && u64::from_le_bytes(got) == 1 {
+        OBJECTS_READ.fetch_add(1, SeqCst);
+    }
+    syscall::sys_exit_code(0);
+}
+
 /// A kernel stack has an unmapped page below it, so a call that runs out of
 /// stack faults on that page, and the fault says it was an overflow and
 /// whose. Only a kernel built with `stacktest` can be made to: there
@@ -10241,6 +10352,7 @@ pub extern "C" fn _start() -> ! {
         ("handlers", test_handlers),
         ("usage", test_usage),
         ("smp", test_smp),
+        ("objects", test_objects),
         ("stackguard", test_stack_guard),
     ];
     let only = quark_rt::args::argv(1);
