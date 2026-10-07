@@ -10017,6 +10017,23 @@ fn test_thousand_threads() {
     );
 }
 
+/// A kernel stack has an unmapped page below it, so a call that runs out of
+/// stack faults on that page, and the fault says it was an overflow and
+/// whose. Only a kernel built with `stacktest` can be made to: there
+/// `SYS_MEM_INFO` 6 calls itself until it has, which ends the machine, and
+/// what is checked is what serial said. Any other kernel answers that it
+/// was not built, and there is nothing here to check.
+fn test_stack_guard() {
+    println!("stackguard:");
+    println!("        running out of kernel stack, which a kernel built for it ends the machine for");
+    let answer = unsafe { syscall::syscall1(syscall::SYS_MEM_INFO, 6) };
+    if answer == u64::MAX {
+        println!("        not built: this kernel was built without stacktest");
+        return;
+    }
+    check("a kernel that ran out of stack came back", false);
+}
+
 /// A thread is joined one of two ways, and the thread says which: waited
 /// for, as any child is, or through a word the kernel clears when it ends.
 /// The second is a C library's, whose threads are not its children.
@@ -10224,6 +10241,7 @@ pub extern "C" fn _start() -> ! {
         ("handlers", test_handlers),
         ("usage", test_usage),
         ("smp", test_smp),
+        ("stackguard", test_stack_guard),
     ];
     let only = quark_rt::args::argv(1);
     let known = only.is_none_or(|o| SECTIONS.iter().any(|(name, _)| o == name.as_bytes()));
