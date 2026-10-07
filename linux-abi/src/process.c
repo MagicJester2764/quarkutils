@@ -55,6 +55,7 @@ long __quark_fork(void) {
 
 void __quark_locks_forked(void) {
     __quark_arena_forked();
+    __quark_side_forked();
 }
 
 #define PAGE_SIZE 4096UL

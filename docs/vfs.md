@@ -377,7 +377,8 @@ ordinary ones, which the kernel keeps for exactly this. `CHDIR` opens the
 directory — the caller must be able to search it — and puts a descriptor for
 it there, replacing what was there; `FCHDIR` does the same with an open
 directory handle's. A relative path with base 0 starts from whatever
-directory the caller's descriptor 64 names, and from `/` if it names none.
+directory the caller's working directory (`FD_CWD`) names, and from `/` if
+it names none.
 `GETCWD` fills the lent buffer with that directory's path and replies with
 its length; it is `NOT_FOUND` once the directory has been removed.
 

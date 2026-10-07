@@ -57,8 +57,29 @@
 #define LX_ENETDOWN   100
 #define LX_EINPROGRESS 115
 
-/* How many descriptors a program has: as many as the kernel's table holds. */
-#define MAX_FDS 64
+/* The most descriptors a program can have: the highest the kernel lets its
+   limit go. What it may have now is its limit (`SYS_FD_LIMIT`). */
+#define MAX_FDS 65536
+
+/* What this layer keeps about one descriptor (fdside.c). Every field is read
+   and written whole, with an atomic: another thread may be asking about the
+   same descriptor. */
+struct __quark_side {
+    unsigned char kind;        /* files.c: what it is, or not yet asked */
+    unsigned char nonblock;    /* files.c: marked not to wait */
+    unsigned char wall;        /* syscall.c: a timer on the wall clock */
+    unsigned char reuse;       /* inet.c: SO_REUSEADDR */
+    unsigned int handle;       /* files.c: the file server's handle for it */
+    unsigned long rcv_timeout; /* inet.c: SO_RCVTIMEO, nanoseconds */
+    unsigned long snd_timeout; /* inet.c: SO_SNDTIMEO */
+};
+/* `fd`'s record, made if it has none; 0 out of range or with no memory. */
+struct __quark_side *__quark_side(long fd);
+/* `fd`'s record if one was ever made, else 0: what is read reads as noughts. */
+struct __quark_side *__quark_side_if(long fd);
+void __quark_side_forked(void);
+/* Pages of zeroes from the arena, for this layer's own tables; 0 if none. */
+void *__quark_pages(unsigned long pages);
 
 /* A lock for the few words this layer keeps between calls: an `int`, 0 when
    nobody has it. Every thread of a program comes through here, and with

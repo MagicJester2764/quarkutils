@@ -150,9 +150,13 @@ struct sock {
 
 /* How long a receive and a send may wait, in nanoseconds — nought for as
    long as it takes — and whether SO_REUSEADDR was said. */
-static unsigned long rcv_timeout[MAX_FDS];
-static unsigned long snd_timeout[MAX_FDS];
-static unsigned char reuse[MAX_FDS];
+/* A socket's timeouts and SO_REUSEADDR are in its descriptor's record
+   (fdside.c); a descriptor with none has neither. */
+static unsigned long timeout_of(long fd, int sending) {
+    struct __quark_side *s = __quark_side_if(fd);
+    return !s ? 0 : sending ? __atomic_load_n(&s->snd_timeout, __ATOMIC_RELAXED)
+                            : __atomic_load_n(&s->rcv_timeout, __ATOMIC_RELAXED);
+}
 
 /* Gathering a datagram from several pieces, or scattering one into them:
    one buffer, one thread at a time. */
@@ -205,10 +209,11 @@ unsigned long __quark_net(int again) {
 }
 
 void __quark_inet_forget(long fd) {
-    if (fd >= 0 && fd < MAX_FDS) {
-        rcv_timeout[fd] = 0;
-        snd_timeout[fd] = 0;
-        reuse[fd] = 0;
+    struct __quark_side *s = __quark_side_if(fd);
+    if (s) {
+        __atomic_store_n(&s->rcv_timeout, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->snd_timeout, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->reuse, 0, __ATOMIC_RELAXED);
     }
 }
 
@@ -435,7 +440,7 @@ long __quark_inet_connect(long fd, const void *addr, unsigned long len) {
     }
     /* Linux's connect waits until it knows; this one in a poll, which a
        signal ends. Ended so, the connection goes on being made, as there. */
-    unsigned long deadline = deadline_after(fd < MAX_FDS ? snd_timeout[fd] : 0);
+    unsigned long deadline = deadline_after(timeout_of(fd, 1));
     for (;;) {
         long w8 = wait_for(fd, QW_WRITABLE, deadline);
         if (w8 == -LX_EAGAIN) {
@@ -463,7 +468,7 @@ long __quark_inet_accept(long fd, void *addr, unsigned int *len, long flags) {
     if (!sock_of(fd, &s)) {
         return -LX_EBADF;
     }
-    unsigned long deadline = deadline_after(fd < MAX_FDS ? rcv_timeout[fd] : 0);
+    unsigned long deadline = deadline_after(timeout_of(fd, 0));
     for (;;) {
         long r = ask(&s, OP_ACCEPT | NOT_WAITING, 0, 0, 0, 0, NULL, 0, 0, &reply);
         if (r == 0) {
@@ -519,7 +524,7 @@ long __quark_inet_shutdown(long fd, long how) {
    wait or a signal comes, and then says how much went. */
 static long send_bytes(long fd, const struct sock *s, const void *buf, unsigned long len, const unsigned long to[3],
                        long flags) {
-    unsigned long deadline = deadline_after(fd < MAX_FDS ? snd_timeout[fd] : 0);
+    unsigned long deadline = deadline_after(timeout_of(fd, 1));
     unsigned long sent = 0;
     for (;;) {
         struct quark_msg reply;
@@ -549,7 +554,7 @@ static long send_bytes(long fd, const struct sock *s, const void *buf, unsigned 
 /* Bytes or a datagram into `buf`, waiting as Linux would: how much; and
    where it came from, and how long a datagram was, into `from`. */
 static long recv_bytes(long fd, const struct sock *s, void *buf, unsigned long len, long flags, unsigned long from[4]) {
-    unsigned long deadline = deadline_after(fd < MAX_FDS ? rcv_timeout[fd] : 0);
+    unsigned long deadline = deadline_after(timeout_of(fd, 0));
     unsigned long op = OP_RECV_FROM | NOT_WAITING | ((flags & MSG_PEEK) ? ONLY_LOOKING : 0);
     for (;;) {
         struct quark_msg reply;
@@ -812,15 +817,15 @@ long __quark_inet_getsockopt(long fd, long level, long name, void *val, unsigned
             return r ? r : int_answer(val, len, (long)(reply.data[0] >> 16));
         }
         case SO_REUSEADDR:
-            return int_answer(val, len, fd < MAX_FDS ? reuse[fd] : 0);
+            return int_answer(val, len, __quark_side_if(fd) ? __atomic_load_n(&__quark_side_if(fd)->reuse, __ATOMIC_RELAXED) : 0);
         case SO_REUSEPORT:
         case SO_BROADCAST:
         case SO_PASSCRED:
             return int_answer(val, len, 0);
         case SO_RCVTIMEO:
-            return time_answer(val, len, fd < MAX_FDS ? rcv_timeout[fd] : 0);
+            return time_answer(val, len, timeout_of(fd, 0));
         case SO_SNDTIMEO:
-            return time_answer(val, len, fd < MAX_FDS ? snd_timeout[fd] : 0);
+            return time_answer(val, len, timeout_of(fd, 1));
         case SO_LINGER: {
             /* Off: a close says goodbye, and does not wait for it. */
             int off[2] = {0, 0};
@@ -892,8 +897,11 @@ long __quark_inet_setsockopt(long fd, long level, long name, const void *val, un
         switch (name) {
         case SO_KEEPALIVE: opt = OPT_KEEPALIVE; break;
         case SO_REUSEADDR:
-            if (fd < MAX_FDS) {
-                reuse[fd] = v != 0;
+            {
+                struct __quark_side *side = __quark_side(fd);
+                if (side) {
+                    __atomic_store_n(&side->reuse, v != 0, __ATOMIC_RELAXED);
+                }
             }
             return 0;
         case SO_RCVTIMEO:
@@ -903,9 +911,11 @@ long __quark_inet_setsockopt(long fd, long level, long name, const void *val, un
             if (bad) {
                 return bad;
             }
-            if (fd < MAX_FDS) {
-                (name == SO_RCVTIMEO ? rcv_timeout : snd_timeout)[fd] = ns;
+            struct __quark_side *side = __quark_side(fd);
+            if (!side) {
+                return -LX_ENOMEM;
             }
+            __atomic_store_n(name == SO_RCVTIMEO ? &side->rcv_timeout : &side->snd_timeout, ns, __ATOMIC_RELAXED);
             return 0;
         }
         /* Taken and not kept: the buffers are what they are, a port is

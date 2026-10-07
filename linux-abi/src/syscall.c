@@ -443,6 +443,20 @@ static long do_mmap(unsigned long hint, unsigned long len, long flags) {
     return (long)at;
 }
 
+/* Pages for this layer's own tables (fdside.c): anonymous memory from the
+   arena, as `mmap` gives a program, and never given back. */
+void *__quark_pages(unsigned long pages) {
+    __quark_lock(&arena_lock);
+    unsigned long at = place(0, pages, 0);
+    if (at == 0 || __syscall3(SYS_MAP_ANON, at, pages, QUARK_MAP_ACCOUNT) == QUARK_ERR) {
+        __quark_unlock(&arena_lock);
+        return 0;
+    }
+    placed(at, pages);
+    __quark_unlock(&arena_lock);
+    return (void *)at;
+}
+
 /* Map memory named by a descriptor, at an address of our choosing. */
 static long do_mmap_fd(long fd, unsigned long hint, unsigned long len, long flags) {
     if (len == 0) {
@@ -593,9 +607,8 @@ static long job_answer(unsigned long r) {
     return (long)r;
 }
 
-/* Which timer descriptors were made on the clock that says the date: a bit
-   for each descriptor. */
-static unsigned long timer_wall;
+/* Which timer descriptors were made on the clock that says the date: a mark
+   in each descriptor's record (fdside.c). */
 
 /* Is `clock` one that says the date, rather than how long the machine has
    been on? */
@@ -731,9 +744,19 @@ static long do_getrlimit(long what, unsigned long *lim) {
         __syscall4(SYS_CPU_LIMIT, 0, 0, (unsigned long)lim, 1);
         return 0;
     }
+    if (what == LX_RLIMIT_NOFILE) {
+        /* The kernel's: what the program may have, and how far it may
+           raise it. */
+        unsigned long r = __syscall4(SYS_FD_LIMIT, 0, 0, 0, 0);
+        if (r == QUARK_ERR) {
+            return -LX_EINVAL;
+        }
+        lim[0] = r & 0xFFFFFFFFUL;
+        lim[1] = r >> 32;
+        return 0;
+    }
     unsigned long v;
     switch (what) {
-    case LX_RLIMIT_NOFILE: v = 64; break;           /* the kernel's table */
     case LX_RLIMIT_STACK:  v = 256 * 4096UL; break; /* what a spawner gives */
     /* How many signals may wait behind their first, which is what sysconf
        answers _SC_SIGQUEUE_MAX with: the kernel's room for a program. */
@@ -748,6 +771,24 @@ static long do_getrlimit(long what, unsigned long *lim) {
 static long do_setrlimit(long what, const unsigned long *lim) {
     if (!lim) {
         return -LX_EFAULT;
+    }
+    if (what == LX_RLIMIT_NOFILE) {
+        if (lim[0] > lim[1]) {
+            return -LX_EINVAL;
+        }
+        unsigned long hard = __syscall4(SYS_FD_LIMIT, 0, 0, 0, 0) >> 32;
+        unsigned long h = lim[1] == LX_RLIM_INFINITY ? hard : lim[1];
+        unsigned long s = lim[0] == LX_RLIM_INFINITY ? h : lim[0];
+        if (h > hard) {
+            return -LX_EPERM; /* raising how far takes what no program has */
+        }
+        /* What it may have first, which is never above how far it may
+           go; then how far, which is then never below it. */
+        if (__syscall4(SYS_FD_LIMIT, 1, s, 0, 0) == QUARK_ERR
+            || (h != hard && __syscall4(SYS_FD_LIMIT, 2, h, 0, 0) == QUARK_ERR)) {
+            return -LX_EINVAL;
+        }
+        return 0;
     }
     if (what != LX_RLIMIT_CPU) {
         /* Not kept: a program that lowers one is told it did. */
@@ -1763,11 +1804,10 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (fd == QUARK_ERR) {
             return -LX_EMFILE;
         }
-        if (fd < MAX_FDS) {
-            if (wall_clock(a1)) {
-                __atomic_fetch_or(&timer_wall, 1UL << fd, __ATOMIC_SEQ_CST);
-            } else {
-                __atomic_fetch_and(&timer_wall, ~(1UL << fd), __ATOMIC_SEQ_CST);
+        {
+            struct __quark_side *side = wall_clock(a1) ? __quark_side((long)fd) : __quark_side_if((long)fd);
+            if (side) {
+                __atomic_store_n(&side->wall, wall_clock(a1) ? 1 : 0, __ATOMIC_SEQ_CST);
             }
         }
         return (long)fd;
@@ -1789,8 +1829,8 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         if (first && (a2 & 1 /* TFD_TIMER_ABSTIME */)) {
             /* What the timer's clock will read. A time already past is a
                timer that fires at once. */
-            int wall = a1 >= 0 && a1 < MAX_FDS
-                       && (__atomic_load_n(&timer_wall, __ATOMIC_SEQ_CST) >> a1 & 1);
+            struct __quark_side *side = __quark_side_if(a1);
+            int wall = side && __atomic_load_n(&side->wall, __ATOMIC_SEQ_CST);
             unsigned long reads = wall ? __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL) : quark_now();
             first = first > reads ? first - reads : 1;
         }
@@ -1920,8 +1960,9 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
     case LX_prctl:
         return prctl(a1, a2);
 
-    /* Limits. Two are facts about this system — a program has sixty-four
-       descriptors and a megabyte of stack — and the rest are not kept. */
+    /* Limits. The descriptors' are the kernel's (`SYS_FD_LIMIT`), the
+       processor time's are too, the stack is a fact about this system — a
+       megabyte — and the rest are not kept. */
     case LX_getrlimit:
         return do_getrlimit(a1, (unsigned long *)a2);
     case LX_setrlimit:

@@ -488,9 +488,48 @@ struct lx_sockaddr_un {
 
 /* What this program named its sockets and connected them to, for
    getsockname and getpeername: the names are the file server's, and the
-   kernel keeps neither. Forgotten at exec, as a C library's memory is. */
-static char named_as[MAX_FDS][SUN_PATH];
-static char connected_to[MAX_FDS][SUN_PATH];
+   kernel keeps neither. Forgotten at exec, as a C library's memory is. Two
+   paths a descriptor, in pages of them made the first time one in the page
+   is named, as the descriptors' records are (fdside.c): a table for every
+   descriptor a program may have would be fourteen megabytes. */
+#define NAMES_PER_PAGE (4096 / (2 * SUN_PATH))
+static char (*name_pages[MAX_FDS / NAMES_PER_PAGE + 1])[2][SUN_PATH];
+static int names_lock;
+
+static void remember(char *to, const char *path);
+
+/* `fd`'s two names, bound and connected; made if `make` and there were
+   none. 0 if there are none, or no room for them. */
+static char (*names_of(long fd, int make))[SUN_PATH] {
+    if (fd < 0 || fd >= MAX_FDS) {
+        return 0;
+    }
+    unsigned long p = (unsigned long)fd / NAMES_PER_PAGE;
+    char (*page)[2][SUN_PATH] = __atomic_load_n(&name_pages[p], __ATOMIC_ACQUIRE);
+    if (!page && make) {
+        __quark_lock(&names_lock);
+        page = name_pages[p];
+        if (!page) {
+            page = __quark_pages(1);
+            __atomic_store_n(&name_pages[p], page, __ATOMIC_RELEASE);
+        }
+        __quark_unlock(&names_lock);
+    }
+    return page ? page[(unsigned long)fd % NAMES_PER_PAGE] : 0;
+}
+
+/* `fd`'s bound name, or with `peer` what it is connected to: "" for none. */
+static const char *name_of(long fd, int peer) {
+    char (*names)[SUN_PATH] = names_of(fd, 0);
+    return names ? names[peer] : "";
+}
+
+static void set_name(long fd, int peer, const char *path) {
+    char (*names)[SUN_PATH] = names_of(fd, path && *path);
+    if (names) {
+        remember(names[peer], path ? path : "");
+    }
+}
 
 static unsigned long kind_of(long fd) {
     unsigned long k = __syscall1(SYS_FD_KIND, (unsigned long)fd);
@@ -570,8 +609,8 @@ long __quark_socket(long domain, long type, long protocol) {
     if (type & LX_SOCK_CLOEXEC) {
         __syscall3(SYS_FD_FLAGS, fd, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
     }
-    named_as[fd][0] = 0;
-    connected_to[fd][0] = 0;
+    set_name((long)fd, 0, "");
+    set_name((long)fd, 1, "");
     return (long)fd;
 }
 
@@ -595,9 +634,7 @@ long __quark_bind(long fd, const void *addr, unsigned long len) {
     if (err) {
         return __quark_vfs_errno(err);
     }
-    if (fd >= 0 && fd < MAX_FDS) {
-        remember(named_as[fd], path);
-    }
+    set_name(fd, 0, path);
     return 0;
 }
 
@@ -671,10 +708,8 @@ long __quark_accept(long fd, void *addr, unsigned int *len, long flags) {
     if (flags & LX_SOCK_CLOEXEC) {
         __syscall3(SYS_FD_FLAGS, r, QUARK_FD_SETFLAGS, QUARK_FD_CLOEXEC);
     }
-    if (r < MAX_FDS) {
-        remember(named_as[r], fd >= 0 && fd < MAX_FDS ? named_as[fd] : "");
-        connected_to[r][0] = 0;
-    }
+    set_name((long)r, 0, name_of(fd, 0));
+    set_name((long)r, 1, "");
     unnamed(addr, len, "");
     return (long)r;
 }
@@ -713,9 +748,7 @@ long __quark_connect(long fd, const void *addr, unsigned long len) {
             return -LX_EINTR;
         }
     }
-    if (fd >= 0 && fd < MAX_FDS) {
-        remember(connected_to[fd], path);
-    }
+    set_name(fd, 1, path);
     return 0;
 }
 
@@ -736,7 +769,7 @@ long __quark_sockname(long fd, void *addr, unsigned int *len, int peer) {
     if (peer && k != QUARK_FD_KIND_STREAM) {
         return -LX_ENOTCONN;
     }
-    const char *path = fd < MAX_FDS ? (peer ? connected_to[fd] : named_as[fd]) : "";
+    const char *path = name_of(fd, peer);
     unnamed(addr, len, path);
     return 0;
 }
@@ -863,7 +896,7 @@ long __quark_recvfrom(long fd, void *buf, unsigned long len, long flags, void *a
     struct msghdr m = {NULL, 0, &v, 1, NULL, 0, 0};
     long n = __quark_recvmsg(fd, &m, flags);
     if (n >= 0 && addr && alen) {
-        unnamed(addr, alen, fd >= 0 && fd < MAX_FDS ? connected_to[fd] : "");
+        unnamed(addr, alen, name_of(fd, 1));
     }
     return n;
 }

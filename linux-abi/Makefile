@@ -20,7 +20,7 @@ CFLAGS  += $(EXTRA_CFLAGS)
 # whichever ran last would decide what the other one linked.
 OBJS    := src/syscall.o src/start.o src/files.o src/net.o src/inet.o src/clone.o \
            src/clone-entry.o src/vfs-client.o src/process.o src/pty.o \
-           src/signal.o
+           src/signal.o src/fdside.o
 # Linked for its section rather than its symbols, so it cannot live in the
 # archive: nothing references it and it would never be pulled in.
 MANIFEST := src/manifest.o

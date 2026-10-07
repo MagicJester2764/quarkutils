@@ -16,6 +16,8 @@ manymaps
 filetest
 dirtest
 threadfile
+fdmany
+fdfiles
 randtest
 linktest
 cwdtest

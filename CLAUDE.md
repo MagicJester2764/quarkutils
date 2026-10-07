@@ -515,7 +515,7 @@ table — only a note of which numbers are files, forgotten whenever something
 changes what a number names (`__quark_fd_forget`; a path that installs a
 descriptor some other way, as `recvmsg` does, has to say so). Three things
 ride along in the same table and so follow a program the same way: its
-working directory (descriptor 64), its umask (`SYS_UMASK`), and nothing else.
+working directory (`FD_CWD`), its umask (`SYS_UMASK`), and nothing else.
 `open` hands out numbers from 3, where POSIX says the lowest free: 0, 1 and 2
 are where a program's standard descriptors go, and a file that landed on one
 because it happened to be closed is the bug that rule invites.
@@ -1795,7 +1795,10 @@ mounts`):
   and stays with the descriptor.
 - **A child is the thread's that forked it**: `waitpid` from another thread
   of the program is `ECHILD`.
-- A program has 64 descriptors, files included; the VFS has 512 handles for
+- A program has as many descriptors as its limit, files included — 1,024 to
+  start, raised as far as 65,536; the C layer keeps what it knows of each
+  in a record made the first time it is spoken of (`linux-abi/src/fdside.c`).
+  The VFS has 512 handles for
   everybody, and 128 for any one program. A pipe, a terminal and a stream all
   say they are a character device to `fstat`: nothing tells the layer what
   kind a kernel descriptor is.

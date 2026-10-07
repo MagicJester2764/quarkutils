@@ -421,9 +421,10 @@ pub const SYS_FD_READY: u64 = 233;
 /// A connected pair whose writes are messages, each read whole: a
 /// `socketpair` of `SOCK_SEQPACKET`.
 pub const SYS_PACKET_PAIR: u64 = 234;
+pub const SYS_FD_LIMIT: u64 = 235;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
-pub const FD_CWD: usize = 64;
+pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 /// `SYS_FD_FLAGS`: close the descriptor when the program becomes another.
 pub const FD_FLAG_CLOEXEC: u64 = 1;
 
@@ -2853,6 +2854,13 @@ pub fn sys_pipe_fd_set(tid: usize, fd: usize, pipe_handle: usize, is_write: bool
 
 /// Duplicate the caller's source fd onto a target task's target fd.
 /// Handles pipe refcounting automatically. Requires CAP_TASK_MGMT.
+/// This program's descriptor limits: `op` 0 reads them, answering
+/// `(how far it may raise it << 32) | what it may have`; 1 sets what it may
+/// have to `n`; 2 lowers how far to `n`. `u64::MAX` when refused.
+pub fn sys_fd_limit(op: u64, n: u64) -> u64 {
+    unsafe { syscall2(SYS_FD_LIMIT, op, n) }
+}
+
 pub fn sys_fd_dup(target_tid: usize, target_fd: usize, source_fd: usize) -> Result<(), ()> {
     let ret = unsafe {
         syscall3(SYS_FD_DUP, target_tid as u64, target_fd as u64, source_fd as u64)
@@ -3049,8 +3057,8 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// kernel installs — the same major, a minor the kernel has reached, and at an
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
-pub const ABI_VERSION_MAJOR: u32 = 3;
-pub const ABI_VERSION_MINOR: u32 = 37;
+pub const ABI_VERSION_MAJOR: u32 = 4;
+pub const ABI_VERSION_MINOR: u32 = 0;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

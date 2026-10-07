@@ -268,7 +268,9 @@ does on Linux. What is different is at the edges:
 
 ## Files and descriptors
 
-- A program has **64 descriptors**. `open` hands out numbers from 3: 0, 1
+- A program has **1,024 descriptors** to start, and may raise that as far as
+  65,536 (`setrlimit`'s `RLIMIT_NOFILE`, which the kernel keeps). `open`
+  hands out numbers from 3: 0, 1
   and 2 are where the standard three go, and a file never lands on one
   because it happened to be closed.
 - A file is a descriptor the kernel knows about, so it is copied by `fork`,
@@ -411,8 +413,9 @@ There is no time zone but what `TZ` spells out.
   `SIGXCPU`, once a second, and at the hard one it is killed, as on Linux.
   A child inherits it, and raising the hard limit takes the same right.
   The other limits are kept nowhere: setting one says it succeeded, and
-  asking says what the system has — 64 descriptors — or that there is no
-  limit. `prlimit` is for the caller's own process.
+  asking says there is no limit — except `RLIMIT_NOFILE`, which is the
+  kernel's and real: 1,024 and 65,536 to start, set and lowered as Linux
+  sets them. `prlimit` is for the caller's own process.
 
 ## Wide registers
 

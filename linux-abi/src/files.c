@@ -37,8 +37,6 @@
 #define A_FILE  2
 #define A_NET   3 /* a socket of the network, which inet.c speaks for */
 
-static unsigned char kind[MAX_FDS];
-static unsigned short handle_of[MAX_FDS];
 
 /* Whether this program has ever taken a lock of its own (fcntl's F_SETLK),
    which is when closing a descriptor has something to drop. */
@@ -109,20 +107,33 @@ static int streq(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* The note of what a descriptor is, read and written whole and in order:
-   another thread may be asking about the same descriptor, and one that
-   reads "a file" must find the handle already there. */
+/* The note of what a descriptor is (its record, fdside.c), read and written
+   whole and in order: another thread may be asking about the same
+   descriptor, and one that reads "a file" must find the handle already
+   there. With no memory for a record nothing is noted, and the descriptor is
+   asked about again next time. */
 static unsigned char kind_of(long fd) {
-    return __atomic_load_n(&kind[fd], __ATOMIC_ACQUIRE);
+    struct __quark_side *s = __quark_side_if(fd);
+    return s ? __atomic_load_n(&s->kind, __ATOMIC_ACQUIRE) : UNKNOWN;
+}
+
+static void note(long fd, unsigned char is) {
+    struct __quark_side *s = __quark_side(fd);
+    if (s) {
+        __atomic_store_n(&s->kind, is, __ATOMIC_RELEASE);
+    }
 }
 
 static void note_kernels(long fd) {
-    __atomic_store_n(&kind[fd], KERNELS, __ATOMIC_RELEASE);
+    note(fd, KERNELS);
 }
 
 static void note_file(long fd, unsigned long handle) {
-    __atomic_store_n(&handle_of[fd], (unsigned short)handle, __ATOMIC_RELAXED);
-    __atomic_store_n(&kind[fd], A_FILE, __ATOMIC_RELEASE);
+    struct __quark_side *s = __quark_side(fd);
+    if (s) {
+        __atomic_store_n(&s->handle, (unsigned int)handle, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->kind, A_FILE, __ATOMIC_RELEASE);
+    }
 }
 
 /* Something has changed what `fd` names, or is about to. Whatever comes to
@@ -130,18 +141,23 @@ static void note_file(long fd, unsigned long handle) {
    there did not, left behind, made the next thing made there answer EAGAIN
    to a read that should have waited. */
 void __quark_fd_forget(long fd) {
-    if (fd >= 0 && fd < MAX_FDS) {
-        __atomic_store_n(&kind[fd], UNKNOWN, __ATOMIC_RELEASE);
+    struct __quark_side *s = __quark_side_if(fd);
+    if (s) {
+        __atomic_store_n(&s->kind, UNKNOWN, __ATOMIC_RELEASE);
         __quark_fd_set_nonblock(fd, 0);
         __quark_inet_forget(fd);
     }
 }
 
 /* What `fd` is, asked once — whose it is, if anybody serves it — and noted
-   until it is forgotten. */
-static unsigned char what_is(long fd) {
+   until it is forgotten. For a file, the server's handle for it in
+   `*handle`, when that is asked for. */
+static unsigned char what_is(long fd, unsigned long *handle) {
     unsigned char is = kind_of(fd);
     if (is != UNKNOWN) {
+        if (is == A_FILE && handle) {
+            *handle = __atomic_load_n(&__quark_side_if(fd)->handle, __ATOMIC_RELAXED);
+        }
         return is;
     }
     unsigned long named[2];
@@ -151,10 +167,13 @@ static unsigned char what_is(long fd) {
            kernel's descriptors are. */
         if (named[0] == quark_vfs() && !(named[1] & QUARK_VFS_NOT_A_FILE)) {
             note_file(fd, named[1]);
+            if (handle) {
+                *handle = named[1];
+            }
             return A_FILE;
         }
         if (named[0] == __quark_net(0)) {
-            __atomic_store_n(&kind[fd], A_NET, __ATOMIC_RELEASE);
+            note(fd, A_NET);
             return A_NET;
         }
     }
@@ -163,7 +182,7 @@ static unsigned char what_is(long fd) {
 }
 
 int __quark_fd_is_net(long fd) {
-    return fd >= 0 && fd < MAX_FDS && what_is(fd) == A_NET;
+    return fd >= 0 && fd < MAX_FDS && what_is(fd, 0) == A_NET;
 }
 
 /* Whether `fd` is a file, and the server's handle for it if so. */
@@ -171,13 +190,7 @@ static int is_file(long fd, unsigned long *handle) {
     if (fd < 0 || fd >= MAX_FDS) {
         return 0;
     }
-    if (what_is(fd) != A_FILE) {
-        return 0;
-    }
-    if (handle) {
-        *handle = __atomic_load_n(&handle_of[fd], __ATOMIC_RELAXED);
-    }
-    return 1;
+    return what_is(fd, handle) == A_FILE;
 }
 
 int __quark_fd_is_file(long fd) {
@@ -1640,28 +1653,23 @@ long __quark_flock(long fd, long op) {
    and there is nothing to wait for. It is this program's own note and does
    not outlive it: what a program is exec'd into holding starts as waiting.
 
-   One word for every descriptor, and so changed with one instruction: two
-   threads marking two descriptors at once, each reading the word and
-   writing it back, lost one of the marks — and a descriptor that was asked
-   not to wait and waits is a program that stops. */
-static unsigned long nonblock_mask;
+   A byte in each descriptor's record (fdside.c), stored whole: two threads
+   marking two descriptors at once, each reading one word of marks and
+   writing it back, lost one of the marks when it was a word — and a
+   descriptor that was asked not to wait and waits is a program that stops. */
 
 /* Say that a descriptor was made non-blocking when it was created, which is
    what `pipe2` and `eventfd` take a flag for. */
 void __quark_fd_set_nonblock(long fd, int on) {
-    if (fd < 0 || fd >= MAX_FDS) {
-        return;
-    }
-    if (on) {
-        __atomic_fetch_or(&nonblock_mask, 1ul << fd, __ATOMIC_SEQ_CST);
-    } else {
-        __atomic_fetch_and(&nonblock_mask, ~(1ul << fd), __ATOMIC_SEQ_CST);
+    struct __quark_side *s = on ? __quark_side(fd) : __quark_side_if(fd);
+    if (s) {
+        __atomic_store_n(&s->nonblock, on ? 1 : 0, __ATOMIC_SEQ_CST);
     }
 }
 
 int __quark_fd_is_nonblock(long fd) {
-    return fd >= 0 && fd < MAX_FDS &&
-           (__atomic_load_n(&nonblock_mask, __ATOMIC_SEQ_CST) & (1ul << fd)) != 0;
+    struct __quark_side *s = __quark_side_if(fd);
+    return s && __atomic_load_n(&s->nonblock, __ATOMIC_SEQ_CST) != 0;
 }
 
 #define LX_FD_CLOEXEC 1

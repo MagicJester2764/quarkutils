@@ -123,6 +123,51 @@ fn test_close() {
     );
 }
 
+/// A program's descriptors at a desktop's size (ABI 4.0): a thousand of
+/// them, 64 an ordinary number, the working directory a number of its own,
+/// and a limit the program can raise. A table of 64 refused all of it.
+fn test_fd_limit() {
+    println!("fdlimit:");
+    let me = syscall::sys_getpid() as usize;
+    let want = syscall::sys_fd_kind(1);
+    let mut made = 0;
+    for n in 3..1003 {
+        if syscall::sys_fd_dup(me, n, 1).is_err() {
+            break;
+        }
+        made += 1;
+    }
+    let same = want.is_some() && (3..3 + made).all(|n| syscall::sys_fd_kind(n) == want);
+    check("a program holds 1,000 descriptors", made == 1000 && same);
+    for n in 3..3 + made {
+        let _ = syscall::sys_fd_close(n);
+    }
+
+    // 64 was the working directory's; it is anybody's number now.
+    let mut got = [0u8; 4];
+    let ordinary = own_pipe(1000, 1001).is_ok()
+        && syscall::sys_fd_dup(me, 64, 1001).is_ok()
+        && syscall::sys_fd_write(64, b"64") == 2
+        && syscall::sys_fd_read(1000, &mut got) == 2
+        && &got[..2] == b"64";
+    check("descriptor 64 is an ordinary one", ordinary);
+    check(
+        "the working directory is not descriptor 64",
+        ordinary && syscall::sys_fd_served(syscall::FD_CWD).is_ok(),
+    );
+    for n in [64, 1000, 1001] {
+        let _ = syscall::sys_fd_close(n);
+    }
+
+    check("the limits are 1,024 and 65,536", syscall::sys_fd_limit(0, 0) == (65536 << 32) | 1024);
+    let raised = syscall::sys_fd_limit(1, 4096) != u64::MAX
+        && syscall::sys_fd_dup(me, 3000, 1).is_ok()
+        && syscall::sys_fd_dup(me, 70000, 1).is_err();
+    check("raised to 4,096, descriptor 3,000 can be made; past the hard limit, refused", raised);
+    let _ = syscall::sys_fd_close(3000);
+    let _ = syscall::sys_fd_limit(1, 1024);
+}
+
 fn test_fd_table() {
     println!("descriptor table:");
     // Eight pipes give sixteen ends — enough to prove the table is deeper
@@ -10082,6 +10127,7 @@ pub extern "C" fn _start() -> ! {
         ("physical", test_physical_authority),
         ("close", test_close),
         ("fds", test_fd_table),
+        ("fdlimit", test_fd_limit),
         ("ipcfd", test_ipc_descriptor),
         ("services", test_services),
         ("seat", test_seat),

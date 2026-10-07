@@ -138,7 +138,11 @@ long __quark_pty_held(const char *path) {
     if (number < 0) {
         return -1;
     }
-    for (long fd = 0; fd < MAX_FDS; fd++) {
+    /* As far as the program's limit: a descriptor above a limit it has
+       lowered since is not one ttyname has to find. */
+    unsigned long limit = __syscall2(SYS_FD_LIMIT, 0, 0);
+    long most = limit == QUARK_ERR ? 1024 : (long)(limit & 0xFFFFFFFFUL);
+    for (long fd = 0; fd < most; fd++) {
         if (__quark_pty_slave_number(fd) == number) {
             return fd;
         }

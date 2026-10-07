@@ -209,7 +209,7 @@
 #define QUARK_FD_GETFLAGS   0UL
 #define QUARK_FD_SETFLAGS   1UL
 /* The working directory's descriptor, one past the ordinary numbers. */
-#define QUARK_FD_CWD        64UL
+#define QUARK_FD_CWD        0xFFFFFFFFFFFFFF9CUL
 #define QUARK_FD_CLOEXEC    1UL
 /* What a descriptor names, and above it a bit for "its other end has gone". */
 #define SYS_FD_KIND         230
@@ -240,6 +240,7 @@
 /* A connected pair whose writes are messages, each read whole:
    socketpair of SOCK_SEQPACKET. */
 #define SYS_PACKET_PAIR     234
+#define SYS_FD_LIMIT        235
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215
