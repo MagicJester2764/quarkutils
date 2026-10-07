@@ -13,6 +13,7 @@ fdleak
 pipepoll
 bigargs
 manymaps
+@600 manyfiles
 filetest
 dirtest
 threadfile

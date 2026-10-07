@@ -301,6 +301,45 @@ extern "C" fn hog_thread() -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// `cwdhold N`: be in `/tmp/cwdN` — say so with a file made there by a name
+/// that is not a path, `here` — until `/tmp/cwd-go` is there, and then say
+/// whether it is still where it went: 0 if it is, 1 if it is somewhere else,
+/// 2 if it could not go there at all, 3 if the word never came.
+fn cwd_hold(n: &[u8]) -> i32 {
+    let Some(v) = nameserver::lookup_retry(b"vfs", 20) else {
+        return 4;
+    };
+    let mut path = [0u8; 32];
+    let at = b"/tmp/cwd".len();
+    path[..at].copy_from_slice(b"/tmp/cwd");
+    let n = &n[..n.len().min(path.len() - at)];
+    path[at..at + n.len()].copy_from_slice(n);
+    let path = &path[..at + n.len()];
+    if vfs::chdir(v, path).is_err() {
+        return 2;
+    }
+    if let Ok((handle, _, _)) = vfs::create(v, b"here", false) {
+        let _ = vfs::close(v, handle);
+    }
+    let mut word = false;
+    for _ in 0..6000 {
+        if let Ok((handle, _, _)) = vfs::open(v, b"/tmp/cwd-go") {
+            let _ = vfs::close(v, handle);
+            word = true;
+            break;
+        }
+        syscall::sleep_ticks(1);
+    }
+    if !word {
+        return 3;
+    }
+    let mut out = [0u8; 64];
+    match vfs::getcwd(v, &mut out) {
+        Ok(len) if &out[..len] == path => 0,
+        _ => 1,
+    }
+}
+
 fn together() -> i32 {
     const ROUNDS: u32 = 100_000;
     const TICKS: u64 = 100;
@@ -1371,6 +1410,9 @@ pub extern "C" fn _start() -> ! {
     }
     if quark_rt::args::argv(1) == Some(&b"pipehog"[..]) {
         syscall::sys_exit_program(pipe_hog());
+    }
+    if quark_rt::args::argv(1) == Some(&b"cwdhold"[..]) {
+        syscall::sys_exit_program(cwd_hold(quark_rt::args::argv(2).unwrap_or(b"")));
     }
     if quark_rt::args::argv(1) == Some(&b"tlb"[..]) {
         syscall::sys_exit_program(tlb());

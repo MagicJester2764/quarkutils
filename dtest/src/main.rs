@@ -10040,6 +10040,90 @@ fn test_thousand_threads() {
     );
 }
 
+/// Seventy programs, each with a working directory of its own, all at once.
+/// The file server kept sixty-four, for every program there was.
+fn test_cwds() {
+    println!("cwds:");
+    let Some(v) = nameserver::lookup(b"vfs") else {
+        check("the file server", false);
+        return;
+    };
+    const N: usize = 70;
+    // `/tmp/cwd` and the number, with `tail` after it.
+    let path = |i: usize, tail: &[u8], out: &mut [u8; 48]| -> usize {
+        let mut text = [0u8; 20];
+        let n = decimal(i, &mut text);
+        let mut len = 0;
+        for part in [&b"/tmp/cwd"[..], n, tail] {
+            out[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
+        }
+        len
+    };
+    let mut buf = [0u8; 48];
+    let _ = vfs::unlink(v, b"/tmp/cwd-go");
+    for i in 0..N {
+        let len = path(i, b"", &mut buf);
+        let _ = vfs::mkdir(v, &buf[..len]);
+    }
+    let mut tids = [0usize; N];
+    let mut started = 0;
+    for i in 0..N {
+        let mut text = [0u8; 20];
+        let Some(child) = load_child(&[b"dchild", b"cwdhold", decimal(i, &mut text)]) else { break };
+        let tid = child.tid;
+        if child.start().is_err() {
+            break;
+        }
+        tids[started] = tid;
+        started += 1;
+    }
+    // Each says it is there with a file in its directory; when all have, or
+    // half a minute has gone, the word.
+    let there = |i: usize, buf: &mut [u8; 48]| {
+        let len = path(i, b"/here", buf);
+        match vfs::open(v, &buf[..len]) {
+            Ok((handle, _, _)) => {
+                let _ = vfs::close(v, handle);
+                true
+            }
+            Err(_) => false,
+        }
+    };
+    for _ in 0..3000 {
+        if (0..started).all(|i| there(i, &mut buf)) {
+            break;
+        }
+        syscall::sleep_ticks(1);
+    }
+    if let Ok((handle, _, _)) = vfs::create(v, b"/tmp/cwd-go", false) {
+        let _ = vfs::close(v, handle);
+    }
+    // What each answered: 0 where it went, 1 somewhere else, 2 could not go,
+    // 3 never heard the word, 4 no file server; and anything else.
+    // Each by its own number: seventy that end together end in any order,
+    // and a wait for any child hands one back that another wait wanted.
+    let mut answers = [0usize; 6];
+    for &tid in &tids[..started] {
+        let answer = syscall::sys_wait_for(tid).ok().map(|(_, code)| code).filter(|a| (0..5).contains(a)).unwrap_or(5);
+        answers[answer as usize] += 1;
+    }
+    check("seventy programs each with a working directory of their own", started == N && answers[0] == N);
+    if answers[0] != N {
+        println!(
+            "    {} started; {} where they went, {} elsewhere, {} could not go, {} not told, {} other",
+            started, answers[0], answers[1], answers[2], answers[3], answers[4] + answers[5]
+        );
+    }
+    let _ = vfs::unlink(v, b"/tmp/cwd-go");
+    for i in 0..N {
+        let len = path(i, b"/here", &mut buf);
+        let _ = vfs::unlink(v, &buf[..len]);
+        let len = path(i, b"", &mut buf);
+        let _ = vfs::rmdir(v, &buf[..len]);
+    }
+}
+
 /// A program's capability space grows: a thousand capabilities held at once,
 /// in slots far past the 256 a space had, each what was put there; the
 /// slots below them where they were; a forked child with all of them; and a
@@ -10548,6 +10632,7 @@ pub extern "C" fn _start() -> ! {
         ("smp", test_smp),
         ("objects", test_objects),
         ("caps", test_cap_space),
+        ("cwds", test_cwds),
         ("stackguard", test_stack_guard),
     ];
     let only = quark_rt::args::argv(1);
