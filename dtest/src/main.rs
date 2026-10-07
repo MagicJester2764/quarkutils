@@ -236,6 +236,7 @@ fn test_ipc_descriptor() {
     );
     // Through it, while it is there: answered.
     check("a write through it is a call it answers", syscall::sys_fd_write(FD, b"hello") == 5);
+    let gone_space = syscall::sys_task_space(gone).ok();
     let _ = syscall::sys_task_kill(gone);
     let _ = syscall::sys_wait_for(gone);
     // Another child with the same number: a task is given the lowest number
@@ -244,8 +245,12 @@ fn test_ipc_descriptor() {
     let mut others = [0usize; 8];
     let mut made = 0;
     let mut again = None;
+    let mut refused = false;
     while made < others.len() {
-        let Some(next) = load_child(&[b"dchild", b"echo"]) else { break };
+        let Some(next) = load_child(&[b"dchild", b"echo"]) else {
+            refused = true;
+            break;
+        };
         let _ = next.start();
         if next.tid == gone {
             again = Some(next.tid);
@@ -260,6 +265,22 @@ fn test_ipc_descriptor() {
     }
     let Some(again) = again else {
         check("a child given the number again", false);
+        // What it was given instead, and whether a child could be made at
+        // all: a number taken by somebody else's task in between is not the
+        // kernel's doing, and a child refused is.
+        print!("    the number was {}; given", gone);
+        for &tid in &others[..made] {
+            print!(" {}", tid);
+        }
+        println!("{}", if refused { ", and then a child was refused" } else { "" });
+        let mut name = [0u8; 64];
+        let n = syscall::sys_program_name(gone, &mut name).unwrap_or(0).min(name.len());
+        println!(
+            "    its program was {:?}; the number is now {:?}'s, {}",
+            gone_space,
+            syscall::sys_task_space(gone).ok(),
+            core::str::from_utf8(&name[..n]).unwrap_or("?"),
+        );
         let _ = syscall::sys_fd_close(FD);
         return;
     };
