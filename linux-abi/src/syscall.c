@@ -944,7 +944,9 @@ static long wait_ms(int ms) {
    bit a descriptor. */
 static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned long *ex,
                       long timeout_ns, const unsigned long *under) {
-    struct { int fd; short events; short revents; } p[32];
+    /* As many as an fd_set has, FD_SETSIZE: it was thirty-two, the kernel's
+       old limit for a poll. */
+    struct { int fd; short events; short revents; } p[1024];
     long n = 0;
     if (nfds < 0 || nfds > 1024) {
         return -LX_EINVAL;
@@ -964,9 +966,6 @@ static long do_select(long nfds, unsigned long *rd, unsigned long *wr, unsigned 
         }
         if (!ev) {
             continue;
-        }
-        if (n == 32) {
-            return -LX_EINVAL;
         }
         p[n].fd = (int)fd;
         p[n].events = ev;

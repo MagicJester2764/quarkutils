@@ -1793,10 +1793,18 @@ pub fn sys_fd_recv_nb(
 /// installed there — or at any free slot if `at` is [`ANY_FD`].
 ///
 /// Returns the byte count, and which descriptor arrived if one did.
+/// The most descriptors one send carries, or one receive takes: as many as
+/// the eight bits that say how many can say.
+pub const FD_MANY_MOST: usize = 255;
+
 /// Send `buf` down stream `fd` with `fds` passed along — all of them or
-/// none, at most 32 — queued before the bytes. How many bytes went.
+/// none, at most [`FD_MANY_MOST`] — queued before the bytes. How many bytes
+/// went.
 pub fn sys_fd_send_many(fd: usize, buf: &[u8], fds: &[u32]) -> Result<usize, ()> {
-    let flags = 2 | (fds.len().min(255) as u64) << 8;
+    if fds.len() > FD_MANY_MOST {
+        return Err(());
+    }
+    let flags = 2 | (fds.len() as u64) << 8;
     match unsafe { syscall5(SYS_FD_SEND, fd as u64, buf.as_ptr() as u64, buf.len() as u64, fds.as_ptr() as u64, flags) } {
         u64::MAX => Err(()),
         n => Ok((n & 0xFFFF_FFFF) as usize),
@@ -1807,7 +1815,7 @@ pub fn sys_fd_send_many(fd: usize, buf: &[u8], fds: &[u32]) -> Result<usize, ()>
 /// and `fds` has room for, each installed in the lowest free slot from 3:
 /// how many bytes, and how many descriptors `fds` now begins with.
 pub fn sys_fd_recv_many(fd: usize, buf: &mut [u8], fds: &mut [u32]) -> Result<(usize, usize), ()> {
-    let flags = 2 | (fds.len().min(255) as u64) << 8;
+    let flags = 2 | (fds.len().min(FD_MANY_MOST) as u64) << 8;
     match unsafe {
         syscall5(SYS_FD_RECV, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, fds.as_mut_ptr() as u64, flags)
     } {

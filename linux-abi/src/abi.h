@@ -78,6 +78,8 @@ struct __quark_side *__quark_side(long fd);
 /* `fd`'s record if one was ever made, else 0: what is read reads as noughts. */
 struct __quark_side *__quark_side_if(long fd);
 void __quark_side_forked(void);
+/* The buffers a poll of many descriptors borrows, all free again. */
+void __quark_poll_forked(void);
 /* Pages of zeroes from the arena, for this layer's own tables; 0 if none. */
 void *__quark_pages(unsigned long pages);
 

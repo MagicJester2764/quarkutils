@@ -94,7 +94,68 @@ struct qw_pollfd {
 #define QW_HANGUP   4
 #define QW_INVALID  8
 
-#define MAX_POLL 32
+/* What one `epoll_wait` reports at most: epoll reports as many as are
+   ready, up to what it was asked for, and fewer is as right an answer. */
+#define EPOLL_BATCH 32
+/* A poll of this many descriptors or fewer has its entries on the stack;
+   one of more has them in a buffer of the pool below. It was refused past
+   thirty-two, which was the kernel's limit. */
+#define POLL_ON_STACK 64
+/* As many as a program can have descriptors. The kernel refuses a poll of
+   more than the program's own limit; this is only so that nothing is made
+   for a number nobody could have. */
+#define POLL_MOST 65536
+
+/* Buffers for the entries of a poll of more than POLL_ON_STACK descriptors,
+   kept and used again: the arena gives nothing back, and a program that
+   polls two hundred descriptors every turn of its main loop would otherwise
+   take a page of it every turn. A thread takes one nobody is using, made
+   bigger if it has to be; with every one of them in use the poll is
+   refused for want of memory. Not malloc's: this is under the C library,
+   and is reached from signal handlers. */
+#define SCRATCHES 16
+static struct {
+    int busy;
+    unsigned long pages;
+    void *at;
+} scratch[SCRATCHES];
+
+static void *scratch_take(unsigned long bytes, int *which) {
+    unsigned long want = 1;
+    while (want * 4096 < bytes) {
+        want *= 2;
+    }
+    for (int i = 0; i < SCRATCHES; i++) {
+        if (__atomic_exchange_n(&scratch[i].busy, 1, __ATOMIC_ACQUIRE) != 0) {
+            continue;
+        }
+        if (scratch[i].pages < want) {
+            /* The smaller one's room is not given back: there is nowhere
+               to give it. Doubling keeps that to as much again. */
+            void *bigger = __quark_pages(want);
+            if (!bigger) {
+                __atomic_store_n(&scratch[i].busy, 0, __ATOMIC_RELEASE);
+                return 0;
+            }
+            scratch[i].at = bigger;
+            scratch[i].pages = want;
+        }
+        *which = i;
+        return scratch[i].at;
+    }
+    return 0;
+}
+
+static void scratch_give(int which) {
+    __atomic_store_n(&scratch[which].busy, 0, __ATOMIC_RELEASE);
+}
+
+/* A forked child has only the thread that forked, which was not polling. */
+void __quark_poll_forked(void) {
+    for (int i = 0; i < SCRATCHES; i++) {
+        scratch[i].busy = 0;
+    }
+}
 
 long __quark_memfd(const char *name, long flags) {
     (void)name;  /* Linux keeps it for /proc; there is no /proc here. */
@@ -920,11 +981,20 @@ long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *un
     /* Waiting on nothing at all is a sleep, and `poll(NULL, 0, ms)` is how a
        main loop whose sources are all timeouts spends its time. Refusing it
        because the array is null turned that wait into a spin. */
-    if (nfds > MAX_POLL) {
+    if (nfds > POLL_MOST) {
         return -LX_EINVAL;
     }
 
-    struct qw_pollfd q[MAX_POLL];
+    struct qw_pollfd small[POLL_ON_STACK];
+    struct qw_pollfd *q = small;
+    int which = -1;
+    if (nfds > POLL_ON_STACK) {
+        q = scratch_take((unsigned long)nfds * sizeof *q, &which);
+        if (!q) {
+            return -LX_ENOMEM;
+        }
+    }
+    long result;
     for (long i = 0; i < nfds; i++) {
         q[i].fd = (unsigned int)p[i].fd;
         q[i].events = 0;
@@ -953,7 +1023,8 @@ long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *un
            nothing leaves what is left of the wait to do. */
         long cut = quark_cut_short(n, 0);
         if (cut < 0) {
-            return cut;
+            result = cut;
+            goto out;
         }
         if (!cut) {
             break;
@@ -964,7 +1035,8 @@ long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *un
         }
     }
     if (n == QUARK_ERR) {
-        return -LX_EINVAL;
+        result = -LX_EINVAL;
+        goto out;
     }
     for (long i = 0; i < nfds; i++) {
         short rev = 0;
@@ -982,7 +1054,12 @@ long __quark_poll(void *fds, long nfds, long timeout_ns, const unsigned long *un
         }
         p[i].revents = rev;
     }
-    return (long)n;
+    result = (long)n;
+out:
+    if (which >= 0) {
+        scratch_give(which);
+    }
+    return result;
 }
 
 #define LX_EPOLL_CLOEXEC 02000000
@@ -1098,11 +1175,11 @@ long __quark_epoll_wait(long epfd, void *events, long maxevents, long timeout_ns
     if (!out || maxevents <= 0) {
         return -LX_EINVAL;
     }
-    if (maxevents > MAX_POLL) {
-        maxevents = MAX_POLL;
+    if (maxevents > EPOLL_BATCH) {
+        maxevents = EPOLL_BATCH;
     }
 
-    struct qw_ready ready[MAX_POLL];
+    struct qw_ready ready[EPOLL_BATCH];
     unsigned long span = timeout_ns < 0 ? ~0UL : quark_span((unsigned long)timeout_ns);
     unsigned long deadline = timeout_ns < 0 ? 0 : quark_now() + (unsigned long)timeout_ns;
     unsigned long n;
