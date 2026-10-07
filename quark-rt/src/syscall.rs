@@ -422,6 +422,7 @@ pub const SYS_FD_READY: u64 = 233;
 /// `socketpair` of `SOCK_SEQPACKET`.
 pub const SYS_PACKET_PAIR: u64 = 234;
 pub const SYS_FD_LIMIT: u64 = 235;
+pub const SYS_TASK_NEXT: u64 = 236;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -722,6 +723,24 @@ pub fn sys_task_create_in(cr3: u64) -> Result<usize, ()> {
 pub fn sys_space_watch(space: u64) -> Result<(), ()> {
     let ret = unsafe { syscall1(SYS_SPACE_WATCH, space) };
     if ret == u64::MAX { Err(()) } else { Ok(()) }
+}
+
+/// The first task at or past `from` that has not been taken apart, living
+/// or dead (`SYS_TASK_NEXT`).
+pub fn sys_task_next(from: usize) -> Option<usize> {
+    let ret = unsafe { syscall1(SYS_TASK_NEXT, from as u64) };
+    if ret == u64::MAX { None } else { Some(ret as usize) }
+}
+
+/// Every task there is, by its number, as `SYS_TASK_NEXT` finds them: one
+/// call a task, where asking about every number would be 32,768.
+pub fn tasks() -> impl Iterator<Item = usize> {
+    let mut at = 0;
+    core::iter::from_fn(move || {
+        let tid = sys_task_next(at)?;
+        at = tid + 1;
+        Some(tid)
+    })
 }
 
 pub fn sys_task_info(tid: usize) -> Result<(u8, usize, u32), ()> {
@@ -3058,7 +3077,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 0;
+pub const ABI_VERSION_MINOR: u32 = 1;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

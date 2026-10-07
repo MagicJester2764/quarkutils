@@ -24,8 +24,6 @@ quark_rt::manifest!([
 /// port: bit 1 says a hard reset, and bit 2, going from 0 to 1, does it.
 const RESET_CONTROL: u16 = 0xCF9;
 
-const MAX_TASKS: usize = 64;
-
 /// The power-management control register of the machine QEMU pretends to
 /// be (PIIX4), for a machine with no tables to say where its own is.
 const ACPI_PM1A_CNT: u16 = 0x604;
@@ -80,7 +78,7 @@ pub extern "C" fn _start() -> ! {
 
     // Phase 1: Signal all user tasks to terminate
     let mut signaled = 0usize;
-    for tid in 2..MAX_TASKS {
+    for tid in syscall::tasks().filter(|&t| t >= 2) {
         if tid == my_tid {
             continue;
         }
@@ -111,7 +109,7 @@ pub extern "C" fn _start() -> ! {
 
     // Phase 2: Force-kill any survivors
     if !force {
-        for tid in 2..MAX_TASKS {
+        for tid in syscall::tasks().filter(|&t| t >= 2) {
             if tid == my_tid {
                 continue;
             }

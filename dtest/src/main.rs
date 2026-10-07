@@ -65,7 +65,7 @@ fn test_physical_authority() {
     let mut seen = 0;
     let mut broad = 0;
     let mut kernel = 0;
-    for tid in 1..64 {
+    for tid in syscall::tasks().filter(|&t| t >= 1) {
         if syscall::sys_task_info(tid).is_err() {
             continue;
         }
@@ -1295,7 +1295,7 @@ fn test_thread_library() {
             && syscall::sys_task_name(me, &mut name) == Some(15)
             && &name[..15] == b"a-name-longer-t",
     );
-    let other = (1..64).find(|&t| syscall::sys_pid(t).is_some() && syscall::sys_pid(t) != syscall::sys_pid(me));
+    let other = syscall::tasks().filter(|&t| t >= 1).find(|&t| syscall::sys_pid(t).is_some() && syscall::sys_pid(t) != syscall::sys_pid(me));
     check(
         "and nobody names a task of another program",
         other.is_some_and(|t| syscall::sys_task_name_set(t, b"x", 0).is_err()),
@@ -7595,7 +7595,7 @@ fn test_devices() {
     let mut nheld = 0;
     let mut two = false;
     let mut ports = 0;
-    for tid in 1..64 {
+    for tid in syscall::tasks().filter(|&t| t >= 1) {
         let Ok((_, parent, _)) = syscall::sys_task_info(tid) else {
             continue;
         };

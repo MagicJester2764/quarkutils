@@ -3,8 +3,6 @@
 
 use quark_rt::{print, println, syscall};
 
-const MAX_TASKS: usize = 64;
-
 const STATE_NAMES: [&str; 5] = ["READY", "RUN", "BLOCK", "DEAD", "STOP"];
 
 #[unsafe(no_mangle)]
@@ -18,7 +16,7 @@ pub extern "C" fn _start() -> ! {
     // How nice it is and how long it has run are its program's, and so is
     // what it was started as, which its spawner told the kernel.
     println!("  PID  PPID  TID  STATE  UID  NI       TIME  CMD");
-    for tid in 0..MAX_TASKS {
+    for tid in syscall::tasks() {
         if let Ok((state, parent, uid)) = syscall::sys_task_info(tid) {
             if state == 3 { continue; } // skip Dead tasks
             let state_str = if (state as usize) < STATE_NAMES.len() {

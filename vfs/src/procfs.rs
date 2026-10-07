@@ -124,7 +124,6 @@ fn id_of(node: Node) -> u64 {
 /// and has not ended.
 fn task_of(pid: u64, tid: usize) -> bool {
     tid != 0
-        && tid < MAX_TASKS
         && matches!(syscall::sys_task_info(tid), Ok((state, _, _)) if state != DEAD)
         && syscall::sys_pid(tid) == Some(pid)
 }
@@ -155,7 +154,7 @@ fn comm_of(pid: u64, tid: usize, out: &mut [u8; 20]) -> usize {
 /// The thread a program's own `comm` is: the task it began as, whose task
 /// id its process id is the endpoint of; or, gone, the first that is left.
 fn first_thread(pid: u64, p: &Program) -> usize {
-    (1..MAX_TASKS).find(|&tid| task_of(pid, tid) && syscall::sys_task_number(tid) == Some(pid)).unwrap_or(p.tid)
+    syscall::tasks().find(|&tid| task_of(pid, tid) && syscall::sys_task_number(tid) == Some(pid)).unwrap_or(p.tid)
 }
 
 fn is_comm(node: Node) -> bool {
@@ -187,8 +186,9 @@ pub fn serving(sender: usize) {
 // Programs, as the kernel's tasks say them
 // ---------------------------------------------------------------------------
 
-/// The kernel's tasks, by slot. Task 0 is its idle task, in no program.
-const MAX_TASKS: usize = 64;
+/// How many process ids a listing of the directory gathers at a time: a
+/// reply's worth, and one that fills goes on from where it ends.
+const BATCH: usize = 64;
 
 /// What the kernel says of a program, gathered from its tasks.
 struct Program {
@@ -217,7 +217,8 @@ fn program(pid: u64) -> Option<Program> {
         _ => 3,
     };
     let mut found: Option<Program> = None;
-    for tid in 1..MAX_TASKS {
+    // Task 0 is the kernel's idle task, in no program.
+    for tid in syscall::tasks().filter(|&t| t >= 1) {
         let Ok((state, parent, _)) = syscall::sys_task_info(tid) else { continue };
         if syscall::sys_pid(tid) != Some(pid) {
             continue;
@@ -255,11 +256,11 @@ fn program(pid: u64) -> Option<Program> {
     found
 }
 
-/// The process ids there are, from `from` up and in order, into `out`: how
-/// many.
-fn processes(from: u64, out: &mut [u64; MAX_TASKS]) -> usize {
+/// The first process ids from `from` up, in order, as many as `out` holds:
+/// how many.
+fn processes(from: u64, out: &mut [u64; BATCH]) -> usize {
     let mut n = 0;
-    for tid in 1..MAX_TASKS {
+    for tid in syscall::tasks().filter(|&t| t >= 1) {
         if syscall::sys_task_info(tid).is_err() {
             continue;
         }
@@ -267,10 +268,17 @@ fn processes(from: u64, out: &mut [u64; MAX_TASKS]) -> usize {
         if pid < from || out[..n].contains(&pid) {
             continue;
         }
-        out[n] = pid;
-        n += 1;
+        // In order, the largest let go when there is no room.
+        let at = out[..n].partition_point(|&p| p < pid);
+        if at == BATCH {
+            continue;
+        }
+        if n < BATCH {
+            n += 1;
+        }
+        out.copy_within(at..n - 1, at + 1);
+        out[at] = pid;
     }
-    out[..n].sort_unstable();
     n
 }
 
@@ -723,13 +731,17 @@ fn list(sender: usize, node: Node, start: u64, room: usize) {
             for (i, (name, f)) in FILES.iter().enumerate() {
                 put(3 + i as u64, id_of(Node::File(*f)), DT_REG, name);
             }
-            let mut pids = [0u64; MAX_TASKS];
+            let mut pids = [0u64; BATCH];
             let n = processes(start.saturating_sub(FIXED), &mut pids);
             for &pid in &pids[..n] {
                 let mut digits = [0u8; 20];
                 if !put(FIXED + pid, id_of(Node::Process(pid)), DT_DIR, decimal(pid, &mut digits)) {
                     break;
                 }
+            }
+            // A batch that all fitted may not be all there is.
+            if n == BATCH {
+                end = false;
             }
         }
         Node::Process(pid) => {
@@ -744,7 +756,7 @@ fn list(sender: usize, node: Node, start: u64, room: usize) {
         Node::Tasks(pid) => {
             put(0, id_of(node), DT_DIR, b".");
             put(1, id_of(Node::Process(pid)), DT_DIR, b"..");
-            for tid in 1..MAX_TASKS {
+            for tid in syscall::tasks().filter(|&t| t >= 1) {
                 let mut digits = [0u8; 20];
                 if task_of(pid, tid) && !put(2 + tid as u64, id_of(Node::Task(pid, tid)), DT_DIR, decimal(tid as u64, &mut digits)) {
                     break;

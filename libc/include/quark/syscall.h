@@ -241,6 +241,7 @@
    socketpair of SOCK_SEQPACKET. */
 #define SYS_PACKET_PAIR     234
 #define SYS_FD_LIMIT        235
+#define SYS_TASK_NEXT       236
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215

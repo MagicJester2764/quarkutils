@@ -52,7 +52,7 @@ static void check(const char *what, int ok) {
 /* The task a process is: the one whose process id is `pid`. A process that
    has made no threads is one task. */
 static unsigned long tid_of(pid_t pid) {
-    for (unsigned long tid = 1; tid < 64; tid++) {
+    for (unsigned long tid = 1; (tid = __syscall1(SYS_TASK_NEXT, tid)) != QUARK_ERR; tid++) {
         if (__syscall1(SYS_PID, tid) == (unsigned long)pid) {
             return tid;
         }

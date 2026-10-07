@@ -16,8 +16,9 @@
 //! start with a copy of its creator's, as they stood: a service one thread
 //! looked up was refused to another.
 //!
-//! Spawning needs no capability for the first sixteen threads (`TaskMgmt` lifts
-//! the limit), and a stack is ordinary memory.
+//! Spawning needs no capability for a program's first 4,096 tasks, its threads
+//! and its children together (`TaskMgmt` lifts the limit), and a stack is
+//! ordinary memory.
 
 use crate::syscall;
 

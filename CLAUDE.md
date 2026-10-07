@@ -1714,8 +1714,9 @@ mounts`):
   spawner does. A shell that execs is as trusted as everything it runs.
   Which is why a user's session has to *begin* holding nothing: there is no
   later point at which it is taken away.
-- **The device manager starts sixteen drivers at most**, as any program
-  without `TaskMgmt` may have sixteen children. A driver that ends by
+- **The device manager starts 128 drivers at most**, its table's size; a
+  program without `TaskMgmt` may have 4,096 tasks, where the kernel's
+  sixteen children were the limit until 4.1. A driver that ends by
   itself, or fails five times in a row, leaves its device without one until
   the machine starts again; and what a failed driver served is its
   claimants' to ask for again, which the network stack does and a disk's
