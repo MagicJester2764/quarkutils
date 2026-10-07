@@ -423,6 +423,8 @@ pub const SYS_FD_READY: u64 = 233;
 pub const SYS_PACKET_PAIR: u64 = 234;
 pub const SYS_FD_LIMIT: u64 = 235;
 pub const SYS_TASK_NEXT: u64 = 236;
+/// Wake some of a futex word's waiters and move the rest to another word.
+pub const SYS_FUTEX_REQUEUE: u64 = 237;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -1361,6 +1363,35 @@ pub fn sys_futex_wake(addr: *const u32, max_wake: usize) -> u64 {
 
 /// Returned by [`sys_futex_wait_timeout`] when the deadline passed.
 pub const FUTEX_TIMED_OUT: u64 = 2;
+
+/// Why [`sys_futex_requeue`] did nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotRequeued {
+    /// The first word does not hold what it was said to: Linux's `EAGAIN`.
+    Changed,
+    /// A word that cannot be waited on.
+    Refused,
+}
+
+/// Wake up to `wake` of the waiters on `first`, and move up to `requeue` of
+/// the rest to wait on `second` instead: Linux's `FUTEX_REQUEUE`, and with
+/// `expected`, its `FUTEX_CMP_REQUEUE`, which does nothing unless `first`
+/// still holds it. How many were woken and moved.
+pub fn sys_futex_requeue(
+    first: *const u32,
+    second: *const u32,
+    wake: u32,
+    requeue: u32,
+    expected: Option<u32>,
+) -> Result<usize, NotRequeued> {
+    let counts = (wake as u64) << 32 | requeue as u64;
+    let (value, flags) = expected.map_or((0, 0), |v| (v as u64, 1));
+    match unsafe { syscall5(SYS_FUTEX_REQUEUE, first as u64, second as u64, counts, value, flags) } {
+        u64::MAX => Err(NotRequeued::Refused),
+        0xFFFF_FFFE => Err(NotRequeued::Changed),
+        n => Ok(n as usize),
+    }
+}
 
 /// The bit that makes a span of time a count of nanoseconds.
 ///
@@ -3094,7 +3125,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 1;
+pub const ABI_VERSION_MINOR: u32 = 2;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

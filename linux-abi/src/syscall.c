@@ -1625,20 +1625,24 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             }
         }
         /* FUTEX_REQUEUE moves waiters from one word to wait on another, so
-           that they wait for a lock rather than all wake to fight for it.
-           Here it wakes them instead, as many as it would have woken and
-           moved: each finds its word changed and goes to wait where it was
-           to be moved to, which is what a futex's user does with a wake it
-           did not expect. musl's condition variables hand each waiter a
-           broadcast woke on to the next this way; refused, the first woke
-           and the rest slept on for good. */
-        if (op == 3) {
+           that they wait for a lock rather than all wake to fight for it —
+           and FUTEX_CMP_REQUEUE does that only if the first word still holds
+           what the caller read, which is what makes it safe to use without
+           a lock. musl's condition variables hand each waiter a broadcast
+           woke on to the next this way; refused, the first woke and the rest
+           slept on for good. They were answered by waking everybody they
+           would have moved, and the second not at all. */
+        if (op == 3 || op == 4) {
             if ((int)a3 < 0 || (int)a4 < 0) {
                 return -LX_EINVAL;
             }
-            unsigned long woken = __syscall2(SYS_FUTEX_WAKE, (unsigned long)a1,
-                                             (unsigned long)(int)a3 + (unsigned long)(int)a4);
-            return woken == QUARK_ERR ? -LX_EINVAL : (long)woken;
+            unsigned long counts = (unsigned long)(unsigned int)a3 << 32 | (unsigned long)(unsigned int)a4;
+            unsigned long r = __syscall5(SYS_FUTEX_REQUEUE, (unsigned long)a1, (unsigned long)a5, counts,
+                                         (unsigned long)(unsigned int)a6, op == 4);
+            if (r == QUARK_FUTEX_CHANGED) {
+                return -LX_EAGAIN;
+            }
+            return r == QUARK_ERR ? -LX_EINVAL : (long)r;
         }
         if (op == 0) {
             unsigned long r;

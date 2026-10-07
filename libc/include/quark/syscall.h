@@ -248,6 +248,12 @@
 #define SYS_PACKET_PAIR     234
 #define SYS_FD_LIMIT        235
 #define SYS_TASK_NEXT       236
+/* Wake some of a futex word's waiters and move the rest to another word:
+   arg0 the first, arg1 the second, arg2 (how many to wake << 32) | how many
+   to move, arg3 what the first must hold and arg4 bit 0 to compare it. It
+   answers how many, or QUARK_FUTEX_CHANGED. */
+#define SYS_FUTEX_REQUEUE   237
+#define QUARK_FUTEX_CHANGED 0xFFFFFFFEUL
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215
