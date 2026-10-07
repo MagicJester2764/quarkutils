@@ -9989,6 +9989,34 @@ fn word_cleared() -> bool {
     true
 }
 
+/// A thousand threads of one program at once. The machine had sixty-four
+/// tasks and a program without TaskMgmt sixteen; it has 32,768, and 4,096 a
+/// program. In a program of its own (`dchild thousand`), which says what held
+/// as a bit each: a thread's stack is not given back when the thread ends,
+/// and a thousand left in this program would be copied by every fork it
+/// makes afterwards.
+fn test_thousand_threads() {
+    println!("threads1000:");
+    let held = run(b"dchild", &[b"thousand"]);
+    let has = |bit: i32| matches!(held, Some(bits) if bits >= 0 && bits & bit != 0);
+    check("a program starts 1,000 threads", has(1));
+    check("and all of them are running at once", has(2));
+    check("the highest-numbered of them, task 255 or above, owns a frame for a device and maps it", has(4));
+    check("released, every one of them is waited for", has(8));
+
+    // A program that makes threads until it is refused is refused, at its
+    // allowance, and the machine goes on: a program started afterwards can
+    // make a thread of its own.
+    check(
+        "a program without TaskMgmt has 4,096 tasks — itself and 4,095 threads — and is refused the next",
+        run(b"dchild", &[b"threadhog"]) == Some(0),
+    );
+    check(
+        "and a program started afterwards runs, and makes a thread",
+        matches!(run(b"dchild", &[b"together"]), Some(bits) if bits & !3 == 0),
+    );
+}
+
 /// A thread is joined one of two ways, and the thread says which: waited
 /// for, as any child is, or through a word the kernel clears when it ends.
 /// The second is a C library's, whose threads are not its children.
@@ -10180,6 +10208,7 @@ pub extern "C" fn _start() -> ! {
         ("flags", test_flags),
         ("wire", test_wire),
         ("threads", test_threads),
+        ("threads1000", test_thousand_threads),
         ("msi", test_msi),
         ("iommu", test_iommu),
         ("devices", test_devices),

@@ -61,5 +61,7 @@ unixtest
 inotifytest
 epolltest
 pthreadtest
+manythreads
+sigthreads
 inettest
 cowstress

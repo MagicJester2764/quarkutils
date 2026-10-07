@@ -190,6 +190,104 @@ extern "C" fn partner() -> ! {
 /// turn. With two processors that is a few million exchanges a second. With
 /// one, each exchange waits for the end of somebody's turn at the
 /// processor, and there are thirty of those a second.
+/// `thousand`: a thousand threads at once, each counting itself in and then
+/// asleep until all of them may go — asleep, as a futex has room for
+/// sixty-four waiters. The one with the highest number, far past 255 with a
+/// thousand others running, owns a frame for a device and maps it: a frame's
+/// owner was a byte, and a task past 254 owned nothing it was given. Then
+/// every one is waited for. A bit for each that held: 1, all were made; 2,
+/// all ran at once; 4, the frame; 8, all were waited for.
+fn thousand() -> i32 {
+    let mut tids = [0usize; THOUSAND];
+    let mut made = 0;
+    while made < THOUSAND {
+        match thread::spawn_with_stack(among_thousand, 4) {
+            Ok(t) => tids[made] = t.tid(),
+            Err(()) => break,
+        }
+        made += 1;
+    }
+    let began = syscall::sys_ticks();
+    while THOUSAND_HERE.load(Ordering::SeqCst) < made && syscall::sys_ticks() - began < 2000 {
+        syscall::sleep_ticks(2);
+    }
+    let all_here = THOUSAND_HERE.load(Ordering::SeqCst) == THOUSAND;
+    let highest = tids[..made].iter().copied().max().unwrap_or(0);
+    THOUSAND_OWNER.store(highest, Ordering::SeqCst);
+    let began = syscall::sys_ticks();
+    while THOUSAND_OWNED.load(Ordering::SeqCst) == 0 && syscall::sys_ticks() - began < 500 {
+        syscall::sleep_ticks(2);
+    }
+    let owned = highest >= 255 && THOUSAND_OWNED.load(Ordering::SeqCst) == highest;
+    THOUSAND_GO.store(true, Ordering::SeqCst);
+    // Whichever ends first is collected first.
+    let mut joined = 0;
+    while joined < made {
+        match syscall::sys_wait() {
+            Ok((tid, 0)) if tids[..made].contains(&tid) => joined += 1,
+            Ok(_) => continue,
+            Err(()) => break,
+        }
+    }
+    let all_joined = made == THOUSAND && joined == made;
+    (made == THOUSAND) as i32 | (all_here as i32) << 1 | (owned as i32) << 2 | (all_joined as i32) << 3
+}
+
+const THOUSAND: usize = 1000;
+static THOUSAND_HERE: AtomicUsize = AtomicUsize::new(0);
+static THOUSAND_GO: AtomicBool = AtomicBool::new(false);
+/// The task to own a frame, and the task that did, once it has: `usize::MAX`
+/// if it could not.
+static THOUSAND_OWNER: AtomicUsize = AtomicUsize::new(0);
+static THOUSAND_OWNED: AtomicUsize = AtomicUsize::new(0);
+const THOUSANDTH_AT: usize = 0xBB_0000_0000;
+
+/// One of a thousand: counts itself in, and sleeps until all of them may go
+/// — owning a frame meanwhile, if it is the one asked to.
+extern "C" fn among_thousand() -> ! {
+    THOUSAND_HERE.fetch_add(1, Ordering::SeqCst);
+    let me = syscall::sys_getpid() as usize;
+    while !THOUSAND_GO.load(Ordering::SeqCst) {
+        if THOUSAND_OWNER.load(Ordering::SeqCst) == me && THOUSAND_OWNED.load(Ordering::SeqCst) == 0 {
+            let owned = syscall::sys_phys_alloc_low(1).is_ok_and(|frame| {
+                let mapped = syscall::sys_map_phys(frame, THOUSANDTH_AT, 1).is_ok();
+                if mapped {
+                    unsafe { core::ptr::write_volatile(THOUSANDTH_AT as *mut u64, me as u64) };
+                    let _ = syscall::sys_munmap(THOUSANDTH_AT, 1);
+                }
+                let _ = syscall::sys_phys_free(frame, 1);
+                mapped
+            });
+            THOUSAND_OWNED.store(if owned { me } else { usize::MAX }, Ordering::SeqCst);
+        }
+        syscall::sleep_ticks(5);
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// `threadhog`: threads until it is refused, each asleep until it is told
+/// to go, and how many said. A program without TaskMgmt may have 4,096
+/// tasks, itself one of them: 0 if it had that many, 1 if not.
+fn thread_hog() -> i32 {
+    let mut made = 0usize;
+    // A long way past the allowance is a kernel with none.
+    while made < 100_000 && thread::spawn_with_stack(hog_thread, 1).is_ok() {
+        made += 1;
+    }
+    println!("threadhog: {} threads, and then refused", made);
+    HOG_GO.store(true, Ordering::SeqCst);
+    if made == 4095 { 0 } else { 1 }
+}
+
+static HOG_GO: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn hog_thread() -> ! {
+    while !HOG_GO.load(Ordering::SeqCst) {
+        syscall::sleep_ticks(10);
+    }
+    syscall::sys_exit_code(0);
+}
+
 fn together() -> i32 {
     const ROUNDS: u32 = 100_000;
     const TICKS: u64 = 100;
@@ -1251,6 +1349,12 @@ pub extern "C" fn _start() -> ! {
     }
     if quark_rt::args::argv(1) == Some(&b"together"[..]) {
         syscall::sys_exit_program(together());
+    }
+    if quark_rt::args::argv(1) == Some(&b"threadhog"[..]) {
+        syscall::sys_exit_program(thread_hog());
+    }
+    if quark_rt::args::argv(1) == Some(&b"thousand"[..]) {
+        syscall::sys_exit_program(thousand());
     }
     if quark_rt::args::argv(1) == Some(&b"tlb"[..]) {
         syscall::sys_exit_program(tlb());
