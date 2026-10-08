@@ -1705,7 +1705,8 @@ mounts`):
   `timer_create` is 32 more: the timers that count time spent running are
   refused, on either.
 - **A program's first thread is not numbered as its process.** `getpid` is
-  a process id, 64 or more, and `gettid` a task id, below 64. On Linux the
+  a process id, 32,768 or more, and `gettid` a task id, below 32,768 (there
+  were sixty-four tasks, and the line was 64, until the kernel's 4.1). On Linux the
   two are equal in the first thread, and code that finds its main thread by
   comparing them, or signals it with `tgkill(getpid(), getpid(), …)`, is
   wrong here. Nothing ported so far does either. `docs/c-library.md` is

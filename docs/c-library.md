@@ -56,8 +56,8 @@ What follows from it:
   way round.
 - **A number printed by one is not found by the other.** `ps` shows both
   columns.
-- **A process id is at least 64**, so the two are never confused: a number
-  below 64 is a task, and one from 64 up is a process.
+- **A process id is at least 32,768**, so the two are never confused: a
+  number below 32,768 is a task, and one from 32,768 up is a process.
 
 Everything a C program does with *processes* uses process ids throughout —
 `fork`, `wait4`, `kill`, `getppid`, `getpgrp`, `setpgid`, `setsid` — and is
