@@ -57,6 +57,7 @@ avxtest
 handlertest
 usagetest
 rtsched
+pimutex
 layouttest
 sigqueuetest
 ptimertest

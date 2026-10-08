@@ -473,6 +473,10 @@ pub const SYS_FUTEX_REQUEUE: u64 = 237;
 /// How one task is scheduled: its niceness, and its class — ordinary, or
 /// real-time FIFO or round-robin at a priority.
 pub const SYS_SCHED: u64 = 238;
+/// Lock, try to lock or unlock a word that lends its holder the place of
+/// whoever waits for it: Linux's FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI and
+/// FUTEX_UNLOCK_PI, for a C library's PTHREAD_PRIO_INHERIT mutexes.
+pub const SYS_FUTEX_PI: u64 = 239;
 /// The working directory's descriptor: one past the ordinary numbers. It can
 /// be copied to and from and asked about, and nothing else.
 pub const FD_CWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -3176,7 +3180,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 3;
+pub const ABI_VERSION_MINOR: u32 = 4;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

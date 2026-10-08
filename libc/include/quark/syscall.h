@@ -264,6 +264,20 @@
 #define QUARK_SCHED_SET_NICE  1
 #define QUARK_SCHED_SET_CLASS 2
 #define QUARK_SCHED_CLASS     3
+/* A lock that lends its holder the place of whoever waits for it, Linux's
+   FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI: arg0 the op, arg1 the
+   word — nought, or its holder's task id with bit 31 while somebody waits in
+   the kernel and bit 30 when its holder died — and arg2 for a lock how long
+   to wait at most (a span; 0 for no end). It answers 0, 2 for a timeout,
+   QUARK_INTERRUPTED, QUARK_NOT_ALLOWED for an unlock of a word the caller
+   does not hold, or one of these. */
+#define SYS_FUTEX_PI        239
+#define QUARK_PI_LOCK         0
+#define QUARK_PI_TRY          1
+#define QUARK_PI_UNLOCK       2
+#define QUARK_PI_BUSY         1UL
+#define QUARK_PI_DEADLOCK     3UL
+#define QUARK_PI_NO_OWNER     4UL
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215

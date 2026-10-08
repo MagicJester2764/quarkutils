@@ -1740,6 +1740,52 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
             }
             return r == QUARK_ERR ? -LX_EINVAL : (long)r;
         }
+        /* A lock that lends its holder the place of whoever waits for it:
+           FUTEX_LOCK_PI, FUTEX_UNLOCK_PI and FUTEX_TRYLOCK_PI, which musl's
+           PTHREAD_PRIO_INHERIT mutexes are made of — and which it asks
+           first, to learn whether it may have one at all
+           (pthread_mutexattr_setprotocol locks a word of its own). Refused,
+           no program could make one. The word is the holder's task id, as
+           Linux's is its thread's. A lock's time is a deadline on the clock
+           that says the date, whatever the flags say, as Linux's is, and is
+           turned into how long from now: one already gone still takes a
+           word nobody holds, and gives up at once on one somebody does. */
+        if (op == 6 || op == 7 || op == 8) {
+            unsigned long r;
+            if (op == 7) {
+                r = __syscall2(SYS_FUTEX_PI, QUARK_PI_UNLOCK, (unsigned long)a1);
+            } else if (op == 8) {
+                r = __syscall2(SYS_FUTEX_PI, QUARK_PI_TRY, (unsigned long)a1);
+            } else {
+                unsigned long span = 0;
+                if (a4) {
+                    const struct lx_timespec *at = (const struct lx_timespec *)a4;
+                    unsigned long deadline =
+                        quark_nanos((unsigned long)at->tv_sec, (unsigned long)at->tv_nsec);
+                    unsigned long now = __syscall1(SYS_CLOCK, QUARK_CLOCK_WALL);
+                    span = quark_span(deadline > now ? deadline - now : 1);
+                }
+                r = __syscall3(SYS_FUTEX_PI, QUARK_PI_LOCK, (unsigned long)a1, span);
+            }
+            switch (r) {
+            case 0:
+                return 0;
+            case QUARK_PI_BUSY:
+                return -LX_EAGAIN;
+            case 2:
+                return -LX_ETIMEDOUT;
+            case QUARK_PI_DEADLOCK:
+                return -LX_EDEADLK;
+            case QUARK_PI_NO_OWNER:
+                return -LX_ESRCH;
+            case QUARK_NOT_ALLOWED:
+                return -LX_EPERM;
+            case QUARK_INTERRUPTED:
+                return -LX_EINTR;
+            default:
+                return -LX_EINVAL;
+            }
+        }
         if (op == 0) {
             unsigned long r;
             if (a4) {
