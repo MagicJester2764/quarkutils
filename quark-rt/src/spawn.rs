@@ -732,6 +732,19 @@ const AT_EGID: u64 = 14;
 const AT_HWCAP: u64 = 16;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
+const AT_HWCAP2: u64 = 26;
+
+/// `AT_HWCAP2`: bit 1, `HWCAP2_FSGSBASE`, where a program may read and write
+/// its own FS and GS bases — the processor has the instructions, and the
+/// kernel is one that turns them on (4.5 or later). Told otherwise, a program
+/// that used them would be ended with SIGILL, or would think a kernel that
+/// does not keep its GS base across a switch kept it.
+fn hwcap2() -> u64 {
+    let leaves = core::arch::x86_64::__cpuid(0).eax;
+    let has = leaves >= 7 && core::arch::x86_64::__cpuid_count(7, 0).ebx & 1 != 0;
+    let (major, minor) = syscall::sys_abi_version();
+    if has && (major > 4 || (major == 4 && minor >= 5)) { 2 } else { 0 }
+}
 
 /// Where in the stack's top [`ARGS_PAGES`] the count of arguments is: eight
 /// bytes in, eight below a multiple of sixteen. That is where a task begins
@@ -778,6 +791,7 @@ fn stack_page(info: &Spawned, args: &[&[u8]], env: &[&[u8]], scratch: &Scratch) 
         (AT_EGID, gid as u64),
         (AT_SECURE, 0),
         (AT_HWCAP, core::arch::x86_64::__cpuid(1).edx as u64),
+        (AT_HWCAP2, hwcap2()),
         (AT_RANDOM, (there + random_at) as u64),
         (AT_QUARK_LINUX, info.linux as u64),
     ];

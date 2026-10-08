@@ -369,6 +369,7 @@ static int give_image(unsigned long cr3, const struct segment *segs, int n, unsi
 #define AT_HWCAP  16
 #define AT_SECURE 23
 #define AT_RANDOM 25
+#define AT_HWCAP2 26
 
 /* How long a C string is. */
 static unsigned long length(const char *s) {
@@ -390,7 +391,7 @@ static unsigned long length(const char *s) {
 #define ARGS_PAGES 32UL
 
 /* The auxiliary vector's entries, its last nought pair not counted. */
-#define NAUX 15UL
+#define NAUX 16UL
 
 /* What `argv` and `envp` take at the top of a stack: their strings, sixteen
    random bytes, and a word for the count, each pointer, each list's nought
@@ -433,6 +434,16 @@ static unsigned long build_stack_top(unsigned char *staged, unsigned long top,
     unsigned long uid = ids >> 32, gid = ids & 0xFFFFFFFFUL;
     unsigned int a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    /* HWCAP2_FSGSBASE: the program may read and write its own FS and GS
+       bases — the processor has the instructions, and the kernel turns them
+       on, which it does from 4.5. */
+    unsigned int leaves, b7 = 0, x1, x2, x3;
+    __asm__ volatile("cpuid" : "=a"(leaves), "=b"(x1), "=c"(x2), "=d"(x3) : "a"(0), "c"(0));
+    if (leaves >= 7) {
+        __asm__ volatile("cpuid" : "=a"(x1), "=b"(b7), "=c"(x2), "=d"(x3) : "a"(7), "c"(0));
+    }
+    unsigned long abi = __syscall0(SYS_ABI_VERSION);
+    unsigned long hwcap2 = (b7 & 1) && abi >= (4UL << 16 | 5) ? 2 : 0;
     const unsigned long aux[][2] = {
         {phnum ? AT_PHDR : AT_PHNUM, phnum ? QUARK_ARGS_PAGE + QUARK_PHDRS_AT + 16 : 0},
         {AT_PHENT, PHDR_SIZE},
@@ -447,6 +458,7 @@ static unsigned long build_stack_top(unsigned char *staged, unsigned long top,
         {AT_EGID, gid},
         {AT_SECURE, 0},
         {AT_HWCAP, d},
+        {AT_HWCAP2, hwcap2},
         {AT_RANDOM, random_at},
         {QUARK_AT_LINUX, linux},
     };

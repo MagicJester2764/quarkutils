@@ -58,6 +58,8 @@ handlertest
 usagetest
 rtsched
 pimutex
+fsgsbase
+kernelentry
 layouttest
 sigqueuetest
 ptimertest
