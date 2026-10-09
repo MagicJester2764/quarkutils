@@ -60,7 +60,7 @@ USR_PROGRAMS  := disktest:DISKTEST qsh:QSH echo:ECHO ls:LS cat:CAT \
                  gpasswd:GPASSWD id:ID date:DATE swapd:SWAPD \
                  free:FREE lspci:LSPCI lsusb:LSUSB fbmode:FBMODE \
                  play:PLAY mixer:MIXER netctl:NETCTL svc:SVC \
-                 svctest:SVCTEST
+                 svctest:SVCTEST callbench:CALLBENCH kstress:KSTRESS
 
 # Drivers for devices nothing needs while the system starts: the device
 # manager reads them from /usr/lib/drivers and starts each for the devices it

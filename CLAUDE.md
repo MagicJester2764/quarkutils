@@ -238,7 +238,13 @@ driver can make another size (a virtio GPU); `dtest sound` one with no
 sound card and eighteen with one.
 `runtests <list>` runs the
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
-throws random requests at every registered service.
+throws random requests at every registered service. `callbench N SECS`
+counts the calls a second N pairs of threads make, each pair kept to a
+processor of its own (`sweep` for 1, 2, 4 and 8): with one lock for the
+kernel, pairs on four processors make what one pair makes. `kstress
+calls|faults|futex|pipes|mix SECS` has every processor hammering the
+kernel and checks each operation — every call answered, every page read
+back as written, every word through a pipe in order, no wake lost.
 
 **The C library's own tests are here too**, in `ctests/`: one small C program
 per lie a ported program has caught the library telling, and `libc.tests`,

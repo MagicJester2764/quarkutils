@@ -7220,6 +7220,108 @@ fn test_offline() {
     check("and every one is brought back", all_back && online().0 == count);
 }
 
+/// `dtest turns`: a thread computing, and a pair calling each other, all on
+/// one processor — how far the first has got, which processor, the
+/// server's task once it answers, and the word that stops all three.
+static TURN_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TURN_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TURN_SERVER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TURN_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn turn_keep() {
+    let cpu = TURN_CPU.load(core::sync::atomic::Ordering::SeqCst);
+    let mut set = [0u64; 4];
+    set[cpu / 64] = 1 << (cpu % 64);
+    let _ = syscall::sys_set_affinity(0, &set);
+}
+
+extern "C" fn turn_computer() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    turn_keep();
+    while !TURN_STOP.load(SeqCst) {
+        spin(1000);
+        TURN_COUNT.fetch_add(1, SeqCst);
+    }
+    syscall::sys_exit_code(0);
+}
+
+extern "C" fn turn_server() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::ipc::{Message, TID_ANY};
+    turn_keep();
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::mint_scratch(syscall::CAP_TYPE_ENDPOINT, me as u64, 0);
+    TURN_SERVER.store(me, SeqCst);
+    loop {
+        let mut msg = Message::empty();
+        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+            continue;
+        }
+        let _ = syscall::sys_reply(msg.sender, &Message { sender: 0, tag: msg.tag + 1, data: [0; 6] });
+        if msg.tag == 0 {
+            syscall::sys_exit_code(0);
+        }
+    }
+}
+
+extern "C" fn turn_client() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::ipc::Message;
+    turn_keep();
+    let to = TURN_SERVER.load(SeqCst);
+    let mut reply = Message::empty();
+    let mut n = 1;
+    while !TURN_STOP.load(SeqCst) {
+        let _ = syscall::sys_call_timeout(to, &Message { sender: 0, tag: n, data: [0; 6] }, &mut reply, 100);
+        n += 1;
+    }
+    let _ = syscall::sys_call_timeout(to, &Message::empty(), &mut reply, 100);
+    syscall::sys_exit_code(0);
+}
+
+/// A pair of threads calling each other back and forth leaves a thread
+/// computing on their processor its turns. A caller woken by its answer
+/// goes first (`unblock_task_next`), and was given a whole turn each time
+/// it did: the pair's turn never ran out, and the computing thread did not
+/// run at all while they called.
+fn test_turns() {
+    use core::sync::atomic::Ordering::SeqCst;
+    println!("turns:");
+    let mut set = [0u64; 4];
+    let _ = syscall::sys_cpu_online(&mut set);
+    let cpu = (0..256).rev().find(|&c| set[c / 64] >> (c % 64) & 1 == 1).unwrap_or(0);
+    TURN_CPU.store(cpu, SeqCst);
+    TURN_STOP.store(false, SeqCst);
+    TURN_SERVER.store(0, SeqCst);
+    let computer = thread::spawn_with_stack(turn_computer, 8).ok();
+    syscall::sleep_ms(100);
+    let before = TURN_COUNT.load(SeqCst);
+    syscall::sleep_ms(500);
+    let alone = TURN_COUNT.load(SeqCst) - before;
+    let server = thread::spawn_with_stack(turn_server, 8).ok();
+    let began = syscall::sys_clock();
+    while TURN_SERVER.load(SeqCst) == 0 && syscall::sys_clock() - began < 1_000_000_000 {
+        syscall::sleep_ms(1);
+    }
+    let client = thread::spawn_with_stack(turn_client, 8).ok();
+    syscall::sleep_ms(100);
+    let before = TURN_COUNT.load(SeqCst);
+    syscall::sleep_ms(1000);
+    let with = TURN_COUNT.load(SeqCst) - before;
+    TURN_STOP.store(true, SeqCst);
+    let made = computer.is_some() && server.is_some() && client.is_some();
+    for t in [client, server, computer].into_iter().flatten() {
+        let _ = t.join();
+    }
+    // Half a second alone is half of what a second would be.
+    let share = with * 100 / (alone * 2).max(1);
+    println!("        on processor {}, alone {} turns of a loop in half a second, beside the pair {} in a second: {}%", cpu, alone, with, share);
+    check(
+        "a pair calling each other leaves a thread computing on their processor its turns",
+        made && share >= 25,
+    );
+}
+
 /// The computing threads of `dtest placement`: as many as 32.
 const PLACERS: usize = 32;
 static PLACE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -11139,6 +11241,7 @@ pub extern "C" fn _start() -> ! {
         ("placement", test_placement),
         ("idle", test_idle),
         ("offline", test_offline),
+        ("turns", test_turns),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),

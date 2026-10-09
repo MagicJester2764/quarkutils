@@ -102,6 +102,9 @@ dtest/  dchild/     1057 checks of the kernel, made through the ABI; twelve
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
+callbench/ kstress/ Calls a second between pairs of threads, a pair to a
+                    processor; and every processor hammering the kernel —
+                    calls, faults, futexes, pipes — each operation checked.
 fstest/ nettest/ socktest/ threadtest/ mousetest/ disktest/ ipcping/
 capdemo/ wmdemo/ wmtype/                One subsystem each, exercised.
 svctest/            A service for the service manager's checks to keep.

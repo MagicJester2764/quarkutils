@@ -57,16 +57,15 @@ impl Thread {
 
     /// Wait for it to finish, returning its exit status.
     ///
-    /// `sys_wait` reaps whichever child exits first, so this loops until the
-    /// one we want comes back. A parent waiting on several threads gets them
-    /// in completion order, not call order.
+    /// For it and no other (`sys_wait_for`). It took whichever child ended
+    /// first and looked again until it was this one, and what it took on
+    /// the way was nobody's: joining one of several threads that ended
+    /// together threw the others' ends away, and joining any of those
+    /// afterwards waited for ever.
     pub fn join(self) -> i32 {
-        loop {
-            match syscall::sys_wait() {
-                Ok((tid, code)) if tid == self.tid => return code,
-                Ok(_) => continue,
-                Err(()) => return -1,
-            }
+        match syscall::sys_wait_for(self.tid) {
+            Ok((_, code)) => code,
+            Err(()) => -1,
         }
     }
 }
