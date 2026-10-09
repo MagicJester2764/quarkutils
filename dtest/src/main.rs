@@ -7471,7 +7471,14 @@ fn test_placement() {
     if let Some(r) = alone {
         println!("        alone: {} moves", r[0].0);
     }
-    check("a computing thread alone moves at most twice in a second", alone.is_some_and(|r| r[0].0 <= 2));
+    // What this guards against is a thread moving every turn — thirty
+    // times a second, as it did with one queue for the machine. A thread
+    // alone may still be handed to a processor with nothing to do when a
+    // server holds its own at a tick (`runq::hand_to_sleeper`): once in a
+    // second most often, and three times on a host running more of these
+    // machines' processors than it has, where a server's moment can last
+    // a tick. Twice was the bound before there was a hand-over.
+    check("a computing thread alone moves at most five times in a second", alone.is_some_and(|r| r[0].0 <= 5));
 
     let spread = computing(count, 1000);
     if let Some(r) = spread {
