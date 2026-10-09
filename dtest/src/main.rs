@@ -7036,6 +7036,49 @@ fn test_cpus() {
     }
 }
 
+/// A machine with nothing to do is not interrupted to find that out. Over
+/// ten seconds with this program asleep, kept to the first processor, the
+/// machine takes fewer than five hundred interrupts: what its programs have
+/// due, what wakes them, and a processor's tick only while it runs
+/// something. Each processor took a thousand, a tick every ten
+/// milliseconds, whether it had anything to run or not. What the rest of
+/// the machine does in the meantime is its own — a console's cursor, a
+/// network stack's timers — and is printed, a processor a line.
+fn test_idle() {
+    const MOST: usize = 256;
+    println!("idle:");
+    let (count, _) = syscall::sys_cpus();
+    let count = count.min(MOST);
+    let me = syscall::sys_getpid() as usize;
+    let was = syscall::sys_affinity(me).unwrap_or([u64::MAX; 4]);
+    let kept = syscall::sys_set_affinity(me, &[1, 0, 0, 0]).is_ok();
+    // What the sections before have left settles first.
+    syscall::sleep_ms(200);
+    let mut before = [(0u64, 0u64, 0u64); MOST];
+    for (i, b) in before.iter_mut().enumerate().take(count) {
+        if let Ok(t) = syscall::sys_cpu_times(Some(i)) {
+            *b = (t.interrupts, t.switches, t.user_ns + t.kernel_ns);
+        }
+    }
+    syscall::sleep_ms(10_000);
+    let mut taken = 0u64;
+    for (i, &(interrupts, switches, busy)) in before.iter().enumerate().take(count) {
+        if let Ok(t) = syscall::sys_cpu_times(Some(i)) {
+            taken += t.interrupts - interrupts;
+            println!(
+                "        processor {}: {} interrupts, {} switches, {} ms running something",
+                i,
+                t.interrupts - interrupts,
+                t.switches - switches,
+                (t.user_ns + t.kernel_ns - busy) / 1_000_000
+            );
+        }
+    }
+    let _ = syscall::sys_set_affinity(me, &was);
+    check("kept to the first processor to sleep", kept);
+    check("over ten seconds asleep the machine takes fewer than five hundred interrupts", taken < 500);
+}
+
 /// The computing threads of `dtest placement`: as many as 32.
 const PLACERS: usize = 32;
 static PLACE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -10940,6 +10983,7 @@ pub extern "C" fn _start() -> ! {
         ("smp", test_smp),
         ("cpus", test_cpus),
         ("placement", test_placement),
+        ("idle", test_idle),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),
