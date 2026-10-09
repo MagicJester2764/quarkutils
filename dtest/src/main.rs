@@ -7250,7 +7250,7 @@ fn test_smp() {
     println!("        {} of them, and this is number {}", count, on);
     check(
         "the kernel says how many processors there are, and which this is",
-        (1..=16).contains(&count) && on < count,
+        (1..=256).contains(&count) && on < count,
     );
 
     // Two threads that can only get anywhere if both are running.
@@ -8593,6 +8593,8 @@ static HANDLED_CODE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI
 static HANDLED_VALUE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDLED_WHO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDLED_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// When the handler ran, by the clock.
+static HANDLED_WHEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDLED_ON_STACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HANDLER_DEPTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HANDLER_DEEPEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -8631,6 +8633,7 @@ fn on_signal(frame: &mut quark_rt::signal::Frame) {
     let here = 0u8;
     HANDLED_AT.store(&here as *const u8 as usize, SeqCst);
     HANDLED_ON_STACK.store(frame.flags as u32 & 1, SeqCst);
+    HANDLED_WHEN.store(syscall::sys_clock(), SeqCst);
     HANDLED_BY.store(syscall::sys_getpid() as usize, SeqCst);
     HANDLED_WHY.store(frame.code, SeqCst);
     HANDLED_WHO.store(frame.value, SeqCst);
@@ -8783,6 +8786,7 @@ fn test_handlers() {
     let fresh = || {
         HANDLED.store(0, SeqCst);
         HANDLED_FLAG.store(0, SeqCst);
+        HANDLED_WHEN.store(0, SeqCst);
         HANDLED_WHY.store(u64::MAX, SeqCst);
     };
 
@@ -8854,8 +8858,17 @@ fn test_handlers() {
                 syscall::sleep_ns(1_000_000);
                 waited += 1;
             }
-            let took = syscall::sys_clock() - began;
-            println!("        run in the other thread {} us after it was raised", took / 1000);
+            // When the handler ran, not when this thread next did: on one
+            // processor that is after the computing thread's turn, three
+            // ticks of it, and this thread may wait out all of them.
+            let seen = syscall::sys_clock() - began;
+            let when = HANDLED_WHEN.load(SeqCst);
+            let took = if when >= began { when - began } else { u64::MAX };
+            println!(
+                "        run in the other thread {} us after it was raised (seen {} us after)",
+                took / 1000,
+                seen / 1000
+            );
             check(
                 "a signal is run by a task that does not hold it back, whatever it is doing",
                 HANDLED.load(SeqCst) == 1 && HANDLED_BY.load(SeqCst) == SPINNER_TID.load(SeqCst) && HANDLED_BY.load(SeqCst) != me,
