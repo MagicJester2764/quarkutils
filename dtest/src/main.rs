@@ -7036,6 +7036,168 @@ fn test_cpus() {
     }
 }
 
+/// The computing threads of `dtest placement`: as many as 32.
+const PLACERS: usize = 32;
+static PLACE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PLACE_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PLACE_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Turns of `spin` to a millisecond, as measured before the threads start.
+static PLACE_PER_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PLACE_BEGAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Each thread's: times it was seen on another processor than the last
+/// time it looked, those after the first fifty milliseconds, and the
+/// processor it was last on.
+static PLACE_MOVES: [core::sync::atomic::AtomicU32; PLACERS] = [const { core::sync::atomic::AtomicU32::new(0) }; PLACERS];
+static PLACE_LATE: [core::sync::atomic::AtomicU32; PLACERS] = [const { core::sync::atomic::AtomicU32::new(0) }; PLACERS];
+static PLACE_LAST: [core::sync::atomic::AtomicU32; PLACERS] = [const { core::sync::atomic::AtomicU32::new(0) }; PLACERS];
+
+fn spin(turns: u64) {
+    let mut x = 0u64;
+    for i in 0..turns {
+        x = core::hint::black_box(x.wrapping_add(i));
+    }
+}
+
+/// Which processor this is, asked of the processor where it can say.
+fn which_processor() -> u32 {
+    if core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+        rdtscp_aux()
+    } else {
+        syscall::sys_cpus().1 as u32
+    }
+}
+
+/// A thread that computes, and looks about a thousand times a second at
+/// which processor it is on.
+extern "C" fn computes_and_looks() -> ! {
+    use core::sync::atomic::Ordering;
+    let me = PLACE_NEXT.fetch_add(1, Ordering::SeqCst);
+    while !PLACE_GO.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
+    let per = PLACE_PER_MS.load(Ordering::Relaxed);
+    let began = PLACE_BEGAN.load(Ordering::SeqCst);
+    let mut last = which_processor();
+    let (mut moves, mut late) = (0, 0);
+    while !PLACE_STOP.load(Ordering::Relaxed) {
+        spin(per);
+        let cpu = which_processor();
+        if cpu != last {
+            moves += 1;
+            if syscall::sys_clock().saturating_sub(began) > 50_000_000 {
+                late += 1;
+            }
+            last = cpu;
+        }
+    }
+    PLACE_MOVES[me].store(moves, Ordering::SeqCst);
+    PLACE_LATE[me].store(late, Ordering::SeqCst);
+    PLACE_LAST[me].store(last, Ordering::SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// `n` computing threads for `ms` milliseconds: for each, its moves, its
+/// moves after the first fifty milliseconds, the processor it ended on, and
+/// the share of a processor it had, in thousandths. `None` if they could
+/// not all be made.
+fn computing(n: usize, ms: u64) -> Option<[(u32, u32, u32, u64); PLACERS]> {
+    use core::sync::atomic::Ordering;
+    PLACE_GO.store(false, Ordering::SeqCst);
+    PLACE_STOP.store(false, Ordering::SeqCst);
+    PLACE_NEXT.store(0, Ordering::SeqCst);
+    let mut threads = [const { None }; PLACERS];
+    for t in threads.iter_mut().take(n) {
+        *t = Some(thread::spawn_with_stack(computes_and_looks, 4).ok()?);
+    }
+    while PLACE_NEXT.load(Ordering::SeqCst) < n {
+        syscall::sleep_ticks(1);
+    }
+    let mut ran = [0u64; PLACERS];
+    for (i, t) in threads.iter().enumerate().take(n) {
+        let tid = t.as_ref().map_or(0, |t| t.tid());
+        ran[i] = syscall::sys_usage_of_task(tid).map_or(0, |u| u.user_ns + u.system_ns);
+    }
+    let began = syscall::sys_clock();
+    PLACE_BEGAN.store(began, Ordering::SeqCst);
+    PLACE_GO.store(true, Ordering::SeqCst);
+    syscall::sleep_ticks(ms / 10);
+    let mut out = [(0, 0, 0, 0); PLACERS];
+    let window = syscall::sys_clock() - began;
+    for (i, t) in threads.iter().enumerate().take(n) {
+        let tid = t.as_ref().map_or(0, |t| t.tid());
+        let used = syscall::sys_usage_of_task(tid).map_or(0, |u| u.user_ns + u.system_ns);
+        out[i].3 = used.saturating_sub(ran[i]) * 1000 / window.max(1);
+    }
+    PLACE_STOP.store(true, Ordering::SeqCst);
+    for t in threads.into_iter().flatten() {
+        let _ = t.join();
+    }
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        o.0 = PLACE_MOVES[i].load(Ordering::SeqCst);
+        o.1 = PLACE_LATE[i].load(Ordering::SeqCst);
+        o.2 = PLACE_LAST[i].load(Ordering::SeqCst);
+    }
+    Some(out)
+}
+
+/// Where computing threads run, on a machine of several processors: one
+/// alone stays where it is; as many as there are processors spread out
+/// over them and stay; twice as many share them evenly. Each processor
+/// chose from one queue for the machine, and a thread whose turn ended went
+/// back into it for whichever processor looked next.
+fn test_placement() {
+    println!("placement:");
+    let (count, _) = syscall::sys_cpus();
+    if count < 2 {
+        println!("        one processor: nothing to place");
+        return;
+    }
+    let count = count.min(PLACERS / 2);
+    // How many turns of `spin` make a millisecond here.
+    let before = syscall::sys_clock();
+    spin(10_000_000);
+    let took = (syscall::sys_clock() - before).max(1);
+    PLACE_PER_MS.store(10_000_000 * 1_000_000 / took, core::sync::atomic::Ordering::SeqCst);
+
+    let alone = computing(1, 1000);
+    if let Some(r) = alone {
+        println!("        alone: {} moves", r[0].0);
+    }
+    check("a computing thread alone moves at most twice in a second", alone.is_some_and(|r| r[0].0 <= 2));
+
+    let spread = computing(count, 1000);
+    if let Some(r) = spread {
+        print!("        {} threads: on", count);
+        for o in r.iter().take(count) {
+            print!(" {}", o.2);
+        }
+        print!(", moved");
+        for o in r.iter().take(count) {
+            print!(" {}/{}", o.1, o.0);
+        }
+        println!();
+    }
+    check(
+        "as many computing threads as processors are on one each, and stay there",
+        spread.is_some_and(|r| {
+            (0..count).all(|i| (0..i).all(|j| r[j].2 != r[i].2)) && r.iter().take(count).all(|o| o.1 == 0)
+        }),
+    );
+
+    let shared = computing(2 * count, 2000);
+    if let Some(r) = shared {
+        print!("        {} threads: thousandths", 2 * count);
+        for o in r.iter().take(2 * count) {
+            print!(" {}", o.3);
+        }
+        println!();
+    }
+    check(
+        "twice as many each have between 40% and 60% of a processor",
+        shared.is_some_and(|r| r.iter().take(2 * count).all(|o| (400..=600).contains(&o.3))),
+    );
+}
+
 fn test_smp() {
     use core::sync::atomic::Ordering;
     use quark_rt::ipc::Message;
@@ -9749,6 +9911,34 @@ fn test_usage() {
             plain += it;
         }
     }
+    // Where each was, and what else was running or ready to: what to look
+    // at when the nicer had more than they are owed.
+    let weighed = n == 2 * cpus && plain > 4 * nicer;
+    if !weighed {
+        for &(tid, nice, began) in &kids[..n] {
+            println!(
+                "        task {} nice {}: {} ms, last on {}",
+                tid,
+                if nice { 10 } else { 0 },
+                ran(tid).saturating_sub(began) / MS,
+                syscall::sys_cpu_last(tid).map_or(-1, |c| c as i64)
+            );
+        }
+        for tid in syscall::tasks() {
+            let busy = matches!(syscall::sys_task_info(tid), Ok((state, _, _)) if state <= 1);
+            if busy && !kids[..n].iter().any(|k| k.0 == tid) {
+                let mut name = [0u8; 48];
+                let len = syscall::sys_program_name(tid, &mut name).unwrap_or(0).min(name.len());
+                let name = core::str::from_utf8(&name[..len]).unwrap_or("?");
+                println!(
+                    "        also ready: task {} ({}), last on {}",
+                    tid,
+                    name.split('\0').next().unwrap_or(""),
+                    syscall::sys_cpu_last(tid).map_or(-1, |c| c as i64)
+                );
+            }
+        }
+    }
     for &(tid, _, _) in &kids[..n] {
         let _ = syscall::sys_task_kill(tid);
         let _ = wait_for(tid);
@@ -9756,7 +9946,7 @@ fn test_usage() {
     println!("        in 600 ms on {} processors: nice 0 ran {} ms, nice 10 {} ms", cpus, plain / MS, nicer / MS);
     check("anybody may ask what a program has used", plain > 0 && nicer > 0);
     // By weight, as on Linux: about nine to one.
-    check("a nicer program has less of its band, on any number of processors", n == 2 * cpus && plain > 4 * nicer);
+    check("a nicer program has less of its band, on any number of processors", weighed);
 
     // As many programs computing as there are processors, for a second, and
     // then one more. The newcomer has run nothing, but is not owed the
@@ -10139,10 +10329,19 @@ fn test_thousand_threads() {
     // A program that makes threads until it is refused is refused, at its
     // allowance, and the machine goes on: a program started afterwards can
     // make a thread of its own.
+    let began = syscall::sys_clock();
+    let hog = run(b"dchild", &[b"threadhog"]);
+    let took = syscall::sys_clock() - began;
     check(
         "a program without TaskMgmt has 4,096 tasks — itself and 4,095 threads — and is refused the next",
-        run(b"dchild", &[b"threadhog"]) == Some(0),
+        hog == Some(0),
     );
+    // Each of the 4,095 asleep and awake ten times a second: the kernel
+    // chose what to run by looking at every ready task, and with thousands
+    // of them the choosing was most of what it did — the program that made
+    // them waited minutes to be chosen and end them.
+    println!("        threadhog took {} ms", took / 1_000_000);
+    check("and ends in less than ten seconds, its threads waking ten times a second", took < 10_000_000_000);
     check(
         "and a program started afterwards runs, and makes a thread",
         matches!(run(b"dchild", &[b"together"]), Some(bits) if bits & !3 == 0),
@@ -10740,6 +10939,7 @@ pub extern "C" fn _start() -> ! {
         ("usage", test_usage),
         ("smp", test_smp),
         ("cpus", test_cpus),
+        ("placement", test_placement),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),
