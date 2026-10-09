@@ -294,6 +294,9 @@
 #define QUARK_CPU_TIMES       1UL
 #define QUARK_CPU_PLACE       2UL
 #define QUARK_CPU_LAST        3UL
+/* Which processors a task may run on (from 4.7): arg0 = 0 read or 1 set,
+   arg1 = the task (0 the caller), arg2 = 256 bits, four words. */
+#define SYS_AFFINITY        219
 /* Where the caller's robust list is (set_robust_list), or u64 all ones to
    ask. */
 #define SYS_ROBUST_LIST     132

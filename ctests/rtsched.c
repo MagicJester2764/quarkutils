@@ -13,8 +13,10 @@
  * And two threads of one program at nice 0 and 10 have between six and
  * twelve to one of the processor (Linux's weights give 9.3).
  *
- * On one processor: with more, the threads would each have one, and what is
- * measured is how they share it. It says so and passes.
+ * On one processor, whatever the machine has: every thread and child is kept
+ * to the last (sched_setaffinity). With more, the threads would each have
+ * one, and what is measured is how they share it. It ran only on a machine
+ * of one, until a thread could be kept anywhere.
  *
  * Exits 0 only if every check holds.
  */
@@ -151,12 +153,24 @@ static void *count(void *arg) {
     return NULL;
 }
 
+/* Every thread of this test, and every child it forks, on one processor —
+   the last, since the first takes the clock and every device's interrupt:
+   with more, each thread would have one, and what is measured is how they
+   share it. */
+static int keep_to_one(void) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(sysconf(_SC_NPROCESSORS_ONLN) - 1, &set);
+    return sched_setaffinity(0, sizeof set, &set);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("rtsched:\n");
-    if (sysconf(_SC_NPROCESSORS_ONLN) > 1) {
-        printf("rtsched: one processor only, and this machine has %ld: passed\n", sysconf(_SC_NPROCESSORS_ONLN));
-        return 0;
+    if (keep_to_one() != 0) {
+        printf("  FAIL  its threads can be kept to one processor\n");
+        printf("rtsched: FAILED\n");
+        return 1;
     }
 
     pid_t child = fork();

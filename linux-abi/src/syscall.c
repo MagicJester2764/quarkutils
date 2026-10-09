@@ -186,6 +186,7 @@ typedef unsigned long size_t;
 #define LX_prctl           157
 #define LX_mremap          25
 #define LX_get_robust_list 274
+#define LX_sched_setaffinity 203
 #define LX_sched_getaffinity 204
 #define LX_getcpu          309
 #define LX_futex           202
@@ -1326,11 +1327,12 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         }
         return -LX_EINVAL;
 
-    /* Every task may run on every processor the kernel is using: nothing
-       pins one yet, so the mask a task is asked for is all of them. That is
-       what makes `nproc` right, and `sysconf(_SC_NPROCESSORS_ONLN)`, which
-       is this call and a count of its bits. It said one for as long as there
-       was one. */
+        /* Which processors a thread may run on: Linux's set, as many bytes as
+       the caller says, of which the kernel keeps 256 bits (4.7). A kernel
+       before that pinned nothing, and every processor is the answer — which
+       is what makes `nproc` right, and `sysconf(_SC_NPROCESSORS_ONLN)`,
+       which is this call and a count of its bits, as musl has it on Linux:
+       a program kept to one processor is told there is one. */
     case LX_sched_getaffinity: {
         unsigned long size = (unsigned long)a2;
         unsigned char *mask = (unsigned char *)a3;
@@ -1340,11 +1342,34 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         for (unsigned long i = 0; i < size; i++) {
             mask[i] = 0;
         }
-        unsigned long cpus = __syscall0(SYS_CPUS) & 0xFFFFFFFFUL;
-        for (unsigned long i = 0; i < cpus && i / 8 < size; i++) {
-            mask[i / 8] |= (unsigned char)(1u << (i % 8));
+        unsigned long set[4] = {0};
+        if (__syscall3(SYS_AFFINITY, 0, sched_task(a1), (unsigned long)set) != 0) {
+            unsigned long cpus = __syscall0(SYS_CPUS) & 0xFFFFFFFFUL;
+            for (unsigned long i = 0; i < cpus && i < 256; i++) {
+                set[i / 64] |= 1UL << (i % 64);
+            }
         }
-        return (long)sizeof(unsigned long);
+        unsigned long said = size < sizeof set ? size & ~(sizeof(unsigned long) - 1) : sizeof set;
+        for (unsigned long i = 0; i < said; i++) {
+            mask[i] = ((unsigned char *)set)[i];
+        }
+        return (long)said;
+    }
+    case LX_sched_setaffinity: {
+        unsigned long size = (unsigned long)a2;
+        const unsigned char *mask = (const unsigned char *)a3;
+        if (!mask) {
+            return -LX_EFAULT;
+        }
+        unsigned long set[4] = {0};
+        for (unsigned long i = 0; i < size && i < sizeof set; i++) {
+            ((unsigned char *)set)[i] = mask[i];
+        }
+        unsigned long r = __syscall3(SYS_AFFINITY, 1, sched_task(a1), (unsigned long)set);
+        if (r == QUARK_ERR - 1) {
+            return -LX_EPERM;
+        }
+        return r == 0 ? 0 : -LX_EINVAL;
     }
 
     /* Which processor this is, as of the question: a task is moved between

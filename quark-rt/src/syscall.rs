@@ -693,6 +693,8 @@ pub const SYS_TASK_NAME: u64 = 215;
 /// What each processor is and does: which are online, how each has spent
 /// its time, where each sits, which a task last ran on (from 4.6).
 pub const SYS_CPU_INFO: u64 = 218;
+/// Which processors a task may run on (from 4.7).
+pub const SYS_AFFINITY: u64 = 219;
 /// The longest a task's name is.
 pub const TASK_NAME_MAX: usize = 15;
 
@@ -1354,6 +1356,20 @@ pub fn sys_cpu_place(cpu: usize) -> Result<CpuPlace, ()> {
         return Err(());
     }
     Ok(CpuPlace { apic: w[0], package: w[1], core: w[2], thread: w[3] })
+}
+
+/// The processors task `tid` — 0, the caller — may run on, a bit each.
+pub fn sys_affinity(tid: usize) -> Result<[u64; 4], ()> {
+    let mut set = [0u64; 4];
+    let r = unsafe { syscall3(SYS_AFFINITY, 0, tid as u64, set.as_mut_ptr() as u64) };
+    if r == 0 { Ok(set) } else { Err(()) }
+}
+
+/// Keep task `tid` — 0, the caller — to the processors `set` has, one of
+/// which must be online.
+pub fn sys_set_affinity(tid: usize, set: &[u64; 4]) -> Result<(), ()> {
+    let r = unsafe { syscall3(SYS_AFFINITY, 1, tid as u64, set.as_ptr() as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
 }
 
 /// The processor task `tid` — 0, the caller — last ran on, or runs on.
@@ -3253,7 +3269,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 6;
+pub const ABI_VERSION_MINOR: u32 = 7;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

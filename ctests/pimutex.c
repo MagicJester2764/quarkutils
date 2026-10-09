@@ -19,9 +19,9 @@
  * mutex, and a normal thread shares the processor again as normal threads
  * do — the lending went with the child.
  *
- * On one processor, as rtsched: with more, the threads would each have one.
- * It says so and passes. Every lock has a deadline, so that a kernel that
- * gets this wrong fails the test rather than hanging it.
+ * On one processor, as rtsched: every thread and child is kept to the last.
+ * Every lock has a deadline, so that a kernel that gets this wrong fails the
+ * test rather than hanging it.
  *
  * Exits 0 only if every check holds.
  */
@@ -239,12 +239,24 @@ static void *killer(void *arg) {
     return NULL;
 }
 
+/* Every thread of this test, and every child it forks, on one processor —
+   the last, since the first takes the clock and every device's interrupt:
+   with more, each thread would have one, and what is measured is how they
+   share it. */
+static int keep_to_one(void) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(sysconf(_SC_NPROCESSORS_ONLN) - 1, &set);
+    return sched_setaffinity(0, sizeof set, &set);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("pimutex:\n");
-    if (sysconf(_SC_NPROCESSORS_ONLN) > 1) {
-        printf("pimutex: one processor only, and this machine has %ld: passed\n", sysconf(_SC_NPROCESSORS_ONLN));
-        return 0;
+    if (keep_to_one() != 0) {
+        printf("  FAIL  its threads can be kept to one processor\n");
+        printf("pimutex: FAILED\n");
+        return 1;
     }
 
     /* 1. */

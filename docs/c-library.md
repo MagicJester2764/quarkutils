@@ -91,8 +91,10 @@ too. The difference is only visible to code that mixes the two kinds.
   asked of the processor itself (`RDPID`, or `RDTSCP`) on a kernel of 4.6
   or later, which keeps each processor's number where those find it, and
   of the kernel before that.
-  Every thread may run on every processor, and `sched_setaffinity` cannot
-  change that: nothing pins one. The kernel itself serves one processor at
+  A thread may be kept to some of them (`sched_setaffinity`,
+  `pthread_setaffinity_np`, on a kernel of 4.7 or later), and what it makes
+  is kept there too; `sched_getaffinity` — and so `sysconf` and `nproc` —
+  then says how many it may use. The kernel itself serves one processor at
   a time, so threads that compute run in parallel and threads that make
   system calls take turns at them.
 - **A thread is cancelled where it waits**: in a read or a write, a

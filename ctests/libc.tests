@@ -60,6 +60,7 @@ rtsched
 pimutex
 fsgsbase
 kernelentry
+affinity
 cpuinfo
 stopfault
 layouttest
