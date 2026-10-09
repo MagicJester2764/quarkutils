@@ -32,7 +32,7 @@
 
 use quark_rt::ipc::{Message, TID_ANY};
 use quark_rt::nameserver;
-use quark_rt::{println, syscall};
+use quark_rt::{println, syscall, thread};
 
 mod glyphs;
 mod width;
@@ -109,6 +109,19 @@ static mut TTY_NUMBER: usize = 0;
 /// one lives: whoever holds a terminal's slave reads what is typed.
 static mut TTY_OWNER: u64 = 0;
 static mut INPUT_TID: usize = 0;
+/// The input server has been asked to say when a key comes, and so is not
+/// asked for keys until it does.
+static mut KEYS_SAID: bool = false;
+
+/// What wakes the console besides a message: its pipe while that is open,
+/// and its terminal's master once there is one, watched by a thread of its
+/// own (`watch`) — a set, each as an edge, so that what arrives is said
+/// once and not for as long as it is there, which is for ever for a
+/// terminal between two sessions. `usize::MAX` where there is none, and
+/// the console looks every tick, as it did.
+static mut WATCHED: usize = usize::MAX;
+/// The console's own task, which the watcher tells.
+static mut MAIN: usize = 0;
 
 // Escape sequences: ECMA-48's shape. After ESC [ come parameter bytes
 // (0x30-0x3F: digits, `;`, and the private markers `<=>?`), intermediate
@@ -239,16 +252,17 @@ pub extern "C" fn _start() -> ! {
     println!("[console] Ready.");
 
     unsafe { CURSOR_LAST_TOGGLE = syscall::sys_ticks(); }
+    start_watching();
 
     // Main loop: draw what has been written, type what has been typed, and
-    // when there is neither, wait a tick and blink.
+    // when there is neither, wait for something to be — or for the cursor to
+    // blink.
     //
-    // Waiting a tick rather than yielding in a loop. There is no way to block
-    // on a pipe, a terminal and IPC at once, so idling here means asking each
-    // again shortly — but a yield loop asks as fast as the machine will go,
-    // forever. That is a whole core spent on an idle terminal, and it was
-    // enough to keep the keyboard driver from being scheduled while somebody
-    // typed.
+    // A task waits on one thing, and the console's is a message: so the pipe
+    // and the terminal are waited on by a thread of its own, which says when
+    // either has something with a message (`watch`), and the input server
+    // says when a key comes. The console used to look at all three a hundred
+    // times a second, and a machine with nothing to do was never idle.
     let mut pipe_open = true;
     let mut passes = 0u32;
     loop {
@@ -268,7 +282,12 @@ pub extern "C" fn _start() -> ! {
                 // Every writer has gone. That is the end of the pipe and not
                 // of this program: it is a server with a name, and somebody
                 // may yet ask it for its terminal.
-                0 => pipe_open = false,
+                0 => {
+                    pipe_open = false;
+                    if unsafe { WATCHED } != usize::MAX {
+                        let _ = syscall::sys_pollset_remove(unsafe { WATCHED }, 0);
+                    }
+                }
                 n if n == syscall::WOULD_BLOCK || n == u64::MAX => break,
                 n => {
                     let n = n as usize;
@@ -311,7 +330,7 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
         passes = 0;
-        serve(1);
+        serve(idle_wait());
         let now = syscall::sys_ticks();
         unsafe {
             if now.wrapping_sub(CURSOR_LAST_TOGGLE) >= CURSOR_BLINK_TICKS {
@@ -320,6 +339,59 @@ pub extern "C" fn _start() -> ! {
                 draw_cursor();
             }
         }
+    }
+}
+
+/// Start the thread that waits on the pipe and the terminal for the
+/// console, which waits for a message and nothing else, and tells it with
+/// one. Without it the console looks at them every tick.
+fn start_watching() {
+    unsafe {
+        let me = syscall::sys_getpid() as usize;
+        let Ok(set) = syscall::sys_pollset_create() else { return };
+        let told = syscall::mint_scratch(syscall::CAP_TYPE_ENDPOINT, me as u64, 0).is_ok();
+        if !told || syscall::sys_pollset_add(set, 0, syscall::POLL_READABLE | syscall::POLL_EDGE, 0).is_err() {
+            let _ = syscall::sys_fd_close(set);
+            return;
+        }
+        MAIN = me;
+        WATCHED = set;
+        if thread::spawn_with_stack(watch, 4).is_err() {
+            WATCHED = usize::MAX;
+            let _ = syscall::sys_fd_close(set);
+        }
+    }
+}
+
+/// The watcher: tell the console whenever its pipe or its terminal has
+/// something new to read.
+extern "C" fn watch() -> ! {
+    let (set, main) = unsafe { (WATCHED, MAIN) };
+    let mut ready = [syscall::Ready::empty(); 2];
+    loop {
+        match syscall::sys_pollset_wait(set, &mut ready, u64::MAX) {
+            Ok(0) => {}
+            Ok(_) => {
+                let _ = syscall::sys_notify(main, 1);
+            }
+            Err(()) => syscall::sleep_ticks(1),
+        }
+    }
+}
+
+/// How long the console waits, in ticks, when it has nothing to do: until
+/// the cursor is to blink, since what else it waits for says when it comes
+/// — a message, the watcher for the pipe and the terminal, the input server
+/// for a key. A tick where one of those cannot: no watcher, or a keyboard
+/// that is to be asked and has not been asked to tell.
+fn idle_wait() -> u64 {
+    unsafe {
+        let keys_unsaid = HAVE_DISPLAY && TTY_MASTER != usize::MAX && !KEYS_SAID;
+        if WATCHED == usize::MAX || keys_unsaid {
+            return 1;
+        }
+        let since = syscall::sys_ticks().wrapping_sub(CURSOR_LAST_TOGGLE);
+        CURSOR_BLINK_TICKS.saturating_sub(since).max(1)
     }
 }
 
@@ -353,6 +425,13 @@ fn tty_number() -> Option<usize> {
         let _ = syscall::sys_pty_set_size(master, ROWS as u16, COLS as u16);
         TTY_MASTER = master;
         TTY_NUMBER = number;
+        // What the session prints wakes the console (`watch`); if it cannot,
+        // the console looks every tick.
+        if WATCHED != usize::MAX
+            && syscall::sys_pollset_add(WATCHED, master, syscall::POLL_READABLE | syscall::POLL_EDGE, 1).is_err()
+        {
+            WATCHED = usize::MAX;
+        }
         Some(number)
     }
 }
@@ -405,16 +484,17 @@ fn pump_keys(master: usize) -> bool {
         if INPUT_TID == 0 {
             // The input server is started after this one. Ask once a pass
             // until it is there; then say the keys are ours while the display
-            // is.
+            // is, with the right to say when one comes on offer.
             let Some(tid) = nameserver::lookup(b"input") else {
                 return false;
             };
             let claim = Message { sender: 0, tag: TAG_INPUT_CLAIM, data: [0; 6] };
             let mut reply = Message::empty();
-            if syscall::sys_call(tid, &claim, &mut reply).is_err() || reply.tag == u64::MAX {
+            if syscall::sys_call_offer_self(tid, &claim, &mut reply).is_err() || reply.tag == u64::MAX {
                 return false;
             }
             INPUT_TID = tid;
+            KEYS_SAID = true;
         }
         INPUT_TID
     };

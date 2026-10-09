@@ -793,7 +793,12 @@ what they write down it is drawn. To a session it is a terminal: asked
 comes out of it and types into it what is typed. It holds the keyboard for
 that the way a compositor does — a claim on `input`, under the compositor's
 when one is running — and turns keys into the bytes a Linux console sends for
-them. It gives its terminal to the first program that asks and to nobody else
+them. It waits for all of it rather than looking: a claim made with the right
+to call the claimant on offer is told when keys come (`input`'s
+`keys_waiting`), and the pipe and the terminal are watched by a thread of the
+console's own (`watch`, a set of edges), which tells it with a notification —
+so the console wakes for what happens and for its cursor, where it looked at
+all three a hundred times a second and the machine was never idle. It gives its terminal to the first program that asks and to nobody else
 while that one lives: whoever holds the slave reads what is typed. What it
 understands of ECMA-48 is what `qtty/termcap` says, which is installed as
 `/etc/termcap`: a capability goes there when the console acts on it and not

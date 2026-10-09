@@ -278,7 +278,13 @@ impl Server {
     /// Take the keys the driver has and cook them, unless somebody holds the
     /// keyboard raw and takes them itself.
     fn keys_waiting(&mut self) {
-        if self.claims.top() != 0 {
+        let top = self.claims.top();
+        if top != 0 {
+            // The claimant's to take (`TAG_INPUT_POLL`), and to be told of
+            // if it offered to be (`claim`): a console that waits for keys
+            // rather than asking for them a hundred times a second. Telling
+            // one that did not is nothing.
+            let _ = syscall::sys_notify(top, 1);
             return;
         }
         for _ in 0..DRAIN_MAX {
@@ -345,6 +351,9 @@ impl Server {
         if !self.claims.push(sender) {
             return error();
         }
+        // A claimant that offered the right to call it is told when keys
+        // come (`keys_waiting`).
+        let _ = syscall::sys_cap_take_any(sender);
         // A claimant that dies without releasing would otherwise keep the
         // keys from everybody below it, down to a console nobody can type at.
         let _ = syscall::sys_task_watch(sender);
