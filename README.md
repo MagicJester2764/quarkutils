@@ -94,11 +94,11 @@ fbmode/ play/ mixer/ netctl/ svc/
                     Programs, in Rust without std.
 hello/  httpget/    Programs in Rust with std, built against the fork.
 cwc/  envtest/      Programs in C.
-dtest/  dchild/     1057 checks of the kernel, made through the ABI; twelve
-                    more on a machine with a device to ask `edu` about,
-                    eight where an IOMMU guards it, twenty-five where
-                    `swapd` is running, and more for USB, a display that
-                    can be another size, and sound.
+dtest/  dchild/     1072 checks of the kernel, made through the ABI, and 1090
+                    on four processors; twelve more on a machine with a
+                    device to ask `edu` about, eight where an IOMMU guards
+                    it, twenty-five where `swapd` is running, and more for
+                    USB, a display that can be another size, and sound.
 ctests/             The C library's own tests, one per lie a ported program
                     has caught it telling; `tools/build-ctests.sh` builds them.
 runtests/  qfuzz/   Run a list of test programs; fuzz every service.
