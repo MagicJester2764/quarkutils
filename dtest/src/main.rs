@@ -6927,6 +6927,115 @@ extern "C" fn second_caller() -> ! {
 /// Every check here is true with one processor too, except the first two,
 /// which say what the number of processors is and whether two threads were
 /// seen to run at once — and those are held to that number, either way.
+/// Asked by four threads, many times each: which processor this is, by the
+/// processor itself (RDTSCP, whose TSC_AUX the kernel sets to its number)
+/// and by the kernel (`SYS_CPUS`). How often the two were asked on one
+/// processor — RDTSCP said the same before and after — how often they
+/// agreed, and which processors RDTSCP named.
+static AUX_ASKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static AUX_AGREED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static AUX_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn rdtscp_aux() -> u32 {
+    let aux: u32;
+    unsafe { core::arch::asm!("rdtscp", out("eax") _, out("edx") _, out("ecx") aux, options(nomem, nostack)) };
+    aux
+}
+
+extern "C" fn asks_which_processor() -> ! {
+    use core::sync::atomic::Ordering;
+    for _ in 0..2000 {
+        let first = rdtscp_aux();
+        let (_, on) = syscall::sys_cpus();
+        let then = rdtscp_aux();
+        if first == then {
+            AUX_ASKED.fetch_add(1, Ordering::Relaxed);
+            if first as usize == on {
+                AUX_AGREED.fetch_add(1, Ordering::Relaxed);
+            }
+            if first < 64 {
+                AUX_SEEN.fetch_or(1 << first, Ordering::Relaxed);
+            }
+        }
+    }
+    syscall::sys_exit_code(0);
+}
+
+/// What the kernel says of each processor (`SYS_CPU_INFO`): which are
+/// online, how each has spent its time, where each sits, and which a task
+/// last ran on — and that a program can ask the processor itself which one
+/// it is on. It said how many there were and which this was, and nothing
+/// else: idle time was thrown away, and every processor was core `n` of
+/// package 0.
+fn test_cpus() {
+    use core::sync::atomic::Ordering;
+    println!("cpus:");
+    let (count, _) = syscall::sys_cpus();
+    let mut set = [0u64; 4];
+    let online = syscall::sys_cpu_online(&mut set);
+    let ones: u32 = set.iter().map(|w| w.count_ones()).sum();
+    check(
+        "the online processors are a set, a bit each",
+        online == Ok(count) && ones as usize == count && (0..count).all(|i| set[i / 64] >> (i % 64) & 1 == 1),
+    );
+
+    let times = |cpu: usize| syscall::sys_cpu_times(Some(cpu));
+    let idle = || (0..count).filter_map(|i| times(i).ok()).map(|t| t.idle_ns).sum::<u64>();
+    check(
+        "each processor says how it has spent its time",
+        (0..count).all(|i| times(i).is_ok_and(|t| t.user_ns + t.kernel_ns + t.idle_ns + t.irq_ns > 0)),
+    );
+    check("and one that is not there says nothing", times(count).is_err());
+    let before = idle();
+    syscall::sleep_ticks(20);
+    let after = idle();
+    check("two hundred milliseconds asleep are counted as time with nothing to do", after.saturating_sub(before) >= 100_000_000);
+    check(
+        "the machine's is its processors' together, with what it has made and what is ready",
+        syscall::sys_cpu_times(None).is_ok_and(|m| m.idle_ns >= after && m.tasks_made > 0 && m.runnable >= 1),
+    );
+
+    let mut apics = [u64::MAX; 256];
+    let mut placed = true;
+    for (i, apic) in apics.iter_mut().enumerate().take(count) {
+        match syscall::sys_cpu_place(i) {
+            Ok(place) => *apic = place.apic,
+            Err(()) => placed = false,
+        }
+    }
+    check(
+        "each processor says where it sits, by an APIC id of its own",
+        placed && (0..count).all(|i| (0..i).all(|j| apics[j] != apics[i])),
+    );
+
+    check(
+        "a task is said to have last run on an online processor",
+        syscall::sys_cpu_last(0).is_ok_and(|cpu| cpu < count),
+    );
+
+    // RDTSCP, where the processor has it: four threads, so that on a
+    // machine of several some are on another processor than the first.
+    if core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+        let mut threads = [None, None, None, None];
+        for t in threads.iter_mut() {
+            *t = thread::spawn_with_stack(asks_which_processor, 4).ok();
+        }
+        for t in threads.into_iter().flatten() {
+            let _ = t.join();
+        }
+        let asked = AUX_ASKED.load(Ordering::Relaxed);
+        let agreed = AUX_AGREED.load(Ordering::Relaxed);
+        let seen = AUX_SEEN.load(Ordering::Relaxed).count_ones() as usize;
+        println!("        {} asked, {} agreed, {} processors named", asked, agreed, seen);
+        check(
+            "RDTSCP says which processor a program is on, as the kernel does",
+            asked >= 1000 && agreed * 10 >= asked * 9 && (count == 1 || seen >= 2),
+        );
+    } else {
+        println!("        this processor has no RDTSCP");
+    }
+}
+
 fn test_smp() {
     use core::sync::atomic::Ordering;
     use quark_rt::ipc::Message;
@@ -10630,6 +10739,7 @@ pub extern "C" fn _start() -> ! {
         ("handlers", test_handlers),
         ("usage", test_usage),
         ("smp", test_smp),
+        ("cpus", test_cpus),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),

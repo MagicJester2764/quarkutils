@@ -1776,9 +1776,9 @@ mounts`):
   found that way: its files are pages nothing has touched lately.
 - **`/proc` is what this system can say**, which is less than Linux: no
   `fd`, `exe`, `environ`, `maps` or `cwd` in a program's directory, no
-  `stat` or `loadavg` for the machine, and no time a program started. The
-  idle time in `uptime` is nought, since nothing counts it, and `meminfo`
-  knows nothing of caches.
+  `loadavg` for the machine, and no time a program started. `stat` counts
+  no time as niced, waiting for a disk, or stolen by a hypervisor, and
+  `meminfo` knows nothing of caches.
 - `O_CREAT` through a symbolic link whose target does not exist says EEXIST,
   where Linux makes the target, and `linkat` cannot name its source by
   descriptor (`AT_EMPTY_PATH`). FAT has no links.

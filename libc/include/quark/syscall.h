@@ -281,6 +281,19 @@
 /* What a task is called, Linux's comm: arg0 = the task, arg1 = 0 set or 1
    read, arg2 = the name or where it goes, arg3 = its length or the room. */
 #define SYS_TASK_NAME       215
+/* What each processor is and does (from 4.6): arg0 = op. 0, which are
+   online, a bit each of 256 at arg1 (arg2 bytes, 32 at least), answering how
+   many; 1, how processor arg1 (or all, for u64 all ones) has spent its
+   time, eight words at arg2 — ns in programs, in the kernel, idle, taking
+   interrupts; interrupts; switches; tasks made since the machine started;
+   tasks running or ready; 2, where processor arg1 sits, four words at arg2 —
+   APIC id, package, core, thread; 3, the processor task arg1 (0, the
+   caller) last ran on. */
+#define SYS_CPU_INFO        218
+#define QUARK_CPU_ONLINE      0UL
+#define QUARK_CPU_TIMES       1UL
+#define QUARK_CPU_PLACE       2UL
+#define QUARK_CPU_LAST        3UL
 /* Where the caller's robust list is (set_robust_list), or u64 all ones to
    ask. */
 #define SYS_ROBUST_LIST     132

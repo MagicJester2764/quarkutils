@@ -6,13 +6,14 @@
 //! walks into it is answered here (`ext2_dir::resolve_to`); on a root with
 //! none, a path is matched as it is written, as `/dev`'s is. There is
 //! `self`, a link to the caller's process id; `cpuinfo`, `meminfo`,
-//! `mounts`, `uptime` and `version`; and a directory for each program, by
-//! its process id, holding `cmdline`, `comm`, `mounts`, `stat` and `status`
-//! — each in Linux's form, since that is what a program that reads one was
-//! written for — and `task`, a directory for each of its threads by its task
-//! id, holding the thread's `comm`. A `comm` is the one thing here that is
-//! written: a thread's name (`SYS_TASK_NAME`), which a program sets for its
-//! own threads, and which is its program's name until it does.
+//! `mounts`, `stat`, `uptime` and `version`; and a directory for each
+//! program, by its process id, holding `cmdline`, `comm`, `mounts`, `stat`
+//! and `status` — each in Linux's form, since that is what a program that
+//! reads one was written for — and `task`, a directory for each of its
+//! threads by its task id, holding the thread's `comm`. A `comm` is the one
+//! thing here that is written: a thread's name (`SYS_TASK_NAME`), which a
+//! program sets for its own threads, and which is its program's name until
+//! it does.
 //!
 //! A file is made when it is read, from what the kernel says at that moment:
 //! one read in pieces may see it change between them, as on Linux. Each says
@@ -61,6 +62,7 @@ pub enum File {
     Cpuinfo,
     Meminfo,
     Mounts,
+    Stat,
     Uptime,
     Version,
 }
@@ -74,10 +76,11 @@ pub enum Each {
     Status,
 }
 
-const FILES: [(&[u8], File); 5] = [
+const FILES: [(&[u8], File); 6] = [
     (b"cpuinfo", File::Cpuinfo),
     (b"meminfo", File::Meminfo),
     (b"mounts", File::Mounts),
+    (b"stat", File::Stat),
     (b"uptime", File::Uptime),
     (b"version", File::Version),
 ];
@@ -815,6 +818,7 @@ fn make(node: Node) -> Result<&'static [u8], u64> {
         Node::File(File::Cpuinfo) => cpuinfo(&mut t),
         Node::File(File::Meminfo) => meminfo(&mut t),
         Node::File(File::Mounts) => mounts(&mut t),
+        Node::File(File::Stat) => machine_stat(&mut t),
         Node::File(File::Uptime) => uptime(&mut t),
         Node::File(File::Version) => version(&mut t),
         Node::Of(pid, each) => {
@@ -877,9 +881,10 @@ fn process_stat(t: &mut Text, pid: u64, p: &Program, name: &[u8]) {
     for _ in 0..12 {
         t.bytes(b" 0");
     }
-    // What its parent is sent when it ends, and the fourteen after.
-    t.bytes(b" 17");
-    for _ in 0..14 {
+    // What its parent is sent when it ends; the processor it last ran on;
+    // and the thirteen after.
+    let _ = write!(t, " 17 {}", syscall::sys_cpu_last(p.tid).unwrap_or(0));
+    for _ in 0..13 {
         t.bytes(b" 0");
     }
     t.bytes(b"\n");
@@ -940,10 +945,50 @@ fn meminfo(t: &mut Text) {
 }
 
 /// Seconds since the machine started, to a hundredth; and the time its
-/// processors have spent with nothing to do, which nothing here counts.
+/// processors have spent with nothing to do, every one's together, as
+/// Linux's is.
 fn uptime(t: &mut Text) {
     let hundredths = syscall::sys_clock() / NS_PER_TICK;
-    let _ = writeln!(t, "{}.{:02} 0.00", hundredths / 100, hundredths % 100);
+    let idle = syscall::sys_cpu_times(None).map_or(0, |all| all.idle_ns / NS_PER_TICK);
+    let _ = writeln!(t, "{}.{:02} {}.{:02}", hundredths / 100, hundredths % 100, idle / 100, idle % 100);
+}
+
+/// `/proc/stat`: how the processors have spent their time, every one's
+/// together and then each, in hundredths of a second, in Linux's ten
+/// columns — user, nice, system, idle, iowait, irq, softirq, steal, guest
+/// and guest_nice, of which the kernel counts the four it has; and the
+/// machine's interrupts, switches, start, tasks made and tasks running.
+fn machine_stat(t: &mut Text) {
+    let line = |t: &mut Text, c: &syscall::CpuTimes| {
+        let _ = writeln!(
+            t,
+            " {} 0 {} {} 0 {} 0 0 0 0",
+            c.user_ns / NS_PER_TICK,
+            c.kernel_ns / NS_PER_TICK,
+            c.idle_ns / NS_PER_TICK,
+            c.irq_ns / NS_PER_TICK
+        );
+    };
+    let all = syscall::sys_cpu_times(None).unwrap_or_default();
+    t.bytes(b"cpu ");
+    line(t, &all);
+    let (count, _) = syscall::sys_cpus();
+    for p in 0..count {
+        if let Ok(c) = syscall::sys_cpu_times(Some(p)) {
+            let _ = write!(t, "cpu{}", p);
+            line(t, &c);
+        }
+    }
+    let up = syscall::sys_clock() / 1_000_000_000;
+    let _ = writeln!(
+        t,
+        "intr {}\nctxt {}\nbtime {}\nprocesses {}\nprocs_running {}",
+        all.interrupts,
+        all.switches,
+        syscall::unix_time().saturating_sub(up),
+        all.tasks_made,
+        all.runnable
+    );
 }
 
 /// What `uname` says: the system, the version of its system calls, the
@@ -1141,7 +1186,18 @@ fn cpuinfo(t: &mut Text) {
     let line = ((one.ebx >> 8) & 0xFF) * 8;
     let mut said = [0u8; 1024];
     let said_len = flags(&mut said);
-    for p in 0..count {
+    // Where each sits, as it said when it started: a kernel before 4.6 says
+    // nothing, and each is then a core of one package.
+    let mut places = [syscall::CpuPlace::default(); 256];
+    for (p, place) in places.iter_mut().enumerate().take(count.min(256)) {
+        *place = syscall::sys_cpu_place(p).unwrap_or(syscall::CpuPlace { apic: p as u64, package: 0, core: p as u64, thread: 0 });
+    }
+    let places = &places[..count.min(256)];
+    for p in 0..places.len() {
+        let here = places[p];
+        let mates = || places.iter().enumerate().filter(move |(_, q)| q.package == here.package);
+        let siblings = mates().count();
+        let cores = mates().filter(|&(i, q)| !places[..i].iter().any(|r| r.package == here.package && r.core == q.core)).count();
         let _ = writeln!(t, "processor\t: {}", p);
         t.bytes(b"vendor_id\t: ");
         t.bytes(&vendor);
@@ -1153,8 +1209,8 @@ fn cpuinfo(t: &mut Text) {
         }
         let _ = writeln!(
             t,
-            "physical id\t: 0\nsiblings\t: {}\ncore id\t\t: {}\ncpu cores\t: {}\napicid\t\t: {}\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: {}\nwp\t\t: yes",
-            count, p, count, p, top.eax
+            "physical id\t: {}\nsiblings\t: {}\ncore id\t\t: {}\ncpu cores\t: {}\napicid\t\t: {}\ninitial apicid\t: {}\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: {}\nwp\t\t: yes",
+            here.package, siblings, here.core, cores, here.apic, here.apic, top.eax
         );
         t.bytes(b"flags\t\t:");
         t.bytes(&said[..said_len]);

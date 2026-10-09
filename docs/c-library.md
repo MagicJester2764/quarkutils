@@ -87,7 +87,10 @@ too. The difference is only visible to code that mixes the two kinds.
   thread forked is `ECHILD`. Fork and wait in the same thread.
 - **Threads run at the same time**, on as many processors as the machine
   has: `sysconf(_SC_NPROCESSORS_ONLN)`, `nproc` and `sched_getaffinity` say
-  how many, and `sched_getcpu` which one a thread is on at that moment.
+  how many, and `sched_getcpu` which one a thread is on at that moment —
+  asked of the processor itself (`RDPID`, or `RDTSCP`) on a kernel of 4.6
+  or later, which keeps each processor's number where those find it, and
+  of the kernel before that.
   Every thread may run on every processor, and `sched_setaffinity` cannot
   change that: nothing pins one. The kernel itself serves one processor at
   a time, so threads that compute run in parallel and threads that make
@@ -278,8 +281,8 @@ does on Linux. What is different is at the edges:
   standard output — but the file itself is in the file server, and reading
   one is a message to it.
 - `/proc` is the file server's, and says what Linux's does of the system
-  and of each program — `self`, `cpuinfo`, `meminfo`, `mounts`, `uptime`,
-  `version`, and a program's `cmdline`, `comm`, `mounts`, `stat`,
+  and of each program — `self`, `cpuinfo`, `meminfo`, `mounts`, `stat`,
+  `uptime`, `version`, and a program's `cmdline`, `comm`, `mounts`, `stat`,
   `status` and `task` — read when it is read. `/proc/self/fd/N` is this
   layer's, for a descriptor that is a terminal, because that is how musl's
   `ttyname` asks what a terminal is called.

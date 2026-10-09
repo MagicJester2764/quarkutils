@@ -60,6 +60,7 @@ rtsched
 pimutex
 fsgsbase
 kernelentry
+cpuinfo
 stopfault
 layouttest
 sigqueuetest

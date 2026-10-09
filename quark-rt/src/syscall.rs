@@ -690,6 +690,9 @@ pub const PROGRAM_NAME_MAX: usize = 128;
 /// nought, as much of them as fits.
 /// What a task is called: a thread's name, Linux's `comm`.
 pub const SYS_TASK_NAME: u64 = 215;
+/// What each processor is and does: which are online, how each has spent
+/// its time, where each sits, which a task last ran on (from 4.6).
+pub const SYS_CPU_INFO: u64 = 218;
 /// The longest a task's name is.
 pub const TASK_NAME_MAX: usize = 15;
 
@@ -1287,6 +1290,76 @@ pub fn sys_getrandom(buf: &mut [u8]) -> Result<usize, ()> {
 pub fn sys_cpus() -> (usize, usize) {
     let ret = unsafe { syscall0(SYS_CPUS) };
     ((ret & 0xFFFF_FFFF) as usize, (ret >> 32) as usize)
+}
+
+/// How a processor has spent its time, by the clock, and what it has done
+/// (`sys_cpu_times`); the last two are the machine's whichever is asked.
+#[derive(Clone, Copy, Default)]
+pub struct CpuTimes {
+    /// Nanoseconds running programs, running the kernel, with nothing to
+    /// do, and taking interrupts.
+    pub user_ns: u64,
+    pub kernel_ns: u64,
+    pub idle_ns: u64,
+    pub irq_ns: u64,
+    /// Interrupts taken, and switches from one task to another.
+    pub interrupts: u64,
+    pub switches: u64,
+    /// Tasks the machine has made since it started, and those running or
+    /// ready to now.
+    pub tasks_made: u64,
+    pub runnable: u64,
+}
+
+/// Where a processor sits: its APIC id, and the package, core and thread
+/// the id is made of.
+#[derive(Clone, Copy, Default)]
+pub struct CpuPlace {
+    pub apic: u64,
+    pub package: u64,
+    pub core: u64,
+    pub thread: u64,
+}
+
+/// Which processors are online, a bit each of 256: how many there are.
+pub fn sys_cpu_online(set: &mut [u64; 4]) -> Result<usize, ()> {
+    let r = unsafe { syscall3(SYS_CPU_INFO, 0, set.as_mut_ptr() as u64, 32) };
+    if r == u64::MAX { Err(()) } else { Ok(r as usize) }
+}
+
+/// How processor `cpu` has spent its time — every processor's together for
+/// `None`.
+pub fn sys_cpu_times(cpu: Option<usize>) -> Result<CpuTimes, ()> {
+    let mut w = [0u64; 8];
+    let which = cpu.map_or(u64::MAX, |c| c as u64);
+    if unsafe { syscall3(SYS_CPU_INFO, 1, which, w.as_mut_ptr() as u64) } != 0 {
+        return Err(());
+    }
+    Ok(CpuTimes {
+        user_ns: w[0],
+        kernel_ns: w[1],
+        idle_ns: w[2],
+        irq_ns: w[3],
+        interrupts: w[4],
+        switches: w[5],
+        tasks_made: w[6],
+        runnable: w[7],
+    })
+}
+
+/// Where processor `cpu` sits.
+pub fn sys_cpu_place(cpu: usize) -> Result<CpuPlace, ()> {
+    let mut w = [0u64; 4];
+    if unsafe { syscall3(SYS_CPU_INFO, 2, cpu as u64, w.as_mut_ptr() as u64) } != 0 {
+        return Err(());
+    }
+    Ok(CpuPlace { apic: w[0], package: w[1], core: w[2], thread: w[3] })
+}
+
+/// The processor task `tid` — 0, the caller — last ran on, or runs on.
+pub fn sys_cpu_last(tid: usize) -> Result<usize, ()> {
+    let r = unsafe { syscall2(SYS_CPU_INFO, 3, tid as u64) };
+    if r == u64::MAX { Err(()) } else { Ok(r as usize) }
 }
 
 pub fn sys_irq_register(irq: u8) -> Result<(), ()> {
@@ -3180,7 +3253,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 5;
+pub const ABI_VERSION_MINOR: u32 = 6;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

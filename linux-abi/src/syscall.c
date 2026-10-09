@@ -702,6 +702,44 @@ static void put_field(char *field, const char *text) {
     }
 }
 
+/* Which processor this is, as of the question. A kernel of 4.6 or later
+   keeps each processor's number in its TSC_AUX, which RDPID reads, and
+   RDTSCP beside the counter: no call. How is decided once: RDPID where the
+   processor has it (CPUID leaf 7, ECX bit 22), else RDTSCP (0x8000_0001,
+   EDX bit 27), else the call. */
+static int getcpu_how;
+
+static unsigned which_processor(void) {
+    int how = __atomic_load_n(&getcpu_how, __ATOMIC_RELAXED);
+    if (!how) {
+        unsigned leaves, ext, a, b, c, d, c7 = 0, d1 = 0;
+        how = 3;
+        if (__syscall0(SYS_ABI_VERSION) >= (4UL << 16 | 6)) {
+            __asm__ volatile("cpuid" : "=a"(leaves), "=b"(b), "=c"(c), "=d"(d) : "a"(0), "c"(0));
+            if (leaves >= 7) {
+                __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c7), "=d"(d) : "a"(7), "c"(0));
+            }
+            __asm__ volatile("cpuid" : "=a"(ext), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000U), "c"(0));
+            if (ext >= 0x80000001U) {
+                __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d1) : "a"(0x80000001U), "c"(0));
+            }
+            how = (c7 & (1U << 22)) ? 1 : (d1 & (1U << 27)) ? 2 : 3;
+        }
+        __atomic_store_n(&getcpu_how, how, __ATOMIC_RELAXED);
+    }
+    if (how == 1) {
+        unsigned long v;
+        __asm__ volatile("rdpid %0" : "=r"(v));
+        return (unsigned)v;
+    }
+    if (how == 2) {
+        unsigned lo, hi, aux;
+        __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        return aux;
+    }
+    return (unsigned)(__syscall0(SYS_CPUS) >> 32);
+}
+
 static long do_uname(char *u) {
     if (!u) {
         return -LX_EFAULT;
@@ -1315,7 +1353,7 @@ static long dispatch(long n, long a1, long a2, long a3, long a4, long a5, long a
         unsigned *cpu = (unsigned *)a1;
         unsigned *node = (unsigned *)a2;
         if (cpu) {
-            *cpu = (unsigned)(__syscall0(SYS_CPUS) >> 32);
+            *cpu = which_processor();
         }
         if (node) {
             *node = 0;
