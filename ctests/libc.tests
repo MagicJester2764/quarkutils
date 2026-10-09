@@ -61,6 +61,7 @@ pimutex
 fsgsbase
 kernelentry
 affinity
+wakelatency
 cpuinfo
 stopfault
 layouttest
