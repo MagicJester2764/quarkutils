@@ -1064,6 +1064,46 @@ fn yield_race(rounds: u64) -> (u64, u64) {
     (still, long)
 }
 
+/// `tables`'s two threads: where their pages are, which processor they are
+/// kept to, and what came of them.
+const TABLES: usize = 0xC0_0000_0000;
+static TABLES_CPU: AtomicUsize = AtomicUsize::new(0);
+static TABLES_STOP: AtomicBool = AtomicBool::new(false);
+static TABLES_WRONG: AtomicBool = AtomicBool::new(false);
+static TABLES_ROUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Map a page, write it, read it back and unmap it, until told to stop.
+/// The two threads' pages are two megabytes apart, in a table each, and
+/// the directory over both holds nothing else of the program's: an unmap
+/// that leaves it empty gives it back.
+extern "C" fn tables_thread(which: usize) -> ! {
+    let cpu = TABLES_CPU.load(Ordering::Relaxed);
+    let mut set = [0u64; 4];
+    set[cpu / 64] = 1 << (cpu % 64);
+    let _ = syscall::sys_set_affinity(0, &set);
+    let page = TABLES + which * 0x20_0000;
+    let mut round = 0u64;
+    while !TABLES_STOP.load(Ordering::Relaxed) {
+        if syscall::sys_mmap(page, 1).is_err() {
+            TABLES_WRONG.store(true, Ordering::Relaxed);
+            break;
+        }
+        let word = page as *mut u64;
+        let mark = (which as u64) << 56 | round;
+        unsafe { word.write_volatile(mark) };
+        if unsafe { word.read_volatile() } != mark {
+            TABLES_WRONG.store(true, Ordering::Relaxed);
+        }
+        if syscall::sys_munmap(page, 1).is_err() {
+            TABLES_WRONG.store(true, Ordering::Relaxed);
+            break;
+        }
+        round += 1;
+    }
+    TABLES_ROUNDS[which].store(round, Ordering::Relaxed);
+    syscall::sys_exit_code(0);
+}
+
 /// The framebuffer device, for `band`'s second task; and that task's word
 /// that its claim and its release are over.
 static BAND_FB: AtomicUsize = AtomicUsize::new(0);
@@ -1162,6 +1202,33 @@ pub extern "C" fn _start() -> ! {
         let (still, long) = yield_race(rounds);
         println!("yieldrace: the count had not moved {} times of {}, {} within ten milliseconds", still, rounds, long);
         syscall::sys_exit_code(0);
+    }
+    // Two threads kept to one processor, each mapping and unmapping a page
+    // under one directory, for so many seconds: a tick that finds one in
+    // the middle of a map lets the other run, and its unmap may leave the
+    // directory empty. 0 if every page was there and held what was written
+    // to it; 1 if one held something else or a map was refused. A page
+    // that was not there at all is the end of the program, by its fault.
+    if quark_rt::args::argv(1) == Some(&b"tables"[..]) {
+        let secs = quark_rt::args::argv(2).and_then(|a| core::str::from_utf8(a).ok()?.parse().ok()).unwrap_or(3u64);
+        let mut online = [0u64; 4];
+        let _ = syscall::sys_cpu_online(&mut online);
+        let last = (0..256).rev().find(|&c| online[c / 64] >> (c % 64) & 1 == 1).unwrap_or(0);
+        TABLES_CPU.store(last, Ordering::Relaxed);
+        let threads = [thread::spawn_with_arg(tables_thread, 0, 4).ok(), thread::spawn_with_arg(tables_thread, 1, 4).ok()];
+        let made = threads.iter().all(Option::is_some);
+        syscall::sleep_ms(secs * 1000);
+        TABLES_STOP.store(true, Ordering::Relaxed);
+        for t in threads.into_iter().flatten() {
+            let _ = t.join();
+        }
+        println!(
+            "tables: {} and {} rounds on processor {}",
+            TABLES_ROUNDS[0].load(Ordering::Relaxed),
+            TABLES_ROUNDS[1].load(Ordering::Relaxed),
+            last
+        );
+        syscall::sys_exit_program((!made || TABLES_WRONG.load(Ordering::Relaxed)) as i32);
     }
     // Called by a server, and asking for its band for a task it makes.
     if quark_rt::args::argv(1) == Some(&b"band"[..]) {

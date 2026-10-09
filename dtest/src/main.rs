@@ -3689,6 +3689,19 @@ extern "C" fn cache_reader() -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// Two threads of a program, kept to one processor, each mapping and
+/// unmapping a page in a table of its own under one directory, which an
+/// unmap that leaves it empty gives back: a tick that finds one of them in
+/// the middle of a map lets the other run, and the directory the first was
+/// filling in must not be given back under it (`dchild tables`).
+fn test_tables() {
+    println!("tables:");
+    check(
+        "two threads mapping and unmapping under one directory for three seconds find every page they mapped",
+        run(b"dchild", &[b"tables", b"3"]) == Some(0),
+    );
+}
+
 fn test_memory() {
     println!("memory on demand:");
     let (free0, charged0) = syscall::sys_mem_info();
@@ -11206,6 +11219,7 @@ pub extern "C" fn _start() -> ! {
         ("random", test_random),
         ("locks", test_locks),
         ("memory", test_memory),
+        ("tables", test_tables),
         ("disks", test_disks),
         ("ramdisk", test_ram_disk),
         ("parts", test_parts),
