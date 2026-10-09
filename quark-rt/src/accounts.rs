@@ -184,9 +184,11 @@ impl Rights {
     pub const NETWORK: u32 = 16;
     /// Run a thread in a real-time class, ahead of every ordinary program.
     pub const REALTIME: u32 = 32;
+    /// Take a processor offline and bring it back.
+    pub const PROCESSORS: u32 = 64;
     /// Everything a session can hold, the right to say who a task is among
     /// it: what user 0 has where nothing says otherwise.
-    pub const ALL: u32 = 0x8000_0000 | 63;
+    pub const ALL: u32 = 0x8000_0000 | 127;
 
     pub fn has(self, right: u32) -> bool {
         self.0 & right == right
@@ -200,6 +202,7 @@ impl Rights {
             b"clock" => Self::CLOCK,
             b"network" => Self::NETWORK,
             b"realtime" => Self::REALTIME,
+            b"processors" => Self::PROCESSORS,
             b"all" => Self::ALL,
             _ => return None,
         })
@@ -207,7 +210,7 @@ impl Rights {
 }
 
 /// The names of the rights, in the order they are written.
-pub const RIGHT_NAMES: [(&[u8], u32); 7] = [
+pub const RIGHT_NAMES: [(&[u8], u32); 8] = [
     (b"all", Rights::ALL),
     (b"power", Rights::POWER),
     (b"tasks", Rights::TASKS),
@@ -215,6 +218,7 @@ pub const RIGHT_NAMES: [(&[u8], u32); 7] = [
     (b"clock", Rights::CLOCK),
     (b"network", Rights::NETWORK),
     (b"realtime", Rights::REALTIME),
+    (b"processors", Rights::PROCESSORS),
 ];
 
 /// What `/etc/rights` gives `name`, whose id is `uid`.

@@ -695,6 +695,8 @@ pub const SYS_TASK_NAME: u64 = 215;
 pub const SYS_CPU_INFO: u64 = 218;
 /// Which processors a task may run on (from 4.7).
 pub const SYS_AFFINITY: u64 = 219;
+/// A processor taken offline, or brought back (from 4.8).
+pub const SYS_CPU_ONLINE: u64 = 220;
 /// The longest a task's name is.
 pub const TASK_NAME_MAX: usize = 15;
 
@@ -1369,6 +1371,15 @@ pub fn sys_affinity(tid: usize) -> Result<[u64; 4], ()> {
 /// which must be online.
 pub fn sys_set_affinity(tid: usize, set: &[u64; 4]) -> Result<(), ()> {
     let r = unsafe { syscall3(SYS_AFFINITY, 1, tid as u64, set.as_ptr() as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Take processor `cpu` offline (`false`), or bring it back (`true`): not
+/// the first, and only with the right to (`CAP_TYPE_PROCESSORS`). Comes
+/// back when it is done — taken offline, the processor has given what it
+/// had to the others and stopped; brought back, it runs again.
+pub fn sys_cpu_set_online(cpu: usize, online: bool) -> Result<(), ()> {
+    let r = unsafe { syscall2(SYS_CPU_ONLINE, online as u64, cpu as u64) };
     if r == 0 { Ok(()) } else { Err(()) }
 }
 
@@ -3133,6 +3144,9 @@ pub const CAP_TYPE_NET_ADMIN: u64 = 15;
 /// The right to put a task in a real-time class (`sys_sched_set_class`).
 /// Leaving one takes nothing.
 pub const CAP_TYPE_REALTIME: u64 = 16;
+/// The right to take a processor offline and bring it back
+/// (`sys_cpu_set_online`).
+pub const CAP_TYPE_PROCESSORS: u64 = 17;
 
 /// CSpace slot conventions shared by init, login and the shell.
 ///
@@ -3269,7 +3283,7 @@ pub const CAP_ENDPOINT: u32 = 1 << 6;
 /// equal version exactly the same calls — and `init` holds them against the
 /// kernel that is actually running, before it does anything else.
 pub const ABI_VERSION_MAJOR: u32 = 4;
-pub const ABI_VERSION_MINOR: u32 = 7;
+pub const ABI_VERSION_MINOR: u32 = 8;
 
 /// Syscall ABI version the running kernel implements, as (major, minor).
 ///

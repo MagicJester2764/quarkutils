@@ -297,6 +297,9 @@
 /* Which processors a task may run on (from 4.7): arg0 = 0 read or 1 set,
    arg1 = the task (0 the caller), arg2 = 256 bits, four words. */
 #define SYS_AFFINITY        219
+/* A processor taken offline (arg0 = 0) or brought back (1), arg1 = which
+   (from 4.8): not the first, and only with QUARK_CAP_PROCESSORS. */
+#define SYS_CPU_ONLINE      220
 /* Where the caller's robust list is (set_robust_list), or u64 all ones to
    ask. */
 #define SYS_ROBUST_LIST     132

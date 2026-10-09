@@ -672,10 +672,10 @@ programs written to read it:
 | Name | What it says |
 |---|---|
 | `self` | a link to the caller's process id |
-| `cpuinfo` | a paragraph for each processor: what `cpuid` says, its features as Linux names them, less what the kernel has not turned on, and where it sits — its package (`physical id`), core and APIC id, as the kernel says (`SYS_CPU_INFO`) |
+| `cpuinfo` | a paragraph for each processor online: what `cpuid` says, its features as Linux names them, less what the kernel has not turned on, and where it sits — its package (`physical id`), core and APIC id, as the kernel says (`SYS_CPU_INFO`) |
 | `meminfo` | `MemTotal`, `MemFree`, `MemAvailable`, `SwapTotal` and `SwapFree`, from the kernel; `Buffers` and `Cached` are nought |
 | `mounts` | a line for each mounted filesystem, as `MOUNTS` counts them: source, place, kind, `rw 0 0` |
-| `stat` | how the processors have spent their time — every one's together, then each — in hundredths of a second, in Linux's ten columns of which the kernel counts user, system, idle and irq; then `intr`, `ctxt`, `btime`, `processes` and `procs_running` |
+| `stat` | how the processors have spent their time — every one's together, then each online — in hundredths of a second, in Linux's ten columns of which the kernel counts user, system, idle and irq; then `intr`, `ctxt`, `btime`, `processes` and `procs_running` |
 | `uptime` | seconds since the machine started, and the time its processors have had nothing to do, every one's together |
 | `version` | `Quark version` and the system calls' version |
 | `PID/` | a directory for each program by its process id, a program's own: `cmdline` (what it was started as, each argument ended by a NUL), `comm`, `mounts`, `stat`, `status` and `task` |

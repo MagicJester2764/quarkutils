@@ -150,6 +150,8 @@ that the passwords are at no moment anybody's to read under either name.
 | `become` | nothing at login. It lets `BLESS` with `OWN` succeed: the account becomes another on its own password |
 | `clock` | the right to set the date (`date -s`), which is the machine's and everybody's |
 | `network` | the right to say how the network treats what comes in (`netctl filter`), which is every program's network |
+| `realtime` | the right to run a thread in a real-time class, `SCHED_FIFO` or `SCHED_RR`, ahead of every ordinary program |
+| `processors` | the right to take a processor offline and bring it back (`sys_cpu_set_online`), which is every program's share of the machine |
 | `all` | everything, `SetUid` among it |
 
 An account no line names has what Unix gives it: everything for user 0 and

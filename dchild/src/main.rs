@@ -1217,6 +1217,18 @@ pub extern "C" fn _start() -> ! {
         syscall::sys_restart();
         syscall::sys_exit_code(made as i32);
     }
+    // Take processor 1 offline, holding nothing that says this may, and
+    // make the right to: 0 if both were refused, 1 — having brought it
+    // back — if either was not.
+    if quark_rt::args::argv(1) == Some(&b"offline"[..]) {
+        const TRIAL_SLOT: usize = 40;
+        let made = syscall::sys_cap_mint(TRIAL_SLOT, syscall::CAP_TYPE_PROCESSORS, 0, 0).is_ok();
+        let taken = syscall::sys_cpu_set_online(1, false).is_ok();
+        if taken {
+            let _ = syscall::sys_cpu_set_online(1, true);
+        }
+        syscall::sys_exit_code((made || taken) as i32);
+    }
     // Try to set the clock, an hour on, holding nothing that says this may:
     // 0 if it was refused, and 1 — having put it back — if it was not.
     if quark_rt::args::argv(1) == Some(&b"clockset"[..]) {

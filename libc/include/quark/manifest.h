@@ -29,6 +29,8 @@
 #define QUARK_CAP_POWER      12UL
 /* Run a thread in a real-time class, SCHED_FIFO or SCHED_RR. */
 #define QUARK_CAP_REALTIME   16UL
+/* Take a processor offline and bring it back. */
+#define QUARK_CAP_PROCESSORS 17UL
 
 /* Each request is three words: what kind, and up to two parameters. */
 #define QUARK_CAP_IOPORT_RANGE(first, last) QUARK_CAP_IOPORT, (first), (last)

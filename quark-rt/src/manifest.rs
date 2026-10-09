@@ -134,6 +134,12 @@ impl CapReq {
         CapReq { cap_type: syscall::CAP_TYPE_REALTIME, param0: 0, param1: 0 }
     }
 
+    /// Take a processor offline and bring it back (`sys_cpu_set_online`).
+    /// A session holds it if its account has the `processors` right.
+    pub const fn processors() -> Self {
+        CapReq { cap_type: syscall::CAP_TYPE_PROCESSORS, param0: 0, param1: 0 }
+    }
+
     /// Be where memory is written out to when there is not enough of it
     /// (`OBJECT_SWAP`). For the one program a system starts to do that:
     /// whoever holds it is handed pages of every program's memory.

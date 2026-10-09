@@ -973,7 +973,8 @@ fn machine_stat(t: &mut Text) {
     t.bytes(b"cpu ");
     line(t, &all);
     let (count, _) = syscall::sys_cpus();
-    for p in 0..count {
+    let online = online_set();
+    for p in (0..count).filter(|&p| online(p)) {
         if let Ok(c) = syscall::sys_cpu_times(Some(p)) {
             let _ = write!(t, "cpu{}", p);
             line(t, &c);
@@ -1142,10 +1143,20 @@ fn flags(out: &mut [u8; 1024]) -> usize {
     len
 }
 
+/// Which processors are online, for whether each is: one taken offline is
+/// not in `/proc`, as on Linux. A kernel before 4.6 does not say, and every
+/// one is.
+fn online_set() -> impl Fn(usize) -> bool {
+    let mut set = [u64::MAX; 4];
+    let _ = syscall::sys_cpu_online(&mut set);
+    move |p: usize| p < 256 && set[p / 64] >> (p % 64) & 1 == 1
+}
+
 /// What the processor says it is — the same of every processor here, so
 /// asked of whichever this server is on — once for each of them.
 fn cpuinfo(t: &mut Text) {
     let (count, _) = syscall::sys_cpus();
+    let online = online_set();
     let top = __cpuid(0);
     let mut vendor = [0u8; 12];
     vendor[..4].copy_from_slice(&top.ebx.to_le_bytes());
@@ -1193,11 +1204,14 @@ fn cpuinfo(t: &mut Text) {
         *place = syscall::sys_cpu_place(p).unwrap_or(syscall::CpuPlace { apic: p as u64, package: 0, core: p as u64, thread: 0 });
     }
     let places = &places[..count.min(256)];
-    for p in 0..places.len() {
+    for p in (0..places.len()).filter(|&p| online(p)) {
         let here = places[p];
-        let mates = || places.iter().enumerate().filter(move |(_, q)| q.package == here.package);
+        let online = &online;
+        let mates = || places.iter().enumerate().filter(move |&(i, q)| online(i) && q.package == here.package);
         let siblings = mates().count();
-        let cores = mates().filter(|&(i, q)| !places[..i].iter().any(|r| r.package == here.package && r.core == q.core)).count();
+        let cores = mates()
+            .filter(|&(i, q)| !places[..i].iter().enumerate().any(|(j, r)| online(j) && r.package == here.package && r.core == q.core))
+            .count();
         let _ = writeln!(t, "processor\t: {}", p);
         t.bytes(b"vendor_id\t: ");
         t.bytes(&vendor);

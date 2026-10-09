@@ -30,8 +30,10 @@ quark_rt::manifest!([
     CapReq::power(),
     // And to say how the network treats what comes in, for `netctl`.
     CapReq::net_admin(),
-    // And to run a thread in a real-time class, for a program that asks to.
+    // And to run a thread in a real-time class, for a program that asks to;
+    // and to take a processor offline and bring it back.
     CapReq::realtime(),
+    CapReq::processors(),
 ]);
 
 const TAG_SET_FOREGROUND: u64 = 2;

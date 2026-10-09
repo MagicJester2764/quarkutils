@@ -14,7 +14,13 @@ use quark_rt::{nameserver, print, println, spawn, sync, syscall, thread, vfs};
 
 // The right to say who a task is, is what `identity` checks the use of. A
 // shell that does not hold it cannot give it, and the section says so.
-quark_rt::manifest!([CapReq::task_mgmt(0), CapReq::phys_alloc(64), CapReq::set_uid(), CapReq::clock()]);
+quark_rt::manifest!([
+    CapReq::task_mgmt(0),
+    CapReq::phys_alloc(64),
+    CapReq::set_uid(),
+    CapReq::clock(),
+    CapReq::processors(),
+]);
 
 static mut PASSED: u32 = 0;
 static mut FAILED: u32 = 0;
@@ -7079,6 +7085,141 @@ fn test_idle() {
     check("over ten seconds asleep the machine takes fewer than five hundred interrupts", taken < 500);
 }
 
+/// `dtest offline`'s threads, both kept to processor 3: one computing — its
+/// task, the processor it last saw itself on, and the word that stops it —
+/// and one waiting in a read of a pipe when the processor goes, and what
+/// came of its read.
+static OFF_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static OFF_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static OFF_ON: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+static OFF_READER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static OFF_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const OFF_PIPE: (usize, usize) = (500, 501);
+
+extern "C" fn offline_spinner() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::sys_set_affinity(me, &[1 << 3, 0, 0, 0]);
+    OFF_TID.store(me, SeqCst);
+    while !OFF_STOP.load(SeqCst) {
+        OFF_ON.store(syscall::sys_cpus().1, SeqCst);
+        spin(10_000);
+    }
+    syscall::sys_exit_code(0);
+}
+
+extern "C" fn offline_reader() -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::sys_set_affinity(me, &[1 << 3, 0, 0, 0]);
+    OFF_READER.store(me, SeqCst);
+    let mut byte = [0u8; 1];
+    let got = syscall::sys_fd_read(OFF_PIPE.0, &mut byte);
+    OFF_READ.store(if got == 1 { 1 } else { 2 }, SeqCst);
+    syscall::sys_exit_code(0);
+}
+
+/// A processor taken offline and brought back (`SYS_CPU_ONLINE`). Offline,
+/// it runs nothing: what it was running, and what was waiting for it, goes
+/// on elsewhere — a thread kept to it no longer kept to it — and a task of
+/// its that was waiting when it went comes back elsewhere. Back, it has
+/// nothing to do again. With all but the first offline, the first does
+/// everything. The first is never taken offline — the clock and every
+/// device are its — and none is by a program without the right to.
+fn test_offline() {
+    use core::sync::atomic::Ordering::SeqCst;
+    println!("processors taken offline and brought back:");
+    let (count, _) = syscall::sys_cpus();
+    check("the first processor is not taken offline", syscall::sys_cpu_set_online(0, false).is_err());
+    check("nor is any, by a program without the right to", run(b"dchild", &[b"offline"]) == Some(0));
+    if count < 4 {
+        println!("        (the rest wants four processors or more)");
+        return;
+    }
+    let online = || {
+        let mut set = [0u64; 4];
+        let n = syscall::sys_cpu_online(&mut set).unwrap_or(0);
+        (n, set)
+    };
+    let wait = |done: &dyn Fn() -> bool| {
+        let began = syscall::sys_clock();
+        while !done() && syscall::sys_clock() - began < 2_000_000_000 {
+            syscall::sleep_ms(5);
+        }
+        done()
+    };
+
+    OFF_STOP.store(false, SeqCst);
+    OFF_ON.store(usize::MAX, SeqCst);
+    OFF_READ.store(0, SeqCst);
+    OFF_READER.store(0, SeqCst);
+    let piped = own_pipe(OFF_PIPE.0, OFF_PIPE.1).is_ok();
+    let spinner = thread::spawn_with_stack(offline_spinner, 8).ok();
+    let reader = if piped { thread::spawn_with_stack(offline_reader, 8).ok() } else { None };
+    let there = wait(&|| OFF_ON.load(SeqCst) == 3 && OFF_READER.load(SeqCst) != 0);
+    // Into its read.
+    syscall::sleep_ms(50);
+    check("a thread kept to processor 3 runs there", there && spinner.is_some() && reader.is_some());
+
+    let off = syscall::sys_cpu_set_online(3, false).is_ok();
+    check("processor 3 is taken offline", off);
+    let (n, set) = online();
+    check("and the machine has one processor fewer", n == count - 1 && set[0] & 1 << 3 == 0);
+    // As /proc says it, which is what a program reads.
+    static mut CPUINFO: [u8; 65536] = [0; 65536];
+    let text = unsafe { &mut *core::ptr::addr_of_mut!(CPUINFO) };
+    let listed = nameserver::lookup(b"vfs").and_then(|vfs| slurp(vfs, b"/proc/cpuinfo", text).ok()).map(|len| {
+        text[..len].windows(10).filter(|w| *w == b"processor\t").count()
+    });
+    check("and /proc/cpuinfo lists one fewer", listed == Some(count - 1));
+    OFF_ON.store(usize::MAX, SeqCst);
+    let moved = wait(&|| OFF_ON.load(SeqCst) != usize::MAX);
+    let on = OFF_ON.load(SeqCst);
+    println!("        the thread kept to it now runs on {}", on as isize);
+    check("the thread it was running goes on, on another", moved && on != 3);
+    let widened = syscall::sys_affinity(OFF_TID.load(SeqCst)).is_ok_and(|set| set[0] & !(1 << 3) != 0);
+    check("kept to it no longer, but to what is online", widened);
+    let _ = syscall::sys_fd_write(OFF_PIPE.1, b"x");
+    let read = wait(&|| OFF_READ.load(SeqCst) != 0);
+    check("a read of its, waiting when it went, comes back elsewhere", read && OFF_READ.load(SeqCst) == 1);
+
+    let back = syscall::sys_cpu_set_online(3, true).is_ok();
+    let (n, set) = online();
+    check("processor 3 is brought back", back && n == count && set[0] & 1 << 3 != 0);
+    let idle = || syscall::sys_cpu_times(Some(3)).map_or(0, |t| t.idle_ns);
+    let before = idle();
+    syscall::sleep_ms(200);
+    check("and has nothing to do again", idle() >= before + 50_000_000);
+    OFF_STOP.store(true, SeqCst);
+    if let Some(t) = spinner {
+        let _ = t.join();
+    }
+    if let Some(t) = reader {
+        let _ = t.join();
+    }
+    let _ = syscall::sys_fd_close(OFF_PIPE.0);
+    let _ = syscall::sys_fd_close(OFF_PIPE.1);
+
+    // The first alone.
+    let mut all_off = true;
+    for cpu in 1..count {
+        all_off &= syscall::sys_cpu_set_online(cpu, false).is_ok();
+    }
+    check("every processor but the first is taken offline", all_off && online().0 == 1);
+    match syscall::sys_fork() {
+        Ok(0) => syscall::sys_exit_program(5),
+        Ok(child) => check("and the first alone forks", wait_for(child) == Some(5)),
+        Err(()) => check("and the first alone forks", false),
+    }
+    check("and answers a call", nameserver::lookup(b"vfs").is_some());
+    test_call_storm();
+    let mut all_back = true;
+    for cpu in 1..count {
+        all_back &= syscall::sys_cpu_set_online(cpu, true).is_ok();
+    }
+    check("and every one is brought back", all_back && online().0 == count);
+}
+
 /// The computing threads of `dtest placement`: as many as 32.
 const PLACERS: usize = 32;
 static PLACE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -10997,6 +11138,7 @@ pub extern "C" fn _start() -> ! {
         ("cpus", test_cpus),
         ("placement", test_placement),
         ("idle", test_idle),
+        ("offline", test_offline),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),
