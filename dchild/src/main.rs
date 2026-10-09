@@ -1104,6 +1104,19 @@ extern "C" fn tables_thread(which: usize) -> ! {
     syscall::sys_exit_code(0);
 }
 
+/// `unmapread`: the reader's descriptor, its page, and what its read said.
+const UNMAPREAD: usize = 0xC0_4000_0000;
+static UNMAPREAD_FD: AtomicUsize = AtomicUsize::new(0);
+static UNMAPREAD_GOT: AtomicU64 = AtomicU64::new(0);
+
+/// Wait to read the pipe into the page, and say what came of it.
+extern "C" fn unmap_reader(_: usize) -> ! {
+    let buf = unsafe { core::slice::from_raw_parts_mut(UNMAPREAD as *mut u8, 8) };
+    let got = syscall::sys_fd_read(UNMAPREAD_FD.load(Ordering::Relaxed), buf);
+    UNMAPREAD_GOT.store(got, Ordering::Relaxed);
+    syscall::sys_exit_code(0);
+}
+
 /// The framebuffer device, for `band`'s second task; and that task's word
 /// that its claim and its release are over.
 static BAND_FB: AtomicUsize = AtomicUsize::new(0);
@@ -1229,6 +1242,33 @@ pub extern "C" fn _start() -> ! {
             last
         );
         syscall::sys_exit_program((!made || TABLES_WRONG.load(Ordering::Relaxed)) as i32);
+    }
+    // A thread waits to read a pipe into a page of its own; another unmaps
+    // the page, and writes to the pipe. The unmap is refused while the read
+    // has the page — the kernel may be waiting to copy to it with
+    // interrupts off — the read has its eight bytes, and once it is over
+    // the page can go: 0 if all three, 1 if not. (An unmap that went
+    // through was a fault in the kernel, and the end of the machine.)
+    if quark_rt::args::argv(1) == Some(&b"unmapread"[..]) {
+        let Ok(h) = syscall::sys_pipe_create() else { syscall::sys_exit_program(1) };
+        let (me, any) = (syscall::sys_getpid(), u64::MAX - 1);
+        let r = unsafe { syscall::syscall4(syscall::SYS_PIPE_FD_SET, me, any, h as u64, 0) };
+        let w = unsafe { syscall::syscall4(syscall::SYS_PIPE_FD_SET, me, any, h as u64, 1) };
+        if r >= u64::MAX - 16 || w >= u64::MAX - 16 || syscall::sys_mmap(UNMAPREAD, 1).is_err() {
+            syscall::sys_exit_program(1);
+        }
+        UNMAPREAD_FD.store(r as usize, Ordering::Relaxed);
+        let reader = thread::spawn_with_arg(unmap_reader, 0, 4).ok();
+        syscall::sleep_ms(200);
+        let refused = syscall::sys_munmap(UNMAPREAD, 1).is_err();
+        let _ = syscall::sys_fd_write(w as usize, b"12345678");
+        if let Some(t) = reader {
+            let _ = t.join();
+        }
+        let got = UNMAPREAD_GOT.load(Ordering::Relaxed);
+        let after = syscall::sys_munmap(UNMAPREAD, 1).is_ok();
+        println!("unmapread: the unmap refused {}, the read answered {:#x}, the unmap after it {}", refused, got, after);
+        syscall::sys_exit_program(if refused && got == 8 && after { 0 } else { 1 });
     }
     // Called by a server, and asking for its band for a task it makes.
     if quark_rt::args::argv(1) == Some(&b"band"[..]) {

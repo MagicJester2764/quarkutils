@@ -3689,16 +3689,25 @@ extern "C" fn cache_reader() -> ! {
     syscall::sys_exit_code(0);
 }
 
-/// Two threads of a program, kept to one processor, each mapping and
-/// unmapping a page in a table of its own under one directory, which an
-/// unmap that leaves it empty gives back: a tick that finds one of them in
-/// the middle of a map lets the other run, and the directory the first was
-/// filling in must not be given back under it (`dchild tables`).
+/// What another thread of a program does to its tables while the kernel
+/// is in the middle of something with them. Two threads, kept to one
+/// processor, each mapping and unmapping a page in a table of its own under
+/// one directory, which an unmap that leaves it empty gives back: a tick
+/// that finds one of them in the middle of a map lets the other run, and
+/// the directory the first was filling in must not be given back under it
+/// (`dchild tables`). And a page a read is waiting to copy to, unmapped by
+/// another thread (`dchild unmapread`).
 fn test_tables() {
     println!("tables:");
     check(
         "two threads mapping and unmapping under one directory for three seconds find every page they mapped",
         run(b"dchild", &[b"tables", b"3"]) == Some(0),
+    );
+    // And a page a call is waiting to copy to is not unmapped under it by
+    // another thread: the kernel would fault on it with interrupts off.
+    check(
+        "a page a waiting read has checked is not unmapped under it, and goes when the read is over",
+        run(b"dchild", &[b"unmapread"]) == Some(0),
     );
 }
 
