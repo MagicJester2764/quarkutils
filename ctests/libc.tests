@@ -61,6 +61,7 @@ pimutex
 fsgsbase
 kernelentry
 affinity
+affinity loaded
 wakelatency
 cpuinfo
 stopfault
