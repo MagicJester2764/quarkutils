@@ -73,6 +73,7 @@ inotifytest
 epolltest
 pthreadtest
 manythreads
+thousand
 sigthreads
 inettest
 cowstress
