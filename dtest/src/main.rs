@@ -7303,6 +7303,121 @@ extern "C" fn turn_client() -> ! {
     syscall::sys_exit_code(0);
 }
 
+static SCALE_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SCALE_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SCALE_WRONG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Each pair's processor, its server's task, and its client's calls.
+static SCALE_CPU: [core::sync::atomic::AtomicUsize; 4] = [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+static SCALE_SERVER: [core::sync::atomic::AtomicUsize; 4] = [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+static SCALE_CALLS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn scale_keep(i: usize) {
+    let cpu = SCALE_CPU[i].load(core::sync::atomic::Ordering::SeqCst);
+    let mut set = [0u64; 4];
+    set[cpu / 64] = 1 << (cpu % 64);
+    let _ = syscall::sys_set_affinity(0, &set);
+}
+
+extern "C" fn scale_server(i: usize) -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::ipc::{Message, TID_ANY};
+    scale_keep(i);
+    let me = syscall::sys_getpid() as usize;
+    let _ = syscall::mint_scratch(syscall::CAP_TYPE_ENDPOINT, me as u64, 0);
+    SCALE_SERVER[i].store(me, SeqCst);
+    loop {
+        let mut msg = Message::empty();
+        if syscall::sys_recv(TID_ANY, &mut msg).is_err() {
+            continue;
+        }
+        let answer = Message { sender: 0, tag: msg.tag.wrapping_add(1), data: msg.data };
+        let _ = syscall::sys_reply(msg.sender, &answer);
+        if msg.tag == 0 {
+            syscall::sys_exit_code(0);
+        }
+    }
+}
+
+extern "C" fn scale_client(i: usize) -> ! {
+    use core::sync::atomic::Ordering::SeqCst;
+    use quark_rt::ipc::Message;
+    scale_keep(i);
+    let to = SCALE_SERVER[i].load(SeqCst);
+    while !SCALE_GO.load(SeqCst) {
+        syscall::sleep_ms(1);
+    }
+    let mut calls = 0u64;
+    let mut reply = Message::empty();
+    while !SCALE_STOP.load(SeqCst) {
+        calls += 1;
+        let ask = Message { sender: 0, tag: calls, data: [calls, i as u64, 0, 0, 0, 0] };
+        let answered = syscall::sys_call_timeout(to, &ask, &mut reply, 100);
+        if !matches!(answered, syscall::CallOutcome::Replied) || reply.tag != calls + 1 || reply.data[0] != calls {
+            SCALE_WRONG.store(true, SeqCst);
+            break;
+        }
+    }
+    SCALE_CALLS[i].store(calls, SeqCst);
+    // The server's last call: a tag of nought.
+    let _ = syscall::sys_call_timeout(to, &Message::empty(), &mut reply, 100);
+    syscall::sys_exit_code(0);
+}
+
+/// `pairs` pairs calling for a second, each kept to a processor of its own:
+/// the calls they made between them.
+fn scale_run(pairs: usize) -> u64 {
+    use core::sync::atomic::Ordering::SeqCst;
+    SCALE_GO.store(false, SeqCst);
+    SCALE_STOP.store(false, SeqCst);
+    let mut threads = [const { None }; 8];
+    for i in 0..pairs {
+        SCALE_SERVER[i].store(0, SeqCst);
+        SCALE_CALLS[i].store(0, SeqCst);
+        threads[2 * i] = thread::spawn_with_arg(scale_server, i, 8).ok();
+        let began = syscall::sys_clock();
+        while SCALE_SERVER[i].load(SeqCst) == 0 && syscall::sys_clock() - began < 2_000_000_000 {
+            syscall::sleep_ms(1);
+        }
+        threads[2 * i + 1] = thread::spawn_with_arg(scale_client, i, 8).ok();
+    }
+    syscall::sleep_ms(50);
+    SCALE_GO.store(true, SeqCst);
+    syscall::sleep_ms(1000);
+    SCALE_STOP.store(true, SeqCst);
+    for t in threads.iter_mut().filter_map(|t| t.take()) {
+        let _ = t.join();
+    }
+    (0..pairs).map(|i| SCALE_CALLS[i].load(SeqCst)).sum()
+}
+
+/// Four pairs of threads calling each other, each pair kept to a processor
+/// of its own, make at least twice what one pair makes alone: a call between
+/// two tasks does not wait for the rest of the kernel. With one lock for all
+/// of the kernel, four made about what one made. Not asked of a machine with
+/// fewer than four processors.
+fn test_scale() {
+    use core::sync::atomic::Ordering::SeqCst;
+    println!("scale:");
+    let mut set = [0u64; 4];
+    let _ = syscall::sys_cpu_online(&mut set);
+    let mut n = 0;
+    for cpu in (0..256).filter(|&c| set[c / 64] >> (c % 64) & 1 == 1).take(4) {
+        SCALE_CPU[n].store(cpu, SeqCst);
+        n += 1;
+    }
+    if n < 4 {
+        println!("        {} processors: nothing to ask", n);
+        return;
+    }
+    SCALE_WRONG.store(false, SeqCst);
+    let one = scale_run(1);
+    let four = scale_run(4);
+    let tenths = four * 10 / one.max(1);
+    println!("        one pair {} calls in a second, four pairs {}: {}.{}x", one, four, tenths / 10, tenths % 10);
+    check("every call of five pairs answered, and rightly", !SCALE_WRONG.load(SeqCst));
+    check("four pairs on four processors make at least twice what one pair makes", one > 0 && four >= 2 * one);
+}
+
 /// A pair of threads calling each other back and forth leaves a thread
 /// computing on their processor its turns. A caller woken by its answer
 /// goes first (`unblock_task_next`), and was given a whole turn each time
@@ -11281,6 +11396,7 @@ pub extern "C" fn _start() -> ! {
         ("idle", test_idle),
         ("offline", test_offline),
         ("turns", test_turns),
+        ("scale", test_scale),
         ("objects", test_objects),
         ("caps", test_cap_space),
         ("cwds", test_cwds),
