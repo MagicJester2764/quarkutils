@@ -173,17 +173,20 @@ framebuffer. To see user-space output headlessly, screendump over QMP
 
 ## Testing
 
-`dtest` is the kernel's test suite as much as this tree's: 1073 checks made
+`dtest` is the kernel's test suite as much as this tree's: 1074 checks made
 from user space through the ABI on a machine of one processor with nothing
 more to ask about — four of them of registers only some processors have,
 and not made where there are none — twenty more on four processors
 (`dtest placement` wants two, `dtest offline` and `dtest scale` four), and
-more on a machine with more, below: 1110 on the machine ExplOSion tests on,
-which has `swapd` and `edu`, and 1130 on it with four processors. A recap of what failed
+more on a machine with more, below: 1111 on the machine ExplOSion tests on,
+which has `swapd` and `edu`, and 1131 on it with four processors. A recap of what failed
 comes before the count. A
 check that times out or is refused says which. It is run on one processor
 and on several (`SMP=4` to a distribution's `boot-test.sh`); `dtest smp` is
-the part about what a second processor changes, and passes on one. `dtest
+the part about what a second processor changes, and passes on one — a
+program ended from another processor while its threads count in ring 3
+(`dchild spin`), and a hundred times while they yield as they count
+(`dchild yields`), among it. `dtest
 clock` is about time: what the clock says, and whether a wait ends when it
 was asked to. A check that a wait is *on time* asks that most of several
 are — one of them is on time by luck on a machine that wakes only on its
