@@ -4,7 +4,9 @@
  * processor, as Linux's does — the time each has spent in programs, in the
  * kernel, with nothing to do and taking interrupts, in hundredths of a
  * second — and the machine's lines after them; and a processor with
- * nothing to do is counted as such: a second's sleep adds to it. The
+ * nothing to do is counted as such: a second's sleep adds to it, on every
+ * processor. One that had run nothing since it was started was counted as
+ * in the kernel for as long as it slept, and the sum hid it. The
  * second number of /proc/uptime is that idle time too, where it was always
  * 0.00. /proc/cpuinfo has a block for each processor with its package,
  * core and APIC id as the processor says them, and /proc/self/stat's
@@ -32,9 +34,12 @@ static void check(const char *what, int ok) {
     }
 }
 
+#define MOST 256
+
 /* The idle hundredths of every `cpuN` line of /proc/stat, summed, and how
-   many such lines there were; -1 if there is no /proc/stat. */
-static long idle_of_all(int *lines, int *machine) {
+   many such lines there were; -1 if there is no /proc/stat. Each line's own
+   goes in `each`, by its processor's number. */
+static long idle_of_all(int *lines, int *machine, long *each) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) {
         return -1;
@@ -52,6 +57,9 @@ static long idle_of_all(int *lines, int *machine) {
         if (numbered && sscanf(line, "cpu%d %llu %llu %llu %llu", &n, &user, &nice, &sys, &quiet) == 5) {
             idle += (long)quiet;
             (*lines)++;
+            if (n >= 0 && n < MOST) {
+                each[n] = (long)quiet;
+            }
         }
         static const char *const wanted[] = {"intr ", "ctxt ", "btime ", "processes ", "procs_running "};
         for (unsigned i = 0; i < sizeof wanted / sizeof wanted[0]; i++) {
@@ -121,15 +129,26 @@ int main(int argc, char **argv) {
     check("sched_getcpu names an online processor", online >= 1 && cpu >= 0 && cpu < online);
 
     int lines = 0, machine = 0;
-    long before = idle_of_all(&lines, &machine);
+    static long each_before[MOST], each_after[MOST];
+    long before = idle_of_all(&lines, &machine, each_before);
     check("/proc/stat has a line for every processor", before >= 0 && lines == online);
     check("and the machine's: intr, ctxt, btime, processes, procs_running", machine == 0x1f);
     struct timespec second = {1, 0};
     nanosleep(&second, NULL);
-    long after = idle_of_all(&lines, &machine);
+    long after = idle_of_all(&lines, &machine, each_after);
     /* A second asleep on an otherwise quiet machine is a hundred hundredths
        a processor; half of one is plenty to tell it from nothing. */
     check("a second's sleep is counted as time with nothing to do", before >= 0 && after - before >= 50);
+    /* And on each processor: a quarter of the second at least, every one. */
+    int each_quiet = before >= 0;
+    for (int i = 0; i < online && i < MOST; i++) {
+        long quiet = each_after[i] - each_before[i];
+        if (quiet < 25) {
+            printf("  (processor %d: %ld hundredths with nothing to do)\n", i, quiet);
+            each_quiet = 0;
+        }
+    }
+    check("on every processor", each_quiet);
 
     double up = 0, idle = 0;
     FILE *f = fopen("/proc/uptime", "r");
