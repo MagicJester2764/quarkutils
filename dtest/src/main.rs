@@ -7208,14 +7208,16 @@ fn test_offline() {
     let back = syscall::sys_cpu_set_online(3, true).is_ok();
     let (n, set) = online();
     check("processor 3 is brought back", back && n == count && set[0] & 1 << 3 != 0);
-    let idle = || syscall::sys_cpu_times(Some(3)).map_or(0, |t| t.idle_ns);
-    let before = idle();
-    syscall::sleep_ms(200);
-    check("and has nothing to do again", idle() >= before + 50_000_000);
+    // The spinner stopped first: let run anywhere since 3 went, it may be
+    // given to 3 the moment 3 is back, and then 3 has something to do.
     OFF_STOP.store(true, SeqCst);
     if let Some(t) = spinner {
         let _ = t.join();
     }
+    let idle = || syscall::sys_cpu_times(Some(3)).map_or(0, |t| t.idle_ns);
+    let before = idle();
+    syscall::sleep_ms(200);
+    check("and has nothing to do again", idle() >= before + 50_000_000);
     if let Some(t) = reader {
         let _ = t.join();
     }
