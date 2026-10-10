@@ -242,8 +242,10 @@ sound card and eighteen with one.
 programs a list names — `/etc/libc.tests`, `/etc/pixman.tests` — and `qfuzz`
 throws random requests at every registered service. `callbench N SECS`
 counts the calls a second N pairs of threads make, each pair kept to a
-processor of its own (`sweep` for 1, 2, 4 and 8): with one lock for the
-kernel, pairs on four processors make what one pair makes. `kstress
+processor of its own (`sweep` for 1, 2, 4 and 8): with every call under
+the kernel's one lock, pairs on four processors made what one pair makes;
+made without it, four pairs make 3.7 times what one makes, and eight on
+eight seven. `kstress
 calls|faults|futex|pipes|mix SECS` has every processor hammering the
 kernel and checks each operation — every call answered, every page read
 back as written, every word through a pipe in order, no wake lost.
