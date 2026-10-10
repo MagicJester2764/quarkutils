@@ -163,6 +163,29 @@ fn spin(threads: usize) -> ! {
     beat_for_ever(0)
 }
 
+/// Adds to its counter and yields, for ever: in the kernel, in a call made
+/// without the one lock, about as often as it is in ring 3.
+extern "C" fn beat_and_yield(slot: usize) -> ! {
+    let at = (BEATS + slot * 8) as *mut u64;
+    loop {
+        unsafe { core::ptr::write_volatile(at, core::ptr::read_volatile(at).wrapping_add(1)) };
+        syscall::sys_yield();
+    }
+}
+
+/// `yields N`: `spin`, but each of its threads yields as it counts.
+fn yields(threads: usize) -> ! {
+    if syscall::sys_mmap_fd(CONN, BEATS).is_err() {
+        syscall::sys_exit_program(1);
+    }
+    for slot in 1..=threads {
+        if thread::spawn_with_arg(beat_and_yield, slot, 4).is_err() {
+            syscall::sys_exit_program(2);
+        }
+    }
+    beat_and_yield(0)
+}
+
 /// Whose turn it is in `together`: 1 the partner's, 0 this task's.
 static TURN: AtomicU32 = AtomicU32::new(0);
 /// The processor the partner was last seen on, and one.
@@ -1517,6 +1540,9 @@ pub extern "C" fn _start() -> ! {
     }
     if quark_rt::args::argv(1) == Some(&b"spin"[..]) {
         spin(quark_rt::args::argv(2).map_or(0, number));
+    }
+    if quark_rt::args::argv(1) == Some(&b"yields"[..]) {
+        yields(quark_rt::args::argv(2).map_or(0, number));
     }
     if quark_rt::args::argv(1) == Some(&b"together"[..]) {
         syscall::sys_exit_program(together());

@@ -6893,7 +6893,12 @@ fn none_beating(threads: usize) -> bool {
 /// Start `dchild spin N` counting in `memory`, which is mapped at
 /// [`BEATS_AT`] here: its task.
 fn start_spinner(memory: usize, threads: &[u8]) -> Option<usize> {
-    let child = load_child(&[b"dchild", b"spin", threads])?;
+    start_counting(memory, b"spin", threads)
+}
+
+/// Start `dchild <how> N` counting in `memory`: its task.
+fn start_counting(memory: usize, how: &[u8], threads: &[u8]) -> Option<usize> {
+    let child = load_child(&[b"dchild", how, threads])?;
     let tid = child.tid;
     if syscall::sys_fd_dup(tid, 3, memory).is_err() {
         child.discard();
@@ -7679,6 +7684,42 @@ fn test_smp() {
         let (free_after, _) = syscall::sys_mem_info();
         check("and its memory comes back", free_after + 64 >= free_before);
     }
+
+    // Its threads in the kernel as often as not instead, in a call made
+    // without the one lock — a yield — and the program ended from another
+    // processor, a hundred times. A switch away that read whether the task
+    // was running before the kill marked it ended, and said it was ready
+    // after, put a thread that had just been ended back in a queue: it ran
+    // on, its descriptors closed and its death told.
+    let mut rounds = 0;
+    let mut ended = 0;
+    while rounds < 100 {
+        let Some(tid) = memory.and_then(|fd| start_counting(fd, b"yields", b"3")) else { break };
+        rounds += 1;
+        let wrong = if !all_beating(4, 100) {
+            "its threads did not all run"
+        } else if syscall::sys_task_kill(tid).is_err() {
+            "it could not be ended"
+        } else if wait_for(tid) != Some(-9) {
+            "it was not ended"
+        } else if {
+            syscall::sleep_ticks(2);
+            !none_beating(4)
+        } {
+            "a thread went on"
+        } else {
+            ""
+        };
+        if !wrong.is_empty() {
+            println!("        round {}: {}", rounds, wrong);
+            break;
+        }
+        ended += 1;
+    }
+    check(
+        "a program whose threads yield on other processors is ended, a hundred times, and none of them goes on",
+        ended == 100,
+    );
 
     let spinner = memory.and_then(|fd| start_spinner(fd, b"1"));
     if let Some(tid) = spinner.filter(|_| all_beating(2, 100)) {
